@@ -256,6 +256,8 @@ func TestReconcileApprovedBaselineBranchDeletesExactReviewedRef(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/matching-refs/heads/hive/baseline-":
+			_, _ = io.WriteString(writer, `[]`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/baseline-reviewed":
 			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/baseline-reviewed","object":{"sha":"reviewed-head","type":"commit"}}`)
 		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/baseline-reviewed":
