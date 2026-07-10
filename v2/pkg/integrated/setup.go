@@ -519,6 +519,7 @@ jobs:
           printf '%%s\n' "$pipeline_exit" > .visual-hive/pipeline-exit-code.txt
           echo "Visual Hive deterministic pipeline exit: $pipeline_exit"
           node "$VISUAL_HIVE_CLI" issues --config visual-hive.config.yaml --write
+          # Writes .visual-hive/baselines.json before artifact upload.
           node "$VISUAL_HIVE_CLI" baselines list --config visual-hive.config.yaml --write
           node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
           node -e 'const fs=require("fs");const candidates=[".visual-hive/plan.full.json",".visual-hive/plan.json"];const p=candidates.find(fs.existsSync);const v=p?JSON.parse(fs.readFileSync(p,"utf8")):{};const rows=Array.isArray(v.items)?v.items:[];const layerPath=".visual-hive/testing-layers.json";const layerReport=fs.existsSync(layerPath)?JSON.parse(fs.readFileSync(layerPath,"utf8")):{};const layers=Array.isArray(layerReport.layers)?layerReport.layers:[];const ids=[...new Set([...rows.map(x=>x.contractId||x.id),...layers.map(x=>Number.isInteger(x.id)?"testing-layer:"+x.id:null)].filter(Boolean))].sort();fs.writeFileSync(".visual-hive/evaluated-contracts.txt",ids.join("\n")+"\n")'
@@ -636,6 +637,7 @@ jobs:
           set -e
           printf '%%s\n' "$pipeline_exit" > .visual-hive/pipeline-exit-code.txt
           node "$VISUAL_HIVE_CLI" issues --config visual-hive.config.yaml --write
+          # Writes .visual-hive/baselines.json before artifact upload.
           node "$VISUAL_HIVE_CLI" baselines list --config visual-hive.config.yaml --write
           node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
       - name: Upload review evidence
