@@ -56,6 +56,7 @@ type FindingLifecycle struct {
 	Labels                []string        `json:"labels"`
 	AffectedContracts     []string        `json:"affected_contracts"`
 	ValidationCommand     string          `json:"validation_command"`
+	HumanReviewRequired   bool            `json:"human_review_required"`
 	BeadID                string          `json:"bead_id,omitempty"`
 	IssueNumber           int             `json:"issue_number,omitempty"`
 	IssueURL              string          `json:"issue_url,omitempty"`
@@ -126,6 +127,7 @@ type ApplyLifecycleOptions struct {
 	VerificationRunID string
 	VerificationURL   string
 	MaxActiveIssues   int
+	PreferRepairable  bool
 }
 
 type ApplyLifecycleResult struct {
@@ -221,7 +223,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	}
 
 	observedFingerprints := make(map[string]bool, len(manifest.Observations))
-	publicationSet := selectIssuePublications(manifest.Observations, s.state.Findings, options.MaxActiveIssues)
+	publicationSet := selectIssuePublications(manifest.Observations, s.state.Findings, options.MaxActiveIssues, options.PreferRepairable)
 	for _, observation := range manifest.Observations {
 		observedFingerprints[observation.RepositoryFingerprint] = true
 		finding := s.state.Findings[observation.RepositoryFingerprint]
@@ -358,7 +360,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	return result, nil
 }
 
-func selectIssuePublications(observations []Observation, findings map[string]*FindingLifecycle, maxActive int) map[string]bool {
+func selectIssuePublications(observations []Observation, findings map[string]*FindingLifecycle, maxActive int, preferRepairable bool) map[string]bool {
 	selected := map[string]bool{}
 	if maxActive <= 0 {
 		for _, observation := range observations {
@@ -393,6 +395,15 @@ func selectIssuePublications(observations []Observation, findings map[string]*Fi
 		if severityRank(left.Severity) != severityRank(right.Severity) {
 			return severityRank(left.Severity) > severityRank(right.Severity)
 		}
+		if preferRepairable {
+			leftHuman, rightHuman := observationNeedsHumanReview(left), observationNeedsHumanReview(right)
+			if leftHuman != rightHuman {
+				return !leftHuman
+			}
+			if repairSignalRank(left) != repairSignalRank(right) {
+				return repairSignalRank(left) > repairSignalRank(right)
+			}
+		}
 		if issueKindRank(left.IssueKind) != issueKindRank(right.IssueKind) {
 			return issueKindRank(left.IssueKind) > issueKindRank(right.IssueKind)
 		}
@@ -405,6 +416,34 @@ func selectIssuePublications(observations []Observation, findings map[string]*Fi
 		selected[observation.RepositoryFingerprint] = true
 	}
 	return selected
+}
+
+func observationNeedsHumanReview(observation Observation) bool {
+	title := strings.ToLower(strings.TrimSpace(observation.Title))
+	if strings.Contains(title, "missing baseline") || strings.Contains(title, "missing_baseline") {
+		return true
+	}
+	for _, label := range observation.Labels {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		if normalized == "stale-baseline" || normalized == "baseline-review" || normalized == "visual-hive/baseline-review" {
+			return true
+		}
+	}
+	return false
+}
+
+func repairSignalRank(observation Observation) int {
+	if observationNeedsHumanReview(observation) {
+		return 0
+	}
+	title := strings.ToLower(strings.TrimSpace(observation.Title))
+	if strings.Contains(title, "console_error") || strings.Contains(title, "console error") || strings.Contains(title, "network_error") || strings.Contains(title, "network error") {
+		return 6
+	}
+	if strings.Contains(title, "failed deterministic validation") || strings.Contains(title, "contract_result") || strings.Contains(title, "contract result") {
+		return 5
+	}
+	return issueKindRank(observation.IssueKind)
 }
 
 func severityRank(value string) int {
@@ -736,6 +775,7 @@ func updateFindingFromObservation(finding *FindingLifecycle, manifest Manifest, 
 	finding.Labels = append([]string(nil), observation.Labels...)
 	finding.AffectedContracts = append([]string(nil), observation.AffectedContracts...)
 	finding.ValidationCommand = observation.ValidationCommand
+	finding.HumanReviewRequired = observationNeedsHumanReview(observation)
 	finding.LastSeenAt = observedAt
 	finding.LastBundleID = manifest.BundleID
 	finding.LastBundleDigest = manifest.OverallDigest

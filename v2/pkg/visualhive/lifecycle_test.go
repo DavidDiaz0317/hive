@@ -256,10 +256,30 @@ func TestIssuePublicationSelectionEnforcesActiveWIPAndRanksDirectFailuresFirst(t
 		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen},
 	}
 
-	selected := selectIssuePublications(observations, findings, 2)
+	selected := selectIssuePublications(observations, findings, 2, false)
 
 	if len(selected) != 1 || !selected["regression"] {
 		t.Fatalf("expected one remaining slot to select the direct high-severity failure, got %v", selected)
+	}
+}
+
+func TestIssuePublicationSelectionPrefersRepairableConsoleFailure(t *testing.T) {
+	observations := []Observation{
+		{RepositoryFingerprint: "baseline", State: "present", Severity: "high", IssueKind: "screenshot_diff", Title: "Review missing baseline for deploy-preview"},
+		{RepositoryFingerprint: "regression", State: "present", Severity: "high", IssueKind: "screenshot_diff", Title: "deploy-preview failed deterministic validation"},
+		{RepositoryFingerprint: "console", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", Title: "Repair deploy-preview: console_error"},
+	}
+	findings := map[string]*FindingLifecycle{
+		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen, HumanReviewRequired: true},
+	}
+
+	selected := selectIssuePublications(observations, findings, 2, true)
+
+	if len(selected) != 1 || !selected["console"] {
+		t.Fatalf("expected repair mode to select the actionable console failure, got %v", selected)
+	}
+	if !observationNeedsHumanReview(observations[0]) {
+		t.Fatal("missing-baseline observations must require human review")
 	}
 }
 

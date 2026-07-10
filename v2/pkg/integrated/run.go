@@ -141,7 +141,8 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 	}
 	apply, err := lifecycle.ApplyBundle(bundle, beadStore, visualhive.ApplyLifecycleOptions{
 		TargetRef: config.DefaultBranch, VerificationRunID: fmt.Sprintf("%d", workflow.RunID), VerificationURL: workflow.RunURL,
-		MaxActiveIssues: config.MaxActiveIssues,
+		MaxActiveIssues:  config.MaxActiveIssues,
+		PreferRepairable: config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge,
 	})
 	if err != nil {
 		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
@@ -339,7 +340,7 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 	sort.Strings(keys)
 	for _, key := range keys {
 		finding := snapshot.Findings[key]
-		if finding == nil || (finding.Status != visualhive.StatusIssueOpen && finding.Status != visualhive.StatusFixQueued && finding.Status != visualhive.StatusNeedsRevision && finding.Status != visualhive.StatusRepairRunning) || finding.IssueNumber <= 0 {
+		if finding == nil || finding.HumanReviewRequired || (finding.Status != visualhive.StatusIssueOpen && finding.Status != visualhive.StatusFixQueued && finding.Status != visualhive.StatusNeedsRevision && finding.Status != visualhive.StatusRepairRunning) || finding.IssueNumber <= 0 {
 			continue
 		}
 		state, err := repair.NewStore(filepath.Join(config.StateDir, "repair"))
@@ -380,7 +381,7 @@ func activeRepairFinding(state visualhive.LifecycleState) (visualhive.FindingLif
 	sort.Strings(keys)
 	for _, key := range keys {
 		finding := state.Findings[key]
-		if finding == nil || finding.IssueNumber <= 0 {
+		if finding == nil || finding.IssueNumber <= 0 || finding.HumanReviewRequired {
 			continue
 		}
 		switch finding.Status {

@@ -269,7 +269,7 @@ func runIntegratedStatus(args []string) int {
 					continue
 				}
 				counts[finding.Status]++
-				items = append(items, map[string]any{"fingerprint": finding.RepositoryFingerprint, "status": finding.Status, "issue_url": finding.IssueURL, "pr_url": finding.PRURL, "repair_attempts": finding.RepairAttempts})
+				items = append(items, map[string]any{"fingerprint": finding.RepositoryFingerprint, "status": finding.Status, "issue_url": finding.IssueURL, "pr_url": finding.PRURL, "repair_attempts": finding.RepairAttempts, "human_review_required": finding.HumanReviewRequired})
 			}
 			status["lifecycle"] = map[string]any{"counts": counts, "findings": items, "pending_outbox": len(lifecycle.PendingOutbox())}
 		}
