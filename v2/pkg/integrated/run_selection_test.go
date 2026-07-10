@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
@@ -73,6 +74,52 @@ func TestRepairPreparationAndPinnedCLIEnvironment(t *testing.T) {
 func TestDispatchRetryIsBoundedToConcurrencyCancellation(t *testing.T) {
 	if !retryCancelledDispatch("cancelled", 1, 3) || retryCancelledDispatch("failure", 1, 3) || retryCancelledDispatch("cancelled", 3, 3) {
 		t.Fatal("dispatch retry classification must be cancellation-only and bounded")
+	}
+}
+
+func TestRetryableRepairAttemptClassification(t *testing.T) {
+	retryable := &repair.RetryableAttemptError{Cause: fmt.Errorf("validation failed")}
+	if !repair.IsRetryableAttemptError(retryable) || repair.IsRetryableAttemptError(fmt.Errorf("policy denied")) {
+		t.Fatal("repair retry classification must be explicit")
+	}
+}
+
+func TestMarkMergePolicyHoldPersistsReviewRequirement(t *testing.T) {
+	dir := t.TempDir()
+	state := visualhive.LifecycleState{
+		SchemaVersion: visualhive.LifecycleSchema,
+		Findings: map[string]*visualhive.FindingLifecycle{
+			"finding": {
+				Repository: "owner/repo", RepositoryFingerprint: "finding", Status: visualhive.StatusReady,
+				IssueNumber: 10, PRNumber: 12, RepairCommitSHA: "repair-sha",
+			},
+		},
+		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := automation.Decision{Action: automation.ActionMergePR, Reasons: []string{"visual-hive.config.yaml is outside the auto-merge allowlist"}}
+	finding, _ := lifecycle.Finding("finding")
+	if err := markMergePolicyHold(lifecycle, finding, decision); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := visualhive.NewLifecycleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, exists := reopened.Finding("finding")
+	if !exists || held.Status != visualhive.StatusReady || !held.HumanReviewRequired || held.ManualReviewKind != "merge_policy" || !strings.Contains(held.ManualReviewReason, "outside the auto-merge allowlist") {
+		t.Fatalf("merge policy hold was not durable: %+v", held)
 	}
 }
 

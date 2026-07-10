@@ -299,7 +299,7 @@ func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 		Title: "Repair deploy-preview-smoke: console_error", Body: "Evidence-backed failure.", IssueKind: "functional", Severity: "high",
 		AffectedContracts: []string{"deploy-preview-smoke"}, OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
-	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "without a source or test change") {
+	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "without a source or test change") || !IsRetryableAttemptError(err) {
 		t.Fatalf("expected bounded no-change failure, got %v", err)
 	}
 	first, _ := state.Get(finding.RepositoryFingerprint)
@@ -395,6 +395,16 @@ func TestCheckpointLocalValidationFailureCreatesBoundedRetryState(t *testing.T) 
 	saved, ok := store.Get(attempt.RepositoryFingerprint)
 	if !ok || saved.Stage != StageNoChange || saved.ModelPatch != "" || !strings.Contains(saved.ModelSummary, "expected 2, got 1") {
 		t.Fatalf("local validation failure was not persisted for a bounded retry: %+v", saved)
+	}
+}
+
+func TestLimitedBufferPreservesValidationFailureTail(t *testing.T) {
+	var output limitedBuffer
+	_, _ = output.Write([]byte("command-start\n" + strings.Repeat("progress\n", 3_000)))
+	_, _ = output.Write([]byte("assertion failure: expected ready, got loading\n"))
+	value := output.String()
+	if !strings.Contains(value, "command-start") || !strings.Contains(value, "assertion failure: expected ready, got loading") || !strings.Contains(value, "bounded output omitted") {
+		t.Fatalf("bounded output did not preserve diagnostic head and tail: %q", value)
 	}
 }
 

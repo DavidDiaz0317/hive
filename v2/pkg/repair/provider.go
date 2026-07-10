@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 type ProviderResult struct {
@@ -87,19 +88,47 @@ func providerEnvironment() []string {
 
 var blockedEnvironmentName = regexp.MustCompile(`(?i)(^|_)(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)($|_)`)
 
-type limitedBuffer struct{ bytes.Buffer }
+type limitedBuffer struct {
+	mu    sync.Mutex
+	head  bytes.Buffer
+	tail  []byte
+	total int
+}
 
 func (b *limitedBuffer) Write(value []byte) (int, error) {
 	const limit = 16 << 10
+	const headLimit = limit / 2
+	const tailLimit = limit - headLimit
 	original := len(value)
-	if b.Len() < limit {
-		remaining := limit - b.Len()
-		if len(value) > remaining {
-			value = value[:remaining]
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.total += original
+	if b.head.Len() < headLimit {
+		remaining := headLimit - b.head.Len()
+		written := min(len(value), remaining)
+		_, _ = b.head.Write(value[:written])
+		value = value[written:]
+	}
+	if len(value) > 0 {
+		if len(value) > tailLimit {
+			value = value[len(value)-tailLimit:]
 		}
-		_, _ = b.Buffer.Write(value)
+		b.tail = append(b.tail, value...)
+		if len(b.tail) > tailLimit {
+			b.tail = append([]byte(nil), b.tail[len(b.tail)-tailLimit:]...)
+		}
 	}
 	return original, nil
+}
+
+func (b *limitedBuffer) String() string {
+	const limit = 16 << 10
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.total <= limit {
+		return b.head.String() + string(b.tail)
+	}
+	return b.head.String() + "\n...[bounded output omitted]...\n" + string(b.tail)
 }
 
 type providerOutputBuffer struct{ bytes.Buffer }

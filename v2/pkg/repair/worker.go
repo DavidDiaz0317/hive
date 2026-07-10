@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -65,6 +66,27 @@ type Worker struct {
 	State     *Store
 	Lifecycle Lifecycle
 	GitHub    PullRequestClient
+}
+
+type RetryableAttemptError struct {
+	Cause error
+}
+
+func (e *RetryableAttemptError) Error() string {
+	return e.Cause.Error()
+}
+
+func (e *RetryableAttemptError) Unwrap() error {
+	return e.Cause
+}
+
+func IsRetryableAttemptError(err error) bool {
+	var retryable *RetryableAttemptError
+	return errors.As(err, &retryable)
+}
+
+func retryableAttemptError(err error) error {
+	return &RetryableAttemptError{Cause: err}
 }
 
 func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (Result, error) {
@@ -170,7 +192,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err != nil {
 			attempt.Stage = StageNoChange
 			_ = w.State.Put(attempt)
-			return Result{}, err
+			return Result{}, retryableAttemptError(err)
 		}
 		attempt.Stage = StageModelComplete
 		if err := w.State.Put(attempt); err != nil {
@@ -188,17 +210,17 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			if patchErr != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
-				return Result{}, patchErr
+				return Result{}, retryableAttemptError(patchErr)
 			}
 			if err := validateChangedFiles(patchFiles, w.Config.AllowedRepairPaths); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
-				return Result{}, err
+				return Result{}, retryableAttemptError(err)
 			}
 			if err := validateFindingScope(finding, patchFiles); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
-				return Result{}, err
+				return Result{}, retryableAttemptError(err)
 			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
 				attempt.Stage = StageNoChange
@@ -208,7 +230,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			if err := applyModelPatch(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
-				return Result{}, err
+				return Result{}, retryableAttemptError(err)
 			}
 			files, err = changedFiles(ctx, attempt.Worktree)
 			if err != nil {
@@ -224,7 +246,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			if err := w.State.Put(attempt); err != nil {
 				return Result{}, err
 			}
-			return Result{}, fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status))
+			return Result{}, retryableAttemptError(fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status)))
 		}
 		if err := validateChangedFiles(files, w.Config.AllowedRepairPaths); err != nil {
 			return Result{}, err
@@ -238,7 +260,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
 						return Result{}, saveErr
 					}
-					return Result{}, err
+					return Result{}, retryableAttemptError(err)
 				}
 				review, recognized, reviewErr := DetectBaselineReview(attempt.Worktree)
 				if reviewErr != nil {
@@ -248,7 +270,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
 						return Result{}, saveErr
 					}
-					return Result{}, err
+					return Result{}, retryableAttemptError(err)
 				}
 				attempt.BaselineReview = review
 				if err := w.State.Put(attempt); err != nil {

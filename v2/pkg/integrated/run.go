@@ -211,6 +211,13 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		repairs, err := runEligibleRepairs(ctx, config, lifecycle, client, policy, evidenceRoot)
 		result.Repairs = append(result.Repairs, repairs...)
 		if err != nil {
+			finding, ok := activeRepairFinding(lifecycle.Snapshot())
+			if repair.IsRetryableAttemptError(err) && ok && finding.RepairAttempts < maxAttempts {
+				continue
+			}
+			if repair.IsRetryableAttemptError(err) && ok {
+				return result, fmt.Errorf("repair attempt budget exhausted for %s after retryable failure: %w", finding.RepositoryFingerprint, err)
+			}
 			return result, err
 		}
 		finding, ok := activeRepairFinding(lifecycle.Snapshot())
@@ -344,8 +351,11 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(automation.ActionMergePR), decision.Allowed, strings.Join(decision.Reasons, "; "))
 		evaluation.Decision = &decision
 		if !decision.Allowed {
+			if err := markMergePolicyHold(lifecycle, finding, decision); err != nil {
+				return result, err
+			}
 			result.Gates = append(result.Gates, evaluation)
-			return result, fmt.Errorf("merge denied for pull request #%d: %s", finding.PRNumber, strings.Join(decision.Reasons, "; "))
+			return result, nil
 		}
 		mergeSHA, err := client.MergePullRequestExact(ctx, config.Repository, finding.PRNumber, gate.HeadSHA)
 		if err != nil {
@@ -363,6 +373,11 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func markMergePolicyHold(lifecycle *visualhive.LifecycleStore, finding visualhive.FindingLifecycle, decision automation.Decision) error {
+	reason := fmt.Sprintf("Hive cannot auto-merge pull request #%d under the configured policy: %s. Review and merge the exact tested head manually, or change repository authority explicitly.", finding.PRNumber, strings.Join(decision.Reasons, "; "))
+	return lifecycle.MarkManualReviewRequired(finding.RepositoryFingerprint, "merge_policy", reason)
 }
 
 func cleanupMergedRepairBranch(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, repository string, finding visualhive.FindingLifecycle, expectedHeadSHA string) {
