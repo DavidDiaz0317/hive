@@ -48,6 +48,13 @@ func TestValidateBundleRejectsTampering(t *testing.T) {
 	}
 }
 
+func TestValidateBundleRejectsExpiredEvidence(t *testing.T) {
+	manifestPath := writeTestBundle(t, t.TempDir(), false)
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expected expired evidence rejection, got %v", err)
+	}
+}
+
 func TestValidateBundleRejectsUntrustedByDefault(t *testing.T) {
 	manifestPath := writeTestBundle(t, t.TempDir(), false)
 	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3}); err == nil || !strings.Contains(err.Error(), "independently verified") {
@@ -58,18 +65,7 @@ func TestValidateBundleRejectsUntrustedByDefault(t *testing.T) {
 func TestValidateBundleAcceptsIndependentProvenanceWithoutProducerTrustClaim(t *testing.T) {
 	root := t.TempDir()
 	manifestPath := writeTestBundle(t, root, false)
-	manifest := readManifest(t, manifestPath)
-	manifest.Source.Event = "workflow_dispatch"
-	manifest.Source.Conclusion = "success"
-	manifest.Source.WorkflowRunID = "42"
-	manifest.Source.WorkflowArtifactID = "99"
-	manifest.Provenance.Kind = "github-actions"
-	manifest.Provenance.AttestationRequired = true
-	manifest.ReplayProtection.Key = replayKey(manifest)
-	fileLines := []string{fmt.Sprintf("file\x00%s\x00%s\x00%d", manifest.Files[0].Path, manifest.Files[0].SHA256, manifest.Files[0].Size)}
-	manifest.OverallDigest = digestBundleContent(manifest, fileLines)
-	manifest.Provenance.SubjectDigest = manifest.OverallDigest
-	writeManifest(t, manifestPath, manifest)
+	bindTestBundleToIndependentProvenance(t, manifestPath)
 
 	validated, err := ValidateBundle(manifestPath, ValidationOptions{
 		Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3,
@@ -80,6 +76,26 @@ func TestValidateBundleAcceptsIndependentProvenanceWithoutProducerTrustClaim(t *
 	}
 	if !validated.Validation.Trusted {
 		t.Fatal("independently verified bundle must be trusted")
+	}
+}
+
+func TestValidateBundleRejectsCrossRepositoryAndStaleRunProvenance(t *testing.T) {
+	manifestPath := writeTestBundle(t, t.TempDir(), false)
+	bindTestBundleToIndependentProvenance(t, manifestPath)
+
+	base := ValidationOptions{
+		Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3,
+		VerifiedProvenance: true, ExpectedRepository: "owner/repo", ExpectedWorkflowRunID: "42",
+	}
+	crossRepository := base
+	crossRepository.ExpectedRepository = "owner/other"
+	if _, err := ValidateBundle(manifestPath, crossRepository); err == nil || !strings.Contains(err.Error(), "repository") {
+		t.Fatalf("expected cross-repository evidence rejection, got %v", err)
+	}
+	staleRun := base
+	staleRun.ExpectedWorkflowRunID = "43"
+	if _, err := ValidateBundle(manifestPath, staleRun); err == nil || !strings.Contains(err.Error(), "workflow run") {
+		t.Fatalf("expected stale-run evidence rejection, got %v", err)
 	}
 }
 
@@ -138,6 +154,22 @@ func writeTestBundle(t *testing.T, root string, trusted bool) string {
 		t.Fatal(err)
 	}
 	return manifestPath
+}
+
+func bindTestBundleToIndependentProvenance(t *testing.T, manifestPath string) {
+	t.Helper()
+	manifest := readManifest(t, manifestPath)
+	manifest.Source.Event = "workflow_dispatch"
+	manifest.Source.Conclusion = "success"
+	manifest.Source.WorkflowRunID = "42"
+	manifest.Source.WorkflowArtifactID = "99"
+	manifest.Provenance.Kind = "github-actions"
+	manifest.Provenance.AttestationRequired = true
+	manifest.ReplayProtection.Key = replayKey(manifest)
+	fileLines := []string{fmt.Sprintf("file\x00%s\x00%s\x00%d", manifest.Files[0].Path, manifest.Files[0].SHA256, manifest.Files[0].Size)}
+	manifest.OverallDigest = digestBundleContent(manifest, fileLines)
+	manifest.Provenance.SubjectDigest = manifest.OverallDigest
+	writeManifest(t, manifestPath, manifest)
 }
 
 func replayKey(manifest Manifest) string {

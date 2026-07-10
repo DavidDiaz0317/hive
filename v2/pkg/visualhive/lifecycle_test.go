@@ -48,6 +48,27 @@ func TestLifecyclePersistsAndDeduplicatesBundle(t *testing.T) {
 	}
 }
 
+func TestLifecycleRejectsReplayKeyWithDifferentDigest(t *testing.T) {
+	root := t.TempDir()
+	manifestPath := writeLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-replay", "present", "refs/heads/main", true)
+	bundle := validateLocalBundle(t, manifestPath)
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+
+	collision := *bundle
+	collision.Manifest = bundle.Manifest
+	collision.Manifest.OverallDigest = strings.Repeat("f", 64)
+	if _, err := lifecycle.ApplyBundle(&collision, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err == nil || !strings.Contains(err.Error(), "different digest") {
+		t.Fatalf("expected replay-key collision rejection, got %v", err)
+	}
+}
+
 func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 	root := t.TempDir()
 	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
