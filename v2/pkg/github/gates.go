@@ -280,6 +280,14 @@ func classifyGatePaths(gate *PullRequestGate) {
 		lower := strings.ToLower(strings.ReplaceAll(file, "\\", "/"))
 		gate.WorkflowChanged = gate.WorkflowChanged || strings.HasPrefix(lower, ".github/workflows/")
 		gate.BaselineChanged = gate.BaselineChanged || strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__")
+		baselineImage := strings.HasSuffix(lower, ".png") &&
+			(strings.HasPrefix(lower, "visual-hive.baselines/") || strings.Contains(lower, "/__screenshots__/"))
+		if baselineImage {
+			// A reviewed snapshot may legitimately describe an auth or deploy
+			// screen. Its filename is not evidence that authentication or
+			// deployment code changed; baseline authority remains separate.
+			continue
+		}
 		gate.SecuritySensitive = gate.SecuritySensitive || containsPathToken(lower, "auth", "security", "secret", "permission", "rbac", "policy")
 		gate.DeploymentChanged = gate.DeploymentChanged || containsPathToken(lower, "deploy", "terraform", "infra", "k8s", "helm") || lower == "dockerfile"
 	}

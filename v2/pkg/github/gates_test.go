@@ -83,6 +83,16 @@ func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 	}
 }
 
+func TestBaselineImageNameDoesNotImplyAuthCodeChange(t *testing.T) {
+	gate := PullRequestGate{ChangedFiles: []string{
+		"visual-hive.baselines/linux/public-auth-boundary__mobile.png",
+	}}
+	classifyGatePaths(&gate)
+	if !gate.BaselineChanged || gate.SecuritySensitive || gate.DeploymentChanged || gate.WorkflowChanged {
+		t.Fatalf("reviewed baseline filename was misclassified as code risk: %+v", gate)
+	}
+}
+
 func TestInspectPullRequestGateReportsExternalMerge(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
