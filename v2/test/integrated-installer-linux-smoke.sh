@@ -5,7 +5,7 @@ hive_root="${1:?Hive v2 source root is required}"
 visual_bundle="${2:?unpacked Visual Hive release bundle is required}"
 work_root="${3:-$(mktemp -d /tmp/hive-integrated-linux.XXXXXX)}"
 hive_commit="${HIVE_COMMIT:-$(git -C "$hive_root" rev-parse HEAD)}"
-visual_commit="${VISUAL_HIVE_COMMIT:-$(sed -nE 's/^[[:space:]]*"gitCommit":[[:space:]]*"([a-f0-9]{40})",?$/\1/p' "$visual_bundle/release-manifest.json")}" 
+visual_commit="${VISUAL_HIVE_COMMIT:-$(sed -nE 's/^[[:space:]]*"gitCommit":[[:space:]]*"([a-f0-9]{40})",?$/\1/p' "$visual_bundle/release-manifest.json")}"
 node_version="22.23.1"
 release_version="vlocal-linux"
 
