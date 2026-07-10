@@ -98,3 +98,23 @@ func TestUpsertRepairPullRequestRejectsDuplicateMarker(t *testing.T) {
 		t.Fatalf("expected duplicate rejection, got %v", err)
 	}
 }
+
+func TestUpsertRepairPullRequestRejectsMarkerOnAnotherBranch(t *testing.T) {
+	marker := "<!-- hive-repair: stable -->"
+	createCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.Method == http.MethodGet {
+			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":7,"body":%q,"head":{"ref":"hive/repair-original"},"base":{"ref":"main"}}]`, marker))
+			return
+		}
+		createCalls++
+		http.Error(writer, "must not create", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	_, err := client.UpsertRepairPullRequest(context.Background(), "owner/repo", "hive/repair-retry", "main", "title", marker, marker)
+	if err == nil || !strings.Contains(err.Error(), "refusing duplicate branch") || createCalls != 0 {
+		t.Fatalf("cross-branch duplicate was not rejected: calls=%d err=%v", createCalls, err)
+	}
+}

@@ -22,6 +22,7 @@ import (
 
 type Lifecycle interface {
 	MarkRepairStarted(repositoryFingerprint, branch string) error
+	MarkRepairRetry(repositoryFingerprint, branch string) error
 	MarkPROpen(repositoryFingerprint, commitSHA string, number int, prURL string) error
 	RecordAuthorization(repositoryFingerprint, action string, allowed bool, detail string)
 }
@@ -110,7 +111,22 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
 	startNewAttempt := !resumed || recurrenceChanged
 	if resumed && attempt.Stage == StageNoChange {
-		startNewAttempt = true
+		if attempt.PRNumber > 0 && attempt.PRNumber == finding.PRNumber && finding.MergeSHA == "" && !recurrenceChanged {
+			attempt.Attempt = max(finding.RepairAttempts+1, attempt.Attempt+1)
+			attempt.PriorModelSummary = attempt.ModelSummary
+			attempt.ModelPatch = ""
+			attempt.Stage = StagePrepared
+			attempt.StartedAt = time.Now().UTC()
+			if err := w.Lifecycle.MarkRepairRetry(finding.RepositoryFingerprint, attempt.Branch); err != nil {
+				return Result{}, err
+			}
+			attempt.LifecycleStarted = true
+			if err := w.State.Put(attempt); err != nil {
+				return Result{}, err
+			}
+		} else {
+			startNewAttempt = true
+		}
 	}
 	if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision && finding.MergeSHA != "" {
 		startNewAttempt = true

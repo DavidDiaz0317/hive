@@ -575,6 +575,24 @@ func (s *LifecycleStore) MarkRepairStarted(repositoryFingerprint, branch string)
 	})
 }
 
+// MarkRepairRetry spends one bounded attempt while preserving the exact open
+// branch and PR. A retry must never create a second active repair PR merely
+// because a model returned no incremental patch.
+func (s *LifecycleStore) MarkRepairRetry(repositoryFingerprint, branch string) error {
+	return s.updateFinding(repositoryFingerprint, "repair_retried", func(finding *FindingLifecycle) error {
+		branch = strings.TrimSpace(branch)
+		if (finding.Status != StatusRepairRunning && finding.Status != StatusNeedsRevision) || finding.PRNumber <= 0 {
+			return fmt.Errorf("cannot retry open repair from %s", finding.Status)
+		}
+		if branch == "" || strings.TrimSpace(finding.Branch) != branch {
+			return fmt.Errorf("retry must preserve the exact repair branch")
+		}
+		finding.Status = StatusRepairRunning
+		finding.RepairAttempts++
+		return nil
+	})
+}
+
 func (s *LifecycleStore) MarkPROpen(repositoryFingerprint, commitSHA string, number int, prURL string) error {
 	return s.updateFinding(repositoryFingerprint, "pr_opened", func(finding *FindingLifecycle) error {
 		if finding.Status != StatusRepairRunning && finding.Status != StatusNeedsRevision {

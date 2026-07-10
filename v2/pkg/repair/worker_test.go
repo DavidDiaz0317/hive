@@ -119,12 +119,18 @@ type fakeLifecycle struct {
 	branch, sha string
 	pr          int
 	starts      int
+	retries     int
 	decisions   []string
 }
 
 func (f *fakeLifecycle) MarkRepairStarted(_ string, branch string) error {
 	f.branch = branch
 	f.starts++
+	return nil
+}
+func (f *fakeLifecycle) MarkRepairRetry(_ string, branch string) error {
+	f.branch = branch
+	f.retries++
 	return nil
 }
 func (f *fakeLifecycle) MarkPROpen(_ string, sha string, number int, _ string) error {
@@ -296,6 +302,46 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 	attempt, _ := state.Get(finding.RepositoryFingerprint)
 	if attempt.Attempt != 2 || attempt.Stage != StagePROpen {
 		t.Fatalf("revision attempt was not persisted: %+v", attempt)
+	}
+}
+
+func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
+	provider := &fakeProvider{}
+	lifecycle := &fakeLifecycle{}
+	pulls := &fakePRClient{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:no-change-open", Status: visualhive.StatusIssueOpen,
+		Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
+		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	first, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, _ := state.Get(finding.RepositoryFingerprint)
+	attempt.Stage = StageNoChange
+	attempt.ModelSummary = "no incremental patch"
+	if err := state.Put(attempt); err != nil {
+		t.Fatal(err)
+	}
+	finding.Status, finding.RepairAttempts, finding.Branch, finding.PRNumber = visualhive.StatusRepairRunning, 1, first.Branch, first.PRNumber
+	second, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Branch != first.Branch || second.PRNumber != first.PRNumber || pulls.calls != 2 || lifecycle.retries != 1 {
+		t.Fatalf("no-change retry duplicated repair objects: first=%+v second=%+v pulls=%d lifecycle=%+v", first, second, pulls.calls, lifecycle)
 	}
 }
 

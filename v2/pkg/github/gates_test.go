@@ -110,6 +110,35 @@ func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 	}
 }
 
+func TestInspectPullRequestGateUsesNewestSameNameCheckRun(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/owner/repo/pulls/10":
+			_, _ = io.WriteString(writer, `{"number":10,"state":"open","mergeable":true,"head":{"sha":"same-head"},"base":{"ref":"main"},"labels":[]}`)
+		case "/repos/owner/repo/pulls/10/files":
+			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
+		case "/repos/owner/repo/branches/main/protection":
+			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]}}`)
+		case "/repos/owner/repo/commits/same-head/check-runs":
+			_, _ = io.WriteString(writer, `{"total_count":2,"check_runs":[{"id":200,"name":"visual-hive","status":"completed","conclusion":"success"},{"id":100,"name":"visual-hive","status":"completed","conclusion":"cancelled"}]}`)
+		case "/repos/owner/repo/commits/same-head/status":
+			_, _ = io.WriteString(writer, `{"state":"failure","statuses":[{"id":300,"context":"visual-hive","state":"failure"}]}`)
+		default:
+			http.Error(writer, "missing", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	gate, err := client.InspectPullRequestGate(context.Background(), "owner/repo", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gate.VisualHiveVerdictGreen || len(gate.RequiredCheckStates) != 1 || gate.RequiredCheckStates[0] != "success" || len(gate.Checks) != 1 {
+		t.Fatalf("newest App-backed check was not selected: %+v", gate)
+	}
+}
+
 func TestBaselineImageNameDoesNotImplyAuthCodeChange(t *testing.T) {
 	gate := PullRequestGate{ChangedFiles: []string{
 		"visual-hive.baselines/linux/public-auth-boundary__mobile.png",

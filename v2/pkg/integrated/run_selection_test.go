@@ -190,6 +190,67 @@ func TestReconcileExternallyMergedRepairPersistsExactMerge(t *testing.T) {
 	}
 }
 
+func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) {
+	closed, deleted := 0, 0
+	marker := "<!-- hive-repair: finding -->"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls" && request.URL.Query().Get("state") == "open":
+			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":11,"html_url":"https://example.test/pull/11","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head"},"base":{"ref":"main"}},{"number":12,"html_url":"https://example.test/pull/12","body":%q,"head":{"ref":"hive/repair-current","sha":"current-head"},"base":{"ref":"main"}}]`, marker, marker))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/11":
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":11,"state":"open","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head"}}`, marker))
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/pulls/11":
+			closed++
+			_, _ = io.WriteString(writer, `{"number":11,"state":"closed"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-old":
+			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-old","object":{"sha":"old-head","type":"commit"}}`)
+		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/repair-old":
+			deleted++
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	state := visualhive.LifecycleState{
+		SchemaVersion: visualhive.LifecycleSchema,
+		Findings: map[string]*visualhive.FindingLifecycle{
+			"finding": {
+				Repository: "owner/repo", RepositoryFingerprint: "finding", Status: visualhive.StatusReady,
+				IssueNumber: 10, PRNumber: 12, PRURL: "https://example.test/pull/12", RepairCommitSHA: "current-head",
+				Branch: "hive/repair-current", RepairAttempts: 2, OwningAgentHint: "quality",
+			},
+		},
+		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	policy := automation.Policy{ACMMLevel: 6, Mode: automation.ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 5}
+	if err := reconcileOpenRepairDuplicates(context.Background(), Config{Repository: "owner/repo", DefaultBranch: "main"}, lifecycle, client, policy); err != nil {
+		t.Fatal(err)
+	}
+	if closed != 1 || deleted != 1 {
+		t.Fatalf("superseded repair was not closed and deleted exactly once: closed=%d deleted=%d", closed, deleted)
+	}
+	finding, _ := lifecycle.Finding("finding")
+	if finding.PRNumber != 12 || finding.Branch != "hive/repair-current" || finding.RepairCommitSHA != "current-head" {
+		t.Fatalf("durable current repair was changed: %+v", finding)
+	}
+}
+
 func TestReconcileExternallyMergedRepairRecoversLegacyClosedState(t *testing.T) {
 	deleted := 0
 	server := newMergedRepairServer(t, &deleted)

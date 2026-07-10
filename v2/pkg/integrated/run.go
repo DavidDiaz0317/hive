@@ -71,6 +71,11 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		return result, err
 	}
 	result.Repository = config.Repository
+	policy := automation.Policy{
+		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
+		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
+		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
+	}
 	if config.Paused {
 		store.Audit(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: "repository automation is paused"})
 		return result, fmt.Errorf("repository automation is paused")
@@ -86,6 +91,9 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		return result, err
 	}
 	if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
+		return result, err
+	}
+	if err := reconcileOpenRepairDuplicates(runCtx, config, lifecycle, options.GitHub, policy); err != nil {
 		return result, err
 	}
 	externalMerge, err := reconcileExternallyMergedRepair(runCtx, lifecycle, options.GitHub)
@@ -110,11 +118,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if err != nil {
 		return result, err
 	}
-	validation, apply, outbox, verifiedArtifact, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, automation.Policy{
-		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
-		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
-		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
-	}, visualhive.ApplyLifecycleOptions{})
+	validation, apply, outbox, verifiedArtifact, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, policy, visualhive.ApplyLifecycleOptions{})
 	if err != nil {
 		return result, err
 	}
@@ -125,11 +129,6 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
 			return result, err
 		}
-	}
-	policy := automation.Policy{
-		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
-		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
-		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 	}
 	if config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge {
 		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact.SourceArtifactPath)
@@ -147,6 +146,63 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	result.CompletedAt = time.Now().UTC()
 	return result, nil
+}
+
+func reconcileOpenRepairDuplicates(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) error {
+	state := lifecycle.Snapshot()
+	keys := make([]string, 0, len(state.Findings))
+	for key := range state.Findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding == nil || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" || finding.Branch == "" || finding.MergeSHA != "" {
+			continue
+		}
+		marker := fmt.Sprintf("<!-- hive-repair: %s -->", finding.RepositoryFingerprint)
+		pulls, err := client.ListOpenRepairPullRequests(ctx, config.Repository, config.DefaultBranch, marker)
+		if err != nil {
+			return err
+		}
+		if len(pulls) <= 1 {
+			continue
+		}
+		currentFound := false
+		for _, pull := range pulls {
+			if pull.Number == finding.PRNumber && pull.Branch == finding.Branch && pull.HeadSHA == finding.RepairCommitSHA {
+				currentFound = true
+				break
+			}
+		}
+		if !currentFound {
+			return fmt.Errorf("multiple open repair PRs exist for %s but none matches the exact durable current repair", finding.RepositoryFingerprint)
+		}
+		for _, pull := range pulls {
+			if pull.Number == finding.PRNumber {
+				continue
+			}
+			actor := repairActor(finding.OwningAgentHint)
+			closeDecision := policy.Authorize(automation.ActionRequest{Action: automation.ActionCloseRepairPR, Agent: actor, Repository: config.Repository, RepairAttempts: finding.RepairAttempts})
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(automation.ActionCloseRepairPR), closeDecision.Allowed, fmt.Sprintf("superseded PR #%d: %s", pull.Number, strings.Join(closeDecision.Reasons, "; ")))
+			if !closeDecision.Allowed {
+				return fmt.Errorf("close superseded repair PR #%d denied: %s", pull.Number, strings.Join(closeDecision.Reasons, "; "))
+			}
+			if err := client.CloseRepairPullRequestExact(ctx, config.Repository, pull.Number, marker, pull.Branch, pull.HeadSHA); err != nil {
+				return err
+			}
+			deleteDecision := policy.Authorize(automation.ActionRequest{Action: automation.ActionDeleteRepairBranch, Agent: actor, Repository: config.Repository, RepairAttempts: finding.RepairAttempts})
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(automation.ActionDeleteRepairBranch), deleteDecision.Allowed, fmt.Sprintf("superseded PR #%d branch %s: %s", pull.Number, pull.Branch, strings.Join(deleteDecision.Reasons, "; ")))
+			if !deleteDecision.Allowed {
+				return fmt.Errorf("delete superseded repair branch %s denied: %s", pull.Branch, strings.Join(deleteDecision.Reasons, "; "))
+			}
+			if err := client.DeleteRepairBranchExact(ctx, config.Repository, pull.Branch, pull.HeadSHA); err != nil {
+				return err
+			}
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "duplicate_repair_reconciled", true, fmt.Sprintf("closed superseded PR #%d and deleted %s at %s; retained PR #%d", pull.Number, pull.Branch, pull.HeadSHA, finding.PRNumber))
+		}
+	}
+	return nil
 }
 
 func repairAttemptLimit(config Config) int {

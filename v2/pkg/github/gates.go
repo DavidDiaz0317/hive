@@ -241,6 +241,7 @@ func (c *Client) checkObservations(ctx context.Context, owner, repo, sha string)
 	}
 	states := map[string]string{}
 	byName := map[string]CheckObservation{}
+	checkRunIDs := map[string]int64{}
 	options := &gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	for {
 		runs, response, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repo, sha, options)
@@ -251,6 +252,10 @@ func (c *Client) checkObservations(ctx context.Context, owner, repo, sha string)
 			name := run.GetName()
 			state := normalizeCheckState(run.GetStatus(), run.GetConclusion())
 			key := normalizeName(name)
+			if prior, exists := checkRunIDs[key]; exists && run.GetID() <= prior {
+				continue
+			}
+			checkRunIDs[key] = run.GetID()
 			states[key] = state
 			byName[key] = CheckObservation{Name: name, State: state, URL: valueOr(run.GetHTMLURL(), run.GetDetailsURL())}
 		}
@@ -259,6 +264,7 @@ func (c *Client) checkObservations(ctx context.Context, owner, repo, sha string)
 		}
 		options.Page = response.NextPage
 	}
+	statusIDs := map[string]int64{}
 	statusOptions := &gh.ListOptions{PerPage: 100}
 	for {
 		combined, response, err := c.client.Repositories.GetCombinedStatus(ctx, owner, repo, sha, statusOptions)
@@ -268,6 +274,16 @@ func (c *Client) checkObservations(ctx context.Context, owner, repo, sha string)
 		for _, status := range combined.Statuses {
 			name := status.GetContext()
 			key := normalizeName(name)
+			// A Check Run and a legacy commit status can share a display name.
+			// Branch protection treats the App-backed Check Run as the relevant
+			// context, so a stale legacy status must not overwrite it.
+			if _, exists := checkRunIDs[key]; exists {
+				continue
+			}
+			if prior, exists := statusIDs[key]; exists && status.GetID() <= prior {
+				continue
+			}
+			statusIDs[key] = status.GetID()
 			states[key] = strings.ToLower(status.GetState())
 			byName[key] = CheckObservation{Name: name, State: states[key], URL: status.GetTargetURL()}
 		}
