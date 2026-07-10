@@ -78,15 +78,18 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, options.Timeout)
 	defer cancel()
+	lifecycle, err := visualhive.NewLifecycleStore(filepath.Join(options.StateDir, "visual-hive"))
+	if err != nil {
+		return result, err
+	}
+	if _, err := reconcileExternallyMergedRepair(runCtx, lifecycle, options.GitHub); err != nil {
+		return result, err
+	}
 	workflow, err := dispatchAndWait(runCtx, options.GitHub, config)
 	if err != nil {
 		return result, err
 	}
 	result.Workflow = workflow
-	lifecycle, err := visualhive.NewLifecycleStore(filepath.Join(options.StateDir, "visual-hive"))
-	if err != nil {
-		return result, err
-	}
 	beadStore, err := beads.NewStore(filepath.Join(options.StateDir, "beads", "quality"))
 	if err != nil {
 		return result, err
@@ -193,8 +196,10 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
 		}
 		summary := checkSummary(gate)
-		if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, green, summary, checkEvidence); err != nil {
-			return result, err
+		if finding.Status != visualhive.StatusReady {
+			if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, green, summary, checkEvidence); err != nil {
+				return result, err
+			}
 		}
 		evaluation := GateEvaluation{RepositoryFingerprint: finding.RepositoryFingerprint, Gate: gate}
 		if !green {
@@ -203,6 +208,22 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 				return result, fmt.Errorf("hosted checks remain red after %d attempts: %s", finding.RepairAttempts, summary)
 			}
 			continue
+		}
+		if gate.Merged {
+			if strings.TrimSpace(gate.MergeSHA) == "" {
+				return result, fmt.Errorf("merged pull request #%d did not report a merge commit", finding.PRNumber)
+			}
+			if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
+				return result, err
+			}
+			result.Gates = append(result.Gates, evaluation)
+			finding.MergeSHA, finding.Status = gate.MergeSHA, visualhive.StatusMerged
+			postMerge, postApply, postOutbox, verifyErr := verifyMergedFinding(ctx, stateDir, config, finding, lifecycle, beadStore, client, policy)
+			result.PostMergeWorkflow, result.PostMergeLifecycle, result.Outbox = &postMerge, &postApply, postOutbox
+			return result, verifyErr
+		}
+		if !gate.Open {
+			return result, fmt.Errorf("repair pull request #%d was closed without merging", finding.PRNumber)
 		}
 		if config.Automation == AutomationRepairPR {
 			result.Gates = append(result.Gates, evaluation)
@@ -238,6 +259,65 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client) (bool, error) {
+	finding, ok := repairPullRequestFinding(lifecycle.Snapshot())
+	if !ok {
+		return false, nil
+	}
+	gate, err := client.InspectPullRequestGate(ctx, finding.Repository, finding.PRNumber)
+	if err != nil {
+		return false, err
+	}
+	if gate.HeadSHA != finding.RepairCommitSHA {
+		return false, fmt.Errorf("pull request #%d head %s does not match Hive repair commit %s", finding.PRNumber, gate.HeadSHA, finding.RepairCommitSHA)
+	}
+	if !gate.Merged {
+		if !gate.Open {
+			return false, fmt.Errorf("repair pull request #%d was closed without merging", finding.PRNumber)
+		}
+		return false, nil
+	}
+	if strings.TrimSpace(gate.MergeSHA) == "" {
+		return false, fmt.Errorf("merged pull request #%d did not report a merge commit", finding.PRNumber)
+	}
+	green := gateChecksGreen(gate)
+	if !green {
+		return false, fmt.Errorf("externally merged pull request #%d lacks green exact-head gates", finding.PRNumber)
+	}
+	if finding.Status != visualhive.StatusReady {
+		checkEvidence := make([]visualhive.CheckEvidence, 0, len(gate.Checks))
+		for _, check := range gate.Checks {
+			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
+		}
+		if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, true, checkSummary(gate), checkEvidence); err != nil {
+			return false, err
+		}
+	}
+	if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.FindingLifecycle, bool) {
+	keys := make([]string, 0, len(state.Findings))
+	for key := range state.Findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding == nil || finding.HumanReviewRequired || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" {
+			continue
+		}
+		switch finding.Status {
+		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusNeedsRevision, visualhive.StatusReady:
+			return *finding, true
+		}
+	}
+	return visualhive.FindingLifecycle{}, false
 }
 
 func verifyMergedFinding(ctx context.Context, stateDir string, config Config, finding visualhive.FindingLifecycle, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (WorkflowRunEvidence, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, error) {

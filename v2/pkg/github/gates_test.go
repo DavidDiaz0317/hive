@@ -82,3 +82,33 @@ func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 		t.Fatalf("unsafe signals were lost: %+v", gate)
 	}
 }
+
+func TestInspectPullRequestGateReportsExternalMerge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/owner/repo/pulls/9":
+			_, _ = io.WriteString(writer, `{"number":9,"state":"closed","merged":true,"merge_commit_sha":"merge-123","head":{"sha":"head-123"},"base":{"ref":"main"},"labels":[]}`)
+		case "/repos/owner/repo/pulls/9/files":
+			_, _ = io.WriteString(writer, `[{"filename":"index.html"}]`)
+		case "/repos/owner/repo/branches/main/protection":
+			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]},"required_pull_request_reviews":{"required_approving_review_count":0}}`)
+		case "/repos/owner/repo/commits/head-123/check-runs":
+			_, _ = io.WriteString(writer, `{"total_count":1,"check_runs":[{"name":"visual-hive","head_sha":"head-123","status":"completed","conclusion":"success"}]}`)
+		case "/repos/owner/repo/commits/head-123/status":
+			_, _ = io.WriteString(writer, `{"state":"success","statuses":[]}`)
+		default:
+			http.Error(writer, "missing", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	gate, err := client.InspectPullRequestGate(context.Background(), "owner/repo", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate.Open || !gate.Merged || gate.MergeSHA != "merge-123" || gate.HeadSHA != "head-123" || !gate.VisualHiveVerdictGreen {
+		t.Fatalf("external merge signals were lost: %+v", gate)
+	}
+}

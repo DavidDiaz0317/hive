@@ -20,6 +20,8 @@ type PullRequestGate struct {
 	Number                  int                `json:"number"`
 	URL                     string             `json:"url"`
 	HeadSHA                 string             `json:"head_sha"`
+	Merged                  bool               `json:"merged"`
+	MergeSHA                string             `json:"merge_sha,omitempty"`
 	BaseBranch              string             `json:"base_branch"`
 	Open                    bool               `json:"open"`
 	Draft                   bool               `json:"draft"`
@@ -75,7 +77,8 @@ func (c *Client) InspectPullRequestGate(ctx context.Context, repository string, 
 	}
 	gate := PullRequestGate{
 		Number: number, URL: pull.GetHTMLURL(), HeadSHA: pull.GetHead().GetSHA(), BaseBranch: pull.GetBase().GetRef(),
-		Open: pull.GetState() == "open", Draft: pull.GetDraft(), MergeableState: pull.GetMergeableState(),
+		Open: pull.GetState() == "open", Merged: pull.GetMerged(), MergeSHA: pull.GetMergeCommitSHA(),
+		Draft: pull.GetDraft(), MergeableState: pull.GetMergeableState(),
 	}
 	if pull.Mergeable != nil {
 		gate.MergeableKnown, gate.Mergeable = true, pull.GetMergeable()
