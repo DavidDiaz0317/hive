@@ -212,11 +212,23 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			result.PostMergeWorkflow, result.PostMergeLifecycle, result.Outbox = &postMerge, &postApply, postOutbox
 			return result, verifyErr
 		}
-		if finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued || finding.Status == visualhive.StatusNeedsRevision || finding.Status == visualhive.StatusRepairRunning {
+		if finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued || finding.Status == visualhive.StatusRepairRunning {
 			if finding.RepairAttempts >= maxAttempts {
 				return result, fmt.Errorf("repair attempt budget exhausted for %s", finding.RepositoryFingerprint)
 			}
 			continue
+		}
+		if finding.Status == visualhive.StatusNeedsRevision {
+			pending, pendingErr := hasPendingBaselineCandidate(stateDir, finding.RepositoryFingerprint)
+			if pendingErr != nil {
+				return result, pendingErr
+			}
+			if !pending {
+				if finding.RepairAttempts >= maxAttempts {
+					return result, fmt.Errorf("repair attempt budget exhausted for %s", finding.RepositoryFingerprint)
+				}
+				continue
+			}
 		}
 		gate, err := waitForPullRequestGate(ctx, client, config.Repository, finding)
 		if err != nil {
@@ -228,11 +240,6 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
 		}
 		summary := checkSummary(gate)
-		if finding.Status != visualhive.StatusReady {
-			if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, green, summary, checkEvidence); err != nil {
-				return result, err
-			}
-		}
 		evaluation := GateEvaluation{RepositoryFingerprint: finding.RepositoryFingerprint, Purpose: "repair", Gate: gate}
 		if !green {
 			attemptState, stateErr := repair.NewStore(filepath.Join(stateDir, "repair"))
@@ -278,11 +285,21 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 				result.Gates = append(result.Gates, evaluation)
 				return result, nil
 			}
+			if finding.Status != visualhive.StatusReady {
+				if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, false, summary, checkEvidence); err != nil {
+					return result, err
+				}
+			}
 			result.Gates = append(result.Gates, evaluation)
 			if finding.RepairAttempts >= maxAttempts {
 				return result, fmt.Errorf("hosted checks remain red after %d attempts: %s", finding.RepairAttempts, summary)
 			}
 			continue
+		}
+		if finding.Status != visualhive.StatusReady {
+			if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, true, summary, checkEvidence); err != nil {
+				return result, err
+			}
 		}
 		if gate.Merged {
 			if strings.TrimSpace(gate.MergeSHA) == "" {
@@ -334,6 +351,15 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func hasPendingBaselineCandidate(stateDir, repositoryFingerprint string) (bool, error) {
+	state, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		return false, err
+	}
+	attempt, exists := state.Get(repositoryFingerprint)
+	return exists && attempt.BaselineReview != nil && attempt.BaselineReview.Status == repair.BaselineReviewCandidateReady, nil
 }
 
 func reconcileBaselineReview(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) (*repair.Result, *GateEvaluation, bool, error) {
