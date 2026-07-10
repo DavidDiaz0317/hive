@@ -33,8 +33,24 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 		t.Fatalf("bad initialize response: %+v", initialize)
 	}
 	tools := list["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 12 {
+	if len(tools) != 13 {
 		t.Fatalf("expected production tool set, got %d", len(tools))
+	}
+	var issueLimit map[string]any
+	for _, candidate := range tools {
+		value := candidate.(map[string]any)
+		if value["name"] == "hive_set_issue_limit" {
+			issueLimit = value
+			break
+		}
+	}
+	if issueLimit == nil {
+		t.Fatal("hive_set_issue_limit is missing")
+	}
+	properties := issueLimit["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	value := properties["value"].(map[string]any)
+	if value["minimum"] != float64(1) && value["minimum"] != 1 {
+		t.Fatalf("unexpected issue-limit schema: %+v", value)
 	}
 	result := call["result"].(map[string]any)
 	if result["isError"] != false || result["structuredContent"].(map[string]any)["tool"] != "hive_status" {

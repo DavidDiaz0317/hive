@@ -33,6 +33,8 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedPause(command, args)
 	case "set-coverage", "set-automation":
 		return runIntegratedSetting(command, args)
+	case "set-issue-limit":
+		return runIntegratedIssueLimit(args)
 	case "run":
 		return runIntegratedRun(args)
 	case "upgrade", "rollback", "uninstall":
@@ -457,6 +459,41 @@ func runIntegratedSetting(command string, args []string) int {
 		return encodeJSON(config)
 	}
 	fmt.Printf("%s updated to %s for %s.\n", command, *value, config.Repository)
+	return 0
+}
+
+func runIntegratedIssueLimit(args []string) int {
+	flags := flag.NewFlagSet("hive set-issue-limit", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
+	value := flags.Int("value", 0, "maximum concurrently open Hive-managed findings (1-100)")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *value < 1 || *value > 100 {
+		fmt.Fprintln(os.Stderr, "--value must be from 1 through 100")
+		return 2
+	}
+	store, err := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+	if err != nil {
+		return 1
+	}
+	config, err := store.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	config.MaxActiveIssues = *value
+	if err := store.Save(config); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	store.Audit(integrated.AuditEntry{Action: "set-issue-limit", Allowed: true, Repository: config.Repository, Detail: fmt.Sprint(*value)})
+	if *jsonOutput {
+		return encodeJSON(config)
+	}
+	fmt.Printf("Active issue limit updated to %d for %s.\n", *value, config.Repository)
 	return 0
 }
 

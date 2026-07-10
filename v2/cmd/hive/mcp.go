@@ -51,6 +51,8 @@ func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any
 		args = []string{"set-coverage", "--state-dir", stateDir, "--value", stringArgument(arguments, "value", ""), "--json"}
 	case "hive_set_automation":
 		args = []string{"set-automation", "--state-dir", stateDir, "--value", stringArgument(arguments, "value", ""), "--json"}
+	case "hive_set_issue_limit":
+		args = []string{"set-issue-limit", "--state-dir", stateDir, "--value", fmt.Sprint(integerArgument(arguments, "value", 0)), "--json"}
 	case "hive_pause":
 		args = []string{"pause", "--state-dir", stateDir, "--json"}
 	case "hive_resume":

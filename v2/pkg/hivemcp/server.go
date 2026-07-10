@@ -139,6 +139,7 @@ func Tools() []Tool {
 		tool("hive_run", "Run Hive now", "Requires configured run authority. Launches a complete Visual Hive scan and processes trusted evidence through Hive lifecycle policy.", false, false, stateSchema()),
 		tool("hive_set_coverage", "Set coverage depth", "Requires configuration authority. Changes testing depth without changing GitHub write authority.", false, false, valueSchema([]string{"essential", "standard", "comprehensive", "custom"})),
 		tool("hive_set_automation", "Set automation authority", "Requires configuration authority. Changes issue/PR/merge authority without changing testing coverage.", false, false, valueSchema([]string{"advisory", "issues", "repair-pr", "auto-merge"})),
+		tool("hive_set_issue_limit", "Set active issue limit", "Requires configuration authority. Changes the repository work-in-progress limit without changing coverage or write authority.", false, false, integerValueSchema(1, 100)),
 		tool("hive_pause", "Pause repository automation", "Requires operator authority. Immediately denies repository lifecycle writes while preserving durable state.", false, false, stateSchema()),
 		tool("hive_resume", "Resume repository automation", "Requires operator authority. Re-enables only the previously configured automation level.", false, false, stateSchema()),
 		tool("hive_upgrade", "Upgrade immutable components", "Requires setup authority. Opens a reviewed upgrade PR and preserves rollback metadata; never changes a mutable tag in place.", false, false, valueSchema(nil)),
@@ -176,6 +177,13 @@ func valueSchema(values []string) map[string]any {
 		value["enum"] = values
 	}
 	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"value"}, "properties": map[string]any{"state_dir": map[string]any{"type": "string"}, "value": value}}
+}
+
+func integerValueSchema(minimum, maximum int) map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"value"}, "properties": map[string]any{
+		"state_dir": map[string]any{"type": "string"},
+		"value":     map[string]any{"type": "integer", "minimum": minimum, "maximum": maximum},
+	}}
 }
 
 func knownTool(name string) bool {
