@@ -115,7 +115,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:"+x.id`} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}

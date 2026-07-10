@@ -342,6 +342,21 @@ func TestLifecycleRejectsPostMergeAbsenceAtWrongSHA(t *testing.T) {
 	}
 }
 
+func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *testing.T) {
+	finding := &FindingLifecycle{IssueKind: "test_adequacy_gap"}
+	manifest := Manifest{
+		Source: Source{Ref: "refs/heads/main"},
+		Scan:   Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"testing-layer:2"}},
+	}
+	if allowed, reason := resolutionAllowed(finding, manifest, "main"); !allowed {
+		t.Fatalf("verified Unit layer should resolve a legacy test-adequacy finding: %s", reason)
+	}
+	manifest.Scan.EvaluatedContracts = []string{"testing-layer:3"}
+	if allowed, _ := resolutionAllowed(finding, manifest, "main"); allowed {
+		t.Fatal("a different testing layer must not resolve the Unit adequacy finding")
+	}
+}
+
 func TestLifecycleAuditIsAppendOnlyJSONL(t *testing.T) {
 	root := t.TempDir()
 	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))

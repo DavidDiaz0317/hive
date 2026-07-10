@@ -948,14 +948,24 @@ func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef s
 	if !manifest.Scan.AuthoritativeForResolution || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, targetRef) {
 		return false, "absence was not from an authoritative target-ref scan"
 	}
-	if finding == nil || len(finding.AffectedContracts) == 0 {
+	if finding == nil {
+		return false, "finding has no affected contract that can be proven evaluated"
+	}
+	affectedContracts := finding.AffectedContracts
+	// Test-adequacy findings created before testing-layer resolution scopes were
+	// introduced are repository-level Unit gaps. Preserve their fingerprint and
+	// require the exact Unit layer inventory before accepting inferred absence.
+	if len(affectedContracts) == 0 && finding.IssueKind == "test_adequacy_gap" {
+		affectedContracts = []string{"testing-layer:2"}
+	}
+	if len(affectedContracts) == 0 {
 		return false, "finding has no affected contract that can be proven evaluated"
 	}
 	evaluated := make(map[string]bool, len(manifest.Scan.EvaluatedContracts))
 	for _, contract := range manifest.Scan.EvaluatedContracts {
 		evaluated[contract] = true
 	}
-	for _, contract := range finding.AffectedContracts {
+	for _, contract := range affectedContracts {
 		if !evaluated[contract] {
 			return false, fmt.Sprintf("affected contract %s was not evaluated", contract)
 		}

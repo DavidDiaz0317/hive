@@ -49,6 +49,11 @@ type setupPRClient interface {
 }
 
 func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
+	stateDir, err := filepath.Abs(options.StateDir)
+	if err != nil {
+		return SetupResult{}, fmt.Errorf("resolve persistent state directory: %w", err)
+	}
+	options.StateDir = filepath.Clean(stateDir)
 	if err := validateSetupOptions(options); err != nil {
 		return SetupResult{}, err
 	}
@@ -515,7 +520,7 @@ jobs:
           echo "Visual Hive deterministic pipeline exit: $pipeline_exit"
           node "$VISUAL_HIVE_CLI" issues --config visual-hive.config.yaml --write
           node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
-          node -e 'const fs=require("fs");const candidates=[".visual-hive/plan.full.json",".visual-hive/plan.json"];const p=candidates.find(fs.existsSync);const v=p?JSON.parse(fs.readFileSync(p,"utf8")):{};const rows=Array.isArray(v.items)?v.items:[];const ids=[...new Set(rows.map(x=>x.contractId||x.id).filter(Boolean))].sort();fs.writeFileSync(".visual-hive/evaluated-contracts.txt",ids.join("\n")+"\n")'
+          node -e 'const fs=require("fs");const candidates=[".visual-hive/plan.full.json",".visual-hive/plan.json"];const p=candidates.find(fs.existsSync);const v=p?JSON.parse(fs.readFileSync(p,"utf8")):{};const rows=Array.isArray(v.items)?v.items:[];const layerPath=".visual-hive/testing-layers.json";const layerReport=fs.existsSync(layerPath)?JSON.parse(fs.readFileSync(layerPath,"utf8")):{};const layers=Array.isArray(layerReport.layers)?layerReport.layers:[];const ids=[...new Set([...rows.map(x=>x.contractId||x.id),...layers.map(x=>Number.isInteger(x.id)?"testing-layer:"+x.id:null)].filter(Boolean))].sort();fs.writeFileSync(".visual-hive/evaluated-contracts.txt",ids.join("\n")+"\n")'
       - name: Upload independently verifiable evidence
         id: evidence
         uses: actions/upload-artifact@%s
