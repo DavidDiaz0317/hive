@@ -3,7 +3,7 @@ package automation
 import "testing"
 
 func TestACMMLowerLevelsCannotWriteWithCredentialsAvailable(t *testing.T) {
-	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionMergePR}
+	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionMergePR}
 	for _, level := range []int{1, 2} {
 		policy := Policy{ACMMLevel: level, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}}
 		for _, action := range actions {

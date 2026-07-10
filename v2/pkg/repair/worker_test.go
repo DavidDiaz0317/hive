@@ -51,6 +51,25 @@ func (p *noChangeThenFixProvider) Run(_ context.Context, worktree, prompt string
 	return ProviderResult{Summary: "fixed from verified evidence"}, os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("fixed after retry\n"), 0o600)
 }
 
+type patchProvider struct{}
+
+func (p *patchProvider) Name() string                 { return "patch-model" }
+func (p *patchProvider) Health(context.Context) error { return nil }
+func (p *patchProvider) Run(_ context.Context, _ string, prompt string) (ProviderResult, error) {
+	if !strings.Contains(prompt, modelPatchBegin) || !strings.Contains(prompt, "intentionally read-only") {
+		return ProviderResult{}, fmt.Errorf("repair prompt did not require the read-only patch contract")
+	}
+	output := `HIVE_PATCH_BEGIN
+diff --git a/src/value.txt b/src/value.txt
+--- a/src/value.txt
++++ b/src/value.txt
+@@ -1 +1 @@
+-broken
++fixed by model patch
+HIVE_PATCH_END`
+	return ProviderResult{Summary: "proposed bounded patch", Output: output}, nil
+}
+
 func TestRepairPreparationHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_REPAIR_PREPARATION_HELPER") != "1" {
 		return
@@ -256,6 +275,45 @@ func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 	if provider.runs != 2 || pulls.calls != 1 || second.Attempt != 2 || second.Stage != StagePROpen || second.Branch == first.Branch || result.PRNumber != 17 {
 		t.Fatalf("retry did not produce exactly one PR on a clean new attempt: first=%+v second=%+v result=%+v runs=%d pulls=%d", first, second, result, provider.runs, pulls.calls)
 	}
+}
+
+func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
+	lifecycle := &fakeLifecycle{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: &patchProvider{}, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{},
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:patch", Status: visualhive.StatusIssueOpen,
+		Title: "Repair value", Body: "Value is broken.", IssueKind: "functional", Severity: "high",
+		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	result, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content := strings.TrimSpace(gitOutput(t, remote, "show", result.Branch+":src/value.txt")); content != "fixed by model patch" {
+		t.Fatalf("authorized model patch was not committed and pushed: %q", content)
+	}
+	if !containsDecision(lifecycle.decisions, string(automation.ActionApplyPatch)+":true") {
+		t.Fatalf("patch application authority was not audited: %v", lifecycle.decisions)
+	}
+}
+
+func containsDecision(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidateChangedFilesRejectsSensitivePaths(t *testing.T) {

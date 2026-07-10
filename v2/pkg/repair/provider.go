@@ -12,6 +12,7 @@ import (
 
 type ProviderResult struct {
 	Summary string
+	Output  string
 }
 
 type Provider interface {
@@ -52,21 +53,23 @@ func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) (Provid
 	args = append(args,
 		"--ask-for-approval", "never",
 		"exec", "--cd", worktree,
-		"--sandbox", "workspace-write",
+		"--sandbox", "read-only",
 		"--ephemeral", "--ignore-user-config", "--color", "never", "-",
 	)
 	command := exec.CommandContext(ctx, p.Command, args...)
 	command.Dir = worktree
 	command.Env = providerEnvironment()
 	command.Stdin = strings.NewReader(prompt)
-	var stdout limitedBuffer
+	var stdout providerOutputBuffer
 	var stderr limitedBuffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
-		return ProviderResult{Summary: safeExcerpt(stdout.String())}, fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String()))
+		output := safeProviderOutput(stdout.String())
+		return ProviderResult{Summary: safeExcerpt(output), Output: output}, fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String()))
 	}
-	return ProviderResult{Summary: safeExcerpt(stdout.String())}, nil
+	output := safeProviderOutput(stdout.String())
+	return ProviderResult{Summary: safeExcerpt(output), Output: output}, nil
 }
 
 func providerEnvironment() []string {
@@ -99,13 +102,32 @@ func (b *limitedBuffer) Write(value []byte) (int, error) {
 	return original, nil
 }
 
+type providerOutputBuffer struct{ bytes.Buffer }
+
+func (b *providerOutputBuffer) Write(value []byte) (int, error) {
+	const limit = 256 << 10
+	original := len(value)
+	if b.Len() < limit {
+		remaining := limit - b.Len()
+		if len(value) > remaining {
+			value = value[:remaining]
+		}
+		_, _ = b.Buffer.Write(value)
+	}
+	return original, nil
+}
+
 var providerSecret = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9]{10,}|sk-[A-Za-z0-9_-]{10,})`)
 
 func safeExcerpt(value string) string {
-	value = providerSecret.ReplaceAllString(value, "[REDACTED]")
+	value = safeProviderOutput(value)
 	value = strings.TrimSpace(value)
 	if len(value) > 2048 {
 		value = value[len(value)-2048:]
 	}
 	return value
+}
+
+func safeProviderOutput(value string) string {
+	return strings.TrimSpace(providerSecret.ReplaceAllString(value, "[REDACTED]"))
 }

@@ -33,6 +33,7 @@ type Attempt struct {
 	Provider              string    `json:"provider"`
 	ModelSummary          string    `json:"model_summary,omitempty"`
 	PriorModelSummary     string    `json:"prior_model_summary,omitempty"`
+	ModelPatch            string    `json:"model_patch,omitempty"`
 	CommitSHA             string    `json:"commit_sha,omitempty"`
 	PRNumber              int       `json:"pr_number,omitempty"`
 	PRURL                 string    `json:"pr_url,omitempty"`

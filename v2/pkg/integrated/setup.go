@@ -104,7 +104,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		MaxActiveIssues: options.MaxActiveIssues,
 		VisualHiveRepo:  options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
 		VisualHiveCommand: options.VisualHiveCommand, VisualHiveArgs: append([]string(nil), options.VisualHiveArgs...),
-		TestCommands: cloneCommands(inspection.TestCommands), AllowedRepairPaths: []string{"src/**", "test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"},
+		TestCommands: cloneCommands(inspection.TestCommands), AllowedRepairPaths: []string{"src/**", "public/**", "index.html", "test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"},
 		AllowedAutoMergePaths: []string{"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"},
 		AllowedAutoMergeRisk:  []automation.RiskTier{automation.RiskAutomatic},
 		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,

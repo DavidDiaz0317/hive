@@ -26,6 +26,7 @@ const (
 	ActionCloseIssue   Action = "close_issue"
 	ActionReopenIssue  Action = "reopen_issue"
 	ActionRepairModel  Action = "repair_model"
+	ActionApplyPatch   Action = "apply_model_patch"
 	ActionCreateBranch Action = "create_branch"
 	ActionCommit       Action = "commit"
 	ActionPush         Action = "push"
@@ -120,7 +121,7 @@ func (p Policy) Authorize(request ActionRequest) Decision {
 		reasons = append(reasons, fmt.Sprintf("ACMM L%d does not permit agent %s to perform %s", p.ACMMLevel, valueOr(request.Agent, "unknown"), request.Action))
 	}
 
-	if request.Action == ActionRepairModel || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionMergePR {
+	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionMergePR {
 		maxAttempts := p.MaxRepairAttempts
 		if maxAttempts <= 0 {
 			maxAttempts = 3
@@ -191,7 +192,7 @@ func modeForAction(action Action) Mode {
 		return ModeAdvisory
 	case ActionCreateIssue, ActionUpdateIssue, ActionCloseIssue, ActionReopenIssue:
 		return ModeIssues
-	case ActionRepairModel, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR:
+	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR:
 		return ModeRepairPR
 	case ActionMergePR:
 		return ModeAutoMerge
