@@ -35,6 +35,8 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedSetting(command, args)
 	case "set-issue-limit":
 		return runIntegratedIssueLimit(args)
+	case "set-retry-limit":
+		return runIntegratedRetryLimit(args)
 	case "run":
 		return runIntegratedRun(args)
 	case "upgrade", "rollback", "uninstall":
@@ -143,6 +145,7 @@ func runSetupCommand(args []string) int {
 	visualRepo := flags.String("visual-hive-repo", valueOrEnv("VISUAL_HIVE_REPOSITORY", "DavidDiaz0317/visual-hive"), "Visual Hive source repository")
 	visualRef := flags.String("visual-hive-ref", os.Getenv("VISUAL_HIVE_REF"), "immutable Visual Hive commit SHA")
 	maxActiveIssues := flags.Int("max-active-issues", 5, "maximum concurrently open Hive-managed findings")
+	maxRepairAttempts := flags.Int("max-repair-attempts", 3, "maximum bounded model-backed repair attempts per finding")
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	planOnly := flags.Bool("plan", false, "produce a read-only setup plan")
 	start := flags.Bool("start", false, "start after the setup PR is merged and doctor is green")
@@ -199,8 +202,9 @@ func runSetupCommand(args []string) int {
 		VisualHive: *visualHive, StateDir: *stateDir, Apply: !*planOnly, Start: *start,
 		VisualHiveCommand: *visualCommand, VisualHiveArgs: append([]string(nil), visualArgs...),
 		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client,
-		MaxActiveIssues: *maxActiveIssues,
-		Policy:          automation.Policy{ACMMLevel: acmm, Mode: mode, AllowedRepositories: []string{*repository}, MaxRepairAttempts: 3},
+		MaxActiveIssues:   *maxActiveIssues,
+		MaxRepairAttempts: *maxRepairAttempts,
+		Policy:            automation.Policy{ACMMLevel: acmm, Mode: mode, AllowedRepositories: []string{*repository}, MaxRepairAttempts: *maxRepairAttempts},
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "setup failed:", err)
@@ -494,6 +498,41 @@ func runIntegratedIssueLimit(args []string) int {
 		return encodeJSON(config)
 	}
 	fmt.Printf("Active issue limit updated to %d for %s.\n", *value, config.Repository)
+	return 0
+}
+
+func runIntegratedRetryLimit(args []string) int {
+	flags := flag.NewFlagSet("hive set-retry-limit", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
+	value := flags.Int("value", 0, "maximum bounded model-backed repair attempts per finding (1-10)")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *value < 1 || *value > 10 {
+		fmt.Fprintln(os.Stderr, "--value must be from 1 through 10")
+		return 2
+	}
+	store, err := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+	if err != nil {
+		return 1
+	}
+	config, err := store.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	config.MaxRepairAttempts = *value
+	if err := store.Save(config); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	store.Audit(integrated.AuditEntry{Action: "set-retry-limit", Allowed: true, Repository: config.Repository, Detail: fmt.Sprint(*value)})
+	if *jsonOutput {
+		return encodeJSON(config)
+	}
+	fmt.Printf("Repair attempt limit updated to %d for %s.\n", *value, config.Repository)
 	return 0
 }
 

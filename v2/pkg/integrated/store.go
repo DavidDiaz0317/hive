@@ -44,6 +44,9 @@ func (s *Store) Load() (Config, error) {
 	if config.SchemaVersion != ConfigSchema {
 		return Config{}, fmt.Errorf("unsupported integrated config schema %q", config.SchemaVersion)
 	}
+	if config.MaxRepairAttempts == 0 {
+		config.MaxRepairAttempts = 3
+	}
 	return config, nil
 }
 

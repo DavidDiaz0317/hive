@@ -111,7 +111,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	validation, apply, outbox, verifiedArtifact, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, automation.Policy{
 		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
-		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: 3,
+		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 	})
 	if err != nil {
@@ -127,7 +127,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	policy := automation.Policy{
 		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
-		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: 3,
+		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 	}
 	if config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge {
@@ -146,6 +146,13 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	result.CompletedAt = time.Now().UTC()
 	return result, nil
+}
+
+func repairAttemptLimit(config Config) int {
+	if config.MaxRepairAttempts < 1 {
+		return 3
+	}
+	return config.MaxRepairAttempts
 }
 
 type repairOrchestrationResult struct {

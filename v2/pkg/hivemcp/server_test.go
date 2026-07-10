@@ -33,7 +33,7 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 		t.Fatalf("bad initialize response: %+v", initialize)
 	}
 	tools := list["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 13 {
+	if len(tools) != 14 {
 		t.Fatalf("expected production tool set, got %d", len(tools))
 	}
 	var issueLimit map[string]any
@@ -51,6 +51,9 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 	value := properties["value"].(map[string]any)
 	if value["minimum"] != float64(1) && value["minimum"] != 1 {
 		t.Fatalf("unexpected issue-limit schema: %+v", value)
+	}
+	if !knownTool("hive_set_retry_limit") {
+		t.Fatal("hive_set_retry_limit is missing")
 	}
 	result := call["result"].(map[string]any)
 	if result["isError"] != false || result["structuredContent"].(map[string]any)["tool"] != "hive_status" {

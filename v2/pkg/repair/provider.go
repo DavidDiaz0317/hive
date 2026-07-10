@@ -122,8 +122,10 @@ var providerSecret = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]{10,}|gh[po
 func safeExcerpt(value string) string {
 	value = safeProviderOutput(value)
 	value = strings.TrimSpace(value)
-	if len(value) > 2048 {
-		value = value[len(value)-2048:]
+	const limit = 8 << 10
+	if len(value) > limit {
+		half := limit / 2
+		value = value[:half] + "\n...[bounded excerpt]...\n" + value[len(value)-half:]
 	}
 	return value
 }

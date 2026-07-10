@@ -33,6 +33,7 @@ func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any
 	case "hive_setup_plan", "hive_setup_apply":
 		args = []string{"setup", "--repo", stringArgument(arguments, "repo", ""), "--coverage", stringArgument(arguments, "coverage", ""), "--automation", stringArgument(arguments, "automation", ""), "--provider", stringArgument(arguments, "provider", "codex"), "--state-dir", stateDir, "--json"}
 		args = append(args, "--max-active-issues", fmt.Sprint(integerArgument(arguments, "max_active_issues", 5)))
+		args = append(args, "--max-repair-attempts", fmt.Sprint(integerArgument(arguments, "max_repair_attempts", 3)))
 		if name == "hive_setup_plan" {
 			args = append(args, "--plan")
 		} else {
@@ -53,6 +54,8 @@ func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any
 		args = []string{"set-automation", "--state-dir", stateDir, "--value", stringArgument(arguments, "value", ""), "--json"}
 	case "hive_set_issue_limit":
 		args = []string{"set-issue-limit", "--state-dir", stateDir, "--value", fmt.Sprint(integerArgument(arguments, "value", 0)), "--json"}
+	case "hive_set_retry_limit":
+		args = []string{"set-retry-limit", "--state-dir", stateDir, "--value", fmt.Sprint(integerArgument(arguments, "value", 0)), "--json"}
 	case "hive_pause":
 		args = []string{"pause", "--state-dir", stateDir, "--json"}
 	case "hive_resume":

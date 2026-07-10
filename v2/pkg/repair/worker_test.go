@@ -375,7 +375,7 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 		}
 	}
 	prompt := repairPrompt(finding, "verified evidence", "")
-	if !strings.Contains(prompt, "test-adequacy repair") || !strings.Contains(prompt, "Change only focused files") {
+	if !strings.Contains(prompt, "test-adequacy repair") || !strings.Contains(prompt, "Change only focused files") || !strings.Contains(prompt, "fileURLToPath") {
 		t.Fatalf("test-only constraint missing from repair prompt: %s", prompt)
 	}
 }
