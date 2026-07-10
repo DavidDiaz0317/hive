@@ -3,6 +3,7 @@ package integrated
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -792,6 +793,13 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		}
 		evidenceSummary, err := repair.LoadEvidenceSummary(evidenceRoot, *finding)
 		if err != nil {
+			if errors.Is(err, repair.ErrNoActionableEvidence) {
+				reason := "Verified evidence does not contain a safe, repository-scoped repair contribution; keep the issue for operator review without dispatching a model or PR."
+				if reviewErr := lifecycle.MarkManualReviewRequired(finding.RepositoryFingerprint, "repair_scope", reason); reviewErr != nil {
+					return nil, reviewErr
+				}
+				return nil, nil
+			}
 			return nil, err
 		}
 		worker := repair.Worker{

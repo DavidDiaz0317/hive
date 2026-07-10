@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,22 @@ import (
 
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
+
+func TestLoadEvidenceSummaryClassifiesMissingRepairSignal(t *testing.T) {
+	root := t.TempDir()
+	verdict := `{"schemaVersion":"visual-hive.verdict.v1","allContributions":[
+{"source":"workflow_audit","kind":"workflow_safety","status":"failed","gating":false,"contractId":"workflow-safety","reason":"Scheduled workflow does not publish a reviewed baseline manifest.","key":"workflow_audit.workflow_safety"}
+]}`
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(verdict), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		Title: "Scheduled workflow should publish a baseline manifest", AffectedContracts: []string{"workflow-safety"},
+	})
+	if !errors.Is(err, ErrNoActionableEvidence) {
+		t.Fatalf("expected missing repair signal classification, got %v", err)
+	}
+}
 
 func TestLoadEvidenceSummaryFiltersToFindingSignalAndContracts(t *testing.T) {
 	root := t.TempDir()

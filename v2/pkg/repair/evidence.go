@@ -3,6 +3,7 @@ package repair
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,8 @@ import (
 const maxVerdictEvidenceBytes = 2 << 20
 const maxCoverageEvidenceBytes = 2 << 20
 const maxTestCreationEvidenceBytes = 2 << 20
+
+var ErrNoActionableEvidence = errors.New("verified Visual Hive evidence has no actionable contribution")
 
 type verdictEvidence struct {
 	SchemaVersion    string                 `json:"schemaVersion"`
@@ -148,7 +151,7 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 		if coverageSummary != "" {
 			return coverageSummary, nil
 		}
-		return "", fmt.Errorf("verified Visual Hive evidence has no actionable contribution for affected contracts")
+		return "", fmt.Errorf("%w for affected contracts", ErrNoActionableEvidence)
 	}
 
 	lines := make([]string, 0, len(matched))

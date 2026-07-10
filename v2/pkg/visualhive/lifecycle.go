@@ -589,7 +589,7 @@ func (s *LifecycleStore) MarkPROpen(repositoryFingerprint, commitSHA string, num
 
 func (s *LifecycleStore) MarkManualReviewRequired(repositoryFingerprint, kind, reason string) error {
 	return s.updateFinding(repositoryFingerprint, "manual_review_required", func(finding *FindingLifecycle) error {
-		if finding.Status != StatusPROpen && finding.Status != StatusChecksRunning && finding.Status != StatusNeedsRevision && finding.Status != StatusReady {
+		if finding.Status != StatusIssueOpen && finding.Status != StatusFixQueued && finding.Status != StatusRepairRunning && finding.Status != StatusPROpen && finding.Status != StatusChecksRunning && finding.Status != StatusNeedsRevision && finding.Status != StatusReady {
 			return fmt.Errorf("cannot require manual review from %s", finding.Status)
 		}
 		kind, reason = strings.TrimSpace(kind), strings.TrimSpace(reason)

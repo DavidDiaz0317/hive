@@ -265,7 +265,7 @@ func validateSetupOptions(options SetupOptions) error {
 	if options.Automation != AutomationAdvisory && options.Automation != AutomationIssues && options.Automation != AutomationRepairPR && options.Automation != AutomationAutoMerge {
 		return fmt.Errorf("automation must be advisory, issues, repair-pr, or auto-merge")
 	}
-	if options.StateDir == "" || options.Provider == "" || options.ProviderCommand == "" {
+	if options.StateDir == "" || options.Provider == "" || (options.Apply && options.ProviderCommand == "") {
 		return fmt.Errorf("state directory and provider are required")
 	}
 	if options.MaxActiveIssues < 1 || options.MaxActiveIssues > 100 {

@@ -211,6 +211,30 @@ func TestLifecyclePersistsManualBaselineReviewAcrossFreshObservations(t *testing
 	}
 }
 
+func TestLifecycleCanHoldUnrepairableIssueForManualScopeReview(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-scope-review", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := bundle.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 101, "https://github.com/owner/repo/issues/101"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkManualReviewRequired(fingerprint, "repair_scope", "No safe repair evidence"); err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if !finding.HumanReviewRequired || finding.ManualReviewKind != "repair_scope" || finding.Status != StatusIssueOpen {
+		t.Fatalf("issue was not held for scope review: %+v", finding)
+	}
+}
+
 func TestLifecycleMigratesV1ManualReviewState(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "lifecycle")
 	if err := os.MkdirAll(root, 0o700); err != nil {
