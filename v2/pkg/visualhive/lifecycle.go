@@ -129,11 +129,14 @@ type LifecycleAuditEntry struct {
 }
 
 type ApplyLifecycleOptions struct {
-	TargetRef         string
-	VerificationRunID string
-	VerificationURL   string
-	MaxActiveIssues   int
-	PreferRepairable  bool
+	TargetRef                        string
+	VerificationRunID                string
+	VerificationURL                  string
+	VerificationCommitSHA            string
+	VerifiedMergeAncestorFingerprint string
+	VerifiedMergeAncestorSHA         string
+	MaxActiveIssues                  int
+	PreferRepairable                 bool
 }
 
 type ApplyLifecycleResult struct {
@@ -238,7 +241,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				result.IgnoredAbsent++
 				continue
 			}
-			if allowed, reason := resolutionAllowed(finding, manifest, targetRef); !allowed {
+			if allowed, reason := resolutionAllowed(finding, manifest, targetRef, options); !allowed {
 				result.IgnoredAbsent++
 				s.auditLocked(LifecycleAuditEntry{Action: "resolve_finding", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: reason})
 				continue
@@ -334,7 +337,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			if finding == nil || !strings.EqualFold(finding.Repository, manifest.Source.Repository) || observedFingerprints[key] || finding.Status == StatusIssueClosed || finding.Status == StatusResolved {
 				continue
 			}
-			if allowed, reason := resolutionAllowed(finding, manifest, targetRef); !allowed {
+			if allowed, reason := resolutionAllowed(finding, manifest, targetRef, options); !allowed {
 				s.auditLocked(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: reason})
 				continue
 			}
@@ -944,7 +947,7 @@ func refsEquivalent(left, right string) bool {
 	return normalize(left) != "" && normalize(left) == normalize(right)
 }
 
-func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string) (bool, string) {
+func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions) (bool, string) {
 	if !manifest.Scan.AuthoritativeForResolution || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, targetRef) {
 		return false, "absence was not from an authoritative target-ref scan"
 	}
@@ -971,7 +974,12 @@ func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef s
 		}
 	}
 	if finding.MergeSHA != "" && (finding.Status == StatusMerged || finding.Status == StatusPostMergeVerifying) && finding.MergeSHA != manifest.Source.CommitSHA {
-		return false, "target-branch verification did not run at the recorded merge SHA"
+		verifiedDescendant := options.VerifiedMergeAncestorFingerprint == finding.RepositoryFingerprint &&
+			options.VerifiedMergeAncestorSHA == finding.MergeSHA &&
+			options.VerificationCommitSHA == manifest.Source.CommitSHA
+		if !verifiedDescendant {
+			return false, "target-branch verification did not run at the recorded merge SHA or a verified non-conflicting descendant"
+		}
 	}
 	return true, ""
 }

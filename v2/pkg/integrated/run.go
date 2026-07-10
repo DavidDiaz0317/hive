@@ -113,7 +113,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
 		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
-	})
+	}, visualhive.ApplyLifecycleOptions{})
 	if err != nil {
 		return result, err
 	}
@@ -163,7 +163,7 @@ type repairOrchestrationResult struct {
 	Outbox             visualhive.OutboxProcessorResult
 }
 
-func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, workflow WorkflowRunEvidence, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (visualhive.Validation, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, hivegithub.VerifiedVisualHiveArtifact, error) {
+func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, workflow WorkflowRunEvidence, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, applyOptions visualhive.ApplyLifecycleOptions) (visualhive.Validation, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, hivegithub.VerifiedVisualHiveArtifact, error) {
 	bundle, verified, err := client.FetchAndVerifyVisualHiveBundle(ctx, hivegithub.VisualHiveArtifactRequest{
 		Repository: config.Repository, WorkflowRunID: workflow.RunID, ArtifactID: workflow.BundleArtifact,
 		SourceArtifactID: workflow.EvidenceArtifact, DestinationDir: filepath.Join(stateDir, "visual-hive", "artifacts"),
@@ -173,11 +173,13 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 	if err != nil {
 		return visualhive.Validation{}, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, hivegithub.VerifiedVisualHiveArtifact{}, err
 	}
-	apply, err := lifecycle.ApplyBundle(bundle, beadStore, visualhive.ApplyLifecycleOptions{
-		TargetRef: config.DefaultBranch, VerificationRunID: fmt.Sprintf("%d", workflow.RunID), VerificationURL: workflow.RunURL,
-		MaxActiveIssues:  config.MaxActiveIssues,
-		PreferRepairable: config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge,
-	})
+	applyOptions.TargetRef = config.DefaultBranch
+	applyOptions.VerificationRunID = fmt.Sprintf("%d", workflow.RunID)
+	applyOptions.VerificationURL = workflow.RunURL
+	applyOptions.VerificationCommitSHA = workflow.HeadSHA
+	applyOptions.MaxActiveIssues = config.MaxActiveIssues
+	applyOptions.PreferRepairable = config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge
+	apply, err := lifecycle.ApplyBundle(bundle, beadStore, applyOptions)
 	if err != nil {
 		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, verified, err
 	}
@@ -597,13 +599,18 @@ func verifyMergedFinding(ctx context.Context, stateDir string, config Config, fi
 	if err != nil {
 		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
 	}
+	applyOptions, err := verifyPostMergeTarget(ctx, stateDir, config, finding, postMerge.HeadSHA, client)
+	if err != nil {
+		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", false, err.Error())
+		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
+	}
 	if postMerge.HeadSHA != finding.MergeSHA {
-		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, fmt.Errorf("post-merge verification ran at %s, expected exact merge SHA %s", postMerge.HeadSHA, finding.MergeSHA)
+		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", true, fmt.Sprintf("repair merge %s is an unchanged-file ancestor of target head %s", finding.MergeSHA, postMerge.HeadSHA))
 	}
 	if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", postMerge.RunID), postMerge.RunURL); err != nil {
 		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
 	}
-	_, postApply, postOutbox, _, err := applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy)
+	_, postApply, postOutbox, _, err := applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy, applyOptions)
 	if err != nil {
 		return postMerge, postApply, postOutbox, err
 	}
@@ -615,6 +622,47 @@ func verifyMergedFinding(ctx context.Context, stateDir string, config Config, fi
 		return postMerge, postApply, postOutbox, fmt.Errorf("post-merge verification did not resolve and close finding %s", finding.RepositoryFingerprint)
 	}
 	return postMerge, postApply, postOutbox, nil
+}
+
+func verifyPostMergeTarget(ctx context.Context, stateDir string, config Config, finding visualhive.FindingLifecycle, headSHA string, client *hivegithub.Client) (visualhive.ApplyLifecycleOptions, error) {
+	options := visualhive.ApplyLifecycleOptions{}
+	if headSHA == finding.MergeSHA {
+		return options, nil
+	}
+	owner, repo, ok := strings.Cut(config.Repository, "/")
+	if !ok || owner == "" || repo == "" {
+		return options, fmt.Errorf("invalid configured repository")
+	}
+	state, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		return options, err
+	}
+	attempt, exists := state.Get(finding.RepositoryFingerprint)
+	if !exists || attempt.CommitSHA != finding.RepairCommitSHA || attempt.PRNumber != finding.PRNumber || len(attempt.ChangedFiles) == 0 {
+		return options, fmt.Errorf("cannot verify descendant target for %s without the exact durable repair attempt", finding.RepositoryFingerprint)
+	}
+	comparison, _, err := client.GoGitHub().Repositories.CompareCommits(ctx, owner, repo, finding.MergeSHA, headSHA, &gh.ListOptions{PerPage: 100})
+	if err != nil {
+		return options, fmt.Errorf("compare repair merge to target head: %w", err)
+	}
+	if comparison.GetStatus() != "ahead" || comparison.GetMergeBaseCommit().GetSHA() != finding.MergeSHA || comparison.GetTotalCommits() < 1 || comparison.GetTotalCommits() > 250 {
+		return options, fmt.Errorf("target head %s is not a bounded descendant of repair merge %s", headSHA, finding.MergeSHA)
+	}
+	if len(comparison.Files) == 0 || len(comparison.Files) >= 300 {
+		return options, fmt.Errorf("target descendant comparison did not provide a complete bounded file inventory")
+	}
+	repairFiles := make(map[string]bool, len(attempt.ChangedFiles))
+	for _, file := range attempt.ChangedFiles {
+		repairFiles[filepath.ToSlash(strings.TrimSpace(file))] = true
+	}
+	for _, file := range comparison.Files {
+		if repairFiles[filepath.ToSlash(file.GetFilename())] || repairFiles[filepath.ToSlash(file.GetPreviousFilename())] {
+			return options, fmt.Errorf("target descendant changed repair file %s after merge", file.GetFilename())
+		}
+	}
+	options.VerifiedMergeAncestorFingerprint = finding.RepositoryFingerprint
+	options.VerifiedMergeAncestorSHA = finding.MergeSHA
+	return options, nil
 }
 
 func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Config) (WorkflowRunEvidence, error) {

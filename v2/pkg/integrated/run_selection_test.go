@@ -3,15 +3,18 @@ package integrated
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
@@ -126,5 +129,35 @@ func TestReconcileExternallyMergedRepairPersistsExactMerge(t *testing.T) {
 	finding, exists := lifecycle.Finding("finding")
 	if !reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != "merge-sha" {
 		t.Fatalf("external merge was not persisted: reconciled=%t finding=%+v", reconciled, finding)
+	}
+}
+
+func TestVerifyPostMergeTargetAcceptsOnlyNonConflictingDescendant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		filename := ".hive/integrated.json"
+		if strings.Contains(request.URL.Path, "head-conflict") {
+			filename = "test/run-with-env.test.mjs"
+		}
+		_, _ = fmt.Fprintf(writer, `{"status":"ahead","ahead_by":1,"behind_by":0,"total_commits":1,"merge_base_commit":{"sha":"merge-sha"},"files":[{"filename":%q}]}`, filename)
+	}))
+	defer server.Close()
+
+	stateDir := t.TempDir()
+	store, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(repair.Attempt{RepositoryFingerprint: "finding", CommitSHA: "repair-sha", PRNumber: 12, ChangedFiles: []string{"test/run-with-env.test.mjs"}}); err != nil {
+		t.Fatal(err)
+	}
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	finding := visualhive.FindingLifecycle{RepositoryFingerprint: "finding", RepairCommitSHA: "repair-sha", MergeSHA: "merge-sha", PRNumber: 12}
+	options, err := verifyPostMergeTarget(context.Background(), stateDir, Config{Repository: "owner/repo"}, finding, "head-safe", client)
+	if err != nil || options.VerifiedMergeAncestorFingerprint != "finding" || options.VerifiedMergeAncestorSHA != "merge-sha" {
+		t.Fatalf("safe descendant was not verified: options=%+v err=%v", options, err)
+	}
+	if _, err := verifyPostMergeTarget(context.Background(), stateDir, Config{Repository: "owner/repo"}, finding, "head-conflict", client); err == nil {
+		t.Fatal("descendant that changed the repair file must be rejected")
 	}
 }

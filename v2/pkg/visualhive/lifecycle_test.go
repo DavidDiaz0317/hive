@@ -343,17 +343,29 @@ func TestLifecycleRejectsPostMergeAbsenceAtWrongSHA(t *testing.T) {
 }
 
 func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *testing.T) {
-	finding := &FindingLifecycle{IssueKind: "test_adequacy_gap"}
+	finding := &FindingLifecycle{RepositoryFingerprint: "finding", IssueKind: "test_adequacy_gap"}
 	manifest := Manifest{
 		Source: Source{Ref: "refs/heads/main"},
 		Scan:   Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"testing-layer:2"}},
 	}
-	if allowed, reason := resolutionAllowed(finding, manifest, "main"); !allowed {
+	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
 		t.Fatalf("verified Unit layer should resolve a legacy test-adequacy finding: %s", reason)
 	}
 	manifest.Scan.EvaluatedContracts = []string{"testing-layer:3"}
-	if allowed, _ := resolutionAllowed(finding, manifest, "main"); allowed {
+	if allowed, _ := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); allowed {
 		t.Fatal("a different testing layer must not resolve the Unit adequacy finding")
+	}
+	manifest.Scan.EvaluatedContracts = []string{"testing-layer:2"}
+	manifest.Source.CommitSHA = "target-head"
+	finding.Status = StatusPostMergeVerifying
+	finding.MergeSHA = "repair-merge"
+	verified := ApplyLifecycleOptions{VerificationCommitSHA: "target-head", VerifiedMergeAncestorFingerprint: "finding", VerifiedMergeAncestorSHA: "repair-merge"}
+	if allowed, reason := resolutionAllowed(finding, manifest, "main", verified); !allowed {
+		t.Fatalf("verified non-conflicting descendant should be accepted: %s", reason)
+	}
+	verified.VerificationCommitSHA = "different-head"
+	if allowed, _ := resolutionAllowed(finding, manifest, "main", verified); allowed {
+		t.Fatal("descendant authorization bound to a different verification SHA must be rejected")
 	}
 }
 
