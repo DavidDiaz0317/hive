@@ -136,4 +136,10 @@ jobs:
         if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$RELEASE_TAG" .release/dist/hive-integrated-*.* --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes
+        run: |
+          gh release create "$RELEASE_TAG" \
+            .release/dist/hive-integrated-*.tar.gz \
+            .release/dist/hive-integrated-*.tar.gz.sha256 \
+            .release/dist/hive-integrated-*.zip \
+            .release/dist/hive-integrated-*.zip.sha256 \
+            --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes
