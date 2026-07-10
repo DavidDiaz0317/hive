@@ -231,6 +231,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		for _, command := range w.Config.ValidationCommands {
 			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "validation"); err != nil {
 				if !isVisualHiveRunCommand(command) {
+					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
+						return Result{}, saveErr
+					}
 					return Result{}, err
 				}
 				review, recognized, reviewErr := DetectBaselineReview(attempt.Worktree)
@@ -238,6 +241,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 					return Result{}, fmt.Errorf("classify baseline review after %w: %v", err, reviewErr)
 				}
 				if !recognized {
+					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
+						return Result{}, saveErr
+					}
 					return Result{}, err
 				}
 				attempt.BaselineReview = review
@@ -307,6 +313,13 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		PRNumber: attempt.PRNumber, PRURL: attempt.PRURL, ChangedFiles: append([]string(nil), attempt.ChangedFiles...),
 		BaselineReview: cloneBaselineReview(attempt.BaselineReview), Resumed: resumed,
 	}, nil
+}
+
+func checkpointLocalValidationFailure(store *Store, attempt *Attempt, validationErr error) error {
+	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nLocal validation failed; revise the patch instead of repeating it:\n" + validationErr.Error())
+	attempt.ModelPatch = ""
+	attempt.Stage = StageNoChange
+	return store.Put(*attempt)
 }
 
 func cloneBaselineReview(review *BaselineReview) *BaselineReview {

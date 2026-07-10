@@ -380,6 +380,24 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 	}
 }
 
+func TestCheckpointLocalValidationFailureCreatesBoundedRetryState(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := Attempt{
+		RepositoryFingerprint: "owner/repo:test-gap", Stage: StageModelComplete,
+		ModelSummary: "first patch", ModelPatch: "diff --git a/test/x.test.js b/test/x.test.js",
+	}
+	if err := checkpointLocalValidationFailure(store, &attempt, fmt.Errorf("expected 2, got 1")); err != nil {
+		t.Fatal(err)
+	}
+	saved, ok := store.Get(attempt.RepositoryFingerprint)
+	if !ok || saved.Stage != StageNoChange || saved.ModelPatch != "" || !strings.Contains(saved.ModelSummary, "expected 2, got 1") {
+		t.Fatalf("local validation failure was not persisted for a bounded retry: %+v", saved)
+	}
+}
+
 func seedGitRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
