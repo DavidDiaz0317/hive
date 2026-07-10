@@ -84,6 +84,31 @@ func TestRetryableRepairAttemptClassification(t *testing.T) {
 	}
 }
 
+func TestApprovedMergedBaselineProposalUsesReadyAndMergeAsApproval(t *testing.T) {
+	gate := hivegithub.PullRequestGate{
+		Merged: true, MergeSHA: "merge-sha", Draft: false, Hold: true,
+		VisualHiveVerdictGreen: true, RequiredCheckStates: []string{"success"},
+	}
+	if !approvedMergedBaselineProposal(gate) {
+		t.Fatal("a non-draft exact merge must be consumable even when GitHub retains Hive's hold label")
+	}
+
+	gate.Draft = true
+	if approvedMergedBaselineProposal(gate) {
+		t.Fatal("a draft merge must not count as reviewed baseline approval")
+	}
+	gate.Draft = false
+	gate.HumanReviewRequired = true
+	if approvedMergedBaselineProposal(gate) {
+		t.Fatal("an unresolved repository review requirement must block baseline approval")
+	}
+	gate.HumanReviewRequired = false
+	gate.RequiredCheckStates = []string{"pending"}
+	if approvedMergedBaselineProposal(gate) {
+		t.Fatal("non-green exact-head checks must block baseline approval")
+	}
+}
+
 func TestMarkMergePolicyHoldPersistsReviewRequirement(t *testing.T) {
 	dir := t.TempDir()
 	state := visualhive.LifecycleState{

@@ -442,8 +442,8 @@ func reconcileBaselineReview(ctx context.Context, stateDir string, config Config
 			}
 			return nil, evaluation, false, fmt.Errorf("baseline proposal #%d was rejected", gate.Number)
 		}
-		if gate.Hold || gate.HumanReviewRequired || !gateChecksGreen(gate) || strings.TrimSpace(gate.MergeSHA) == "" {
-			return nil, evaluation, false, fmt.Errorf("merged baseline proposal #%d lacks released hold, human approval, green exact-head checks, or merge SHA", gate.Number)
+		if !approvedMergedBaselineProposal(gate) {
+			return nil, evaluation, false, fmt.Errorf("merged baseline proposal #%d lacks ready-for-review human approval, green exact-head checks, or merge SHA", gate.Number)
 		}
 		decision := policy.Authorize(automation.ActionRequest{
 			Action: automation.ActionApplyBaselineReview, Agent: repairActor(finding.OwningAgentHint), Repository: config.Repository,
@@ -467,6 +467,17 @@ func reconcileBaselineReview(ctx context.Context, stateDir string, config Config
 		return &result, evaluation, false, nil
 	}
 	return nil, nil, false, nil
+}
+
+// approvedMergedBaselineProposal treats the explicit merge of Hive's exact,
+// non-draft baseline-only proposal as the human approval. UpsertReviewPullRequest
+// deliberately applies a durable hold label, and GitHub retains that label after
+// a reviewer marks the PR ready and merges it. The label must continue blocking
+// an open proposal, but cannot make an otherwise exact reviewed merge impossible
+// to consume. Exact head, candidate paths, and risk classification are verified
+// immediately before this helper is called.
+func approvedMergedBaselineProposal(gate hivegithub.PullRequestGate) bool {
+	return gate.Merged && !gate.Draft && !gate.HumanReviewRequired && gateChecksGreen(gate) && strings.TrimSpace(gate.MergeSHA) != ""
 }
 
 func baselineProposalConfig(config Config, stateDir string) repair.BaselineProposalConfig {
