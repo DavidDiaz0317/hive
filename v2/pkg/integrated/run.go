@@ -676,12 +676,11 @@ func retryCancelledDispatch(conclusion string, attempt, limit int) bool {
 
 func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) ([]repair.Result, error) {
 	snapshot := lifecycle.Snapshot()
-	keys := make([]string, 0, len(snapshot.Findings))
-	for key := range snapshot.Findings {
-		keys = append(keys, key)
+	key := selectedRepairKey(snapshot)
+	if key == "" {
+		return nil, nil
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range []string{key} {
 		finding := snapshot.Findings[key]
 		if finding == nil || finding.HumanReviewRequired || (finding.Status != visualhive.StatusIssueOpen && finding.Status != visualhive.StatusFixQueued && finding.Status != visualhive.StatusNeedsRevision && finding.Status != visualhive.StatusRepairRunning) || finding.IssueNumber <= 0 {
 			continue
@@ -719,6 +718,47 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		return []repair.Result{result}, nil // repository concurrency budget defaults to one repair
 	}
 	return nil, nil
+}
+
+// selectedRepairKey enforces the repository-wide concurrency budget before a
+// worker is constructed. Any existing branch/PR/merge lifecycle blocks a new
+// issue from starting; only the already-active repair may resume or revise.
+func selectedRepairKey(state visualhive.LifecycleState) string {
+	keys := make([]string, 0, len(state.Findings))
+	for key := range state.Findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	resumeKey := ""
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding == nil {
+			continue
+		}
+		switch finding.Status {
+		case visualhive.StatusRepairRunning, visualhive.StatusNeedsRevision:
+			if finding.HumanReviewRequired {
+				return ""
+			}
+			if resumeKey == "" {
+				resumeKey = key
+			}
+		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusReady,
+			visualhive.StatusMerged, visualhive.StatusPostMergeVerifying:
+			return ""
+		}
+	}
+	if resumeKey != "" {
+		return resumeKey
+	}
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding != nil && !finding.HumanReviewRequired && finding.IssueNumber > 0 &&
+			(finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued) {
+			return key
+		}
+	}
+	return ""
 }
 
 func repairPreparationCommands(checkout string) []repair.Command {

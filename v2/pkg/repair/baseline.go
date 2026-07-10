@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -65,7 +66,10 @@ func ReadHostedBaselineReview(artifactRoot string) (*BaselineReview, bool, error
 func readBaselineReview(root, source string) (*BaselineReview, bool, error) {
 	reportPath, err := findUniqueReport(root)
 	if err != nil {
-		return nil, false, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	data, err := os.ReadFile(reportPath)
 	if err != nil {
@@ -145,10 +149,6 @@ func findUniqueReport(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	direct := filepath.Join(root, ".visual-hive", "report.json")
-	if info, statErr := os.Lstat(direct); statErr == nil && info.Mode().IsRegular() {
-		return direct, nil
-	}
 	matches := []string{}
 	err = filepath.WalkDir(root, func(candidate string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -163,14 +163,21 @@ func findUniqueReport(root string) (string, error) {
 		if entry.IsDir() || !strings.EqualFold(entry.Name(), "report.json") {
 			return nil
 		}
-		parent := filepath.Base(filepath.Dir(candidate))
-		if parent == ".visual-hive" {
+		relative, relErr := filepath.Rel(root, candidate)
+		if relErr != nil {
+			return relErr
+		}
+		normalized := filepath.ToSlash(relative)
+		if normalized == "report.json" || normalized == ".visual-hive/report.json" {
 			matches = append(matches, candidate)
 		}
 		return nil
 	})
 	if err != nil {
 		return "", err
+	}
+	if len(matches) == 0 {
+		return "", os.ErrNotExist
 	}
 	if len(matches) != 1 {
 		return "", fmt.Errorf("expected one .visual-hive/report.json, found %d", len(matches))
@@ -226,9 +233,12 @@ func locateCandidate(root, reported string) (string, error) {
 	if strings.HasPrefix(relative, "../") || strings.Contains(relative, "/../") {
 		return "", fmt.Errorf("invalid actual screenshot path")
 	}
-	direct := filepath.Join(root, filepath.FromSlash(relative))
-	if _, statErr := os.Lstat(direct); statErr == nil {
-		return direct, nil
+	relatives := []string{relative, strings.TrimPrefix(relative, ".visual-hive/")}
+	for _, candidateRelative := range relatives {
+		direct := filepath.Join(root, filepath.FromSlash(candidateRelative))
+		if _, statErr := os.Lstat(direct); statErr == nil {
+			return direct, nil
+		}
 	}
 	matches := []string{}
 	err = filepath.WalkDir(root, func(candidate string, entry fs.DirEntry, walkErr error) error {
@@ -241,8 +251,14 @@ func locateCandidate(root, reported string) (string, error) {
 			}
 			return nil
 		}
-		if !entry.IsDir() && strings.HasSuffix(filepath.ToSlash(candidate), relative) {
-			matches = append(matches, candidate)
+		if !entry.IsDir() {
+			normalizedCandidate := filepath.ToSlash(candidate)
+			for _, candidateRelative := range relatives {
+				if strings.HasSuffix(normalizedCandidate, candidateRelative) {
+					matches = append(matches, candidate)
+					break
+				}
+			}
 		}
 		return nil
 	})

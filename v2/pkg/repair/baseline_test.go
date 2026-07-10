@@ -77,6 +77,37 @@ func TestDetectBaselineReviewRejectsMixedFailure(t *testing.T) {
 	}
 }
 
+func TestReadHostedBaselineReviewSupportsStrippedArtifactRoot(t *testing.T) {
+	root := t.TempDir()
+	actual := filepath.Join(root, "artifacts", "screenshots", "contract__mobile__mobile.png")
+	writeTestPNG(t, actual)
+	report := map[string]any{
+		"status":               "failed",
+		"summary":              map[string]any{"missingBaselines": 1, "visualDiffs": 0, "consoleErrors": 0, "pageErrors": 0, "flowStepsFailed": 0},
+		"verdictSummary":       map[string]any{"visualHiveVerdict": "blocked", "failedBecause": []string{}},
+		"verdictContributions": []map[string]any{{"kind": "missing_baseline", "status": "blocked", "gating": true}},
+		"results": []map[string]any{{"screenshotAssertions": []map[string]any{{
+			"contractId": "contract", "screenshotName": "mobile", "route": "/", "viewport": "mobile", "status": "missing_baseline",
+			"baselinePath": "/home/runner/work/repo/repo/visual-hive.baselines/linux/contract__mobile__mobile.png",
+			"actualPath":   "/home/runner/work/repo/repo/.visual-hive/artifacts/screenshots/contract__mobile__mobile.png",
+		}}}},
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "report.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	review, recognized, err := ReadHostedBaselineReview(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recognized || len(review.Candidates) != 1 || review.Candidates[0].Platform != "linux" || review.Candidates[0].ActualPath != actual {
+		t.Fatalf("stripped hosted artifact was not recognized: review=%+v recognized=%t", review, recognized)
+	}
+}
+
 func TestDetectBaselineReviewRejectsUnsafeBaselinePath(t *testing.T) {
 	root := t.TempDir()
 	actual := filepath.Join(root, ".visual-hive", "artifacts", "screenshots", "candidate.png")

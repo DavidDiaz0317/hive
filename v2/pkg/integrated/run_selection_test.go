@@ -33,6 +33,24 @@ func TestActiveRepairFindingSkipsHumanReviewOnlyIssue(t *testing.T) {
 	}
 }
 
+func TestSelectedRepairKeyEnforcesRepositoryConcurrencyBeforeSortOrder(t *testing.T) {
+	state := visualhive.LifecycleState{Findings: map[string]*visualhive.FindingLifecycle{
+		"a-new-issue": {RepositoryFingerprint: "a-new-issue", Status: visualhive.StatusIssueOpen, IssueNumber: 1},
+		"z-open-pr":   {RepositoryFingerprint: "z-open-pr", Status: visualhive.StatusPROpen, IssueNumber: 2, PRNumber: 3},
+	}}
+	if selected := selectedRepairKey(state); selected != "" {
+		t.Fatalf("open PR must block a new repair regardless of fingerprint order, got %q", selected)
+	}
+	state.Findings["z-open-pr"].Status = visualhive.StatusRepairRunning
+	if selected := selectedRepairKey(state); selected != "z-open-pr" {
+		t.Fatalf("existing repair must resume before a new issue, got %q", selected)
+	}
+	state.Findings["z-open-pr"].HumanReviewRequired = true
+	if selected := selectedRepairKey(state); selected != "" {
+		t.Fatalf("manual review hold must block all repair dispatch, got %q", selected)
+	}
+}
+
 func TestRepairPreparationAndPinnedCLIEnvironment(t *testing.T) {
 	checkout := t.TempDir()
 	if err := os.WriteFile(filepath.Join(checkout, "package-lock.json"), []byte("{}\n"), 0o600); err != nil {
