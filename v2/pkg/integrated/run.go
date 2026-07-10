@@ -401,17 +401,51 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 		return WorkflowRunEvidence{}, fmt.Errorf("invalid configured repository")
 	}
 	const workflowFile = "hive-visual-hive.yml"
+	const dispatchAttemptLimit = 3
+	for attempt := 1; attempt <= dispatchAttemptLimit; attempt++ {
+		selected, err := dispatchAndWaitAttempt(ctx, client, owner, repo, workflowFile, config.DefaultBranch)
+		if err != nil {
+			return WorkflowRunEvidence{}, err
+		}
+		if retryCancelledDispatch(selected.GetConclusion(), attempt, dispatchAttemptLimit) {
+			continue
+		}
+		if selected.GetConclusion() != "success" {
+			return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow %s concluded %s", selected.GetHTMLURL(), selected.GetConclusion())
+		}
+		artifacts, _, err := client.GoGitHub().Actions.ListWorkflowRunArtifacts(ctx, owner, repo, selected.GetID(), &gh.ListOptions{PerPage: 100})
+		if err != nil {
+			return WorkflowRunEvidence{}, fmt.Errorf("list production evidence artifacts: %w", err)
+		}
+		workflow := WorkflowRunEvidence{RunID: selected.GetID(), RunURL: selected.GetHTMLURL(), HeadSHA: selected.GetHeadSHA(), Conclusion: selected.GetConclusion()}
+		for _, artifact := range artifacts.Artifacts {
+			switch {
+			case strings.HasPrefix(artifact.GetName(), "visual-hive-evidence-"):
+				workflow.EvidenceArtifact = artifact.GetID()
+			case strings.HasPrefix(artifact.GetName(), "visual-hive-bundle-"):
+				workflow.BundleArtifact = artifact.GetID()
+			}
+		}
+		if workflow.EvidenceArtifact <= 0 || workflow.BundleArtifact <= 0 {
+			return WorkflowRunEvidence{}, fmt.Errorf("workflow did not publish both evidence and provenance-bound bundle artifacts")
+		}
+		return workflow, nil
+	}
+	return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow was cancelled by concurrency %d consecutive times", dispatchAttemptLimit)
+}
+
+func dispatchAndWaitAttempt(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref string) (*gh.WorkflowRun, error) {
 	started := time.Now().UTC().Add(-5 * time.Second)
-	_, err := client.GoGitHub().Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, workflowFile, gh.CreateWorkflowDispatchEventRequest{Ref: config.DefaultBranch})
+	_, err := client.GoGitHub().Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, workflowFile, gh.CreateWorkflowDispatchEventRequest{Ref: ref})
 	if err != nil {
-		return WorkflowRunEvidence{}, fmt.Errorf("dispatch Visual Hive production workflow: %w", err)
+		return nil, fmt.Errorf("dispatch Visual Hive production workflow: %w", err)
 	}
 	var selected *gh.WorkflowRun
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for selected == nil {
 		runs, _, listErr := client.GoGitHub().Actions.ListWorkflowRunsByFileName(ctx, owner, repo, workflowFile, &gh.ListWorkflowRunsOptions{
-			Branch: config.DefaultBranch, Event: "workflow_dispatch", ExcludePullRequests: true, ListOptions: gh.ListOptions{PerPage: 20},
+			Branch: ref, Event: "workflow_dispatch", ExcludePullRequests: true, ListOptions: gh.ListOptions{PerPage: 20},
 		})
 		if listErr == nil {
 			for _, candidate := range runs.WorkflowRuns {
@@ -428,14 +462,14 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 		}
 		select {
 		case <-ctx.Done():
-			return WorkflowRunEvidence{}, fmt.Errorf("wait for dispatched workflow: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for dispatched workflow: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
 	for selected.GetStatus() != "completed" {
 		select {
 		case <-ctx.Done():
-			return WorkflowRunEvidence{}, fmt.Errorf("wait for workflow completion: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for workflow completion: %w", ctx.Err())
 		case <-ticker.C:
 		}
 		current, _, getErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, selected.GetID())
@@ -444,26 +478,11 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 		}
 		selected = current
 	}
-	if selected.GetConclusion() != "success" {
-		return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow %s concluded %s", selected.GetHTMLURL(), selected.GetConclusion())
-	}
-	artifacts, _, err := client.GoGitHub().Actions.ListWorkflowRunArtifacts(ctx, owner, repo, selected.GetID(), &gh.ListOptions{PerPage: 100})
-	if err != nil {
-		return WorkflowRunEvidence{}, fmt.Errorf("list production evidence artifacts: %w", err)
-	}
-	workflow := WorkflowRunEvidence{RunID: selected.GetID(), RunURL: selected.GetHTMLURL(), HeadSHA: selected.GetHeadSHA(), Conclusion: selected.GetConclusion()}
-	for _, artifact := range artifacts.Artifacts {
-		switch {
-		case strings.HasPrefix(artifact.GetName(), "visual-hive-evidence-"):
-			workflow.EvidenceArtifact = artifact.GetID()
-		case strings.HasPrefix(artifact.GetName(), "visual-hive-bundle-"):
-			workflow.BundleArtifact = artifact.GetID()
-		}
-	}
-	if workflow.EvidenceArtifact <= 0 || workflow.BundleArtifact <= 0 {
-		return WorkflowRunEvidence{}, fmt.Errorf("workflow did not publish both evidence and provenance-bound bundle artifacts")
-	}
-	return workflow, nil
+	return selected, nil
+}
+
+func retryCancelledDispatch(conclusion string, attempt, limit int) bool {
+	return strings.EqualFold(strings.TrimSpace(conclusion), "cancelled") && attempt < limit
 }
 
 func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) ([]repair.Result, error) {

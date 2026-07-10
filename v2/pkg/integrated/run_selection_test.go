@@ -49,6 +49,12 @@ func TestRepairPreparationAndPinnedCLIEnvironment(t *testing.T) {
 	}
 }
 
+func TestDispatchRetryIsBoundedToConcurrencyCancellation(t *testing.T) {
+	if !retryCancelledDispatch("cancelled", 1, 3) || retryCancelledDispatch("failure", 1, 3) || retryCancelledDispatch("cancelled", 3, 3) {
+		t.Fatal("dispatch retry classification must be cancellation-only and bounded")
+	}
+}
+
 func TestReconcileExternallyMergedRepairPersistsExactMerge(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
