@@ -52,8 +52,17 @@ type coverageMaintenanceFinding struct {
 }
 
 type coverageRecommendation struct {
-	MaintenanceFindingID string `json:"maintenanceFindingId"`
-	SuggestedConfigYAML  string `json:"suggestedConfigYaml"`
+	ID                   string   `json:"id"`
+	Kind                 string   `json:"kind"`
+	Title                string   `json:"title"`
+	ContractID           string   `json:"contractId"`
+	TargetID             string   `json:"targetId"`
+	Route                string   `json:"route"`
+	Viewport             string   `json:"viewport"`
+	Rationale            []string `json:"rationale"`
+	SuggestedTests       []string `json:"suggestedTests"`
+	MaintenanceFindingID string   `json:"maintenanceFindingId"`
+	SuggestedConfigYAML  string   `json:"suggestedConfigYaml"`
 }
 
 // LoadEvidenceSummary reads only the deterministic verdict from an independently
@@ -184,6 +193,24 @@ func loadCoverageEvidenceSummary(root string, finding visualhive.FindingLifecycl
 	}
 	title := strings.ToLower(finding.Title)
 	lines := make([]string, 0)
+	for _, item := range evidence.Recommendations {
+		if !contracts[strings.ToLower(strings.TrimSpace(item.ContractID))] {
+			continue
+		}
+		itemKind, itemTitle := strings.ToLower(strings.TrimSpace(item.Kind)), strings.ToLower(strings.TrimSpace(item.Title))
+		if (itemKind == "" || !strings.Contains(title, itemKind)) && (itemTitle == "" || !strings.Contains(title, itemTitle)) {
+			continue
+		}
+		values := []string{item.ID, item.Kind, item.ContractID, item.TargetID, item.Route, item.Viewport, item.Title, strings.Join(item.Rationale, ","), strings.Join(item.SuggestedTests, ","), item.SuggestedConfigYAML}
+		for index, value := range values {
+			value = strings.TrimSpace(value)
+			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
+				return "", fmt.Errorf("verified Visual Hive coverage evidence contains an unsafe value")
+			}
+			values[index] = strings.ReplaceAll(value, "\n", "\\n")
+		}
+		lines = append(lines, fmt.Sprintf("- key=coverage.%s source=coverage kind=%s status=warning contract=%s target=%s route=%s viewport=%s reason=%s rationale=%s suggested_tests=%s suggested_config=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]))
+	}
 	for _, item := range evidence.MaintenanceFindings {
 		if !contracts[strings.ToLower(strings.TrimSpace(item.ContractID))] || !strings.Contains(title, strings.ToLower(strings.TrimSpace(item.Kind))) {
 			continue

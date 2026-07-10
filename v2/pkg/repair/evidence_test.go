@@ -64,3 +64,26 @@ func TestLoadEvidenceSummaryUsesDeterministicCoverageRecommendation(t *testing.T
 		t.Fatalf("unexpected coverage evidence summary: %s", summary)
 	}
 }
+
+func TestLoadEvidenceSummaryUsesFirstClassFlowRecommendation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(`{"allContributions":[{"source":"playwright","kind":"deterministic_run","status":"passed","gating":true}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coverage := `{"maintenanceFindings":[],"recommendations":[
+{"id":"flow-steps:app-shell-stability","kind":"add_flow_steps","title":"Add deterministic flow steps for \"app-shell-stability\"","contractId":"app-shell-stability","targetId":"localPreview","route":"/","rationale":["Contract has no deterministic user-flow steps."],"suggestedConfigYaml":"steps:\n  - action: goto\n    route: /\n  - action: assertVisible\n    selector: '[data-testid=dashboard-page]'","suggestedTests":["Run the contract locally."]},
+{"id":"flow-steps:other","kind":"add_flow_steps","title":"Add deterministic flow steps for other","contractId":"other"}
+]}`
+	if err := os.WriteFile(filepath.Join(root, "coverage-recommendations.json"), []byte(coverage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "missing_visual_coverage", Title: `[Visual Hive] Add visual coverage: Add deterministic flow steps for "app-shell-stability"`, AffectedContracts: []string{"app-shell-stability"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "coverage.flow-steps:app-shell-stability") || !strings.Contains(summary, "kind=add_flow_steps") || !strings.Contains(summary, "assertVisible") || strings.Contains(summary, "flow-steps:other") {
+		t.Fatalf("unexpected first-class coverage evidence: %s", summary)
+	}
+}
