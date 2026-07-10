@@ -5,7 +5,7 @@ hive_root="${1:?Hive v2 source root is required}"
 visual_bundle="${2:?unpacked Visual Hive release bundle is required}"
 work_root="${3:-$(mktemp -d /tmp/hive-integrated-linux.XXXXXX)}"
 hive_commit="${HIVE_COMMIT:-$(git -C "$hive_root" rev-parse HEAD)}"
-visual_commit="${VISUAL_HIVE_COMMIT:-$(node -e "const m=require(process.argv[1]); process.stdout.write(m.gitCommit)" "$visual_bundle/release-manifest.json")}" 
+visual_commit="${VISUAL_HIVE_COMMIT:-$(sed -nE 's/^[[:space:]]*"gitCommit":[[:space:]]*"([a-f0-9]{40})",?$/\1/p' "$visual_bundle/release-manifest.json")}" 
 node_version="22.23.1"
 release_version="vlocal-linux"
 
@@ -13,12 +13,12 @@ release_version="vlocal-linux"
 [[ "$visual_commit" =~ ^[a-f0-9]{40}$ ]] || { echo "immutable Visual Hive commit is required" >&2; exit 1; }
 
 mkdir -p "$work_root/node" "$work_root/release"
-archive="node-v${node_version}-linux-x64.tar.xz"
+archive="node-v${node_version}-linux-x64.tar.gz"
 base="https://nodejs.org/dist/v${node_version}"
 curl --fail --silent --show-error --location "$base/SHASUMS256.txt" -o "$work_root/node/SHASUMS256.txt"
 curl --fail --silent --show-error --location "$base/$archive" -o "$work_root/node/$archive"
 (cd "$work_root/node" && grep "  $archive$" SHASUMS256.txt | sha256sum --check --strict -)
-tar -xJf "$work_root/node/$archive" -C "$work_root/node"
+tar -xzf "$work_root/node/$archive" -C "$work_root/node"
 node_root="$work_root/node/node-v${node_version}-linux-x64"
 
 (cd "$hive_root" && go build -trimpath -ldflags "-s -w -X main.gitHash=$hive_commit -X main.gitShort=${hive_commit:0:12}" -o "$work_root/hive" ./cmd/hive)
