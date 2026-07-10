@@ -11,6 +11,9 @@ on:
         description: Optional Hive fork release tag (for example v0.3.0-integrated.1)
         required: false
         type: string
+  push:
+    tags:
+      - "v*-integrated.*"
 
 permissions:
   contents: write
@@ -23,7 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '59ca827ea5955bcd4459eb9ae203e9703533226a' }}
+      RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+      RELEASE_VERSION: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -82,8 +87,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          linux_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ inputs.release_tag || github.sha }}-linux-amd64"
-          windows_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ inputs.release_tag || github.sha }}-windows-amd64"
+          linux_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ env.RELEASE_VERSION }}-linux-amd64"
+          windows_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ env.RELEASE_VERSION }}-windows-amd64"
           go run ./cmd/hive-dist \
             --hive "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --hive-commit "$GITHUB_SHA" \
             --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
@@ -104,8 +109,8 @@ jobs:
         run: |
           set -euo pipefail
           cd .release/dist
-          linux_dir="hive-integrated-${{ inputs.release_tag || github.sha }}-linux-amd64"
-          windows_dir="hive-integrated-${{ inputs.release_tag || github.sha }}-windows-amd64"
+          linux_dir="hive-integrated-${{ env.RELEASE_VERSION }}-linux-amd64"
+          windows_dir="hive-integrated-${{ env.RELEASE_VERSION }}-windows-amd64"
           tar -czf "${linux_dir}.tar.gz" "$linux_dir"
           zip -qr "${windows_dir}.zip" "$windows_dir"
           sha256sum "${linux_dir}.tar.gz" > "${linux_dir}.tar.gz.sha256"
@@ -128,7 +133,7 @@ jobs:
             .release/dist/hive-integrated-*.zip
             .release/dist/hive-integrated-*.zip.sha256
       - name: Publish fork release
-        if: inputs.release_tag != ''
+        if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ inputs.release_tag }}" .release/dist/hive-integrated-*.* --target "$GITHUB_SHA" --title "Hive integrated ${{ inputs.release_tag }}" --generate-notes
+        run: gh release create "$RELEASE_TAG" .release/dist/hive-integrated-*.* --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes
