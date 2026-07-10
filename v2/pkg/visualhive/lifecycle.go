@@ -961,6 +961,15 @@ func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef s
 	if len(affectedContracts) == 0 && finding.IssueKind == "test_adequacy_gap" {
 		affectedContracts = []string{"testing-layer:2"}
 	}
+	// Repository-level workflow and provider findings intentionally have no UI
+	// contract. Their deterministic audit artifacts are explicit evaluation
+	// scopes so a complete target-branch scan can prove resolution safely.
+	if len(affectedContracts) == 0 && finding.IssueKind == "workflow_safety" {
+		affectedContracts = []string{"workflow-safety"}
+	}
+	if len(affectedContracts) == 0 && finding.IssueKind == "provider_governance" {
+		affectedContracts = []string{"provider-governance"}
+	}
 	if len(affectedContracts) == 0 {
 		return false, "finding has no affected contract that can be proven evaluated"
 	}

@@ -522,7 +522,26 @@ jobs:
           # Writes .visual-hive/baselines.json before artifact upload.
           node "$VISUAL_HIVE_CLI" baselines list --config visual-hive.config.yaml --write
           node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
-          node -e 'const fs=require("fs");const candidates=[".visual-hive/plan.full.json",".visual-hive/plan.json"];const p=candidates.find(fs.existsSync);const v=p?JSON.parse(fs.readFileSync(p,"utf8")):{};const rows=Array.isArray(v.items)?v.items:[];const layerPath=".visual-hive/testing-layers.json";const layerReport=fs.existsSync(layerPath)?JSON.parse(fs.readFileSync(layerPath,"utf8")):{};const layers=Array.isArray(layerReport.layers)?layerReport.layers:[];const ids=[...new Set([...rows.map(x=>x.contractId||x.id),...layers.map(x=>Number.isInteger(x.id)?"testing-layer:"+x.id:null)].filter(Boolean))].sort();fs.writeFileSync(".visual-hive/evaluated-contracts.txt",ids.join("\n")+"\n")'
+          node <<'NODE'
+          const fs = require("fs");
+          const candidates = [".visual-hive/plan.full.json", ".visual-hive/plan.json"];
+          const planPath = candidates.find(fs.existsSync);
+          const plan = planPath ? JSON.parse(fs.readFileSync(planPath, "utf8")) : {};
+          const rows = Array.isArray(plan.items) ? plan.items : [];
+          const layerPath = ".visual-hive/testing-layers.json";
+          const layerReport = fs.existsSync(layerPath) ? JSON.parse(fs.readFileSync(layerPath, "utf8")) : {};
+          const layers = Array.isArray(layerReport.layers) ? layerReport.layers : [];
+          const systemScopes = [
+            ["workflow-safety", ".visual-hive/workflows.json"],
+            ["provider-governance", ".visual-hive/provider-results.json"]
+          ].filter(([, artifact]) => fs.existsSync(artifact)).map(([scope]) => scope);
+          const ids = [...new Set([
+            ...rows.map((item) => item.contractId || item.id),
+            ...layers.map((layer) => Number.isInteger(layer.id) ? "testing-layer:" + layer.id : null),
+            ...systemScopes
+          ].filter(Boolean))].sort();
+          fs.writeFileSync(".visual-hive/evaluated-contracts.txt", ids.join("\n") + "\n");
+          NODE
       - name: Upload independently verifiable evidence
         id: evidence
         uses: actions/upload-artifact@%s

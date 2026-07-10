@@ -414,6 +414,25 @@ func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *test
 	}
 }
 
+func TestResolutionAllowsRepositoryAuditFindingsOnlyForExactEvaluatedScope(t *testing.T) {
+	manifest := Manifest{
+		Source: Source{Ref: "refs/heads/main"},
+		Scan:   Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"workflow-safety"}},
+	}
+	finding := &FindingLifecycle{IssueKind: "workflow_safety"}
+	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
+		t.Fatalf("verified workflow audit should resolve a repository workflow finding: %s", reason)
+	}
+	manifest.Scan.EvaluatedContracts = []string{"provider-governance"}
+	if allowed, _ := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); allowed {
+		t.Fatal("provider evidence must not resolve a workflow finding")
+	}
+	finding.IssueKind = "provider_governance"
+	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
+		t.Fatalf("verified provider evidence should resolve a provider finding: %s", reason)
+	}
+}
+
 func TestLifecycleAuditIsAppendOnlyJSONL(t *testing.T) {
 	root := t.TempDir()
 	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
