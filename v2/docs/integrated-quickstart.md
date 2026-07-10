@@ -11,14 +11,14 @@ Prerequisites are Git and a current GitHub CLI with `gh attestation verify` supp
 Windows PowerShell:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-RestMethod "https://raw.githubusercontent.com/DavidDiaz0317/hive/v0.3.0-integrated.3/v2/install-integrated.ps1")))
+& ([scriptblock]::Create((Invoke-RestMethod "https://raw.githubusercontent.com/DavidDiaz0317/hive/v0.3.1-integrated.1/v2/install-integrated.ps1")))
 ```
 
 Linux:
 
 ```bash
 curl --fail --silent --show-error --location \
-  https://raw.githubusercontent.com/DavidDiaz0317/hive/v0.3.0-integrated.3/v2/install-integrated.sh | sh
+  https://raw.githubusercontent.com/DavidDiaz0317/hive/v0.3.1-integrated.1/v2/install-integrated.sh | sh
 ```
 
 The installer verifies the archive checksum, GitHub Sigstore build attestation, platform, and every file in `distribution-manifest.json` before atomically activating it. The install fails closed if `gh attestation verify` fails.

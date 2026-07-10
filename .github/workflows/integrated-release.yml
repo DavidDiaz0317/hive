@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '59ca827ea5955bcd4459eb9ae203e9703533226a' }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '2f20e95a3734c86552e8e40e735f689f24cb8081' }}
       RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
       RELEASE_VERSION: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:
