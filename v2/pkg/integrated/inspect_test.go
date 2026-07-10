@@ -73,6 +73,15 @@ func TestBuildSetupPlanKeepsCoverageAndAuthoritySeparate(t *testing.T) {
 	}
 }
 
+func TestVisualTestConfigRequiresHumanMergeAuthority(t *testing.T) {
+	if !contains(defaultAllowedRepairPaths(), "visual-hive.config.yaml") {
+		t.Fatal("repair PR mode must be able to propose repository testing-plan improvements")
+	}
+	if contains(defaultAllowedAutoMergePaths(), "visual-hive.config.yaml") {
+		t.Fatal("Visual Hive config changes must remain outside the default auto-merge allowlist")
+	}
+}
+
 func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 	sha := "0123456789012345678901234567890123456789"
 	if !exactCommitPin(sha, sha) {

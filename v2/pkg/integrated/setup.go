@@ -104,8 +104,8 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		MaxActiveIssues: options.MaxActiveIssues,
 		VisualHiveRepo:  options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
 		VisualHiveCommand: options.VisualHiveCommand, VisualHiveArgs: append([]string(nil), options.VisualHiveArgs...),
-		TestCommands: cloneCommands(inspection.TestCommands), AllowedRepairPaths: []string{"src/**", "public/**", "index.html", "test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"},
-		AllowedAutoMergePaths: []string{"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"},
+		TestCommands: cloneCommands(inspection.TestCommands), AllowedRepairPaths: defaultAllowedRepairPaths(),
+		AllowedAutoMergePaths: defaultAllowedAutoMergePaths(),
 		AllowedAutoMergeRisk:  []automation.RiskTier{automation.RiskAutomatic},
 		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,
 		InstalledAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
@@ -193,6 +193,14 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	result.Applied, result.Idempotent, result.Config = true, idempotent, &config
 	result.Branch, result.CommitSHA, result.PRNumber, result.PRURL = branch, sha, pull.Number, pull.URL
 	return result, nil
+}
+
+func defaultAllowedRepairPaths() []string {
+	return []string{"src/**", "public/**", "index.html", "visual-hive.config.yaml", "test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
+}
+
+func defaultAllowedAutoMergePaths() []string {
+	return []string{"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
 }
 
 func VerifyVisualHiveCommit(ctx context.Context, client *hivegithub.Client, repository, ref string) error {

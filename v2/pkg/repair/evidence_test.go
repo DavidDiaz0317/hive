@@ -41,3 +41,26 @@ func TestLoadEvidenceSummaryRejectsCredentials(t *testing.T) {
 		t.Fatalf("expected credential rejection, got %v", err)
 	}
 }
+
+func TestLoadEvidenceSummaryUsesDeterministicCoverageRecommendation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(`{"allContributions":[{"source":"playwright","kind":"deterministic_run","status":"passed","gating":true,"reason":"passed"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coverage := `{"maintenanceFindings":[
+{"id":"missing-mobile-scenarios","kind":"missing_mobile_viewport","contractId":"scenario-gallery-contract","targetId":"localPreview","route":"/scenarios","viewport":"mobile","message":"Contract has no mobile screenshot.","evidence":["viewports=desktop"],"recommendedAction":"expand"},
+{"id":"unrelated","kind":"missing_mobile_viewport","contractId":"other","message":"unrelated"}
+],"recommendations":[{"maintenanceFindingId":"missing-mobile-scenarios","suggestedConfigYaml":"screenshots:\n  - name: scenarios-mobile\n    route: /scenarios\n    viewport: mobile"}]}`
+	if err := os.WriteFile(filepath.Join(root, "coverage-recommendations.json"), []byte(coverage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "missing_visual_coverage", Title: "Maintain visual test: missing_mobile_viewport", AffectedContracts: []string{"scenario-gallery-contract"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "coverage.missing-mobile-scenarios") || !strings.Contains(summary, "suggested_config=screenshots") || strings.Contains(summary, "unrelated") {
+		t.Fatalf("unexpected coverage evidence summary: %s", summary)
+	}
+}
