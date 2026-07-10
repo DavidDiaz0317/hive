@@ -115,10 +115,36 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	inspection.DeploymentFiles = sortedUnique(inspection.DeploymentFiles)
 	inspection.BaselineFiles = sortedUnique(inspection.BaselineFiles)
 	inspection.HighRiskPaths = sortedUnique(inspection.HighRiskPaths)
-	sort.Slice(inspection.TestCommands, func(i, j int) bool {
+	sort.SliceStable(inspection.TestCommands, func(i, j int) bool {
+		left, right := testCommandPriority(inspection.TestCommands[i]), testCommandPriority(inspection.TestCommands[j])
+		if left != right {
+			return left < right
+		}
 		return strings.Join(inspection.TestCommands[i], "\x00") < strings.Join(inspection.TestCommands[j], "\x00")
 	})
 	return inspection, nil
+}
+
+// testCommandPriority keeps generated repair validation plans dependency-safe.
+// Repository producers (tests, suites, mutation runs) must execute before proof
+// and validation scripts that consume their reports. Derived planning belongs
+// last because it may consume both the primary and mutation evidence.
+func testCommandPriority(command []string) int {
+	value := strings.ToLower(strings.Join(command, " "))
+	switch {
+	case strings.Contains(value, "test-creation") || strings.Contains(value, "test_creation"):
+		return 50
+	case strings.Contains(value, "proof") || strings.Contains(value, "verify") || strings.Contains(value, "validation") || strings.Contains(value, "validate") || strings.Contains(value, "check-"):
+		return 40
+	case strings.Contains(value, "suite") || strings.Contains(value, "mutation") || strings.Contains(value, "mutate") || strings.Contains(value, " e2e") || strings.Contains(value, " visual") || strings.Contains(value, " test"):
+		return 30
+	case strings.Contains(value, "typecheck") || strings.Contains(value, "lint"):
+		return 20
+	case strings.Contains(value, " build"):
+		return 10
+	default:
+		return 30
+	}
 }
 
 func mergeMaps(left, right map[string]string) map[string]string {
