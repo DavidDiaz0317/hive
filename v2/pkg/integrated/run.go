@@ -2,6 +2,7 @@ package integrated
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,6 +50,7 @@ type RunResult struct {
 
 type GateEvaluation struct {
 	RepositoryFingerprint string                     `json:"repository_fingerprint"`
+	Purpose               string                     `json:"purpose,omitempty"`
 	Gate                  hivegithub.PullRequestGate `json:"gate"`
 	Decision              *automation.Decision       `json:"merge_decision,omitempty"`
 	MergeSHA              string                     `json:"merge_sha,omitempty"`
@@ -181,6 +183,16 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 
 func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) (repairOrchestrationResult, error) {
 	result := repairOrchestrationResult{}
+	resumed, baselineGate, pendingReview, err := reconcileBaselineReview(ctx, stateDir, config, lifecycle, client, policy)
+	if baselineGate != nil {
+		result.Gates = append(result.Gates, *baselineGate)
+	}
+	if resumed != nil {
+		result.Repairs = append(result.Repairs, *resumed)
+	}
+	if err != nil || pendingReview {
+		return result, err
+	}
 	maxAttempts := policy.MaxRepairAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 3
@@ -221,8 +233,51 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 				return result, err
 			}
 		}
-		evaluation := GateEvaluation{RepositoryFingerprint: finding.RepositoryFingerprint, Gate: gate}
+		evaluation := GateEvaluation{RepositoryFingerprint: finding.RepositoryFingerprint, Purpose: "repair", Gate: gate}
 		if !green {
+			attemptState, stateErr := repair.NewStore(filepath.Join(stateDir, "repair"))
+			if stateErr != nil {
+				return result, stateErr
+			}
+			attempt, exists := attemptState.Get(finding.RepositoryFingerprint)
+			if exists && attempt.BaselineReview != nil && attempt.BaselineReview.Status == repair.BaselineReviewCandidateReady {
+				decision := policy.Authorize(automation.ActionRequest{
+					Action: automation.ActionCreateBaselineReview, Agent: repairActor(finding.OwningAgentHint), Repository: config.Repository,
+					Risk: automation.RiskRestricted, ChangedFiles: baselineCandidatePaths(attempt.BaselineReview.Candidates), RepairAttempts: finding.RepairAttempts,
+				})
+				lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(automation.ActionCreateBaselineReview), decision.Allowed, strings.Join(decision.Reasons, "; "))
+				if !decision.Allowed {
+					return result, fmt.Errorf("baseline review proposal denied: %s", strings.Join(decision.Reasons, "; "))
+				}
+				verified, fetchErr := client.FetchAndVerifyPullRequestArtifact(ctx, hivegithub.PullRequestArtifactRequest{
+					Repository: config.Repository, ExpectedHeadSHA: attempt.CommitSHA, ExpectedHeadBranch: attempt.Branch,
+					ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
+					DestinationDir: filepath.Join(stateDir, "repair", "baseline-artifacts", repairStateKey(finding.RepositoryFingerprint)),
+				})
+				if fetchErr != nil {
+					return result, fetchErr
+				}
+				hosted, recognized, reviewErr := repair.ReadHostedBaselineReview(verified.ArtifactRoot)
+				if reviewErr != nil {
+					return result, reviewErr
+				}
+				if !recognized {
+					return result, fmt.Errorf("failed exact-head PR run did not contain an exclusive missing-baseline review")
+				}
+				updated, proposalErr := repair.CreateBaselineProposal(ctx, baselineProposalConfig(config, stateDir), finding, repair.BaselineProposalSource{
+					WorkflowRunID: verified.WorkflowRunID, ArtifactID: verified.ArtifactID, RunURL: verified.RunURL,
+				}, hosted, attemptState, client)
+				if proposalErr != nil {
+					return result, proposalErr
+				}
+				reason := fmt.Sprintf("Visual baseline proposal %s requires full-resolution review of %d exact candidate image(s)", updated.BaselineReview.ProposalPRURL, len(updated.BaselineReview.Candidates))
+				if err := lifecycle.MarkManualReviewRequired(finding.RepositoryFingerprint, "visual_baseline", reason); err != nil {
+					return result, err
+				}
+				replaceRepairResult(&result.Repairs, repairResultFromAttempt(updated, true))
+				result.Gates = append(result.Gates, evaluation)
+				return result, nil
+			}
 			result.Gates = append(result.Gates, evaluation)
 			if finding.RepairAttempts >= maxAttempts {
 				return result, fmt.Errorf("hosted checks remain red after %d attempts: %s", finding.RepairAttempts, summary)
@@ -279,6 +334,140 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func reconcileBaselineReview(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) (*repair.Result, *GateEvaluation, bool, error) {
+	state, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		return nil, nil, false, err
+	}
+	snapshot := state.Snapshot()
+	keys := make([]string, 0, len(snapshot.Attempts))
+	for key := range snapshot.Attempts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		attempt := snapshot.Attempts[key]
+		if attempt == nil || attempt.BaselineReview == nil || attempt.BaselineReview.Status != repair.BaselineReviewProposalOpen || attempt.BaselineReview.ProposalPRNumber <= 0 {
+			continue
+		}
+		finding, exists := lifecycle.Finding(key)
+		if !exists || finding.PRNumber != attempt.PRNumber {
+			return nil, nil, false, fmt.Errorf("baseline proposal lost its originating repair lifecycle")
+		}
+		gate, err := client.InspectPullRequestGate(ctx, config.Repository, attempt.BaselineReview.ProposalPRNumber)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		evaluation := &GateEvaluation{RepositoryFingerprint: key, Purpose: "baseline_review", Gate: gate}
+		expected := baselineCandidatePaths(attempt.BaselineReview.Candidates)
+		if gate.HeadSHA != attempt.BaselineReview.ProposalCommitSHA || !sameStringSet(gate.ChangedFiles, expected) || !gate.BaselineChanged || gate.WorkflowChanged || gate.SecuritySensitive || gate.DeploymentChanged {
+			return nil, evaluation, false, fmt.Errorf("baseline proposal #%d was tampered or changed outside its exact candidate set", gate.Number)
+		}
+		reason := fmt.Sprintf("Visual baseline proposal %s requires full-resolution review of %d exact candidate image(s)", attempt.BaselineReview.ProposalPRURL, len(attempt.BaselineReview.Candidates))
+		if gate.Open {
+			if err := lifecycle.MarkManualReviewRequired(key, "visual_baseline", reason); err != nil {
+				return nil, evaluation, false, err
+			}
+			return nil, evaluation, true, nil
+		}
+		if !gate.Merged {
+			attempt.BaselineReview.Status = repair.BaselineReviewRejected
+			attempt.BaselineReview.RejectionReason = "baseline proposal was closed without merging"
+			if err := state.Put(*attempt); err != nil {
+				return nil, evaluation, false, err
+			}
+			return nil, evaluation, false, fmt.Errorf("baseline proposal #%d was rejected", gate.Number)
+		}
+		if gate.Hold || gate.HumanReviewRequired || !gateChecksGreen(gate) || strings.TrimSpace(gate.MergeSHA) == "" {
+			return nil, evaluation, false, fmt.Errorf("merged baseline proposal #%d lacks released hold, human approval, green exact-head checks, or merge SHA", gate.Number)
+		}
+		decision := policy.Authorize(automation.ActionRequest{
+			Action: automation.ActionApplyBaselineReview, Agent: repairActor(finding.OwningAgentHint), Repository: config.Repository,
+			Risk: automation.RiskRestricted, ChangedFiles: expected, RepairAttempts: finding.RepairAttempts,
+		})
+		lifecycle.RecordAuthorization(key, string(automation.ActionApplyBaselineReview), decision.Allowed, strings.Join(decision.Reasons, "; "))
+		if !decision.Allowed {
+			return nil, evaluation, false, fmt.Errorf("apply reviewed baseline denied: %s", strings.Join(decision.Reasons, "; "))
+		}
+		updated, err := repair.ResumeAfterBaselineApproval(ctx, baselineProposalConfig(config, stateDir), finding, gate.MergeSHA, state, client)
+		if err != nil {
+			return nil, evaluation, false, err
+		}
+		if err := lifecycle.MarkPRHeadUpdated(key, updated.CommitSHA); err != nil {
+			return nil, evaluation, false, err
+		}
+		if err := lifecycle.MarkManualReviewComplete(key, "visual_baseline"); err != nil {
+			return nil, evaluation, false, err
+		}
+		result := repairResultFromAttempt(updated, true)
+		return &result, evaluation, false, nil
+	}
+	return nil, nil, false, nil
+}
+
+func baselineProposalConfig(config Config, stateDir string) repair.BaselineProposalConfig {
+	commands := make([]repair.Command, 0, len(config.TestCommands))
+	for _, parts := range config.TestCommands {
+		if len(parts) > 0 {
+			commands = append(commands, repair.Command{Name: parts[0], Args: append([]string(nil), parts[1:]...)})
+		}
+	}
+	return repair.BaselineProposalConfig{
+		RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(stateDir, "repair", "baseline-worktrees"), BaseBranch: config.DefaultBranch,
+		ValidationCommands: commands, Environment: repairValidationEnvironment(config), CommandTimeout: 15 * time.Minute,
+	}
+}
+
+func baselineCandidatePaths(candidates []repair.BaselineCandidate) []string {
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		result = append(result, candidate.BaselinePath)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, value := range left {
+		counts[filepath.ToSlash(strings.TrimPrefix(value, "./"))]++
+	}
+	for _, value := range right {
+		key := filepath.ToSlash(strings.TrimPrefix(value, "./"))
+		if counts[key] == 0 {
+			return false
+		}
+		counts[key]--
+	}
+	return true
+}
+
+func repairResultFromAttempt(attempt repair.Attempt, resumed bool) repair.Result {
+	review := attempt.BaselineReview
+	return repair.Result{
+		RepositoryFingerprint: attempt.RepositoryFingerprint, Branch: attempt.Branch, CommitSHA: attempt.CommitSHA,
+		PRNumber: attempt.PRNumber, PRURL: attempt.PRURL, ChangedFiles: append([]string(nil), attempt.ChangedFiles...), BaselineReview: review, Resumed: resumed,
+	}
+}
+
+func replaceRepairResult(results *[]repair.Result, replacement repair.Result) {
+	for index := range *results {
+		if (*results)[index].RepositoryFingerprint == replacement.RepositoryFingerprint {
+			(*results)[index] = replacement
+			return
+		}
+	}
+	*results = append(*results, replacement)
+}
+
+func repairStateKey(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:6])
 }
 
 func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client) (bool, error) {

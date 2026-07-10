@@ -3,7 +3,7 @@ package automation
 import "testing"
 
 func TestACMMLowerLevelsCannotWriteWithCredentialsAvailable(t *testing.T) {
-	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionMergePR}
+	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCreateBaselineReview, ActionApplyBaselineReview, ActionMergePR}
 	for _, level := range []int{1, 2} {
 		policy := Policy{ACMMLevel: level, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}}
 		for _, action := range actions {
@@ -11,6 +11,23 @@ func TestACMMLowerLevelsCannotWriteWithCredentialsAvailable(t *testing.T) {
 			if decision.Allowed {
 				t.Fatalf("ACMM L%d unexpectedly allowed %s", level, action)
 			}
+		}
+	}
+}
+
+func TestBaselineReviewActionsRequireRepairAuthority(t *testing.T) {
+	for _, action := range []Action{ActionCreateBaselineReview, ActionApplyBaselineReview} {
+		allowed := (Policy{ACMMLevel: 5, Mode: ModeRepairPR, AllowedRepositories: []string{"owner/repo"}}).Authorize(ActionRequest{
+			Action: action, Agent: "quality", Repository: "owner/repo", RepairAttempts: 1,
+		})
+		if !allowed.Allowed {
+			t.Fatalf("L5 repair policy denied %s: %v", action, allowed.Reasons)
+		}
+		denied := (Policy{ACMMLevel: 2, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}}).Authorize(ActionRequest{
+			Action: action, Agent: "quality", Repository: "owner/repo", RepairAttempts: 1,
+		})
+		if denied.Allowed {
+			t.Fatalf("L2 unexpectedly allowed %s", action)
 		}
 	}
 }

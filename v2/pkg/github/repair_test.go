@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,6 +47,41 @@ func TestUpsertRepairPullRequestCreatesThenUpdates(t *testing.T) {
 	}
 	if listCalls != 2 || createCalls != 1 || editCalls != 1 {
 		t.Fatalf("unexpected calls list=%d create=%d edit=%d", listCalls, createCalls, editCalls)
+	}
+}
+
+func TestUpsertReviewPullRequestIsDraftAndHoldLabeled(t *testing.T) {
+	draft := false
+	labelsAdded := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
+			_, _ = io.WriteString(writer, `[]`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/pulls":
+			var body struct {
+				Draft bool `json:"draft"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&body)
+			draft = body.Draft
+			_, _ = io.WriteString(writer, `{"number":7,"html_url":"https://example.test/pull/7","head":{"sha":"abc"}}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/labels":
+			_, _ = io.WriteString(writer, `{"name":"created"}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/issues/7/labels":
+			_ = json.NewDecoder(request.Body).Decode(&labelsAdded)
+			_, _ = io.WriteString(writer, `[]`)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	pull, err := client.UpsertReviewPullRequest(context.Background(), "owner/repo", "hive/baseline", "main", "Review baseline", "body", "<!-- marker -->")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !draft || pull.Number != 7 || len(labelsAdded) != 2 || labelsAdded[0] != "hold" || labelsAdded[1] != "hive/baseline-review" {
+		t.Fatalf("review PR was not held: draft=%t pull=%+v labels=%v", draft, pull, labelsAdded)
 	}
 }
 

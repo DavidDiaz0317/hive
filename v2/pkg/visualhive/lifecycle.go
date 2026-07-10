@@ -14,7 +14,10 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/beads"
 )
 
-const LifecycleSchema = "hive.visual-hive-lifecycle.v1"
+const (
+	LifecycleSchemaV1 = "hive.visual-hive-lifecycle.v1"
+	LifecycleSchema   = "hive.visual-hive-lifecycle.v2"
+)
 
 type LifecycleStatus string
 
@@ -43,41 +46,44 @@ const (
 )
 
 type FindingLifecycle struct {
-	Repository            string          `json:"repository"`
-	RepositoryID          string          `json:"repository_id,omitempty"`
-	Fingerprint           string          `json:"fingerprint"`
-	RepositoryFingerprint string          `json:"repository_fingerprint"`
-	Status                LifecycleStatus `json:"status"`
-	IssueKind             string          `json:"issue_kind"`
-	Severity              string          `json:"severity"`
-	OwningAgentHint       string          `json:"owning_agent_hint"`
-	Title                 string          `json:"title"`
-	Body                  string          `json:"body"`
-	Labels                []string        `json:"labels"`
-	AffectedContracts     []string        `json:"affected_contracts"`
-	ValidationCommand     string          `json:"validation_command"`
-	HumanReviewRequired   bool            `json:"human_review_required"`
-	BeadID                string          `json:"bead_id,omitempty"`
-	IssueNumber           int             `json:"issue_number,omitempty"`
-	IssueURL              string          `json:"issue_url,omitempty"`
-	Branch                string          `json:"branch,omitempty"`
-	RepairCommitSHA       string          `json:"repair_commit_sha,omitempty"`
-	PRNumber              int             `json:"pr_number,omitempty"`
-	PRURL                 string          `json:"pr_url,omitempty"`
-	MergeSHA              string          `json:"merge_sha,omitempty"`
-	ValidationRunID       string          `json:"validation_run_id,omitempty"`
-	ValidationRunURL      string          `json:"validation_run_url,omitempty"`
-	LastCheckSummary      string          `json:"last_check_summary,omitempty"`
-	LastCheckRuns         []CheckEvidence `json:"last_check_runs,omitempty"`
-	FirstSeenAt           time.Time       `json:"first_seen_at"`
-	LastSeenAt            time.Time       `json:"last_seen_at"`
-	ResolvedAt            *time.Time      `json:"resolved_at,omitempty"`
-	ClosedAt              *time.Time      `json:"closed_at,omitempty"`
-	LastBundleID          string          `json:"last_bundle_id"`
-	LastBundleDigest      string          `json:"last_bundle_digest"`
-	LastWorkflowRunID     string          `json:"last_workflow_run_id,omitempty"`
-	RepairAttempts        int             `json:"repair_attempts"`
-	Recurrences           int             `json:"recurrences"`
+	Repository                     string          `json:"repository"`
+	RepositoryID                   string          `json:"repository_id,omitempty"`
+	Fingerprint                    string          `json:"fingerprint"`
+	RepositoryFingerprint          string          `json:"repository_fingerprint"`
+	Status                         LifecycleStatus `json:"status"`
+	IssueKind                      string          `json:"issue_kind"`
+	Severity                       string          `json:"severity"`
+	OwningAgentHint                string          `json:"owning_agent_hint"`
+	Title                          string          `json:"title"`
+	Body                           string          `json:"body"`
+	Labels                         []string        `json:"labels"`
+	AffectedContracts              []string        `json:"affected_contracts"`
+	ValidationCommand              string          `json:"validation_command"`
+	HumanReviewRequired            bool            `json:"human_review_required"`
+	ObservationHumanReviewRequired bool            `json:"observation_human_review_required"`
+	ManualReviewKind               string          `json:"manual_review_kind,omitempty"`
+	ManualReviewReason             string          `json:"manual_review_reason,omitempty"`
+	BeadID                         string          `json:"bead_id,omitempty"`
+	IssueNumber                    int             `json:"issue_number,omitempty"`
+	IssueURL                       string          `json:"issue_url,omitempty"`
+	Branch                         string          `json:"branch,omitempty"`
+	RepairCommitSHA                string          `json:"repair_commit_sha,omitempty"`
+	PRNumber                       int             `json:"pr_number,omitempty"`
+	PRURL                          string          `json:"pr_url,omitempty"`
+	MergeSHA                       string          `json:"merge_sha,omitempty"`
+	ValidationRunID                string          `json:"validation_run_id,omitempty"`
+	ValidationRunURL               string          `json:"validation_run_url,omitempty"`
+	LastCheckSummary               string          `json:"last_check_summary,omitempty"`
+	LastCheckRuns                  []CheckEvidence `json:"last_check_runs,omitempty"`
+	FirstSeenAt                    time.Time       `json:"first_seen_at"`
+	LastSeenAt                     time.Time       `json:"last_seen_at"`
+	ResolvedAt                     *time.Time      `json:"resolved_at,omitempty"`
+	ClosedAt                       *time.Time      `json:"closed_at,omitempty"`
+	LastBundleID                   string          `json:"last_bundle_id"`
+	LastBundleDigest               string          `json:"last_bundle_digest"`
+	LastWorkflowRunID              string          `json:"last_workflow_run_id,omitempty"`
+	RepairAttempts                 int             `json:"repair_attempts"`
+	Recurrences                    int             `json:"recurrences"`
 }
 
 type CheckEvidence struct {
@@ -578,6 +584,46 @@ func (s *LifecycleStore) MarkPROpen(repositoryFingerprint, commitSHA string, num
 	})
 }
 
+func (s *LifecycleStore) MarkManualReviewRequired(repositoryFingerprint, kind, reason string) error {
+	return s.updateFinding(repositoryFingerprint, "manual_review_required", func(finding *FindingLifecycle) error {
+		if finding.Status != StatusPROpen && finding.Status != StatusChecksRunning && finding.Status != StatusNeedsRevision && finding.Status != StatusReady {
+			return fmt.Errorf("cannot require manual review from %s", finding.Status)
+		}
+		kind, reason = strings.TrimSpace(kind), strings.TrimSpace(reason)
+		if kind == "" || reason == "" {
+			return fmt.Errorf("manual review kind and reason are required")
+		}
+		finding.ManualReviewKind, finding.ManualReviewReason, finding.HumanReviewRequired = kind, truncate(reason, 4096), true
+		return nil
+	})
+}
+
+func (s *LifecycleStore) MarkManualReviewComplete(repositoryFingerprint, kind string) error {
+	return s.updateFinding(repositoryFingerprint, "manual_review_completed", func(finding *FindingLifecycle) error {
+		if strings.TrimSpace(kind) == "" || finding.ManualReviewKind != strings.TrimSpace(kind) {
+			return fmt.Errorf("manual review kind does not match pending review")
+		}
+		finding.ManualReviewKind, finding.ManualReviewReason = "", ""
+		finding.HumanReviewRequired = finding.ObservationHumanReviewRequired
+		return nil
+	})
+}
+
+func (s *LifecycleStore) MarkPRHeadUpdated(repositoryFingerprint, commitSHA string) error {
+	return s.updateFinding(repositoryFingerprint, "pr_head_updated", func(finding *FindingLifecycle) error {
+		if finding.Status != StatusPROpen && finding.Status != StatusChecksRunning && finding.Status != StatusNeedsRevision && finding.Status != StatusReady {
+			return fmt.Errorf("cannot update PR head from %s", finding.Status)
+		}
+		if strings.TrimSpace(commitSHA) == "" || finding.PRNumber <= 0 {
+			return fmt.Errorf("updated PR head and persisted PR are required")
+		}
+		finding.RepairCommitSHA, finding.Status = strings.TrimSpace(commitSHA), StatusPROpen
+		finding.LastCheckSummary = ""
+		finding.LastCheckRuns = nil
+		return nil
+	})
+}
+
 func (s *LifecycleStore) MarkChecks(repositoryFingerprint, testedSHA string, allGreen bool) error {
 	return s.MarkChecksWithEvidence(repositoryFingerprint, testedSHA, allGreen, "", nil)
 }
@@ -727,7 +773,16 @@ func (s *LifecycleStore) load() error {
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return fmt.Errorf("parse lifecycle state: %w", err)
 	}
-	if s.state.SchemaVersion != LifecycleSchema {
+	migrated := false
+	if s.state.SchemaVersion == LifecycleSchemaV1 {
+		s.state.SchemaVersion = LifecycleSchema
+		for _, finding := range s.state.Findings {
+			if finding != nil {
+				finding.ObservationHumanReviewRequired = finding.HumanReviewRequired
+			}
+		}
+		migrated = true
+	} else if s.state.SchemaVersion != LifecycleSchema {
 		return fmt.Errorf("unsupported lifecycle state schema %q", s.state.SchemaVersion)
 	}
 	if s.state.Findings == nil {
@@ -738,6 +793,11 @@ func (s *LifecycleStore) load() error {
 	}
 	if s.state.Outbox == nil {
 		s.state.Outbox = []*OutboxEntry{}
+	}
+	if migrated {
+		if err := s.persistLocked(); err != nil {
+			return fmt.Errorf("migrate lifecycle state: %w", err)
+		}
 	}
 	return nil
 }
@@ -793,7 +853,8 @@ func updateFindingFromObservation(finding *FindingLifecycle, manifest Manifest, 
 	finding.Labels = append([]string(nil), observation.Labels...)
 	finding.AffectedContracts = append([]string(nil), observation.AffectedContracts...)
 	finding.ValidationCommand = observation.ValidationCommand
-	finding.HumanReviewRequired = observationNeedsHumanReview(observation)
+	finding.ObservationHumanReviewRequired = observationNeedsHumanReview(observation)
+	finding.HumanReviewRequired = finding.ObservationHumanReviewRequired || finding.ManualReviewKind != ""
 	finding.LastSeenAt = observedAt
 	finding.LastBundleID = manifest.BundleID
 	finding.LastBundleDigest = manifest.OverallDigest

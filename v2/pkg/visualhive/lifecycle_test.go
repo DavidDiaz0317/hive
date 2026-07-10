@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,6 +143,74 @@ func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 	reopenEntry := lifecycle.PendingOutbox()[0]
 	if reopenEntry.Action != OutboxReopenIssue || reopenEntry.IssueNumber != 101 {
 		t.Fatalf("expected reopen issue outbox, got %+v", reopenEntry)
+	}
+}
+
+func TestLifecyclePersistsManualBaselineReviewAcrossFreshObservations(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-review-one", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 48, "https://example.test/issues/48"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(fingerprint, "repair-head", 49, "https://example.test/pull/49"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkManualReviewRequired(fingerprint, "visual_baseline", "Review exact candidate digests in PR #50"); err != nil {
+		t.Fatal(err)
+	}
+	fresh := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "fresh"), "bundle-review-two", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(fresh, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	held, _ := lifecycle.Finding(fingerprint)
+	if !held.HumanReviewRequired || held.ManualReviewKind != "visual_baseline" || held.ObservationHumanReviewRequired {
+		t.Fatalf("fresh producer evidence erased the manual hold: %+v", held)
+	}
+	if err := lifecycle.MarkPRHeadUpdated(fingerprint, "repair-head-with-baseline"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkManualReviewComplete(fingerprint, "visual_baseline"); err != nil {
+		t.Fatal(err)
+	}
+	completed, _ := lifecycle.Finding(fingerprint)
+	if completed.HumanReviewRequired || completed.ManualReviewKind != "" || completed.RepairCommitSHA != "repair-head-with-baseline" || completed.Status != StatusPROpen {
+		t.Fatalf("manual review completion did not reset the exact-head gate: %+v", completed)
+	}
+}
+
+func TestLifecycleMigratesV1ManualReviewState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "lifecycle")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"schema_version":"hive.visual-hive-lifecycle.v1","updated_at":"2026-07-10T00:00:00Z","findings":{"fp":{"repository":"owner/repo","fingerprint":"source","repository_fingerprint":"fp","status":"issue_open","issue_kind":"screenshot_diff","severity":"high","owning_agent_hint":"quality","title":"review","body":"review","labels":[],"affected_contracts":[],"validation_command":"vh","human_review_required":true,"first_seen_at":"2026-07-10T00:00:00Z","last_seen_at":"2026-07-10T00:00:00Z","last_bundle_id":"bundle","last_bundle_digest":"digest","repair_attempts":0,"recurrences":0}},"replay_keys":{},"outbox":[]}`
+	statePath := filepath.Join(root, "visual-hive-lifecycle.json")
+	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewLifecycleStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := store.Finding("fp")
+	if !finding.ObservationHumanReviewRequired || !finding.HumanReviewRequired {
+		t.Fatalf("legacy review authority was not migrated: %+v", finding)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil || !strings.Contains(string(data), LifecycleSchema) {
+		t.Fatalf("migrated lifecycle schema was not persisted: %q err=%v", data, err)
 	}
 }
 

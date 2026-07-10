@@ -95,6 +95,51 @@ func TestFetchAndVerifyVisualHiveBundleRejectsWrongTargetBranch(t *testing.T) {
 	}
 }
 
+func TestFetchAndVerifyPullRequestArtifactBindsFailedExactHead(t *testing.T) {
+	artifactZip := buildPRReviewZip(t)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/owner/repo":
+			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
+		case "/repos/owner/repo/actions/runs":
+			if request.URL.Query().Get("event") != "pull_request" || request.URL.Query().Get("head_sha") != "pr-head" {
+				t.Errorf("missing exact-head run filters: %s", request.URL.RawQuery)
+			}
+			_, _ = io.WriteString(writer, `{"total_count":1,"workflow_runs":[{"id":77,"name":"Visual Hive PR","path":".github/workflows/visual-hive-pr.yml","head_branch":"hive/repair-one","head_sha":"pr-head","event":"pull_request","status":"completed","conclusion":"failure","html_url":"https://github.test/owner/repo/actions/runs/77"}]}`)
+		case "/repos/owner/repo/actions/runs/77/artifacts":
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":1,"artifacts":[{"id":88,"name":"visual-hive-pr","size_in_bytes":%d,"expired":false,"workflow_run":{"id":77,"repository_id":123,"head_sha":"pr-head"}}]}`, len(artifactZip)))
+		case "/repos/owner/repo/actions/artifacts/88/zip":
+			writer.Header().Set("Location", server.URL+"/signed-pr-artifact")
+			writer.WriteHeader(http.StatusFound)
+		case "/signed-pr-artifact":
+			if request.Header.Get("Authorization") != "" {
+				t.Errorf("signed PR artifact request leaked GitHub authorization")
+			}
+			writer.Header().Set("Content-Type", "application/zip")
+			_, _ = writer.Write(artifactZip)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	verified, err := client.FetchAndVerifyPullRequestArtifact(context.Background(), PullRequestArtifactRequest{
+		Repository: "owner/repo", ExpectedHeadSHA: "pr-head", ExpectedHeadBranch: "hive/repair-one",
+		ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr", DestinationDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.RepositoryID != "123" || verified.WorkflowRunID != 77 || verified.ArtifactID != 88 || verified.Conclusion != "failure" || verified.CommitSHA != "pr-head" {
+		t.Fatalf("unexpected verified PR artifact: %+v", verified)
+	}
+	if data, err := os.ReadFile(filepath.Join(verified.ArtifactRoot, ".visual-hive", "report.json")); err != nil || !strings.Contains(string(data), "missing_baseline") {
+		t.Fatalf("PR review evidence was not extracted: %q err=%v", data, err)
+	}
+}
+
 func TestExtractVisualHiveZipRejectsTraversal(t *testing.T) {
 	zipPath := filepath.Join(t.TempDir(), "unsafe.zip")
 	file, err := os.Create(zipPath)
@@ -159,6 +204,17 @@ func buildEvidenceZip(t *testing.T) []byte {
 	buffer := new(bytes.Buffer)
 	archive := zip.NewWriter(buffer)
 	writeZipEntry(t, archive, "verdict.json", []byte(`{"schemaVersion":"visual-hive.verdict.v1","allContributions":[]}`))
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func buildPRReviewZip(t *testing.T) []byte {
+	t.Helper()
+	buffer := new(bytes.Buffer)
+	archive := zip.NewWriter(buffer)
+	writeZipEntry(t, archive, ".visual-hive/report.json", []byte(`{"status":"failed","kind":"missing_baseline"}`))
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)
 	}

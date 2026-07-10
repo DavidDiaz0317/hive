@@ -49,13 +49,14 @@ type Config struct {
 }
 
 type Result struct {
-	RepositoryFingerprint string   `json:"repository_fingerprint"`
-	Branch                string   `json:"branch"`
-	CommitSHA             string   `json:"commit_sha"`
-	PRNumber              int      `json:"pr_number"`
-	PRURL                 string   `json:"pr_url"`
-	ChangedFiles          []string `json:"changed_files"`
-	Resumed               bool     `json:"resumed"`
+	RepositoryFingerprint string          `json:"repository_fingerprint"`
+	Branch                string          `json:"branch"`
+	CommitSHA             string          `json:"commit_sha"`
+	PRNumber              int             `json:"pr_number"`
+	PRURL                 string          `json:"pr_url"`
+	ChangedFiles          []string        `json:"changed_files"`
+	BaselineReview        *BaselineReview `json:"baseline_review,omitempty"`
+	Resumed               bool            `json:"resumed"`
 }
 
 type Worker struct {
@@ -221,7 +222,21 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 		for _, command := range w.Config.ValidationCommands {
 			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "validation"); err != nil {
-				return Result{}, err
+				if !isVisualHiveRunCommand(command) {
+					return Result{}, err
+				}
+				review, recognized, reviewErr := DetectBaselineReview(attempt.Worktree)
+				if reviewErr != nil {
+					return Result{}, fmt.Errorf("classify baseline review after %w: %v", err, reviewErr)
+				}
+				if !recognized {
+					return Result{}, err
+				}
+				attempt.BaselineReview = review
+				if err := w.State.Put(attempt); err != nil {
+					return Result{}, err
+				}
+				continue
 			}
 		}
 		attempt.ChangedFiles, attempt.ModelPatch, attempt.Stage = files, "", StageValidated
@@ -281,8 +296,23 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 
 	return Result{
 		RepositoryFingerprint: finding.RepositoryFingerprint, Branch: attempt.Branch, CommitSHA: attempt.CommitSHA,
-		PRNumber: attempt.PRNumber, PRURL: attempt.PRURL, ChangedFiles: append([]string(nil), attempt.ChangedFiles...), Resumed: resumed,
+		PRNumber: attempt.PRNumber, PRURL: attempt.PRURL, ChangedFiles: append([]string(nil), attempt.ChangedFiles...),
+		BaselineReview: cloneBaselineReview(attempt.BaselineReview), Resumed: resumed,
 	}, nil
+}
+
+func cloneBaselineReview(review *BaselineReview) *BaselineReview {
+	if review == nil {
+		return nil
+	}
+	copy := *review
+	copy.Candidates = append([]BaselineCandidate(nil), review.Candidates...)
+	return &copy
+}
+
+func isVisualHiveRunCommand(command Command) bool {
+	joined := strings.ToLower(strings.Join(append([]string{command.Name}, command.Args...), " "))
+	return strings.Contains(joined, "vh:run") || strings.Contains(joined, "visual-hive run") || strings.Contains(joined, "visual-hive-cli") && strings.Contains(joined, " run")
 }
 
 func (w *Worker) validate(finding visualhive.FindingLifecycle) error {
@@ -520,8 +550,12 @@ Rules:
 }
 
 func repairPRBody(marker string, finding visualhive.FindingLifecycle, attempt Attempt) string {
-	return fmt.Sprintf("%s\n\nAutomated Hive repair for %s.\n\nRefs #%d\n\n- Finding: `%s`\n- Commit: `%s`\n- Provider: `%s`\n- Changed files: %d\n\nHive intentionally uses `Refs` rather than a closing keyword. The issue remains open until a complete authoritative target-branch Visual Hive run confirms the finding is absent.",
-		marker, finding.IssueURL, finding.IssueNumber, finding.RepositoryFingerprint, attempt.CommitSHA, attempt.Provider, len(attempt.ChangedFiles))
+	review := ""
+	if attempt.BaselineReview != nil {
+		review = fmt.Sprintf("\n\n## Required visual baseline review\n\nThe deterministic repair validation is blocked only by %d missing baseline candidate(s). Hive will retrieve the exact Linux evidence from this PR run and open a separate draft baseline-review PR. This repair must remain on hold until that proposal is visually reviewed and merged. No baseline is included or approved here.", len(attempt.BaselineReview.Candidates))
+	}
+	return fmt.Sprintf("%s\n\nAutomated Hive repair for %s.\n\nRefs #%d\n\n- Finding: `%s`\n- Commit: `%s`\n- Provider: `%s`\n- Changed files: %d%s\n\nHive intentionally uses `Refs` rather than a closing keyword. The issue remains open until a complete authoritative target-branch Visual Hive run confirms the finding is absent.",
+		marker, finding.IssueURL, finding.IssueNumber, finding.RepositoryFingerprint, attempt.CommitSHA, attempt.Provider, len(attempt.ChangedFiles), review)
 }
 
 func shortFingerprint(value string) string {

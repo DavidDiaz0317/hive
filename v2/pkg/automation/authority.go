@@ -20,22 +20,24 @@ const (
 type Action string
 
 const (
-	ActionAnalyze      Action = "analyze"
-	ActionCreateIssue  Action = "create_issue"
-	ActionUpdateIssue  Action = "update_issue"
-	ActionCloseIssue   Action = "close_issue"
-	ActionReopenIssue  Action = "reopen_issue"
-	ActionRepairModel  Action = "repair_model"
-	ActionApplyPatch   Action = "apply_model_patch"
-	ActionCreateBranch Action = "create_branch"
-	ActionCommit       Action = "commit"
-	ActionPush         Action = "push"
-	ActionCreatePR     Action = "create_pr"
-	ActionMergePR      Action = "merge_pr"
-	ActionSetupBranch  Action = "setup_branch"
-	ActionSetupCommit  Action = "setup_commit"
-	ActionSetupPush    Action = "setup_push"
-	ActionSetupPR      Action = "setup_pr"
+	ActionAnalyze              Action = "analyze"
+	ActionCreateIssue          Action = "create_issue"
+	ActionUpdateIssue          Action = "update_issue"
+	ActionCloseIssue           Action = "close_issue"
+	ActionReopenIssue          Action = "reopen_issue"
+	ActionRepairModel          Action = "repair_model"
+	ActionApplyPatch           Action = "apply_model_patch"
+	ActionCreateBranch         Action = "create_branch"
+	ActionCommit               Action = "commit"
+	ActionPush                 Action = "push"
+	ActionCreatePR             Action = "create_pr"
+	ActionCreateBaselineReview Action = "create_baseline_review"
+	ActionApplyBaselineReview  Action = "apply_baseline_review"
+	ActionMergePR              Action = "merge_pr"
+	ActionSetupBranch          Action = "setup_branch"
+	ActionSetupCommit          Action = "setup_commit"
+	ActionSetupPush            Action = "setup_push"
+	ActionSetupPR              Action = "setup_pr"
 )
 
 type RiskTier int
@@ -121,7 +123,7 @@ func (p Policy) Authorize(request ActionRequest) Decision {
 		reasons = append(reasons, fmt.Sprintf("ACMM L%d does not permit agent %s to perform %s", p.ACMMLevel, valueOr(request.Agent, "unknown"), request.Action))
 	}
 
-	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionMergePR {
+	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionCreateBaselineReview || request.Action == ActionApplyBaselineReview || request.Action == ActionMergePR {
 		maxAttempts := p.MaxRepairAttempts
 		if maxAttempts <= 0 {
 			maxAttempts = 3
@@ -192,7 +194,7 @@ func modeForAction(action Action) Mode {
 		return ModeAdvisory
 	case ActionCreateIssue, ActionUpdateIssue, ActionCloseIssue, ActionReopenIssue:
 		return ModeIssues
-	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR:
+	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCreateBaselineReview, ActionApplyBaselineReview:
 		return ModeRepairPR
 	case ActionMergePR:
 		return ModeAutoMerge

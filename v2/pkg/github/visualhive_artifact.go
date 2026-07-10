@@ -49,6 +49,97 @@ type VerifiedVisualHiveArtifact struct {
 	SourceArtifactPath string `json:"source_artifact_path"`
 }
 
+type PullRequestArtifactRequest struct {
+	Repository           string
+	ExpectedHeadSHA      string
+	ExpectedHeadBranch   string
+	ExpectedWorkflowPath string
+	ArtifactName         string
+	DestinationDir       string
+}
+
+// VerifiedPullRequestArtifact is deliberately review-only evidence. A failed
+// pull_request run can never resolve a finding or satisfy a merge gate, but its
+// exact-head screenshots may be presented through the separate baseline review
+// path after Hive independently verifies the run and artifact provenance.
+type VerifiedPullRequestArtifact struct {
+	RepositoryID  string `json:"repository_id"`
+	WorkflowRunID int64  `json:"workflow_run_id"`
+	ArtifactID    int64  `json:"artifact_id"`
+	ArtifactName  string `json:"artifact_name"`
+	CommitSHA     string `json:"commit_sha"`
+	HeadBranch    string `json:"head_branch"`
+	WorkflowPath  string `json:"workflow_path"`
+	Conclusion    string `json:"conclusion"`
+	RunURL        string `json:"run_url"`
+	ArtifactRoot  string `json:"artifact_root"`
+}
+
+// FetchAndVerifyPullRequestArtifact retrieves a failed exact-head PR artifact
+// for human review. It intentionally accepts only completed pull_request runs
+// with conclusion=failure; successful gating evidence continues through
+// FetchAndVerifyVisualHiveBundle instead.
+func (c *Client) FetchAndVerifyPullRequestArtifact(ctx context.Context, request PullRequestArtifactRequest) (VerifiedPullRequestArtifact, error) {
+	owner, repo, err := splitFullRepository(request.Repository)
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, err
+	}
+	if strings.TrimSpace(request.ExpectedHeadSHA) == "" || strings.TrimSpace(request.ExpectedHeadBranch) == "" ||
+		strings.TrimSpace(request.ExpectedWorkflowPath) == "" || strings.TrimSpace(request.ArtifactName) == "" || strings.TrimSpace(request.DestinationDir) == "" {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("exact PR head, branch, workflow path, artifact name, and destination are required")
+	}
+	repository, _, err := c.client.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("verify PR artifact repository: %w", err)
+	}
+	runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &gh.ListWorkflowRunsOptions{
+		Event: "pull_request", Status: "completed", HeadSHA: request.ExpectedHeadSHA, ListOptions: gh.ListOptions{PerPage: 100},
+	})
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("list exact-head PR workflow runs: %w", err)
+	}
+	var selected *gh.WorkflowRun
+	for _, run := range runs.WorkflowRuns {
+		if run.GetHeadSHA() != request.ExpectedHeadSHA || run.GetHeadBranch() != request.ExpectedHeadBranch || run.GetEvent() != "pull_request" ||
+			run.GetStatus() != "completed" || run.GetConclusion() != "failure" || !workflowPathMatches(run.GetPath(), request.ExpectedWorkflowPath) {
+			continue
+		}
+		if selected == nil || run.GetID() > selected.GetID() {
+			selected = run
+		}
+	}
+	if selected == nil {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("no completed failed PR run matches exact head %s and workflow %s", request.ExpectedHeadSHA, request.ExpectedWorkflowPath)
+	}
+	artifact, err := c.findRunArtifactByName(ctx, owner, repo, selected.GetID(), request.ArtifactName)
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, err
+	}
+	if artifact.GetExpired() || artifact.GetSizeInBytes() <= 0 || artifact.GetSizeInBytes() > maxVisualHiveArtifactBytes {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("PR review artifact is expired or has an invalid size")
+	}
+	if artifact.WorkflowRun != nil {
+		if artifact.WorkflowRun.GetID() != 0 && artifact.WorkflowRun.GetID() != selected.GetID() {
+			return VerifiedPullRequestArtifact{}, fmt.Errorf("PR review artifact workflow run mismatch")
+		}
+		if artifact.WorkflowRun.GetRepositoryID() != 0 && artifact.WorkflowRun.GetRepositoryID() != repository.GetID() {
+			return VerifiedPullRequestArtifact{}, fmt.Errorf("PR review artifact repository mismatch")
+		}
+		if artifact.WorkflowRun.GetHeadSHA() != "" && artifact.WorkflowRun.GetHeadSHA() != request.ExpectedHeadSHA {
+			return VerifiedPullRequestArtifact{}, fmt.Errorf("PR review artifact commit mismatch")
+		}
+	}
+	root, err := c.downloadAndExtractArtifact(ctx, owner, repo, artifact.GetID(), request.DestinationDir, "pr-artifact")
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, err
+	}
+	return VerifiedPullRequestArtifact{
+		RepositoryID: strconv.FormatInt(repository.GetID(), 10), WorkflowRunID: selected.GetID(), ArtifactID: artifact.GetID(),
+		ArtifactName: artifact.GetName(), CommitSHA: selected.GetHeadSHA(), HeadBranch: selected.GetHeadBranch(), WorkflowPath: selected.GetPath(),
+		Conclusion: selected.GetConclusion(), RunURL: selected.GetHTMLURL(), ArtifactRoot: root,
+	}, nil
+}
+
 // FetchAndVerifyVisualHiveBundle downloads the artifact through Hive's GitHub
 // client and binds the extracted manifest to authoritative repository and run
 // metadata before allowing the bundle validator to mark provenance verified.
@@ -160,6 +251,37 @@ func (c *Client) findRunArtifact(ctx context.Context, owner, repo string, runID,
 	return nil, fmt.Errorf("Visual Hive artifact %d does not belong to workflow run %d", artifactID, runID)
 }
 
+func (c *Client) findRunArtifactByName(ctx context.Context, owner, repo string, runID int64, name string) (*gh.Artifact, error) {
+	page := 1
+	var matched *gh.Artifact
+	for page > 0 {
+		artifacts, response, err := c.client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, &gh.ListOptions{Page: page, PerPage: 100})
+		if err != nil {
+			return nil, fmt.Errorf("list PR workflow artifacts: %w", err)
+		}
+		for _, artifact := range artifacts.Artifacts {
+			if artifact.GetName() != name {
+				continue
+			}
+			if matched != nil {
+				return nil, fmt.Errorf("multiple PR workflow artifacts are named %q", name)
+			}
+			matched = artifact
+		}
+		page = response.NextPage
+	}
+	if matched == nil {
+		return nil, fmt.Errorf("PR workflow run %d has no artifact named %q", runID, name)
+	}
+	return matched, nil
+}
+
+func workflowPathMatches(actual, expected string) bool {
+	actual = strings.ReplaceAll(strings.TrimSpace(strings.Split(actual, "@")[0]), "\\", "/")
+	expected = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(expected), "\\", "/"), "./")
+	return actual == expected || strings.HasSuffix(actual, "/"+expected)
+}
+
 func (c *Client) downloadAndExtractVisualHiveArtifact(ctx context.Context, owner, repo string, artifactID int64, destinationDir string) (string, error) {
 	root, err := c.downloadAndExtractArtifact(ctx, owner, repo, artifactID, destinationDir, "artifact")
 	if err != nil {
@@ -172,7 +294,7 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 	if err := os.MkdirAll(destinationDir, 0o700); err != nil {
 		return "", fmt.Errorf("create Visual Hive artifact directory: %w", err)
 	}
-	if prefix != "artifact" && prefix != "source-artifact" {
+	if prefix != "artifact" && prefix != "source-artifact" && prefix != "pr-artifact" {
 		return "", fmt.Errorf("invalid Visual Hive artifact extraction prefix")
 	}
 	finalDir := filepath.Join(destinationDir, fmt.Sprintf("%s-%d", prefix, artifactID))
