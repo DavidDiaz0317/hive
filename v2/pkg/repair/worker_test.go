@@ -22,10 +22,10 @@ type fakeProvider struct {
 
 func (p *fakeProvider) Name() string                 { return "test-model" }
 func (p *fakeProvider) Health(context.Context) error { return nil }
-func (p *fakeProvider) Run(_ context.Context, worktree, _ string) error {
+func (p *fakeProvider) Run(_ context.Context, worktree, _ string) (ProviderResult, error) {
 	if p.requiredMarker != "" {
 		if _, err := os.Stat(p.requiredMarker); err != nil {
-			return fmt.Errorf("repair preparation marker is missing: %w", err)
+			return ProviderResult{}, fmt.Errorf("repair preparation marker is missing: %w", err)
 		}
 	}
 	p.runs++
@@ -33,7 +33,22 @@ func (p *fakeProvider) Run(_ context.Context, worktree, _ string) error {
 	if p.runs > 1 {
 		value = "fixed again\n"
 	}
-	return os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte(value), 0o600)
+	return ProviderResult{Summary: "updated src/value.txt"}, os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte(value), 0o600)
+}
+
+type noChangeThenFixProvider struct{ runs int }
+
+func (p *noChangeThenFixProvider) Name() string                 { return "test-model" }
+func (p *noChangeThenFixProvider) Health(context.Context) error { return nil }
+func (p *noChangeThenFixProvider) Run(_ context.Context, worktree, prompt string) (ProviderResult, error) {
+	p.runs++
+	if p.runs == 1 {
+		return ProviderResult{Summary: "I could not identify the concrete failure."}, nil
+	}
+	if !strings.Contains(prompt, "Prior bounded model response") || !strings.Contains(prompt, "key=playwright.console_error.deploy-preview-smoke") {
+		return ProviderResult{}, fmt.Errorf("retry prompt did not include prior response and verified evidence")
+	}
+	return ProviderResult{Summary: "fixed from verified evidence"}, os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("fixed after retry\n"), 0o600)
 }
 
 func TestRepairPreparationHelperProcess(t *testing.T) {
@@ -201,6 +216,45 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 	attempt, _ := state.Get(finding.RepositoryFingerprint)
 	if attempt.Attempt != 2 || attempt.Stage != StagePROpen {
 		t.Fatalf("revision attempt was not persisted: %+v", attempt)
+	}
+}
+
+func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
+	provider := &noChangeThenFixProvider{}
+	lifecycle := &fakeLifecycle{}
+	pulls := &fakePRClient{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			EvidenceSummary: "- key=playwright.console_error.deploy-preview-smoke source=playwright kind=console_error status=failed contract=deploy-preview-smoke target=deployPreview reason=404",
+			ModelTimeout:    time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:no-change", Status: visualhive.StatusIssueOpen,
+		Title: "Repair deploy-preview-smoke: console_error", Body: "Evidence-backed failure.", IssueKind: "functional", Severity: "high",
+		AffectedContracts: []string{"deploy-preview-smoke"}, OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "without a source or test change") {
+		t.Fatalf("expected bounded no-change failure, got %v", err)
+	}
+	first, _ := state.Get(finding.RepositoryFingerprint)
+	if first.Stage != StageNoChange || first.ModelSummary == "" || first.Attempt != 1 {
+		t.Fatalf("no-change checkpoint was not durable: %+v", first)
+	}
+	finding.Status, finding.RepairAttempts = visualhive.StatusRepairRunning, 1
+	result, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _ := state.Get(finding.RepositoryFingerprint)
+	if provider.runs != 2 || pulls.calls != 1 || second.Attempt != 2 || second.Stage != StagePROpen || second.Branch == first.Branch || result.PRNumber != 17 {
+		t.Fatalf("retry did not produce exactly one PR on a clean new attempt: first=%+v second=%+v result=%+v runs=%d pulls=%d", first, second, result, provider.runs, pulls.calls)
 	}
 }
 

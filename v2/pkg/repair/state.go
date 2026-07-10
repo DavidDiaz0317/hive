@@ -16,6 +16,7 @@ type Stage string
 const (
 	StagePrepared      Stage = "prepared"
 	StageModelComplete Stage = "model_complete"
+	StageNoChange      Stage = "no_change"
 	StageValidated     Stage = "validated"
 	StageCommitted     Stage = "committed"
 	StagePushed        Stage = "pushed"
@@ -30,6 +31,8 @@ type Attempt struct {
 	Worktree              string    `json:"worktree"`
 	Stage                 Stage     `json:"stage"`
 	Provider              string    `json:"provider"`
+	ModelSummary          string    `json:"model_summary,omitempty"`
+	PriorModelSummary     string    `json:"prior_model_summary,omitempty"`
 	CommitSHA             string    `json:"commit_sha,omitempty"`
 	PRNumber              int       `json:"pr_number,omitempty"`
 	PRURL                 string    `json:"pr_url,omitempty"`

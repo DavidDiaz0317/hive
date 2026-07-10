@@ -24,27 +24,29 @@ const (
 )
 
 type VisualHiveArtifactRequest struct {
-	Repository       string
-	WorkflowRunID    int64
-	ArtifactID       int64
-	SourceArtifactID int64
-	DestinationDir   string
-	TargetRef        string
-	MaxACMM          int
+	Repository          string
+	WorkflowRunID       int64
+	ArtifactID          int64
+	SourceArtifactID    int64
+	FetchSourceArtifact bool
+	DestinationDir      string
+	TargetRef           string
+	MaxACMM             int
 }
 
 type VerifiedVisualHiveArtifact struct {
-	RepositoryID     string `json:"repository_id"`
-	WorkflowRunID    string `json:"workflow_run_id"`
-	ArtifactID       string `json:"artifact_id"`
-	SourceArtifactID string `json:"source_artifact_id"`
-	ArtifactName     string `json:"artifact_name"`
-	CommitSHA        string `json:"commit_sha"`
-	HeadBranch       string `json:"head_branch"`
-	Event            string `json:"event"`
-	WorkflowName     string `json:"workflow_name"`
-	RunURL           string `json:"run_url"`
-	ManifestPath     string `json:"manifest_path"`
+	RepositoryID       string `json:"repository_id"`
+	WorkflowRunID      string `json:"workflow_run_id"`
+	ArtifactID         string `json:"artifact_id"`
+	SourceArtifactID   string `json:"source_artifact_id"`
+	ArtifactName       string `json:"artifact_name"`
+	CommitSHA          string `json:"commit_sha"`
+	HeadBranch         string `json:"head_branch"`
+	Event              string `json:"event"`
+	WorkflowName       string `json:"workflow_name"`
+	RunURL             string `json:"run_url"`
+	ManifestPath       string `json:"manifest_path"`
+	SourceArtifactPath string `json:"source_artifact_path"`
 }
 
 // FetchAndVerifyVisualHiveBundle downloads the artifact through Hive's GitHub
@@ -131,6 +133,13 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if manifest.Source.WorkflowName != "" && verified.WorkflowName != "" && manifest.Source.WorkflowName != verified.WorkflowName {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive manifest workflow name mismatch")
 	}
+	if request.FetchSourceArtifact {
+		sourceArtifactPath, err := c.downloadAndExtractArtifact(ctx, owner, repo, sourceArtifactID, request.DestinationDir, "source-artifact")
+		if err != nil {
+			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("download verified Visual Hive source artifact: %w", err)
+		}
+		verified.SourceArtifactPath = sourceArtifactPath
+	}
 	return bundle, verified, nil
 }
 
@@ -152,12 +161,32 @@ func (c *Client) findRunArtifact(ctx context.Context, owner, repo string, runID,
 }
 
 func (c *Client) downloadAndExtractVisualHiveArtifact(ctx context.Context, owner, repo string, artifactID int64, destinationDir string) (string, error) {
+	root, err := c.downloadAndExtractArtifact(ctx, owner, repo, artifactID, destinationDir, "artifact")
+	if err != nil {
+		return "", err
+	}
+	return findVisualHiveManifest(root)
+}
+
+func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo string, artifactID int64, destinationDir, prefix string) (string, error) {
 	if err := os.MkdirAll(destinationDir, 0o700); err != nil {
 		return "", fmt.Errorf("create Visual Hive artifact directory: %w", err)
 	}
-	finalDir := filepath.Join(destinationDir, fmt.Sprintf("artifact-%d", artifactID))
-	if manifestPath, err := findVisualHiveManifest(finalDir); err == nil {
-		return manifestPath, nil
+	if prefix != "artifact" && prefix != "source-artifact" {
+		return "", fmt.Errorf("invalid Visual Hive artifact extraction prefix")
+	}
+	finalDir := filepath.Join(destinationDir, fmt.Sprintf("%s-%d", prefix, artifactID))
+	completePath := filepath.Join(finalDir, ".hive-extraction-complete")
+	if info, err := os.Lstat(completePath); err == nil && info.Mode().IsRegular() {
+		return finalDir, nil
+	}
+	if prefix == "artifact" {
+		if _, err := findVisualHiveManifest(finalDir); err == nil {
+			return finalDir, nil
+		}
+	}
+	if _, err := os.Stat(finalDir); err == nil {
+		return "", fmt.Errorf("refusing incomplete existing Visual Hive artifact directory %q", finalDir)
 	}
 	downloadURL, _, err := c.client.Actions.DownloadArtifact(ctx, owner, repo, artifactID, 3)
 	if err != nil {
@@ -201,12 +230,13 @@ func (c *Client) downloadAndExtractVisualHiveArtifact(ctx context.Context, owner
 	if err := extractVisualHiveZip(temporaryZip, temporaryDir); err != nil {
 		return "", err
 	}
-	if err := os.Rename(temporaryDir, finalDir); err != nil {
-		if _, statErr := os.Stat(finalDir); statErr != nil {
-			return "", fmt.Errorf("publish Visual Hive artifact: %w", err)
-		}
+	if err := os.WriteFile(filepath.Join(temporaryDir, ".hive-extraction-complete"), []byte(strconv.FormatInt(artifactID, 10)+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("mark Visual Hive artifact extraction complete: %w", err)
 	}
-	return findVisualHiveManifest(finalDir)
+	if err := os.Rename(temporaryDir, finalDir); err != nil {
+		return "", fmt.Errorf("publish Visual Hive artifact: %w", err)
+	}
+	return finalDir, nil
 }
 
 func isLoopbackDownload(host string) bool {

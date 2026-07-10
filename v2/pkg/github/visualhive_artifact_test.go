@@ -23,6 +23,7 @@ import (
 
 func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	zipData := buildVerifiedBundleZip(t)
+	evidenceZip := buildEvidenceZip(t)
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
@@ -36,12 +37,21 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 		case "/repos/owner/repo/actions/artifacts/99/zip":
 			writer.Header().Set("Location", server.URL+"/signed-artifact")
 			writer.WriteHeader(http.StatusFound)
+		case "/repos/owner/repo/actions/artifacts/98/zip":
+			writer.Header().Set("Location", server.URL+"/signed-evidence")
+			writer.WriteHeader(http.StatusFound)
 		case "/signed-artifact":
 			if request.Header.Get("Authorization") != "" {
 				t.Errorf("signed artifact request leaked GitHub authorization")
 			}
 			writer.Header().Set("Content-Type", "application/zip")
 			_, _ = writer.Write(zipData)
+		case "/signed-evidence":
+			if request.Header.Get("Authorization") != "" {
+				t.Errorf("signed evidence request leaked GitHub authorization")
+			}
+			writer.Header().Set("Content-Type", "application/zip")
+			_, _ = writer.Write(evidenceZip)
 		default:
 			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
 		}
@@ -49,13 +59,16 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	defer server.Close()
 	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	bundle, verified, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
-		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, SourceArtifactID: 98, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
+		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, SourceArtifactID: 98, FetchSourceArtifact: true, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bundle.Validation.Trusted || verified.RepositoryID != "123" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" {
+	if !bundle.Validation.Trusted || verified.RepositoryID != "123" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" {
 		t.Fatalf("unexpected verified artifact: bundle=%+v verified=%+v", bundle.Validation, verified)
+	}
+	if data, err := os.ReadFile(filepath.Join(verified.SourceArtifactPath, "verdict.json")); err != nil || !strings.Contains(string(data), "allContributions") {
+		t.Fatalf("verified source evidence was not extracted: %q err=%v", data, err)
 	}
 }
 
@@ -135,6 +148,17 @@ func buildVerifiedBundleZip(t *testing.T) []byte {
 	archive := zip.NewWriter(buffer)
 	writeZipEntry(t, archive, ".visual-hive/bundles/verified-bundle/manifest.json", manifestData)
 	writeZipEntry(t, archive, ".visual-hive/bundles/verified-bundle/files/.visual-hive/hive/beads.json", beadsData)
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func buildEvidenceZip(t *testing.T) []byte {
+	t.Helper()
+	buffer := new(bytes.Buffer)
+	archive := zip.NewWriter(buffer)
+	writeZipEntry(t, archive, "verdict.json", []byte(`{"schemaVersion":"visual-hive.verdict.v1","allContributions":[]}`))
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)
 	}

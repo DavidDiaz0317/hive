@@ -91,7 +91,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if err != nil {
 		return result, err
 	}
-	validation, apply, outbox, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, automation.Policy{
+	validation, apply, outbox, verifiedArtifact, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, automation.Policy{
 		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
 		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: 3,
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
@@ -106,7 +106,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 	}
 	if config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge {
-		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy)
+		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact.SourceArtifactPath)
 		result.Repairs, result.Gates = orchestration.Repairs, orchestration.Gates
 		result.PostMergeWorkflow, result.PostMergeLifecycle = orchestration.PostMergeWorkflow, orchestration.PostMergeLifecycle
 		result.Outbox.Succeeded += orchestration.Outbox.Succeeded
@@ -131,14 +131,15 @@ type repairOrchestrationResult struct {
 	Outbox             visualhive.OutboxProcessorResult
 }
 
-func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, workflow WorkflowRunEvidence, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (visualhive.Validation, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, error) {
-	bundle, _, err := client.FetchAndVerifyVisualHiveBundle(ctx, hivegithub.VisualHiveArtifactRequest{
+func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, workflow WorkflowRunEvidence, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (visualhive.Validation, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, hivegithub.VerifiedVisualHiveArtifact, error) {
+	bundle, verified, err := client.FetchAndVerifyVisualHiveBundle(ctx, hivegithub.VisualHiveArtifactRequest{
 		Repository: config.Repository, WorkflowRunID: workflow.RunID, ArtifactID: workflow.BundleArtifact,
 		SourceArtifactID: workflow.EvidenceArtifact, DestinationDir: filepath.Join(stateDir, "visual-hive", "artifacts"),
-		TargetRef: config.DefaultBranch, MaxACMM: config.ACMMLevel,
+		FetchSourceArtifact: config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge,
+		TargetRef:           config.DefaultBranch, MaxACMM: config.ACMMLevel,
 	})
 	if err != nil {
-		return visualhive.Validation{}, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
+		return visualhive.Validation{}, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, hivegithub.VerifiedVisualHiveArtifact{}, err
 	}
 	apply, err := lifecycle.ApplyBundle(bundle, beadStore, visualhive.ApplyLifecycleOptions{
 		TargetRef: config.DefaultBranch, VerificationRunID: fmt.Sprintf("%d", workflow.RunID), VerificationURL: workflow.RunURL,
@@ -146,23 +147,23 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 		PreferRepairable: config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge,
 	})
 	if err != nil {
-		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
+		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, verified, err
 	}
 	outbox := visualhive.ProcessOutbox(ctx, lifecycle, beadStore, policy, client)
 	if outbox.Failed > 0 {
-		return bundle.Validation, apply, outbox, fmt.Errorf("GitHub lifecycle outbox failed: %s", strings.Join(outbox.Errors, "; "))
+		return bundle.Validation, apply, outbox, verified, fmt.Errorf("GitHub lifecycle outbox failed: %s", strings.Join(outbox.Errors, "; "))
 	}
-	return bundle.Validation, apply, outbox, nil
+	return bundle.Validation, apply, outbox, verified, nil
 }
 
-func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (repairOrchestrationResult, error) {
+func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) (repairOrchestrationResult, error) {
 	result := repairOrchestrationResult{}
 	maxAttempts := policy.MaxRepairAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 3
 	}
 	for cycle := 0; cycle <= maxAttempts; cycle++ {
-		repairs, err := runEligibleRepairs(ctx, config, lifecycle, client, policy)
+		repairs, err := runEligibleRepairs(ctx, config, lifecycle, client, policy, evidenceRoot)
 		result.Repairs = append(result.Repairs, repairs...)
 		if err != nil {
 			return result, err
@@ -250,7 +251,7 @@ func verifyMergedFinding(ctx context.Context, stateDir string, config Config, fi
 	if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", postMerge.RunID), postMerge.RunURL); err != nil {
 		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
 	}
-	_, postApply, postOutbox, err := applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy)
+	_, postApply, postOutbox, _, err := applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy)
 	if err != nil {
 		return postMerge, postApply, postOutbox, err
 	}
@@ -332,7 +333,7 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 	return workflow, nil
 }
 
-func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) ([]repair.Result, error) {
+func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) ([]repair.Result, error) {
 	snapshot := lifecycle.Snapshot()
 	keys := make([]string, 0, len(snapshot.Findings))
 	for key := range snapshot.Findings {
@@ -357,11 +358,15 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		if len(commands) == 0 {
 			return nil, fmt.Errorf("validated repository test plan has no executable commands")
 		}
+		evidenceSummary, err := repair.LoadEvidenceSummary(evidenceRoot, *finding)
+		if err != nil {
+			return nil, err
+		}
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
 				Policy: policy, AllowedRepairPaths: config.AllowedRepairPaths, PreparationCommands: repairPreparationCommands(config.CheckoutDir), ValidationCommands: commands,
-				Environment:  repairValidationEnvironment(config),
+				Environment: repairValidationEnvironment(config), EvidenceSummary: evidenceSummary,
 				ModelTimeout: 20 * time.Minute, CommandTimeout: 15 * time.Minute,
 			},
 			Provider: repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}, State: state, Lifecycle: lifecycle, GitHub: client,

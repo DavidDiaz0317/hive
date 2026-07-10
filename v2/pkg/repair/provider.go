@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 )
 
+type ProviderResult struct {
+	Summary string
+}
+
 type Provider interface {
 	Name() string
 	Health(ctx context.Context) error
-	Run(ctx context.Context, worktree, prompt string) error
+	Run(ctx context.Context, worktree, prompt string) (ProviderResult, error)
 }
 
 // CodexProvider invokes the stable non-interactive Codex CLI surface. Prefix
@@ -44,7 +47,7 @@ func (p CodexProvider) Health(ctx context.Context) error {
 	return nil
 }
 
-func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) error {
+func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) (ProviderResult, error) {
 	args := append([]string(nil), p.Prefix...)
 	args = append(args,
 		"--ask-for-approval", "never",
@@ -56,13 +59,14 @@ func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) error {
 	command.Dir = worktree
 	command.Env = providerEnvironment()
 	command.Stdin = strings.NewReader(prompt)
-	command.Stdout = io.Discard
+	var stdout limitedBuffer
 	var stderr limitedBuffer
+	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
-		return fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String()))
+		return ProviderResult{Summary: safeExcerpt(stdout.String())}, fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String()))
 	}
-	return nil
+	return ProviderResult{Summary: safeExcerpt(stdout.String())}, nil
 }
 
 func providerEnvironment() []string {
