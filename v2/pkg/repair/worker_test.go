@@ -364,6 +364,22 @@ func TestValidateChangedFilesRejectsSensitivePaths(t *testing.T) {
 	}
 }
 
+func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
+	finding := visualhive.FindingLifecycle{IssueKind: "test_adequacy_gap"}
+	if err := validateFindingScope(finding, []string{"tests/safe-default.test.js"}); err != nil {
+		t.Fatalf("focused test file should be allowed: %v", err)
+	}
+	for _, files := range [][]string{{"src/App.tsx"}, {"package.json"}, {"visual-hive.config.yaml"}, {"tests/safe.test.js", "src/App.tsx"}} {
+		if err := validateFindingScope(finding, files); err == nil {
+			t.Fatalf("test adequacy scope allowed non-test files: %v", files)
+		}
+	}
+	prompt := repairPrompt(finding, "verified evidence", "")
+	if !strings.Contains(prompt, "test-adequacy repair") || !strings.Contains(prompt, "Change only focused files") {
+		t.Fatalf("test-only constraint missing from repair prompt: %s", prompt)
+	}
+}
+
 func seedGitRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()

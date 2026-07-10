@@ -43,7 +43,7 @@ func TestValidateBundleRejectsTampering(t *testing.T) {
 	if err := os.WriteFile(beadsPath, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ValidateBundle(manifestPath, ValidationOptions{MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "size") {
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "size") {
 		t.Fatalf("expected tamper rejection, got %v", err)
 	}
 }
@@ -90,7 +90,7 @@ func TestValidateBundleRejectsAbsentObservationFromPartialScan(t *testing.T) {
 	manifest.Scan.AuthoritativeForResolution = false
 	manifest.Observations[0].State = "absent"
 	writeManifest(t, manifestPath, manifest)
-	if _, err := ValidateBundle(manifestPath, ValidationOptions{MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "authoritative") {
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "authoritative") {
 		t.Fatalf("expected unsafe resolution rejection, got %v", err)
 	}
 }

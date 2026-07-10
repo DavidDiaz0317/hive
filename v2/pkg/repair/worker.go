@@ -191,6 +191,11 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				_ = w.State.Put(attempt)
 				return Result{}, err
 			}
+			if err := validateFindingScope(finding, patchFiles); err != nil {
+				attempt.Stage = StageNoChange
+				_ = w.State.Put(attempt)
+				return Result{}, err
+			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
@@ -218,6 +223,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status))
 		}
 		if err := validateChangedFiles(files, w.Config.AllowedRepairPaths); err != nil {
+			return Result{}, err
+		}
+		if err := validateFindingScope(finding, files); err != nil {
 			return Result{}, err
 		}
 		for _, command := range w.Config.ValidationCommands {
@@ -425,6 +433,17 @@ func validateChangedFiles(files, allowedPatterns []string) error {
 	return nil
 }
 
+func validateFindingScope(finding visualhive.FindingLifecycle, files []string) error {
+	if !strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
+		return nil
+	}
+	testOnly := []string{"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
+	if err := validateChangedFiles(files, testOnly); err != nil {
+		return fmt.Errorf("test adequacy repair must change test files only: %w", err)
+	}
+	return nil
+}
+
 func matchPathPattern(pattern, file string) bool {
 	pattern = strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(pattern)), "./")
 	if strings.HasPrefix(pattern, "**/") {
@@ -519,6 +538,10 @@ func repairPrompt(finding visualhive.FindingLifecycle, evidenceSummary, priorMod
 	if strings.TrimSpace(priorModelSummary) != "" {
 		priorSection = "\nPrior bounded model response (the prior attempt made no usable change):\n" + priorModelSummary + "\n"
 	}
+	findingScope := ""
+	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
+		findingScope = "\n- This is a test-adequacy repair. Change only focused files under test/ or tests/, or files matching *.test.*, *.spec.*, or *_test.go. Do not change application source or configuration.\n"
+	}
 	return fmt.Sprintf(`You are a Hive repair worker inspecting an isolated Git worktree in an intentionally read-only provider process. Produce the smallest production-quality source or test patch that resolves the confirmed finding below. Hive alone will authorize and apply the patch, validate it, commit it, push it, and open the pull request.
 
 Finding: %s
@@ -546,7 +569,7 @@ Rules:
 - Run read-only inspection or reproduction commands when practical. Hive will independently run the required commands afterward.
 - Return exactly one patch between HIVE_PATCH_BEGIN and HIVE_PATCH_END, using standard diff --git a/path b/path headers and no binary, rename, copy, mode, or submodule changes.
 - Put no prose inside the patch markers. If no safe patch is possible, omit the markers and explain why.
-`, finding.Title, finding.IssueURL, finding.IssueKind, finding.Severity, strings.Join(finding.AffectedContracts, ", "), finding.ValidationCommand, finding.LastCheckSummary, finding.Body, evidenceSummary, priorSection)
+%s`, finding.Title, finding.IssueURL, finding.IssueKind, finding.Severity, strings.Join(finding.AffectedContracts, ", "), finding.ValidationCommand, finding.LastCheckSummary, finding.Body, evidenceSummary, priorSection, findingScope)
 }
 
 func repairPRBody(marker string, finding visualhive.FindingLifecycle, attempt Attempt) string {

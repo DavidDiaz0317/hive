@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,9 +18,9 @@ import (
 )
 
 const (
-	checkoutActionSHA       = "34e114876b0b11c390a56381ad16ebd13914f8d5"
-	setupNodeActionSHA      = "49933ea5288caeca8642d1e84afbd3f7d6820020"
-	uploadArtifactActionSHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
+	checkoutActionSHA       = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" // actions/checkout v7.0.0
+	setupNodeActionSHA      = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" // actions/setup-node v6.4.0
+	uploadArtifactActionSHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
 )
 
 type SetupOptions struct {
@@ -104,7 +105,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		MaxActiveIssues: options.MaxActiveIssues,
 		VisualHiveRepo:  options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
 		VisualHiveCommand: options.VisualHiveCommand, VisualHiveArgs: append([]string(nil), options.VisualHiveArgs...),
-		TestCommands: cloneCommands(inspection.TestCommands), AllowedRepairPaths: defaultAllowedRepairPaths(),
+		TestCommands: testCommandsForCoverage(inspection, options.Coverage), AllowedRepairPaths: defaultAllowedRepairPaths(),
 		AllowedAutoMergePaths: defaultAllowedAutoMergePaths(),
 		AllowedAutoMergeRisk:  []automation.RiskTier{automation.RiskAutomatic},
 		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,
@@ -279,7 +280,7 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 	}
 	managedFiles := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
 	if options.VisualHive {
-		managedFiles = append(managedFiles, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
+		managedFiles = append(managedFiles, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml", ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
 	}
 	return SetupPlan{
 		SchemaVersion: PlanSchema, GeneratedAt: time.Now().UTC(), Repository: options.Repository,
@@ -410,6 +411,9 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 		"docs/hive-quickstart.md":                quickstart(config, inspection),
 		".github/workflows/hive-visual-hive.yml": workflow(config),
 	}
+	if config.VisualHive {
+		files[".github/workflows/visual-hive-pr.yml"] = pullRequestWorkflow(config)
+	}
 	for relative, content := range files {
 		target := filepath.Join(root, filepath.FromSlash(relative))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -430,6 +434,7 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 }
 
 func workflow(config Config) string {
+	repositoryTests := repositoryTestShell(config)
 	return fmt.Sprintf(`name: Hive Visual Hive Production
 
 on:
@@ -495,6 +500,7 @@ jobs:
       - name: Run complete deterministic production scan
         shell: bash
         run: |
+%s
           set +e
           node "$VISUAL_HIVE_CLI" pipeline --config visual-hive.config.yaml --mode full --ci --continue-on-error --skip-install
           pipeline_exit=$?
@@ -534,7 +540,157 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
-`, config.DefaultBranch, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA)
+`, config.DefaultBranch, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, repositoryTests, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA)
+}
+
+func pullRequestWorkflow(config Config) string {
+	repositoryTests := repositoryTestShell(config)
+	return fmt.Sprintf(`name: Visual Hive PR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: visual-hive-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  visual-hive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@%s
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@%s
+        with:
+          repository: %s
+          ref: %s
+          path: .hive-visual-tooling
+      - uses: actions/setup-node@%s
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .hive-visual-tooling/package-lock.json
+      - name: Build immutable Visual Hive tooling
+        working-directory: .hive-visual-tooling
+        run: npm ci && npm run build
+      - name: Move trusted tooling outside target tree
+        shell: bash
+        run: |
+          mv .hive-visual-tooling "$RUNNER_TEMP/visual-hive-tooling"
+          echo "VISUAL_HIVE_CLI=$RUNNER_TEMP/visual-hive-tooling/packages/cli/dist/index.js" >> "$GITHUB_ENV"
+      - name: Install target dependencies and matching Playwright browser
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --immutable
+          elif [ -f package.json ]; then
+            npm install
+          fi
+          playwright_cli="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
+          if [ -f node_modules/@playwright/test/cli.js ]; then
+            playwright_cli="node_modules/@playwright/test/cli.js"
+          fi
+          node "$playwright_cli" install --with-deps chromium
+      - name: Capture pull request scope
+        shell: bash
+        run: |
+          mkdir -p .visual-hive
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > .visual-hive/changed-files.pr.txt
+          else
+            git fetch origin %s --depth=1
+            git diff --name-only "origin/%s"...HEAD > .visual-hive/changed-files.pr.txt
+          fi
+      - name: Run deterministic repository and Visual Hive gates
+        shell: bash
+        run: |
+%s
+          set +e
+          node "$VISUAL_HIVE_CLI" pipeline --config visual-hive.config.yaml --mode pr --changed-files .visual-hive/changed-files.pr.txt --ci --continue-on-error --skip-install
+          pipeline_exit=$?
+          set -e
+          printf '%%s\n' "$pipeline_exit" > .visual-hive/pipeline-exit-code.txt
+          node "$VISUAL_HIVE_CLI" issues --config visual-hive.config.yaml --write
+          node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
+      - name: Upload review evidence
+        if: always()
+        uses: actions/upload-artifact@%s
+        with:
+          name: visual-hive-pr
+          path: .visual-hive
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - name: Enforce deterministic verdict
+        if: always()
+        shell: bash
+        run: exit "$(cat .visual-hive/pipeline-exit-code.txt)"
+`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, config.DefaultBranch, config.DefaultBranch, repositoryTests, uploadArtifactActionSHA)
+}
+
+func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage) [][]string {
+	commands := cloneCommands(inspection.TestCommands)
+	if coverage != CoverageComprehensive && coverage != CoverageCustom {
+		return commands
+	}
+	if !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(commands) {
+		return commands
+	}
+	commands = append(commands, []string{"node", "--test"})
+	return sortTestCommands(commands)
+}
+
+func hasRepositoryUnitCommand(commands [][]string) bool {
+	for _, command := range commands {
+		value := strings.ToLower(strings.Join(command, " "))
+		if value == "node --test" || strings.Contains(value, "vitest") || strings.Contains(value, "jest") || strings.HasSuffix(value, " run test") || strings.Contains(value, "test:unit") {
+			return true
+		}
+	}
+	return false
+}
+
+func sortTestCommands(commands [][]string) [][]string {
+	commands = cloneCommands(commands)
+	sort.SliceStable(commands, func(i, j int) bool {
+		left, right := testCommandPriority(commands[i]), testCommandPriority(commands[j])
+		if left != right {
+			return left < right
+		}
+		return strings.Join(commands[i], "\x00") < strings.Join(commands[j], "\x00")
+	})
+	return commands
+}
+
+func repositoryTestShell(config Config) string {
+	for _, command := range config.TestCommands {
+		if len(command) == 2 && command[0] == "node" && command[1] == "--test" {
+			return "          node --test"
+		}
+	}
+	return "          : # No additional repository unit-test bootstrap was required."
+}
+
+func containsValue(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func quickstart(config Config, inspection RepositoryInspection) string {

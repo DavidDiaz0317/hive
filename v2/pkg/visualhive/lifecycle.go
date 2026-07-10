@@ -398,9 +398,6 @@ func selectIssuePublications(observations []Observation, findings map[string]*Fi
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
-		if severityRank(left.Severity) != severityRank(right.Severity) {
-			return severityRank(left.Severity) > severityRank(right.Severity)
-		}
 		if preferRepairable {
 			leftHuman, rightHuman := observationNeedsHumanReview(left), observationNeedsHumanReview(right)
 			if leftHuman != rightHuman {
@@ -409,6 +406,9 @@ func selectIssuePublications(observations []Observation, findings map[string]*Fi
 			if repairSignalRank(left) != repairSignalRank(right) {
 				return repairSignalRank(left) > repairSignalRank(right)
 			}
+		}
+		if severityRank(left.Severity) != severityRank(right.Severity) {
+			return severityRank(left.Severity) > severityRank(right.Severity)
 		}
 		if issueKindRank(left.IssueKind) != issueKindRank(right.IssueKind) {
 			return issueKindRank(left.IssueKind) > issueKindRank(right.IssueKind)
@@ -467,7 +467,7 @@ func severityRank(value string) int {
 
 func issueKindRank(value string) int {
 	switch value {
-	case "visual_regression", "selector_contract_failure", "screenshot_diff", "mutation_survivor", "accessibility_failure", "console_error", "network_error", "security_failure":
+	case "visual_regression", "selector_contract_failure", "screenshot_diff", "mutation_survivor", "test_adequacy_gap", "accessibility_failure", "console_error", "network_error", "security_failure":
 		return 4
 	case "workflow_safety", "provider_governance":
 		return 3

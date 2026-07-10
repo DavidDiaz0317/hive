@@ -405,6 +405,21 @@ func TestIssuePublicationSelectionPrefersRepairableConsoleFailure(t *testing.T) 
 	}
 }
 
+func TestIssuePublicationSelectionPrefersTestOnlyRepairOverUnrepairableBacklog(t *testing.T) {
+	observations := []Observation{
+		{RepositoryFingerprint: "onboarding", State: "present", Severity: "critical", IssueKind: "external_repo_onboarding", Title: "Review readiness gate"},
+		{RepositoryFingerprint: "tests", State: "present", Severity: "high", IssueKind: "test_adequacy_gap", Title: "Add repository unit test coverage"},
+	}
+	selected := selectIssuePublications(observations, nil, 1, true)
+	if len(selected) != 1 || !selected["tests"] {
+		t.Fatalf("repair mode should select the bounded test-only repair before advisory backlog: %v", selected)
+	}
+	selected = selectIssuePublications(observations, nil, 1, false)
+	if len(selected) != 1 || !selected["onboarding"] {
+		t.Fatalf("issues-only mode should preserve severity ordering: %v", selected)
+	}
+}
+
 func writeLifecycleBundle(t *testing.T, root, bundleID, state, ref string, authoritative bool) string {
 	t.Helper()
 	manifestPath := writeTestBundle(t, root, false)

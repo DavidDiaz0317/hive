@@ -87,3 +87,26 @@ func TestLoadEvidenceSummaryUsesFirstClassFlowRecommendation(t *testing.T) {
 		t.Fatalf("unexpected first-class coverage evidence: %s", summary)
 	}
 }
+
+func TestLoadEvidenceSummaryUsesVerifiedTestCreationRecommendation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(`{"schemaVersion":"visual-hive.verdict.v1","allContributions":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan := `{"schemaVersion":"visual-hive.test-creation-plan.v1","recommendations":[
+{"id":"layer-2-unknown","gapId":"testing-layer:2:unknown","source":"testing_layer","kind":"unit_test","priority":"medium","title":"Add unit test evidence for Unit","rationale":["No repository unit test was detected."],"suggestedTests":["Add focused tests for non-visual behavior."],"artifacts":[".visual-hive/repo-map.json"]},
+{"id":"layer-3-unknown","source":"testing_layer","kind":"accessibility_check","title":"unrelated"}
+]}`
+	if err := os.WriteFile(filepath.Join(root, "test-creation-plan.json"), []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "test_adequacy_gap", Title: "[Visual Hive] Add repository test coverage: Add unit test evidence for Unit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "test_creation.layer-2-unknown") || !strings.Contains(summary, "required_scope=test_files_only") || strings.Contains(summary, "unrelated") {
+		t.Fatalf("unexpected test-creation evidence: %s", summary)
+	}
+}

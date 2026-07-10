@@ -73,6 +73,23 @@ func TestBuildSetupPlanKeepsCoverageAndAuthoritySeparate(t *testing.T) {
 	}
 }
 
+func TestComprehensiveSetupBootstrapsNodeTestWithoutWeakeningAutoMergePaths(t *testing.T) {
+	inspection := RepositoryInspection{
+		Languages:    []string{"TypeScript/JavaScript"},
+		TestCommands: [][]string{{"npm", "run", "build"}, {"npm", "run", "vh:run"}},
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("comprehensive Node setup must include the zero-test-safe built-in runner: %+v", commands)
+	}
+	if hasCommand(testCommandsForCoverage(inspection, CoverageStandard), "node", "--test") {
+		t.Fatal("standard coverage must not add the comprehensive unit-test bootstrap")
+	}
+	if contains(defaultAllowedAutoMergePaths(), "package.json") {
+		t.Fatal("test bootstrap must not broaden auto-merge to package metadata")
+	}
+}
+
 func TestVisualTestConfigRequiresHumanMergeAuthority(t *testing.T) {
 	if !contains(defaultAllowedRepairPaths(), "visual-hive.config.yaml") {
 		t.Fatal("repair PR mode must be able to propose repository testing-plan improvements")
@@ -93,7 +110,8 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 }
 
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
-	value := workflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4})
+	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}}}
+	value := workflow(config)
 	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -114,8 +132,23 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	if !containsString(value, "--acmm-request 4") {
 		t.Fatal("workflow must bind bundle authority to Hive's configured ACMM level")
 	}
+	if !containsString(value, "node --test") {
+		t.Fatal("production workflow must execute the repository unit-test bootstrap")
+	}
 	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
 		t.Fatalf("workflow has an unsafe write lane:\n%s", value)
+	}
+}
+
+func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
+	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict"} {
+		if !containsString(value, required) {
+			t.Fatalf("pull request workflow missing %q", required)
+		}
+	}
+	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
+		t.Fatalf("pull request workflow has an unsafe write lane:\n%s", value)
 	}
 }
 
@@ -144,6 +177,10 @@ func TestManagedRepositoryConfigExcludesLocalPaths(t *testing.T) {
 			t.Fatalf("standalone writer %s must be removed in integrated mode", relative)
 		}
 	}
+	prWorkflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "visual-hive-pr.yml"))
+	if err != nil || !strings.Contains(string(prWorkflow), config.VisualHiveRef) {
+		t.Fatalf("managed pull request workflow is missing or not pinned: %v", err)
+	}
 }
 
 func writeFixture(t *testing.T, root, relative, content string) {
@@ -168,4 +205,13 @@ func contains(values []string, target string) bool {
 
 func containsString(value, target string) bool {
 	return len(target) > 0 && strings.Contains(value, target)
+}
+
+func hasCommand(commands [][]string, want ...string) bool {
+	for _, command := range commands {
+		if strings.Join(command, "\x00") == strings.Join(want, "\x00") {
+			return true
+		}
+	}
+	return false
 }

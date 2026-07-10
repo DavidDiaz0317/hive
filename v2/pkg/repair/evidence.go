@@ -15,6 +15,7 @@ import (
 
 const maxVerdictEvidenceBytes = 2 << 20
 const maxCoverageEvidenceBytes = 2 << 20
+const maxTestCreationEvidenceBytes = 2 << 20
 
 type verdictEvidence struct {
 	SchemaVersion    string                 `json:"schemaVersion"`
@@ -65,6 +66,23 @@ type coverageRecommendation struct {
 	SuggestedConfigYAML  string   `json:"suggestedConfigYaml"`
 }
 
+type testCreationEvidence struct {
+	SchemaVersion   string                       `json:"schemaVersion"`
+	Recommendations []testCreationRecommendation `json:"recommendations"`
+}
+
+type testCreationRecommendation struct {
+	ID             string   `json:"id"`
+	GapID          string   `json:"gapId"`
+	Source         string   `json:"source"`
+	Kind           string   `json:"kind"`
+	Priority       string   `json:"priority"`
+	Title          string   `json:"title"`
+	Rationale      []string `json:"rationale"`
+	SuggestedTests []string `json:"suggestedTests"`
+	Artifacts      []string `json:"artifacts"`
+}
+
 // LoadEvidenceSummary reads only the deterministic verdict from an independently
 // fetched source artifact. It deliberately does not expose arbitrary repository
 // prose or large artifact payloads to the repair model.
@@ -92,6 +110,9 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 	}
 	if len(verdict.AllContributions) > 2048 {
 		return "", fmt.Errorf("verified Visual Hive verdict has too many contributions")
+	}
+	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
+		return loadTestCreationEvidenceSummary(root, finding)
 	}
 
 	contracts := make(map[string]bool, len(finding.AffectedContracts))
@@ -156,6 +177,63 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 	summary := strings.Join(lines, "\n")
 	if len(summary) > 16<<10 {
 		return "", fmt.Errorf("verified Visual Hive evidence summary exceeds limit")
+	}
+	return string(bytes.Clone([]byte(summary))), nil
+}
+
+func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLifecycle) (string, error) {
+	path := filepath.Join(root, "test-creation-plan.json")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("verified Visual Hive test evidence is missing test-creation-plan.json: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxTestCreationEvidenceBytes {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence has an invalid size or type")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var evidence testCreationEvidence
+	if err := json.NewDecoder(io.LimitReader(file, maxTestCreationEvidenceBytes+1)).Decode(&evidence); err != nil {
+		return "", fmt.Errorf("decode verified Visual Hive test-creation evidence: %w", err)
+	}
+	if evidence.SchemaVersion != "visual-hive.test-creation-plan.v1" {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence has unsupported schema %q", evidence.SchemaVersion)
+	}
+	if len(evidence.Recommendations) > 2048 {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence has too many recommendations")
+	}
+	title := strings.ToLower(strings.TrimSpace(finding.Title))
+	lines := make([]string, 0, 1)
+	for _, recommendation := range evidence.Recommendations {
+		if !strings.EqualFold(strings.TrimSpace(recommendation.Source), "testing_layer") || !strings.EqualFold(strings.TrimSpace(recommendation.Kind), "unit_test") {
+			continue
+		}
+		if recommendation.Title != "" && !strings.Contains(title, strings.ToLower(strings.TrimSpace(recommendation.Title))) {
+			continue
+		}
+		values := []string{
+			recommendation.ID, recommendation.GapID, recommendation.Source, recommendation.Kind, recommendation.Priority,
+			recommendation.Title, strings.Join(recommendation.Rationale, ","), strings.Join(recommendation.SuggestedTests, ","), strings.Join(recommendation.Artifacts, ","),
+		}
+		for index, value := range values {
+			value = strings.TrimSpace(value)
+			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
+				return "", fmt.Errorf("verified Visual Hive test-creation evidence contains an unsafe value")
+			}
+			values[index] = strings.ReplaceAll(value, "\n", "\\n")
+		}
+		lines = append(lines, fmt.Sprintf("- key=test_creation.%s gap=%s source=%s kind=%s priority=%s title=%s rationale=%s suggested_tests=%s artifacts=%s required_scope=test_files_only", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]))
+	}
+	if len(lines) == 0 {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence has no matching unit-test recommendation")
+	}
+	sort.Strings(lines)
+	summary := strings.Join(lines, "\n")
+	if len(summary) > 16<<10 {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence summary exceeds limit")
 	}
 	return string(bytes.Clone([]byte(summary))), nil
 }
