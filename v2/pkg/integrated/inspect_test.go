@@ -115,7 +115,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:"+x.id`} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:"+x.id`, "baselines list", "--github-step-summary"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}
@@ -145,7 +145,7 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 
 func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow missing %q", required)
 		}
