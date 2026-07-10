@@ -38,7 +38,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		}
 		for name, script := range packageData.Scripts {
 			lowerName := strings.ToLower(name)
-			if name == "test" || name == "build" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
+			if name == "test" || name == "build" || name == "vh:plan" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
 				inspection.TestCommands = append(inspection.TestCommands, []string{"npm", "run", name})
 				inspection.Signals["script:"+name] = script
 			}
@@ -143,6 +143,8 @@ func testCommandPriority(command []string) int {
 		return 30
 	case strings.Contains(value, "typecheck") || strings.Contains(value, "lint"):
 		return 20
+	case strings.Contains(value, " plan"):
+		return 25
 	case strings.Contains(value, " build"):
 		return 10
 	default:
