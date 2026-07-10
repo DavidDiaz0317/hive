@@ -317,6 +317,7 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
 				return result, err
 			}
+			cleanupMergedRepairBranch(ctx, lifecycle, client, config.Repository, finding, gate.HeadSHA)
 			result.Gates = append(result.Gates, evaluation)
 			finding.MergeSHA, finding.Status = gate.MergeSHA, visualhive.StatusMerged
 			postMerge, postApply, postOutbox, verifyErr := verifyMergedFinding(ctx, stateDir, config, finding, lifecycle, beadStore, client, policy)
@@ -354,12 +355,22 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, mergeSHA); err != nil {
 			return result, err
 		}
+		cleanupMergedRepairBranch(ctx, lifecycle, client, config.Repository, finding, gate.HeadSHA)
 		finding.MergeSHA, finding.Status = mergeSHA, visualhive.StatusMerged
 		postMerge, postApply, postOutbox, verifyErr := verifyMergedFinding(ctx, stateDir, config, finding, lifecycle, beadStore, client, policy)
 		result.PostMergeWorkflow, result.PostMergeLifecycle, result.Outbox = &postMerge, &postApply, postOutbox
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func cleanupMergedRepairBranch(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, repository string, finding visualhive.FindingLifecycle, expectedHeadSHA string) {
+	err := client.DeleteRepairBranchExact(ctx, repository, finding.Branch, expectedHeadSHA)
+	if err != nil {
+		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "delete_repair_branch", false, err.Error())
+		return
+	}
+	lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "delete_repair_branch", true, fmt.Sprintf("deleted %s at exact merged head %s", finding.Branch, expectedHeadSHA))
 }
 
 func hasPendingBaselineCandidate(stateDir, repositoryFingerprint string) (bool, error) {

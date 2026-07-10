@@ -141,6 +141,35 @@ func (c *Client) MergePullRequestExact(ctx context.Context, repository string, n
 	return merged.GetSHA(), nil
 }
 
+// DeleteRepairBranchExact removes only a Hive repair branch whose current ref
+// still points at the exact head that passed merge gates. A moved branch is
+// preserved for investigation instead of being deleted by name alone.
+func (c *Client) DeleteRepairBranchExact(ctx context.Context, repository, branch, expectedHeadSHA string) error {
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return err
+	}
+	branch = strings.TrimSpace(branch)
+	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+	if !strings.HasPrefix(branch, "hive/repair-") || expectedHeadSHA == "" {
+		return fmt.Errorf("exact Hive repair branch and expected head SHA are required")
+	}
+	ref, response, err := c.client.Git.GetRef(ctx, owner, repo, "heads/"+branch)
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		return fmt.Errorf("read merged repair branch %s: %w", branch, err)
+	}
+	if ref.GetObject().GetSHA() != expectedHeadSHA {
+		return fmt.Errorf("refusing to delete moved repair branch %s: got %s, expected %s", branch, ref.GetObject().GetSHA(), expectedHeadSHA)
+	}
+	if _, err := c.client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch); err != nil {
+		return fmt.Errorf("delete merged repair branch %s: %w", branch, err)
+	}
+	return nil
+}
+
 func (c *Client) listPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]string, error) {
 	files := []string{}
 	options := &gh.ListOptions{PerPage: 100}

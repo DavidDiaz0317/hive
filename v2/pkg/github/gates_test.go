@@ -54,6 +54,33 @@ func TestInspectPullRequestGateAndMergeExactSHA(t *testing.T) {
 	}
 }
 
+func TestDeleteRepairBranchRequiresExactUnmovedHead(t *testing.T) {
+	deleted := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-proof":
+			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-proof","object":{"sha":"repair-head","type":"commit"}}`)
+		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/repair-proof":
+			deleted++
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	if err := client.DeleteRepairBranchExact(context.Background(), "owner/repo", "hive/repair-proof", "different-head"); err == nil || deleted != 0 {
+		t.Fatalf("moved repair branch must be preserved: deleted=%d err=%v", deleted, err)
+	}
+	if err := client.DeleteRepairBranchExact(context.Background(), "owner/repo", "hive/repair-proof", "repair-head"); err != nil || deleted != 1 {
+		t.Fatalf("exact merged repair branch was not deleted: deleted=%d err=%v", deleted, err)
+	}
+	if err := client.DeleteRepairBranchExact(context.Background(), "owner/repo", "codex/not-hive", "repair-head"); err == nil {
+		t.Fatal("non-Hive branch deletion must be rejected")
+	}
+}
+
 func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
