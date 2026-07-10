@@ -398,6 +398,36 @@ func TestCheckpointLocalValidationFailureCreatesBoundedRetryState(t *testing.T) 
 	}
 }
 
+func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	worktree := filepath.Join(t.TempDir(), "worktrees", "attempt")
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a1", "main", ""); err != nil {
+		t.Fatal(err)
+	}
+	dirty := filepath.Join(worktree, "test", "failed.test.js")
+	if err := os.MkdirAll(filepath.Dir(dirty), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dirty, []byte("failed patch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "wrong-branch"); err == nil {
+		t.Fatal("dirty worktree must not be cleaned without the exact persisted failed branch")
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("unauthorized cleanup changed the worktree: %v", err)
+	}
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "hive/repair-test-a1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dirty); !os.IsNotExist(err) {
+		t.Fatalf("failed attempt patch survived scoped cleanup: %v", err)
+	}
+	if branch := strings.TrimSpace(gitOutput(t, worktree, "branch", "--show-current")); branch != "hive/repair-test-a2" {
+		t.Fatalf("worktree branch = %q, want attempt 2", branch)
+	}
+}
+
 func seedGitRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()

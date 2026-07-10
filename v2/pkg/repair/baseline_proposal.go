@@ -66,7 +66,7 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 		return Attempt{}, err
 	}
 	worktree := filepath.Join(config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint))
-	if err := prepareWorktree(ctx, config.RepositoryDir, worktree, review.ProposalBranch, config.BaseBranch); err != nil {
+	if err := prepareWorktree(ctx, config.RepositoryDir, worktree, review.ProposalBranch, config.BaseBranch, ""); err != nil {
 		return Attempt{}, err
 	}
 	expectedFiles := make([]string, 0, len(candidates))

@@ -72,6 +72,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		return Result{}, err
 	}
 	attempt, resumed := w.State.Get(finding.RepositoryFingerprint)
+	discardDirtyBranch := ""
 	if resumed && attempt.Stage == StageModelComplete {
 		files, changedErr := changedFiles(ctx, attempt.Worktree)
 		if changedErr != nil {
@@ -107,6 +108,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		startNewAttempt = true
 	}
 	if startNewAttempt {
+		if resumed && attempt.Stage == StageNoChange {
+			discardDirtyBranch = attempt.Branch
+		}
 		attemptNumber := max(finding.RepairAttempts+1, attempt.Attempt+1)
 		branch := fmt.Sprintf("hive/repair-%s-a%d", shortFingerprint(finding.RepositoryFingerprint), attemptNumber)
 		priorModelSummary := attempt.ModelSummary
@@ -118,7 +122,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err := w.authorize(finding, automation.ActionCreateBranch, nil); err != nil {
 			return Result{}, err
 		}
-		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch); err != nil {
+		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, discardDirtyBranch); err != nil {
 			return Result{}, err
 		}
 		if err := w.State.Put(attempt); err != nil {
@@ -361,7 +365,7 @@ func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automatio
 	return nil
 }
 
-func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base string) error {
+func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base, discardDirtyBranch string) error {
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err == nil {
 		current, gitErr := runGit(ctx, worktree, "branch", "--show-current")
 		if gitErr != nil {
@@ -375,7 +379,15 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base 
 			return statusErr
 		}
 		if len(status) != 0 {
-			return fmt.Errorf("existing repair worktree has uncommitted files and cannot move to %s", branch)
+			if strings.TrimSpace(discardDirtyBranch) == "" || strings.TrimSpace(current) != strings.TrimSpace(discardDirtyBranch) {
+				return fmt.Errorf("existing repair worktree has uncommitted files and cannot move to %s", branch)
+			}
+			if _, restoreErr := runGit(ctx, worktree, "restore", "--source=HEAD", "--staged", "--worktree", "--", "."); restoreErr != nil {
+				return fmt.Errorf("restore failed Hive repair attempt: %w", restoreErr)
+			}
+			if _, cleanErr := runGit(ctx, worktree, "clean", "-fd", "--", "."); cleanErr != nil {
+				return fmt.Errorf("clean failed Hive repair attempt: %w", cleanErr)
+			}
 		}
 		if _, fetchErr := runGit(ctx, repositoryDir, "fetch", "--prune", "origin", base); fetchErr != nil {
 			return fmt.Errorf("fetch repair base: %w", fetchErr)
