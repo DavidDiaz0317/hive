@@ -31,6 +31,7 @@ type Attempt struct {
 	Worktree              string    `json:"worktree"`
 	Stage                 Stage     `json:"stage"`
 	Provider              string    `json:"provider"`
+	LifecycleStarted      bool      `json:"lifecycle_started,omitempty"`
 	ModelSummary          string    `json:"model_summary,omitempty"`
 	PriorModelSummary     string    `json:"prior_model_summary,omitempty"`
 	ModelPatch            string    `json:"model_patch,omitempty"`

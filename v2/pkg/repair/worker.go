@@ -87,11 +87,15 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	if resumed && attempt.Stage == StageNoChange {
 		startNewAttempt = true
 	}
-	if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision {
+	if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision && finding.MergeSHA != "" {
+		startNewAttempt = true
+	} else if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision {
 		// A failed check iterates on the same Hive branch and PR. Creating a new
 		// branch here would violate the one-active-PR invariant and strand review
 		// history. Reset only the durable worker stage.
-		attempt.Attempt = finding.RepairAttempts + 1
+		attempt.Attempt = max(finding.RepairAttempts+1, attempt.Attempt+1)
+		attempt.LifecycleStarted = false
+		attempt.PriorModelSummary = attempt.ModelSummary
 		attempt.Stage = StagePrepared
 		attempt.StartedAt = time.Now().UTC()
 		if err := w.State.Put(attempt); err != nil {
@@ -102,7 +106,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		startNewAttempt = true
 	}
 	if startNewAttempt {
-		attemptNumber := finding.RepairAttempts + 1
+		attemptNumber := max(finding.RepairAttempts+1, attempt.Attempt+1)
 		branch := fmt.Sprintf("hive/repair-%s-a%d", shortFingerprint(finding.RepositoryFingerprint), attemptNumber)
 		priorModelSummary := attempt.ModelSummary
 		attempt = Attempt{
@@ -130,8 +134,12 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				return Result{}, err
 			}
 		}
-		if finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued || finding.Status == visualhive.StatusNeedsRevision {
+		if !attempt.LifecycleStarted {
 			if err := w.Lifecycle.MarkRepairStarted(finding.RepositoryFingerprint, attempt.Branch); err != nil {
+				return Result{}, err
+			}
+			attempt.LifecycleStarted = true
+			if err := w.State.Put(attempt); err != nil {
 				return Result{}, err
 			}
 		}

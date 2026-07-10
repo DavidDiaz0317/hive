@@ -118,11 +118,13 @@ func TestWorkerPreparesIsolatedWorktreeBeforeModel(t *testing.T) {
 type fakeLifecycle struct {
 	branch, sha string
 	pr          int
+	starts      int
 	decisions   []string
 }
 
 func (f *fakeLifecycle) MarkRepairStarted(_ string, branch string) error {
 	f.branch = branch
+	f.starts++
 	return nil
 }
 func (f *fakeLifecycle) MarkPROpen(_ string, sha string, number int, _ string) error {
@@ -235,6 +237,44 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 	attempt, _ := state.Get(finding.RepositoryFingerprint)
 	if attempt.Attempt != 2 || attempt.Stage != StagePROpen {
 		t.Fatalf("revision attempt was not persisted: %+v", attempt)
+	}
+}
+
+func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
+	provider := &fakeProvider{}
+	lifecycle := &fakeLifecycle{}
+	pulls := &fakePRClient{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:post-merge", Status: visualhive.StatusIssueOpen,
+		Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
+		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	first, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding.Status, finding.RepairAttempts, finding.MergeSHA = visualhive.StatusNeedsRevision, 1, "merged-first-fix"
+	second, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Branch == second.Branch || provider.runs != 2 || pulls.calls != 2 || lifecycle.starts != 2 {
+		t.Fatalf("post-merge retry did not start a fresh bounded attempt: first=%+v second=%+v starts=%d pulls=%d runs=%d", first, second, lifecycle.starts, pulls.calls, provider.runs)
+	}
+	attempt, _ := state.Get(finding.RepositoryFingerprint)
+	if attempt.Attempt != 2 || !attempt.LifecycleStarted || attempt.PriorModelSummary == "" {
+		t.Fatalf("post-merge attempt did not retain retry context: %+v", attempt)
 	}
 }
 

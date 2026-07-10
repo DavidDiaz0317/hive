@@ -73,6 +73,13 @@ func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-app-shell"); err != nil {
 		t.Fatal(err)
 	}
+	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-app-shell"); err != nil {
+		t.Fatal(err)
+	}
+	started, _ := lifecycle.Finding(fingerprint)
+	if started.RepairAttempts != 1 {
+		t.Fatalf("restart replay incremented repair attempts: %+v", started)
+	}
 	if err := lifecycle.MarkPROpen(fingerprint, "repair-sha", 202, "https://github.com/owner/repo/pull/202"); err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +142,52 @@ func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 	reopenEntry := lifecycle.PendingOutbox()[0]
 	if reopenEntry.Action != OutboxReopenIssue || reopenEntry.IssueNumber != 101 {
 		t.Fatalf("expected reopen issue outbox, got %+v", reopenEntry)
+	}
+}
+
+func TestPostMergeVerificationFailureReturnsFindingToRepair(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-present", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 101, "https://example.test/issues/101"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-a1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(fingerprint, "repair-sha", 202, "https://example.test/pull/202"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkChecks(fingerprint, "repair-sha", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkMerged(fingerprint, "merge-sha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPostMergeVerifying(fingerprint, "run-303", "https://example.test/runs/303"); err != nil {
+		t.Fatal(err)
+	}
+
+	stillPresent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "still-present"), "bundle-still-present", "present", "refs/heads/main", true))
+	stillPresent.Manifest.Source.WorkflowRunID = "run-303"
+	stillPresent.Manifest.Source.CommitSHA = "merge-sha"
+	if _, err := lifecycle.ApplyBundle(stillPresent, beadStore, ApplyLifecycleOptions{TargetRef: "main", VerificationRunID: "run-303"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPostMergeFailed(fingerprint, "finding remained present"); err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if finding.Status != StatusNeedsRevision || finding.MergeSHA != "merge-sha" || finding.LastCheckSummary != "finding remained present" {
+		t.Fatalf("failed post-merge verification lost retry evidence: %+v", finding)
 	}
 }
 

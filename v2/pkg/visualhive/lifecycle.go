@@ -549,13 +549,17 @@ func (s *LifecycleStore) MarkIssueOpened(repositoryFingerprint string, number in
 
 func (s *LifecycleStore) MarkRepairStarted(repositoryFingerprint, branch string) error {
 	return s.updateFinding(repositoryFingerprint, "repair_started", func(finding *FindingLifecycle) error {
-		if finding.Status != StatusIssueOpen && finding.Status != StatusFixQueued && finding.Status != StatusNeedsRevision {
+		if finding.Status == StatusRepairRunning && strings.TrimSpace(finding.Branch) == strings.TrimSpace(branch) {
+			return nil
+		}
+		if finding.Status != StatusIssueOpen && finding.Status != StatusFixQueued && finding.Status != StatusNeedsRevision && finding.Status != StatusRepairRunning {
 			return fmt.Errorf("cannot start repair from %s", finding.Status)
 		}
 		if strings.TrimSpace(branch) == "" {
 			return fmt.Errorf("repair branch is required")
 		}
 		finding.Branch, finding.Status = branch, StatusRepairRunning
+		finding.MergeSHA, finding.ValidationRunID, finding.ValidationRunURL = "", "", ""
 		finding.RepairAttempts++
 		return nil
 	})
@@ -616,6 +620,20 @@ func (s *LifecycleStore) MarkPostMergeVerifying(repositoryFingerprint, runID, ru
 			return fmt.Errorf("cannot start post-merge verification from %s", finding.Status)
 		}
 		finding.ValidationRunID, finding.ValidationRunURL, finding.Status = runID, runURL, StatusPostMergeVerifying
+		return nil
+	})
+}
+
+func (s *LifecycleStore) MarkPostMergeFailed(repositoryFingerprint, summary string) error {
+	return s.updateFinding(repositoryFingerprint, "post_merge_failed", func(finding *FindingLifecycle) error {
+		if finding.Status != StatusPostMergeVerifying {
+			return fmt.Errorf("cannot fail post-merge verification from %s", finding.Status)
+		}
+		if strings.TrimSpace(finding.ValidationRunID) == "" || finding.LastWorkflowRunID != finding.ValidationRunID {
+			return fmt.Errorf("post-merge failure requires evidence from the recorded verification run")
+		}
+		finding.Status = StatusNeedsRevision
+		finding.LastCheckSummary = strings.TrimSpace(summary)
 		return nil
 	})
 }

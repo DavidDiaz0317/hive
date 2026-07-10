@@ -82,7 +82,11 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if err != nil {
 		return result, err
 	}
-	if _, err := reconcileExternallyMergedRepair(runCtx, lifecycle, options.GitHub); err != nil {
+	if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
+		return result, err
+	}
+	externalMerge, err := reconcileExternallyMergedRepair(runCtx, lifecycle, options.GitHub)
+	if err != nil {
 		return result, err
 	}
 	workflow, err := dispatchAndWait(runCtx, options.GitHub, config)
@@ -90,6 +94,15 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		return result, err
 	}
 	result.Workflow = workflow
+	if externalMerge {
+		finding, ok := mergedRepairFinding(lifecycle.Snapshot())
+		if !ok || finding.MergeSHA != workflow.HeadSHA {
+			return result, fmt.Errorf("post-merge verification ran at %s without a matching reconciled merge", workflow.HeadSHA)
+		}
+		if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", workflow.RunID), workflow.RunURL); err != nil {
+			return result, err
+		}
+	}
 	beadStore, err := beads.NewStore(filepath.Join(options.StateDir, "beads", "quality"))
 	if err != nil {
 		return result, err
@@ -103,6 +116,13 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		return result, err
 	}
 	result.Validation, result.Lifecycle, result.Outbox = validation, apply, outbox
+	if externalMerge {
+		workflowCopy, lifecycleCopy := workflow, apply
+		result.PostMergeWorkflow, result.PostMergeLifecycle = &workflowCopy, &lifecycleCopy
+		if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
+			return result, err
+		}
+	}
 	policy := automation.Policy{
 		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
 		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: 3,
@@ -309,7 +329,7 @@ func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.Findi
 	sort.Strings(keys)
 	for _, key := range keys {
 		finding := state.Findings[key]
-		if finding == nil || finding.HumanReviewRequired || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" {
+		if finding == nil || finding.HumanReviewRequired || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" || finding.MergeSHA != "" {
 			continue
 		}
 		switch finding.Status {
@@ -318,6 +338,36 @@ func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.Findi
 		}
 	}
 	return visualhive.FindingLifecycle{}, false
+}
+
+func mergedRepairFinding(state visualhive.LifecycleState) (visualhive.FindingLifecycle, bool) {
+	for _, finding := range state.Findings {
+		if finding != nil && finding.Status == visualhive.StatusMerged && finding.MergeSHA != "" {
+			return *finding, true
+		}
+	}
+	return visualhive.FindingLifecycle{}, false
+}
+
+func recoverCompletedPostMergeVerification(lifecycle *visualhive.LifecycleStore) (bool, error) {
+	state := lifecycle.Snapshot()
+	keys := make([]string, 0, len(state.Findings))
+	for key := range state.Findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding == nil || finding.Status != visualhive.StatusPostMergeVerifying || finding.ValidationRunID == "" || finding.LastWorkflowRunID != finding.ValidationRunID {
+			continue
+		}
+		summary := fmt.Sprintf("finding remained present after authoritative target-branch verification %s", finding.ValidationRunURL)
+		if err := lifecycle.MarkPostMergeFailed(finding.RepositoryFingerprint, summary); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func verifyMergedFinding(ctx context.Context, stateDir string, config Config, finding visualhive.FindingLifecycle, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy) (WorkflowRunEvidence, visualhive.ApplyLifecycleResult, visualhive.OutboxProcessorResult, error) {
@@ -337,6 +387,9 @@ func verifyMergedFinding(ctx context.Context, stateDir string, config Config, fi
 	}
 	verified, exists := lifecycle.Finding(finding.RepositoryFingerprint)
 	if !exists || verified.Status != visualhive.StatusIssueClosed {
+		if _, recoveryErr := recoverCompletedPostMergeVerification(lifecycle); recoveryErr != nil {
+			return postMerge, postApply, postOutbox, recoveryErr
+		}
 		return postMerge, postApply, postOutbox, fmt.Errorf("post-merge verification did not resolve and close finding %s", finding.RepositoryFingerprint)
 	}
 	return postMerge, postApply, postOutbox, nil
