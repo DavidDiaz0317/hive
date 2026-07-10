@@ -125,7 +125,18 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		return result, err
 	}
 	idempotent := strings.TrimSpace(diff) == ""
-	if idempotent && hasPrior {
+	reuseRemoteSetup := false
+	sha := ""
+	if !idempotent && hasPrior && prior.SetupBranch != "" {
+		matches, remoteSHA, matchErr := stagedTreeMatchesRemoteBranch(ctx, checkout, prior.SetupBranch)
+		if matchErr != nil {
+			return result, matchErr
+		}
+		if matches {
+			idempotent, reuseRemoteSetup, sha = true, true, remoteSHA
+		}
+	}
+	if idempotent && hasPrior && !reuseRemoteSetup {
 		sha, shaErr := git(ctx, checkout, "rev-parse", "HEAD")
 		if shaErr != nil {
 			return result, shaErr
@@ -143,17 +154,24 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 			return result, err
 		}
 	}
-	sha, err := git(ctx, checkout, "rev-parse", "HEAD")
-	if err != nil {
-		return result, err
+	if sha == "" {
+		sha, err = git(ctx, checkout, "rev-parse", "HEAD")
+		if err != nil {
+			return result, err
+		}
+		sha = strings.TrimSpace(sha)
 	}
-	sha = strings.TrimSpace(sha)
-	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPush); err != nil {
-		return result, err
+	if !reuseRemoteSetup {
+		if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPush); err != nil {
+			return result, err
+		}
+		if _, err := git(ctx, checkout, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+branch); err != nil {
+			return result, err
+		}
 	}
-	if _, err := git(ctx, checkout, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+branch); err != nil {
-		return result, err
-	}
+	// A matching remote setup tree is reused without another commit or
+	// force-push, while the PR upsert still recovers an interrupted or
+	// manually closed setup PR.
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPR); err != nil {
 		return result, err
 	}
@@ -170,6 +188,27 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	result.Applied, result.Idempotent, result.Config = true, idempotent, &config
 	result.Branch, result.CommitSHA, result.PRNumber, result.PRURL = branch, sha, pull.Number, pull.URL
 	return result, nil
+}
+
+func stagedTreeMatchesRemoteBranch(ctx context.Context, checkout, branch string) (bool, string, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false, "", nil
+	}
+	desiredTree, err := git(ctx, checkout, "write-tree")
+	if err != nil {
+		return false, "", fmt.Errorf("write desired setup tree: %w", err)
+	}
+	remoteRef := "refs/remotes/origin/" + branch
+	remoteSHA, err := git(ctx, checkout, "rev-parse", "--verify", remoteRef)
+	if err != nil {
+		return false, "", nil
+	}
+	remoteTree, err := git(ctx, checkout, "rev-parse", "--verify", remoteRef+"^{tree}")
+	if err != nil {
+		return false, "", fmt.Errorf("read existing setup tree: %w", err)
+	}
+	return strings.TrimSpace(desiredTree) == strings.TrimSpace(remoteTree), strings.TrimSpace(remoteSHA), nil
 }
 
 func validateSetupOptions(options SetupOptions) error {
