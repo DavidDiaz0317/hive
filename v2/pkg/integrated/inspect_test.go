@@ -28,14 +28,14 @@ func TestInspectCheckoutBuildsRepositorySpecificSignals(t *testing.T) {
 
 func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T) {
 	root := t.TempDir()
-	writeFixture(t, root, "package.json", `{"scripts":{"vh:test-creation":"node test-creation.js","vh:suite":"node suite.js","vh:mutation-proof":"node proof.js","typecheck":"tsc --noEmit","build":"vite build"}}`)
+	writeFixture(t, root, "package.json", `{"scripts":{"vh:test-creation":"node test-creation.js","vh:suite":"node suite.js","vh:mutation-proof":"node proof.js","vh:mutate":"node mutate.js","vh:run":"node run.js","typecheck":"tsc --noEmit","build":"vite build"}}`)
 	writeFixture(t, root, "package-lock.json", `{}`)
 
 	inspection, err := InspectCheckout(root, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"build", "typecheck", "vh:suite", "vh:mutation-proof", "vh:test-creation"}
+	want := []string{"build", "typecheck", "vh:run", "vh:mutate", "vh:mutation-proof", "vh:test-creation"}
 	if len(inspection.TestCommands) != len(want) {
 		t.Fatalf("unexpected commands: %+v", inspection.TestCommands)
 	}
@@ -44,6 +44,19 @@ func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T
 		if len(command) != 3 || command[2] != name {
 			t.Fatalf("command %d = %v, want npm run %s", index, command, name)
 		}
+	}
+}
+
+func TestInspectCheckoutRetainsSuiteWhenItIsOnlyProducer(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:suite":"node suite.js"}}`)
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.TestCommands) != 2 || inspection.TestCommands[1][2] != "test:suite" {
+		t.Fatalf("standalone suite should be retained: %+v", inspection.TestCommands)
 	}
 }
 

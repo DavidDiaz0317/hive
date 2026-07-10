@@ -38,11 +38,12 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		}
 		for name, script := range packageData.Scripts {
 			lowerName := strings.ToLower(name)
-			if name == "test" || name == "build" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
+			if name == "test" || name == "build" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
 				inspection.TestCommands = append(inspection.TestCommands, []string{"npm", "run", name})
 				inspection.Signals["script:"+name] = script
 			}
 		}
+		inspection.TestCommands = preferGranularTestCommands(inspection.TestCommands)
 	}
 	if exists(filepath.Join(root, "package-lock.json")) {
 		managers["npm"] = true
@@ -136,7 +137,9 @@ func testCommandPriority(command []string) int {
 		return 50
 	case strings.Contains(value, "proof") || strings.Contains(value, "verify") || strings.Contains(value, "validation") || strings.Contains(value, "validate") || strings.Contains(value, "check-"):
 		return 40
-	case strings.Contains(value, "suite") || strings.Contains(value, "mutation") || strings.Contains(value, "mutate") || strings.Contains(value, " e2e") || strings.Contains(value, " visual") || strings.Contains(value, " test"):
+	case strings.Contains(value, "mutation") || strings.Contains(value, "mutate"):
+		return 35
+	case strings.Contains(value, "suite") || strings.Contains(value, " e2e") || strings.Contains(value, " visual") || strings.Contains(value, " test") || strings.Contains(value, " run"):
 		return 30
 	case strings.Contains(value, "typecheck") || strings.Contains(value, "lint"):
 		return 20
@@ -145,6 +148,41 @@ func testCommandPriority(command []string) int {
 	default:
 		return 30
 	}
+}
+
+func preferGranularTestCommands(commands [][]string) [][]string {
+	hasGranularProducer := false
+	for _, command := range commands {
+		name := commandScriptName(command)
+		if !strings.Contains(name, "suite") && isEvidenceProducerScript(name) {
+			hasGranularProducer = true
+			break
+		}
+	}
+	if !hasGranularProducer {
+		return commands
+	}
+	result := make([][]string, 0, len(commands))
+	for _, command := range commands {
+		if !strings.Contains(commandScriptName(command), "suite") {
+			result = append(result, command)
+		}
+	}
+	return result
+}
+
+func commandScriptName(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	return strings.ToLower(command[len(command)-1])
+}
+
+func isEvidenceProducerScript(name string) bool {
+	if name == "test" || name == "vh:run" || strings.Contains(name, "mutate") || strings.Contains(name, "e2e") || strings.Contains(name, "visual") {
+		return true
+	}
+	return strings.Contains(name, "test") && !strings.Contains(name, "test-creation") && !strings.Contains(name, "proof") && !strings.Contains(name, "check") && !strings.Contains(name, "validate")
 }
 
 func mergeMaps(left, right map[string]string) map[string]string {
