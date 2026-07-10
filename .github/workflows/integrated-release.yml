@@ -1,0 +1,134 @@
+name: Build integrated Hive release
+
+on:
+  workflow_dispatch:
+    inputs:
+      visual_hive_ref:
+        description: Immutable 40-character Visual Hive commit
+        required: true
+        type: string
+      release_tag:
+        description: Optional Hive fork release tag (for example v0.3.0-integrated.1)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NODE_VERSION: 22.23.1
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Validate immutable inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VISUAL_HIVE_REF" =~ ^[a-f0-9]{40}$ ]]
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: DavidDiaz0317/visual-hive
+          ref: ${{ inputs.visual_hive_ref }}
+          path: .release/visual-hive-source
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .release/visual-hive-source/package-lock.json
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.25.6
+          cache-dependency-path: v2/go.sum
+      - name: Build immutable Visual Hive bundle
+        working-directory: .release/visual-hive-source
+        env:
+          VISUAL_HIVE_GIT_COMMIT: ${{ inputs.visual_hive_ref }}
+        run: |
+          npm ci
+          npm run build
+          node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
+      - name: Download and verify Node 22 runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .release/node .release/dist
+          base="https://nodejs.org/dist/v${NODE_VERSION}"
+          curl --fail --location --silent --show-error "$base/SHASUMS256.txt" -o .release/node/SHASUMS256.txt
+          for archive in "node-v${NODE_VERSION}-linux-x64.tar.xz" "node-v${NODE_VERSION}-win-x64.zip"; do
+            curl --fail --location --silent --show-error "$base/$archive" -o ".release/node/$archive"
+            (cd .release/node && grep "  $archive$" SHASUMS256.txt | sha256sum --check --strict -)
+          done
+          tar -xJf ".release/node/node-v${NODE_VERSION}-linux-x64.tar.xz" -C .release/node
+          unzip -q ".release/node/node-v${NODE_VERSION}-win-x64.zip" -d .release/node
+      - name: Build Hive fork binaries
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.release/bin"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12}" -o "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" ./cmd/hive
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12}" -o "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" ./cmd/hive
+      - name: Assemble clean-install distributions
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          linux_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ inputs.release_tag || github.sha }}-linux-amd64"
+          windows_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ inputs.release_tag || github.sha }}-windows-amd64"
+          go run ./cmd/hive-dist \
+            --hive "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --hive-commit "$GITHUB_SHA" \
+            --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
+            --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-linux-x64/bin/node" \
+            --node-license "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-linux-x64/LICENSE" \
+            --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
+            --target-os linux --target-arch amd64 --output "$linux_root"
+          go run ./cmd/hive-dist \
+            --hive "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" --hive-commit "$GITHUB_SHA" \
+            --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
+            --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/node.exe" \
+            --node-license "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/LICENSE" \
+            --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
+            --target-os windows --target-arch amd64 --output "$windows_root"
+          "$linux_root/runtime/node" "$linux_root/visual-hive/visual-hive.mjs" --version
+      - name: Archive and checksum distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .release/dist
+          linux_dir="hive-integrated-${{ inputs.release_tag || github.sha }}-linux-amd64"
+          windows_dir="hive-integrated-${{ inputs.release_tag || github.sha }}-windows-amd64"
+          tar -czf "${linux_dir}.tar.gz" "$linux_dir"
+          zip -qr "${windows_dir}.zip" "$windows_dir"
+          sha256sum "${linux_dir}.tar.gz" > "${linux_dir}.tar.gz.sha256"
+          sha256sum "${windows_dir}.zip" > "${windows_dir}.zip.sha256"
+      - name: Sign build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            .release/dist/hive-integrated-*.tar.gz
+            .release/dist/hive-integrated-*.tar.gz.sha256
+            .release/dist/hive-integrated-*.zip
+            .release/dist/hive-integrated-*.zip.sha256
+      - name: Retain installer artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hive-integrated-${{ github.sha }}
+          path: |
+            .release/dist/hive-integrated-*.tar.gz
+            .release/dist/hive-integrated-*.tar.gz.sha256
+            .release/dist/hive-integrated-*.zip
+            .release/dist/hive-integrated-*.zip.sha256
+      - name: Publish fork release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ inputs.release_tag }}" .release/dist/hive-integrated-*.* --target "$GITHUB_SHA" --title "Hive integrated ${{ inputs.release_tag }}" --generate-notes

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -29,6 +30,12 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedStatus(args)
 	case "doctor":
 		return runIntegratedDoctor(args)
+	case "start":
+		return runIntegratedStart(args)
+	case "stop":
+		return runIntegratedStop(args)
+	case "daemon":
+		return runIntegratedDaemon(args)
 	case "pause", "resume":
 		return runIntegratedPause(command, args)
 	case "set-coverage", "set-automation":
@@ -64,6 +71,23 @@ func runIntegratedManagement(command string, args []string) int {
 	if command != "uninstall" && visualRef == "" && command != "rollback" {
 		fmt.Fprintln(os.Stderr, "--visual-hive-ref is required")
 		return 2
+	}
+	if command == "uninstall" {
+		status := readIntegratedDaemonStatus(*stateDir)
+		if status.Running {
+			if stopErr := terminateProcess(status.PID); stopErr != nil {
+				fmt.Fprintln(os.Stderr, "uninstall could not stop the persistent scheduler:", stopErr)
+				return 1
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) && processIsAlive(status.PID) {
+				time.Sleep(100 * time.Millisecond)
+			}
+			if processIsAlive(status.PID) {
+				fmt.Fprintln(os.Stderr, "uninstall could not stop the persistent scheduler within 10 seconds")
+				return 1
+			}
+		}
 	}
 	token := resolveGitHubToken(*githubTokenEnv)
 	if token == "" {
@@ -141,7 +165,8 @@ func runSetupCommand(args []string) int {
 	provider := flags.String("provider", "codex", "repair model provider")
 	providerCommand := flags.String("provider-command", "codex", "repair provider executable")
 	visualHive := flags.Bool("visual-hive", true, "install Visual Hive deterministic testing")
-	visualCommand := flags.String("visual-hive-command", "node", "Visual Hive CLI launcher")
+	visualCommand := flags.String("visual-hive-command", "", "Visual Hive CLI launcher; defaults to the packaged runtime")
+	visualHome := flags.String("visual-hive-home", os.Getenv("HIVE_VISUAL_HIVE_HOME"), "directory containing an immutable Visual Hive release bundle")
 	visualRepo := flags.String("visual-hive-repo", valueOrEnv("VISUAL_HIVE_REPOSITORY", "DavidDiaz0317/visual-hive"), "Visual Hive source repository")
 	visualRef := flags.String("visual-hive-ref", os.Getenv("VISUAL_HIVE_REF"), "immutable Visual Hive commit SHA")
 	maxActiveIssues := flags.Int("max-active-issues", 5, "maximum concurrently open Hive-managed findings")
@@ -149,6 +174,7 @@ func runSetupCommand(args []string) int {
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	planOnly := flags.Bool("plan", false, "produce a read-only setup plan")
 	start := flags.Bool("start", false, "start after the setup PR is merged and doctor is green")
+	runInterval := flags.Duration("run-interval", 15*time.Minute, "persistent production scan interval")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
@@ -192,6 +218,24 @@ func runSetupCommand(args []string) int {
 			return 2
 		}
 	}
+	if !*planOnly && *visualHive {
+		resolvedCommand, resolvedArgs, resolveErr := resolveVisualHiveLauncher(*visualCommand, visualArgs, *visualHome)
+		if resolveErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", resolveErr)
+			return 2
+		}
+		*visualCommand, visualArgs = resolvedCommand, resolvedArgs
+		if len(visualArgs) > 0 && filepath.Base(visualArgs[0]) == "visual-hive.mjs" {
+			manifest, manifestErr := integrated.ValidateVisualHiveRelease(visualArgs[0], *visualRef)
+			if manifestErr != nil {
+				fmt.Fprintln(os.Stderr, "setup failed:", manifestErr)
+				return 2
+			}
+			if *visualRef == "" {
+				*visualRef = manifest.GitCommit
+			}
+		}
+	}
 	acmm := acmmForIntegratedAutomation(automationMode)
 	mode := automationModeForIntegrated(automationMode)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -210,13 +254,19 @@ func runSetupCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "setup failed:", err)
 		return 1
 	}
+	if *start && result.Applied {
+		if _, startErr := ensureIntegratedDaemonStarted(*stateDir, *runInterval); startErr != nil {
+			fmt.Fprintln(os.Stderr, "setup applied but persistent startup failed:", startErr)
+			return 1
+		}
+	}
 	if *jsonOutput {
 		return encodeJSON(result)
 	}
 	if result.Applied {
 		fmt.Printf("Setup PR ready: %s\nPersistent state: %s\n", result.PRURL, *stateDir)
 		if *start {
-			fmt.Println("Start is pending setup-PR merge and a green hive doctor result.")
+			fmt.Println("Persistent Hive started; it will retry safely until the setup PR is merged and production gates are ready.")
 		}
 	} else {
 		fmt.Printf("Setup plan for %s: coverage=%s automation=%s ACMM=L%d\n", result.Plan.Repository, result.Plan.Coverage, result.Plan.Automation, result.Plan.ACMMLevel)
@@ -264,6 +314,7 @@ func runIntegratedStatus(args []string) int {
 		"schema_version": "hive.status.v1", "config": config, "paused": config.Paused, "production_ready": ready,
 		"readiness_checks": liveChecks, "provider_ready": providerErr == nil, "provider_message": errorOr(providerErr, "provider authenticated"),
 	}
+	status["daemon"] = readIntegratedDaemonStatus(*stateDir)
 	lifecyclePath := filepath.Join(*stateDir, "visual-hive", "visual-hive-lifecycle.json")
 	if _, statErr := os.Stat(lifecyclePath); statErr == nil {
 		if lifecycle, lifecycleErr := visualhive.NewLifecycleStore(filepath.Dir(lifecyclePath)); lifecycleErr == nil {
@@ -321,6 +372,8 @@ func runIntegratedDoctor(args []string) int {
 		checks = append(checks, doctorCheck{Name: "checkout", OK: gitErr == nil, Message: errorOr(gitErr, "managed checkout is present")})
 		immutable := len(config.VisualHiveRef) == 40
 		checks = append(checks, doctorCheck{Name: "visual_hive_pin", OK: immutable, Message: ternary(immutable, "Visual Hive is pinned to an immutable commit", "Visual Hive ref is not immutable")})
+		runtimeOK, runtimeMessage := validateVisualHiveLauncher(config)
+		checks = append(checks, doctorCheck{Name: "visual_hive_runtime", OK: runtimeOK, Message: runtimeMessage})
 		provider := repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		providerErr := provider.Health(ctx)
@@ -350,6 +403,82 @@ func runIntegratedDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func resolveVisualHiveLauncher(command string, args []string, home string) (string, []string, error) {
+	command = strings.TrimSpace(command)
+	if command != "" {
+		return command, append([]string(nil), args...), nil
+	}
+	if len(args) > 0 {
+		node, err := exec.LookPath("node")
+		if err != nil {
+			return "", nil, fmt.Errorf("VISUAL_HIVE_CLI requires Node 22 or --visual-hive-command")
+		}
+		return node, append([]string(nil), args...), nil
+	}
+
+	homes := []string{}
+	if strings.TrimSpace(home) != "" {
+		homes = append(homes, home)
+	}
+	if executable, err := os.Executable(); err == nil {
+		homes = append(homes, filepath.Join(filepath.Dir(executable), "visual-hive"))
+	}
+	for _, candidate := range homes {
+		absolute, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		cli := filepath.Join(absolute, "visual-hive.mjs")
+		if info, statErr := os.Stat(cli); statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		nodeName := "node"
+		if runtime.GOOS == "windows" {
+			nodeName = "node.exe"
+		}
+		node := filepath.Join(filepath.Dir(absolute), "runtime", nodeName)
+		if info, statErr := os.Stat(node); statErr == nil && info.Mode().IsRegular() {
+			return node, append([]string{cli}, args...), nil
+		}
+		if pathNode, lookErr := exec.LookPath("node"); lookErr == nil {
+			return pathNode, append([]string{cli}, args...), nil
+		}
+	}
+	if visualHive, err := exec.LookPath("visual-hive"); err == nil {
+		return visualHive, append([]string(nil), args...), nil
+	}
+	return "", nil, fmt.Errorf("immutable Visual Hive runtime not found; install the integrated Hive bundle or pass --visual-hive-home")
+}
+
+func validateVisualHiveLauncher(config integrated.Config) (bool, string) {
+	command := config.VisualHiveCommand
+	if !filepath.IsAbs(command) {
+		resolved, err := exec.LookPath(command)
+		if err != nil {
+			return false, "Visual Hive launcher is unavailable"
+		}
+		command = resolved
+	}
+	if info, err := os.Stat(command); err != nil || !info.Mode().IsRegular() {
+		return false, "Visual Hive launcher is unavailable"
+	}
+	if len(config.VisualHiveArgs) == 0 || filepath.Base(config.VisualHiveCommand) == "visual-hive" || filepath.Base(config.VisualHiveCommand) == "visual-hive.exe" {
+		return true, "Visual Hive launcher is available"
+	}
+	entrypoint := config.VisualHiveArgs[0]
+	if info, err := os.Stat(entrypoint); err != nil || !info.Mode().IsRegular() {
+		return false, "Visual Hive release entrypoint is unavailable"
+	}
+	return validateVisualHiveRelease(entrypoint, config.VisualHiveRef)
+}
+
+func validateVisualHiveRelease(entrypoint, expectedCommit string) (bool, string) {
+	if _, err := integrated.ValidateVisualHiveRelease(entrypoint, expectedCommit); err != nil {
+		return false, err.Error()
+	}
+	return true, "Visual Hive release manifest matches the immutable pin"
 }
 
 func liveRepositoryChecks(ctx context.Context, client *hivegithub.Client, config integrated.Config) []doctorCheck {
