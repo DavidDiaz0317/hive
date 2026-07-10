@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: DavidDiaz0317/visual-hive
-          ref: ${{ inputs.visual_hive_ref }}
+          ref: ${{ env.VISUAL_HIVE_REF }}
           path: .release/visual-hive-source
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -56,7 +56,7 @@ jobs:
       - name: Build immutable Visual Hive bundle
         working-directory: .release/visual-hive-source
         env:
-          VISUAL_HIVE_GIT_COMMIT: ${{ inputs.visual_hive_ref }}
+          VISUAL_HIVE_GIT_COMMIT: ${{ env.VISUAL_HIVE_REF }}
         run: |
           npm ci
           npm run build
