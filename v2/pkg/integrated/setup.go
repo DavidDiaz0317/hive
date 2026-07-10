@@ -76,6 +76,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if options.GitHub == nil {
 		return result, fmt.Errorf("GitHub client is required to apply setup")
 	}
+	if options.VisualHive {
+		if err := VerifyVisualHiveCommit(ctx, options.GitHub, options.VisualHiveRepo, options.VisualHiveRef); err != nil {
+			return result, err
+		}
+	}
 	branch := "hive/setup"
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupBranch); err != nil {
 		return result, err
@@ -188,6 +193,29 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	result.Applied, result.Idempotent, result.Config = true, idempotent, &config
 	result.Branch, result.CommitSHA, result.PRNumber, result.PRURL = branch, sha, pull.Number, pull.URL
 	return result, nil
+}
+
+func VerifyVisualHiveCommit(ctx context.Context, client *hivegithub.Client, repository, ref string) error {
+	if client == nil || client.GoGitHub() == nil {
+		return fmt.Errorf("GitHub client is required to verify the Visual Hive commit")
+	}
+	owner, repo, ok := strings.Cut(strings.TrimSpace(repository), "/")
+	if !ok || owner == "" || repo == "" {
+		return fmt.Errorf("Visual Hive repository must be owner/name")
+	}
+	commit, _, err := client.GoGitHub().Repositories.GetCommit(ctx, owner, repo, ref, nil)
+	if err != nil {
+		return fmt.Errorf("verify immutable Visual Hive commit %s in %s: %w", ref, repository, err)
+	}
+	if !exactCommitPin(ref, commit.GetSHA()) {
+		return fmt.Errorf("Visual Hive ref resolved to %s instead of exact commit %s", commit.GetSHA(), ref)
+	}
+	return nil
+}
+
+func exactCommitPin(expected, actual string) bool {
+	expected, actual = strings.ToLower(strings.TrimSpace(expected)), strings.ToLower(strings.TrimSpace(actual))
+	return len(expected) == 40 && expected == actual
 }
 
 func stagedTreeMatchesRemoteBranch(ctx context.Context, checkout, branch string) (bool, string, error) {

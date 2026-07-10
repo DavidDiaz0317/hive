@@ -375,6 +375,8 @@ func liveRepositoryChecks(ctx context.Context, client *hivegithub.Client, config
 	checks = append(checks, doctorCheck{Name: "setup_pr_merged", OK: setupMerged, Message: setupMessage})
 	content, _, _, workflowErr := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, ".github/workflows/hive-visual-hive.yml", &gh.RepositoryContentGetOptions{Ref: config.DefaultBranch})
 	checks = append(checks, doctorCheck{Name: "workflow_installed", OK: workflowErr == nil && content != nil, Message: errorOr(workflowErr, "production workflow is installed on the target branch")})
+	visualRefErr := integrated.VerifyVisualHiveCommit(ctx, client, config.VisualHiveRepo, config.VisualHiveRef)
+	checks = append(checks, doctorCheck{Name: "visual_hive_ref_exists", OK: visualRefErr == nil, Message: errorOr(visualRefErr, "Visual Hive pin resolves to the exact remote commit")})
 	if config.Automation == integrated.AutomationAutoMerge {
 		protection, protectionErr := client.BranchProtection(ctx, config.Repository, config.DefaultBranch)
 		protected := protectionErr == nil && protection.Enabled && len(protection.RequiredChecks) > 0

@@ -39,6 +39,16 @@ func TestBuildSetupPlanKeepsCoverageAndAuthoritySeparate(t *testing.T) {
 	}
 }
 
+func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
+	sha := "0123456789012345678901234567890123456789"
+	if !exactCommitPin(sha, sha) {
+		t.Fatal("exact immutable commit should match")
+	}
+	if exactCommitPin(sha[:8], sha) || exactCommitPin(sha, "1123456789012345678901234567890123456789") {
+		t.Fatal("abbreviated or different refs must not match")
+	}
+}
+
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	value := workflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4})
 	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}"} {
