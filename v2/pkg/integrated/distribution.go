@@ -150,11 +150,24 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	if err := os.WriteFile(filepath.Join(staging, "distribution-manifest.json"), append(data, '\n'), 0o644); err != nil {
 		return DistributionManifest{}, err
 	}
-	if err := os.Rename(staging, output); err != nil {
+	if err := renameDistribution(staging, output); err != nil {
 		return DistributionManifest{}, fmt.Errorf("publish distribution atomically: %w", err)
 	}
 	committed = true
 	return manifest, nil
+}
+
+func renameDistribution(staging, output string) error {
+	var last error
+	for attempt := 0; attempt < 20; attempt++ {
+		if err := os.Rename(staging, output); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return last
 }
 
 func copyRegularTree(source, destination string) error {

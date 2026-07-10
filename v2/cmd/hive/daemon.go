@@ -19,6 +19,7 @@ import (
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/integrated"
+	"github.com/kubestellar/hive/v2/pkg/repair"
 )
 
 const daemonStatusSchema = "hive.integrated-daemon.v1"
@@ -250,6 +251,31 @@ func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time
 		return integrated.RunResult{}, fmt.Errorf("GitHub authorization is unavailable; run gh auth login")
 	}
 	client := hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		return integrated.RunResult{}, err
+	}
+	config, err := store.Load()
+	if err != nil {
+		return integrated.RunResult{}, err
+	}
+	if config.Paused {
+		return integrated.RunResult{}, fmt.Errorf("repository automation is paused")
+	}
+	if ok, message := validateVisualHiveLauncher(config); !ok {
+		return integrated.RunResult{}, fmt.Errorf("Visual Hive runtime is not ready: %s", message)
+	}
+	providerCtx, providerCancel := context.WithTimeout(ctx, 45*time.Second)
+	providerErr := (repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}).Health(providerCtx)
+	providerCancel()
+	if providerErr != nil {
+		return integrated.RunResult{}, providerErr
+	}
+	for _, check := range liveRepositoryChecks(ctx, client, config) {
+		if !check.OK {
+			return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %s", check.Name, check.Message)
+		}
+	}
 	return integrated.RunOnce(ctx, integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client})
 }
 

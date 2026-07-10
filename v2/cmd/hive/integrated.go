@@ -163,7 +163,7 @@ func runSetupCommand(args []string) int {
 	coverageValue := flags.String("coverage", "", "essential, standard, comprehensive, or custom")
 	automationValue := flags.String("automation", "", "advisory, issues, repair-pr, or auto-merge")
 	provider := flags.String("provider", "codex", "repair model provider")
-	providerCommand := flags.String("provider-command", "codex", "repair provider executable")
+	providerCommand := flags.String("provider-command", os.Getenv("HIVE_CODEX_COMMAND"), "repair provider executable; auto-detected for Codex")
 	visualHive := flags.Bool("visual-hive", true, "install Visual Hive deterministic testing")
 	visualCommand := flags.String("visual-hive-command", "", "Visual Hive CLI launcher; defaults to the packaged runtime")
 	visualHome := flags.String("visual-hive-home", os.Getenv("HIVE_VISUAL_HIVE_HOME"), "directory containing an immutable Visual Hive release bundle")
@@ -236,6 +236,16 @@ func runSetupCommand(args []string) int {
 			}
 		}
 	}
+	if !*planOnly {
+		providerCtx, providerCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		resolvedProviderCommand, providerErr := resolveIntegratedProvider(providerCtx, *provider, *providerCommand, providerArgs)
+		providerCancel()
+		if providerErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", providerErr)
+			return 2
+		}
+		*providerCommand = resolvedProviderCommand
+	}
 	acmm := acmmForIntegratedAutomation(automationMode)
 	mode := automationModeForIntegrated(automationMode)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -301,6 +311,8 @@ func runIntegratedStatus(args []string) int {
 		client = hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), *githubAPIURL)
 	}
 	liveChecks := liveRepositoryChecks(ctx, client, config)
+	runtimeOK, runtimeMessage := validateVisualHiveLauncher(config)
+	liveChecks = append(liveChecks, doctorCheck{Name: "visual_hive_runtime", OK: runtimeOK, Message: runtimeMessage})
 	ready := !config.Paused && len(config.VisualHiveRef) == 40
 	for _, check := range liveChecks {
 		ready = ready && check.OK
@@ -450,6 +462,66 @@ func resolveVisualHiveLauncher(command string, args []string, home string) (stri
 		return visualHive, append([]string(nil), args...), nil
 	}
 	return "", nil, fmt.Errorf("immutable Visual Hive runtime not found; install the integrated Hive bundle or pass --visual-hive-home")
+}
+
+func resolveIntegratedProvider(ctx context.Context, provider, command string, args []string) (string, error) {
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		if strings.TrimSpace(command) == "" {
+			return "", fmt.Errorf("provider %q requires --provider-command", provider)
+		}
+		return command, nil
+	}
+	candidates := []string{}
+	if strings.TrimSpace(command) != "" {
+		candidates = append(candidates, command)
+	}
+	if resolved, err := exec.LookPath("codex"); err == nil {
+		candidates = append(candidates, resolved)
+	}
+	homes := []string{}
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		homes = append(homes, codexHome)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		homes = append(homes, filepath.Join(home, ".codex"))
+	}
+	for _, home := range homes {
+		name := "codex"
+		if runtime.GOOS == "windows" {
+			name = "codex.exe"
+		}
+		candidates = append(candidates, filepath.Join(home, ".sandbox-bin", name))
+	}
+	seen := map[string]bool{}
+	errorsSeen := []string{}
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if seen[strings.ToLower(candidate)] {
+			continue
+		}
+		seen[strings.ToLower(candidate)] = true
+		resolved := candidate
+		if !filepath.IsAbs(candidate) {
+			if pathValue, err := exec.LookPath(candidate); err == nil {
+				resolved = pathValue
+			}
+		}
+		if info, err := os.Stat(resolved); err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		healthCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := (repair.CodexProvider{Command: resolved, Prefix: append([]string(nil), args...)}).Health(healthCtx)
+		cancel()
+		if err == nil {
+			absolute, _ := filepath.Abs(resolved)
+			return absolute, nil
+		}
+		errorsSeen = append(errorsSeen, fmt.Sprintf("%s: %s", resolved, err))
+	}
+	if len(errorsSeen) > 0 {
+		return "", fmt.Errorf("no usable authenticated Codex provider was found (%s)", strings.Join(errorsSeen, "; "))
+	}
+	return "", fmt.Errorf("Codex provider was not found; install/authenticate Codex or pass --provider-command")
 }
 
 func validateVisualHiveLauncher(config integrated.Config) (bool, string) {
