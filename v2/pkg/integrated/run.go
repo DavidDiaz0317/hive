@@ -557,6 +557,13 @@ func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.
 	if !green {
 		return false, fmt.Errorf("externally merged pull request #%d lacks green exact-head gates", finding.PRNumber)
 	}
+	if finding.Status == visualhive.StatusResolved || finding.Status == visualhive.StatusIssueClosed {
+		if err := lifecycle.MarkRecoveredMerge(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
+			return false, err
+		}
+		cleanupMergedRepairBranch(ctx, lifecycle, client, finding.Repository, finding, gate.HeadSHA)
+		return false, nil
+	}
 	if finding.Status != visualhive.StatusReady {
 		checkEvidence := make([]visualhive.CheckEvidence, 0, len(gate.Checks))
 		for _, check := range gate.Checks {
@@ -566,9 +573,15 @@ func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.
 			return false, err
 		}
 	}
+	if finding.ManualReviewKind == "merge_policy" {
+		if err := lifecycle.MarkManualReviewComplete(finding.RepositoryFingerprint, "merge_policy"); err != nil {
+			return false, err
+		}
+	}
 	if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
 		return false, err
 	}
+	cleanupMergedRepairBranch(ctx, lifecycle, client, finding.Repository, finding, gate.HeadSHA)
 	return true, nil
 }
 
@@ -580,11 +593,11 @@ func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.Findi
 	sort.Strings(keys)
 	for _, key := range keys {
 		finding := state.Findings[key]
-		if finding == nil || finding.HumanReviewRequired || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" || finding.MergeSHA != "" {
+		if finding == nil || (finding.HumanReviewRequired && finding.ManualReviewKind != "merge_policy") || finding.PRNumber <= 0 || finding.RepairCommitSHA == "" || finding.MergeSHA != "" {
 			continue
 		}
 		switch finding.Status {
-		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusNeedsRevision, visualhive.StatusReady:
+		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusNeedsRevision, visualhive.StatusReady, visualhive.StatusResolved, visualhive.StatusIssueClosed:
 			return *finding, true
 		}
 	}

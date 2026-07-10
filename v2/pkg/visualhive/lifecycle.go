@@ -285,6 +285,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				finding.ResolvedAt = nil
 				finding.ClosedAt = nil
 				finding.Recurrences++
+				resetRepairCycle(finding)
 				result.Reopened++
 				wasReopened = true
 			}
@@ -663,6 +664,27 @@ func (s *LifecycleStore) MarkMerged(repositoryFingerprint, mergeSHA string) erro
 	})
 }
 
+// MarkRecoveredMerge records the exact merge for lifecycle state written by a
+// previous Hive version that closed a repaired finding before reconciling its
+// externally reviewed PR. The finding stays resolved/closed; this method only
+// repairs the durable chain and clears a no-longer-actionable merge hold.
+func (s *LifecycleStore) MarkRecoveredMerge(repositoryFingerprint, mergeSHA string) error {
+	return s.updateFinding(repositoryFingerprint, "external_merge_recovered", func(finding *FindingLifecycle) error {
+		if finding.Status != StatusResolved && finding.Status != StatusIssueClosed {
+			return fmt.Errorf("cannot recover merge from %s", finding.Status)
+		}
+		if finding.PRNumber <= 0 || strings.TrimSpace(finding.RepairCommitSHA) == "" || strings.TrimSpace(mergeSHA) == "" {
+			return fmt.Errorf("recovered merge requires a repair PR, exact repair commit, and merge SHA")
+		}
+		if finding.MergeSHA != "" && finding.MergeSHA != strings.TrimSpace(mergeSHA) {
+			return fmt.Errorf("recovered merge SHA conflicts with persisted merge %s", finding.MergeSHA)
+		}
+		finding.MergeSHA = strings.TrimSpace(mergeSHA)
+		finding.ManualReviewKind, finding.ManualReviewReason, finding.HumanReviewRequired = "", "", false
+		return nil
+	})
+}
+
 func (s *LifecycleStore) MarkPostMergeVerifying(repositoryFingerprint, runID, runURL string) error {
 	return s.updateFinding(repositoryFingerprint, "post_merge_verifying", func(finding *FindingLifecycle) error {
 		if finding.Status != StatusMerged && finding.Status != StatusPostMergeVerifying {
@@ -701,6 +723,7 @@ func (s *LifecycleStore) MarkIssueClosed(repositoryFingerprint string, beadStore
 	}
 	now := time.Now().UTC()
 	finding.Status, finding.ClosedAt = StatusIssueClosed, &now
+	finding.ManualReviewKind, finding.ManualReviewReason, finding.HumanReviewRequired = "", "", false
 	if finding.BeadID != "" {
 		if err := beadStore.Close(finding.BeadID); err != nil {
 			return err
@@ -797,6 +820,12 @@ func (s *LifecycleStore) load() error {
 	if s.state.Outbox == nil {
 		s.state.Outbox = []*OutboxEntry{}
 	}
+	for _, finding := range s.state.Findings {
+		if finding != nil && finding.Status == StatusIssueClosed && (finding.HumanReviewRequired || finding.ManualReviewKind != "" || finding.ManualReviewReason != "") {
+			finding.HumanReviewRequired, finding.ManualReviewKind, finding.ManualReviewReason = false, "", ""
+			migrated = true
+		}
+	}
 	if migrated {
 		if err := s.persistLocked(); err != nil {
 			return fmt.Errorf("migrate lifecycle state: %w", err)
@@ -862,6 +891,22 @@ func updateFindingFromObservation(finding *FindingLifecycle, manifest Manifest, 
 	finding.LastBundleID = manifest.BundleID
 	finding.LastBundleDigest = manifest.OverallDigest
 	finding.LastWorkflowRunID = manifest.Source.WorkflowRunID
+}
+
+func resetRepairCycle(finding *FindingLifecycle) {
+	finding.Branch = ""
+	finding.RepairCommitSHA = ""
+	finding.PRNumber = 0
+	finding.PRURL = ""
+	finding.MergeSHA = ""
+	finding.ValidationRunID = ""
+	finding.ValidationRunURL = ""
+	finding.LastCheckSummary = ""
+	finding.LastCheckRuns = nil
+	finding.ManualReviewKind = ""
+	finding.ManualReviewReason = ""
+	finding.HumanReviewRequired = false
+	finding.RepairAttempts = 0
 }
 
 func beadInputForObservation(manifest Manifest, observation Observation) beads.BatchInput {
@@ -982,7 +1027,26 @@ func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef s
 			return false, fmt.Sprintf("affected contract %s was not evaluated", contract)
 		}
 	}
-	if finding.MergeSHA != "" && (finding.Status == StatusMerged || finding.Status == StatusPostMergeVerifying) && finding.MergeSHA != manifest.Source.CommitSHA {
+	hasActiveRepair := finding.Branch != "" || finding.RepairCommitSHA != "" || finding.PRNumber > 0 || finding.MergeSHA != ""
+	if hasActiveRepair && finding.Status != StatusResolved && finding.Status != StatusIssueClosed {
+		if finding.MergeSHA == "" {
+			return false, "repaired finding has no recorded merge"
+		}
+		if finding.Status != StatusPostMergeVerifying {
+			return false, "repaired finding is not in post-merge verification"
+		}
+		verificationRunID := strings.TrimSpace(options.VerificationRunID)
+		if verificationRunID == "" {
+			verificationRunID = strings.TrimSpace(manifest.Source.WorkflowRunID)
+		}
+		if finding.ValidationRunID == "" || verificationRunID != finding.ValidationRunID || manifest.Source.WorkflowRunID != finding.ValidationRunID {
+			return false, "absence did not come from the recorded post-merge verification run"
+		}
+		if options.VerificationCommitSHA != "" && options.VerificationCommitSHA != manifest.Source.CommitSHA {
+			return false, "verification commit does not match the bundle source commit"
+		}
+	}
+	if finding.MergeSHA != "" && finding.Status == StatusPostMergeVerifying && finding.MergeSHA != manifest.Source.CommitSHA {
 		verifiedDescendant := options.VerifiedMergeAncestorFingerprint == finding.RepositoryFingerprint &&
 			options.VerifiedMergeAncestorSHA == finding.MergeSHA &&
 			options.VerificationCommitSHA == manifest.Source.CommitSHA

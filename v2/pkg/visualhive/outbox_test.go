@@ -72,7 +72,8 @@ func TestProcessOutboxUsesACMMAndClosesOnlyResolvedFinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-absent", "absent", "refs/heads/main", true))
-	if _, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+	absent.Manifest.Source.WorkflowRunID = "run-19"
+	if _, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main", VerificationRunID: "run-19", VerificationCommitSHA: absent.Manifest.Source.CommitSHA}); err != nil {
 		t.Fatal(err)
 	}
 	closed := ProcessOutbox(context.Background(), lifecycle, beadStore, automation.Policy{

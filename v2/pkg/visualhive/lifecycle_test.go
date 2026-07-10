@@ -120,7 +120,10 @@ func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 
 	absentPath := writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-absent", "absent", "refs/heads/main", true)
 	absent := validateLocalBundle(t, absentPath)
-	resolved, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	absent.Manifest.Source.WorkflowRunID = "run-303"
+	resolved, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{
+		TargetRef: "main", VerificationRunID: "run-303", VerificationCommitSHA: absent.Manifest.Source.CommitSHA,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,12 +161,57 @@ func TestLifecycleIssuePRMergeCloseAndRecurrence(t *testing.T) {
 	}
 	finding, _ = lifecycle.Finding(fingerprint)
 	bead, _ = beadStore.Get(finding.BeadID)
-	if finding.Recurrences != 1 || bead.Status != beads.StatusOpen {
+	if finding.Recurrences != 1 || bead.Status != beads.StatusOpen || finding.Branch != "" || finding.RepairCommitSHA != "" || finding.PRNumber != 0 || finding.MergeSHA != "" || finding.ValidationRunID != "" || finding.RepairAttempts != 0 || finding.HumanReviewRequired || finding.ManualReviewKind != "" {
 		t.Fatalf("recurrence did not reopen existing issue/bead: finding=%+v bead=%+v", finding, bead)
 	}
 	reopenEntry := lifecycle.PendingOutbox()[0]
 	if reopenEntry.Action != OutboxReopenIssue || reopenEntry.IssueNumber != 101 {
 		t.Fatalf("expected reopen issue outbox, got %+v", reopenEntry)
+	}
+}
+
+func TestRepairedFindingCannotResolveBeforeRecordedPostMergeVerification(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-premerge-present", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 101, "https://example.test/issues/101"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-a1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(fingerprint, "repair-sha", 202, "https://example.test/pull/202"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkChecks(fingerprint, "repair-sha", true); err != nil {
+		t.Fatal(err)
+	}
+	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-premerge-absent", "absent", "refs/heads/main", true))
+	absent.Manifest.Source.WorkflowRunID = "run-before-merge"
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{
+		TargetRef: "main", VerificationRunID: "run-before-merge", VerificationCommitSHA: absent.Manifest.Source.CommitSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if result.Resolved != 0 || result.IgnoredAbsent != 1 || finding.Status != StatusReady {
+		t.Fatalf("unreconciled repair was allowed to resolve: result=%+v finding=%+v", result, finding)
+	}
+	audit, err := os.ReadFile(filepath.Join(root, "lifecycle", "visual-hive-lifecycle-audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), `"action":"resolve_finding"`) || !strings.Contains(string(audit), `"allowed":false`) || !strings.Contains(string(audit), "no recorded merge") {
+		t.Fatalf("missing denied pre-merge resolution audit: %s", audit)
 	}
 }
 
@@ -402,9 +450,11 @@ func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *test
 	}
 	manifest.Scan.EvaluatedContracts = []string{"testing-layer:2"}
 	manifest.Source.CommitSHA = "target-head"
+	manifest.Source.WorkflowRunID = "run-verified"
 	finding.Status = StatusPostMergeVerifying
 	finding.MergeSHA = "repair-merge"
-	verified := ApplyLifecycleOptions{VerificationCommitSHA: "target-head", VerifiedMergeAncestorFingerprint: "finding", VerifiedMergeAncestorSHA: "repair-merge"}
+	finding.ValidationRunID = "run-verified"
+	verified := ApplyLifecycleOptions{VerificationRunID: "run-verified", VerificationCommitSHA: "target-head", VerifiedMergeAncestorFingerprint: "finding", VerifiedMergeAncestorSHA: "repair-merge"}
 	if allowed, reason := resolutionAllowed(finding, manifest, "main", verified); !allowed {
 		t.Fatalf("verified non-conflicting descendant should be accepted: %s", reason)
 	}

@@ -107,7 +107,8 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			}
 		}
 	}
-	startNewAttempt := !resumed
+	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
+	startNewAttempt := !resumed || recurrenceChanged
 	if resumed && attempt.Stage == StageNoChange {
 		startNewAttempt = true
 	}
@@ -130,15 +131,19 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		startNewAttempt = true
 	}
 	if startNewAttempt {
-		if resumed && attempt.Stage == StageNoChange {
+		if recurrenceChanged || resumed && attempt.Stage == StageNoChange {
 			discardDirtyBranch = attempt.Branch
 		}
-		attemptNumber := max(finding.RepairAttempts+1, attempt.Attempt+1)
-		branch := fmt.Sprintf("hive/repair-%s-a%d", shortFingerprint(finding.RepositoryFingerprint), attemptNumber)
+		attemptNumber := finding.RepairAttempts + 1
+		if !recurrenceChanged {
+			attemptNumber = max(attemptNumber, attempt.Attempt+1)
+		}
+		branch := repairBranchName(finding.RepositoryFingerprint, finding.Recurrences, attemptNumber)
 		priorModelSummary := attempt.ModelSummary
 		attempt = Attempt{
 			Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, Attempt: attemptNumber,
-			Branch: branch, Worktree: filepath.Join(w.Config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint)),
+			Recurrence: finding.Recurrences,
+			Branch:     branch, Worktree: filepath.Join(w.Config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint)),
 			Stage: StagePrepared, Provider: w.Provider.Name(), PriorModelSummary: priorModelSummary, StartedAt: time.Now().UTC(),
 		}
 		if err := w.authorize(finding, automation.ActionCreateBranch, nil, attempt.Attempt); err != nil {
@@ -631,6 +636,13 @@ func repairPRBody(marker string, finding visualhive.FindingLifecycle, attempt At
 func shortFingerprint(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:12]
+}
+
+func repairBranchName(repositoryFingerprint string, recurrence, attempt int) string {
+	if recurrence <= 0 {
+		return fmt.Sprintf("hive/repair-%s-a%d", shortFingerprint(repositoryFingerprint), attempt)
+	}
+	return fmt.Sprintf("hive/repair-%s-r%d-a%d", shortFingerprint(repositoryFingerprint), recurrence, attempt)
 }
 
 func repairActor(hint string) string {

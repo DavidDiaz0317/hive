@@ -187,6 +187,65 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 	}
 }
 
+func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &fakeProvider{}
+	lifecycle := &fakeLifecycle{}
+	pulls := &fakePRClient{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:recurrence", Status: visualhive.StatusIssueOpen,
+		Title: "Repair recurring value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
+		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	first, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding.Recurrences = 1
+	second, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, _ := state.Get(finding.RepositoryFingerprint)
+	if first.Branch == second.Branch || !strings.Contains(second.Branch, "-r1-a1") || provider.runs != 2 || pulls.calls != 2 || lifecycle.starts != 2 || attempt.Recurrence != 1 || attempt.Attempt != 1 {
+		t.Fatalf("recurrence did not start a fresh bounded repair cycle: first=%+v second=%+v attempt=%+v runs=%d pulls=%d starts=%d", first, second, attempt, provider.runs, pulls.calls, lifecycle.starts)
+	}
+}
+
+func TestRepairStateMigratesV2WithInitialRecurrence(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"schema_version":"hive.repair-worker-state.v2","attempts":{"finding":{"repository":"owner/repo","repository_fingerprint":"finding","attempt":2,"branch":"hive/repair-proof-a2","worktree":"worktree","stage":"pr_open","provider":"codex","started_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}}}`
+	path := filepath.Join(dir, "repair-worker-state.json")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, exists := store.Get("finding")
+	if !exists || attempt.Recurrence != 0 || store.Snapshot().SchemaVersion != StateSchema {
+		t.Fatalf("v2 repair state was not migrated: exists=%t attempt=%+v state=%+v", exists, attempt, store.Snapshot())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), StateSchema) {
+		t.Fatalf("migrated repair schema was not persisted: %q err=%v", data, err)
+	}
+}
+
 func TestWorkerDeniesModelAtLowerACMMBeforeRun(t *testing.T) {
 	repository, _ := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))

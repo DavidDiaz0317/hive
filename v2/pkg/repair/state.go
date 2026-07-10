@@ -11,7 +11,8 @@ import (
 
 const (
 	StateSchemaV1 = "hive.repair-worker-state.v1"
-	StateSchema   = "hive.repair-worker-state.v2"
+	StateSchemaV2 = "hive.repair-worker-state.v2"
+	StateSchema   = "hive.repair-worker-state.v3"
 )
 
 type Stage string
@@ -29,6 +30,7 @@ const (
 type Attempt struct {
 	Repository            string          `json:"repository"`
 	RepositoryFingerprint string          `json:"repository_fingerprint"`
+	Recurrence            int             `json:"recurrence,omitempty"`
 	Attempt               int             `json:"attempt"`
 	Branch                string          `json:"branch"`
 	Worktree              string          `json:"worktree"`
@@ -112,7 +114,7 @@ func NewStore(dir string) (*Store, error) {
 			return nil, fmt.Errorf("parse repair worker state: %w", err)
 		}
 		migrated := false
-		if store.data.SchemaVersion == StateSchemaV1 {
+		if store.data.SchemaVersion == StateSchemaV1 || store.data.SchemaVersion == StateSchemaV2 {
 			store.data.SchemaVersion = StateSchema
 			migrated = true
 		} else if store.data.SchemaVersion != StateSchema {
