@@ -118,3 +118,31 @@ func TestUpsertRepairPullRequestRejectsMarkerOnAnotherBranch(t *testing.T) {
 		t.Fatalf("cross-branch duplicate was not rejected: calls=%d err=%v", createCalls, err)
 	}
 }
+
+func TestListMergedBaselineBranchesRequiresLiveExactLabeledMerge(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	repairHead := strings.Repeat("b", 40)
+	marker := fmt.Sprintf("<!-- hive-baseline-review: %s:%s -->", fingerprint, repairHead)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/matching-refs/heads/hive/baseline-":
+			_, _ = io.WriteString(writer, `[{"ref":"refs/heads/hive/baseline-proof","object":{"sha":"baseline-head","type":"commit"}}]`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls" && request.URL.Query().Get("state") == "closed":
+			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":137,"body":%q,"head":{"ref":"hive/baseline-proof","sha":"baseline-head"},"base":{"ref":"main"},"labels":[{"name":"hive/baseline-review"}]}]`, marker))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/137":
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":137,"html_url":"https://example.test/pull/137","state":"closed","merged":true,"body":%q,"head":{"ref":"hive/baseline-proof","sha":"baseline-head"},"base":{"ref":"main"},"labels":[{"name":"hive/baseline-review"}]}`, marker))
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	branches, err := client.ListMergedBaselineBranches(context.Background(), "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 1 || branches[0].PRNumber != 137 || branches[0].RepositoryFingerprint != fingerprint || branches[0].Branch != "hive/baseline-proof" || branches[0].HeadSHA != "baseline-head" {
+		t.Fatalf("unexpected merged baseline branches: %+v", branches)
+	}
+}

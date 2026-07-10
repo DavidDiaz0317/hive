@@ -184,6 +184,28 @@ func reconcileApprovedBaselineBranches(ctx context.Context, stateDir string, con
 			lifecycle.RecordAuthorization(key, "approved_baseline_branch_reconciled", true, fmt.Sprintf("deleted %s at exact reviewed head %s from proposal PR #%d", attempt.BaselineReview.ProposalBranch, attempt.BaselineReview.ProposalCommitSHA, attempt.BaselineReview.ProposalPRNumber))
 		}
 	}
+	legacy, err := client.ListMergedBaselineBranches(ctx, config.Repository, config.DefaultBranch)
+	if err != nil {
+		return err
+	}
+	for _, proposal := range legacy {
+		actor, attempts := "quality", 0
+		if finding, exists := lifecycle.Finding(proposal.RepositoryFingerprint); exists {
+			actor, attempts = repairActor(finding.OwningAgentHint), finding.RepairAttempts
+		}
+		decision := policy.Authorize(automation.ActionRequest{Action: automation.ActionDeleteBaselineBranch, Agent: actor, Repository: config.Repository, RepairAttempts: attempts})
+		lifecycle.RecordAuthorization(proposal.RepositoryFingerprint, string(automation.ActionDeleteBaselineBranch), decision.Allowed, fmt.Sprintf("legacy proposal PR #%d: %s", proposal.PRNumber, strings.Join(decision.Reasons, "; ")))
+		if !decision.Allowed {
+			return fmt.Errorf("delete legacy baseline branch %s denied: %s", proposal.Branch, strings.Join(decision.Reasons, "; "))
+		}
+		deleted, err := client.DeleteBaselineBranchExact(ctx, config.Repository, proposal.Branch, proposal.HeadSHA)
+		if err != nil {
+			return err
+		}
+		if deleted {
+			lifecycle.RecordAuthorization(proposal.RepositoryFingerprint, "legacy_baseline_branch_reconciled", true, fmt.Sprintf("deleted %s at exact merged proposal head %s from PR #%d", proposal.Branch, proposal.HeadSHA, proposal.PRNumber))
+		}
+	}
 	return nil
 }
 

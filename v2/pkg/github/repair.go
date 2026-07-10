@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,6 +24,14 @@ type OpenRepairPullRequest struct {
 	URL     string `json:"url"`
 	Branch  string `json:"branch"`
 	HeadSHA string `json:"head_sha"`
+}
+
+type MergedBaselineBranch struct {
+	PRNumber              int    `json:"pr_number"`
+	PRURL                 string `json:"pr_url"`
+	RepositoryFingerprint string `json:"repository_fingerprint"`
+	Branch                string `json:"branch"`
+	HeadSHA               string `json:"head_sha"`
 }
 
 // UpsertRepairPullRequest creates or updates exactly one open repair PR for a
@@ -148,8 +157,78 @@ func (c *Client) CloseRepairPullRequestExact(ctx context.Context, repository str
 }
 
 func (c *Client) listOpenPullRequests(ctx context.Context, owner, repo, base string) ([]*gh.PullRequest, error) {
+	return c.listPullRequestsByState(ctx, owner, repo, base, "open")
+}
+
+// ListMergedBaselineBranches returns only still-existing Hive baseline refs
+// that are proven to be the exact heads of merged, labeled baseline-review PRs.
+// This recovers branches created by older Hive versions even if their local
+// repair checkpoint was later superseded.
+func (c *Client) ListMergedBaselineBranches(ctx context.Context, repository, base string) ([]MergedBaselineBranch, error) {
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	refOptions := &gh.ReferenceListOptions{Ref: "heads/hive/baseline-", ListOptions: gh.ListOptions{PerPage: 100}}
+	for {
+		page, response, err := c.client.Git.ListMatchingRefs(ctx, owner, repo, refOptions)
+		if err != nil {
+			return nil, fmt.Errorf("list Hive baseline refs: %w", err)
+		}
+		for _, ref := range page {
+			branch := strings.TrimPrefix(ref.GetRef(), "refs/heads/")
+			if strings.HasPrefix(branch, "hive/baseline-") && ref.GetObject().GetSHA() != "" {
+				refs[branch] = ref.GetObject().GetSHA()
+			}
+		}
+		if response.NextPage == 0 {
+			break
+		}
+		refOptions.Page = response.NextPage
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	pulls, err := c.listPullRequestsByState(ctx, owner, repo, base, "closed")
+	if err != nil {
+		return nil, fmt.Errorf("list closed baseline review pull requests: %w", err)
+	}
+	byBranch := map[string]MergedBaselineBranch{}
+	for _, summary := range pulls {
+		branch := summary.GetHead().GetRef()
+		expectedSHA, exists := refs[branch]
+		if !exists || !hasExactLabel(summary.Labels, "hive/baseline-review") {
+			continue
+		}
+		pull, _, err := c.client.PullRequests.Get(ctx, owner, repo, summary.GetNumber())
+		if err != nil {
+			return nil, fmt.Errorf("get baseline review pull request #%d: %w", summary.GetNumber(), err)
+		}
+		fingerprint, marked := baselineReviewFingerprint(pull.GetBody())
+		if !pull.GetMerged() || pull.GetHead().GetRef() != branch || pull.GetHead().GetSHA() != expectedSHA || !hasExactLabel(pull.Labels, "hive/baseline-review") || !marked {
+			continue
+		}
+		if _, duplicate := byBranch[branch]; duplicate {
+			return nil, fmt.Errorf("multiple merged baseline review PRs claim branch %s", branch)
+		}
+		byBranch[branch] = MergedBaselineBranch{PRNumber: pull.GetNumber(), PRURL: pull.GetHTMLURL(), RepositoryFingerprint: fingerprint, Branch: branch, HeadSHA: expectedSHA}
+	}
+	if len(byBranch) != len(refs) {
+		return nil, fmt.Errorf("a live Hive baseline branch lacks an exact merged baseline-review PR")
+	}
+	branches := make([]MergedBaselineBranch, 0, len(byBranch))
+	for _, branch := range byBranch {
+		branches = append(branches, branch)
+	}
+	sort.Slice(branches, func(i, j int) bool { return branches[i].PRNumber < branches[j].PRNumber })
+	return branches, nil
+}
+
+func (c *Client) listPullRequestsByState(ctx context.Context, owner, repo, base, state string) ([]*gh.PullRequest, error) {
 	result := make([]*gh.PullRequest, 0)
-	options := &gh.PullRequestListOptions{State: "open", Base: base, ListOptions: gh.ListOptions{PerPage: 100}}
+	options := &gh.PullRequestListOptions{State: state, Base: base, ListOptions: gh.ListOptions{PerPage: 100}}
 	for {
 		pulls, response, err := c.client.PullRequests.List(ctx, owner, repo, options)
 		if err != nil {
@@ -161,6 +240,35 @@ func (c *Client) listOpenPullRequests(ctx context.Context, owner, repo, base str
 		}
 		options.Page = response.NextPage
 	}
+}
+
+func hasExactLabel(labels []*gh.Label, expected string) bool {
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label.GetName()), expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func baselineReviewFingerprint(body string) (string, bool) {
+	const prefix = "<!-- hive-baseline-review: "
+	line := strings.TrimSpace(strings.SplitN(body, "\n", 2)[0])
+	if !strings.HasPrefix(line, prefix) || !strings.HasSuffix(line, " -->") {
+		return "", false
+	}
+	payload := strings.TrimSuffix(strings.TrimPrefix(line, prefix), " -->")
+	parts := strings.Split(payload, ":")
+	if len(parts) != 2 || len(parts[0]) != 64 || len(parts[1]) != 40 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(parts[0]); err != nil {
+		return "", false
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return "", false
+	}
+	return parts[0], true
 }
 
 func (c *Client) ensureLabel(ctx context.Context, owner, repo, name, color string) error {
