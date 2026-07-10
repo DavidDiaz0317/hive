@@ -3,6 +3,7 @@ package integrated
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -359,7 +360,8 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
-				Policy: policy, AllowedRepairPaths: config.AllowedRepairPaths, ValidationCommands: commands,
+				Policy: policy, AllowedRepairPaths: config.AllowedRepairPaths, PreparationCommands: repairPreparationCommands(config.CheckoutDir), ValidationCommands: commands,
+				Environment:  repairValidationEnvironment(config),
 				ModelTimeout: 20 * time.Minute, CommandTimeout: 15 * time.Minute,
 			},
 			Provider: repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}, State: state, Lifecycle: lifecycle, GitHub: client,
@@ -371,6 +373,34 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		return []repair.Result{result}, nil // repository concurrency budget defaults to one repair
 	}
 	return nil, nil
+}
+
+func repairPreparationCommands(checkout string) []repair.Command {
+	for _, candidate := range []struct {
+		lockfile string
+		command  repair.Command
+	}{
+		{"package-lock.json", repair.Command{Name: "npm", Args: []string{"ci"}}},
+		{"pnpm-lock.yaml", repair.Command{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}}},
+		{"yarn.lock", repair.Command{Name: "yarn", Args: []string{"install", "--immutable"}}},
+		{"bun.lock", repair.Command{Name: "bun", Args: []string{"install", "--frozen-lockfile"}}},
+		{"bun.lockb", repair.Command{Name: "bun", Args: []string{"install", "--frozen-lockfile"}}},
+	} {
+		if _, err := os.Stat(filepath.Join(checkout, candidate.lockfile)); err == nil {
+			return []repair.Command{candidate.command}
+		}
+	}
+	return nil
+}
+
+func repairValidationEnvironment(config Config) map[string]string {
+	for _, argument := range config.VisualHiveArgs {
+		trimmed := strings.TrimSpace(argument)
+		if filepath.IsAbs(trimmed) && (strings.HasSuffix(strings.ToLower(trimmed), ".js") || strings.HasSuffix(strings.ToLower(trimmed), ".mjs") || strings.HasSuffix(strings.ToLower(trimmed), ".cjs")) {
+			return map[string]string{"VISUAL_HIVE_CLI": trimmed}
+		}
+	}
+	return nil
 }
 
 func activeRepairFinding(state visualhive.LifecycleState) (visualhive.FindingLifecycle, bool) {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -34,14 +35,16 @@ type Command struct {
 }
 
 type Config struct {
-	RepositoryDir      string
-	WorktreeRoot       string
-	BaseBranch         string
-	Policy             automation.Policy
-	AllowedRepairPaths []string
-	ValidationCommands []Command
-	ModelTimeout       time.Duration
-	CommandTimeout     time.Duration
+	RepositoryDir       string
+	WorktreeRoot        string
+	BaseBranch          string
+	Policy              automation.Policy
+	AllowedRepairPaths  []string
+	PreparationCommands []Command
+	ValidationCommands  []Command
+	Environment         map[string]string
+	ModelTimeout        time.Duration
+	CommandTimeout      time.Duration
 }
 
 type Result struct {
@@ -105,6 +108,11 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err := w.authorize(finding, automation.ActionRepairModel, nil); err != nil {
 			return Result{}, err
 		}
+		for _, command := range w.Config.PreparationCommands {
+			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "preparation"); err != nil {
+				return Result{}, err
+			}
+		}
 		if finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued || finding.Status == visualhive.StatusNeedsRevision {
 			if err := w.Lifecycle.MarkRepairStarted(finding.RepositoryFingerprint, attempt.Branch); err != nil {
 				return Result{}, err
@@ -145,7 +153,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, err
 		}
 		for _, command := range w.Config.ValidationCommands {
-			if err := runValidation(ctx, attempt.Worktree, command, w.Config.CommandTimeout); err != nil {
+			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "validation"); err != nil {
 				return Result{}, err
 			}
 		}
@@ -318,9 +326,9 @@ func matchPathPattern(pattern, file string) bool {
 	return matched
 }
 
-func runValidation(ctx context.Context, worktree string, command Command, timeout time.Duration) error {
+func runRepairCommand(ctx context.Context, worktree string, command Command, timeout time.Duration, environment map[string]string, phase string) error {
 	if strings.TrimSpace(command.Name) == "" {
-		return fmt.Errorf("validation command executable is required")
+		return fmt.Errorf("%s command executable is required", phase)
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -329,13 +337,40 @@ func runValidation(ctx context.Context, worktree string, command Command, timeou
 	defer cancel()
 	process := exec.CommandContext(commandCtx, command.Name, command.Args...)
 	process.Dir = worktree
-	process.Env = providerEnvironment()
+	process.Env = commandEnvironment(environment)
 	var output limitedBuffer
 	process.Stdout, process.Stderr = &output, &output
 	if err := process.Run(); err != nil {
-		return fmt.Errorf("validation %s failed: %w: %s", command.Name, err, safeExcerpt(output.String()))
+		return fmt.Errorf("%s %s failed: %w: %s", phase, command.Name, err, safeExcerpt(output.String()))
 	}
 	return nil
+}
+
+func commandEnvironment(overrides map[string]string) []string {
+	base := providerEnvironment()
+	if len(overrides) == 0 {
+		return base
+	}
+	result := make([]string, 0, len(base)+len(overrides))
+	for _, pair := range base {
+		name, _, _ := strings.Cut(pair, "=")
+		if _, overridden := overrides[name]; !overridden {
+			result = append(result, pair)
+		}
+	}
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	validName := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	for _, key := range keys {
+		if !validName.MatchString(key) || blockedEnvironmentName.MatchString(key) {
+			continue
+		}
+		result = append(result, key+"="+overrides[key])
+	}
+	return result
 }
 
 func commitRepair(ctx context.Context, worktree string, files []string, title string, issue int) (string, error) {

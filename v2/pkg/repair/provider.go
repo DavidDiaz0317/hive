@@ -66,11 +66,10 @@ func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) error {
 }
 
 func providerEnvironment() []string {
-	blocked := regexp.MustCompile(`(?i)(^|_)(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)($|_)`)
 	result := make([]string, 0, len(os.Environ()))
 	for _, pair := range os.Environ() {
 		name, _, _ := strings.Cut(pair, "=")
-		if blocked.MatchString(name) || strings.EqualFold(name, "GH_TOKEN") || strings.EqualFold(name, "GITHUB_TOKEN") {
+		if blockedEnvironmentName.MatchString(name) || strings.EqualFold(name, "GH_TOKEN") || strings.EqualFold(name, "GITHUB_TOKEN") {
 			continue
 		}
 		result = append(result, pair)
@@ -78,6 +77,8 @@ func providerEnvironment() []string {
 	result = append(result, "GIT_TERMINAL_PROMPT=0")
 	return result
 }
+
+var blockedEnvironmentName = regexp.MustCompile(`(?i)(^|_)(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)($|_)`)
 
 type limitedBuffer struct{ bytes.Buffer }
 

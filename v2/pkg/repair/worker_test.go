@@ -15,17 +15,70 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
-type fakeProvider struct{ runs int }
+type fakeProvider struct {
+	runs           int
+	requiredMarker string
+}
 
 func (p *fakeProvider) Name() string                 { return "test-model" }
 func (p *fakeProvider) Health(context.Context) error { return nil }
 func (p *fakeProvider) Run(_ context.Context, worktree, _ string) error {
+	if p.requiredMarker != "" {
+		if _, err := os.Stat(p.requiredMarker); err != nil {
+			return fmt.Errorf("repair preparation marker is missing: %w", err)
+		}
+	}
 	p.runs++
 	value := "fixed\n"
 	if p.runs > 1 {
 		value = "fixed again\n"
 	}
 	return os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte(value), 0o600)
+}
+
+func TestRepairPreparationHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_REPAIR_PREPARATION_HELPER") != "1" {
+		return
+	}
+	marker := os.Args[len(os.Args)-1]
+	if err := os.WriteFile(marker, []byte("prepared\n"), 0o600); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestWorkerPreparesIsolatedWorktreeBeforeModel(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "prepared")
+	t.Setenv("GO_WANT_REPAIR_PREPARATION_HELPER", "1")
+	provider := &fakeProvider{requiredMarker: marker}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:              automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths:  []string{"src/**"},
+			PreparationCommands: []Command{{Name: os.Args[0], Args: []string{"-test.run=^TestRepairPreparationHelperProcess$", "--", marker}}},
+			ValidationCommands:  []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout:        time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: provider, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{},
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:prepared", Fingerprint: "prepared",
+		Status: visualhive.StatusIssueOpen, Title: "Repair prepared value", Body: "Value should be fixed.",
+		IssueKind: "functional", Severity: "medium", OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+
+	if _, err := worker.Run(context.Background(), finding); err != nil {
+		t.Fatal(err)
+	}
+	if provider.runs != 1 {
+		t.Fatalf("provider runs = %d, want 1", provider.runs)
+	}
 }
 
 type fakeLifecycle struct {
