@@ -93,6 +93,9 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
 		return result, err
 	}
+	if err := reconcileApprovedBaselineBranches(runCtx, options.StateDir, config, lifecycle, options.GitHub, policy); err != nil {
+		return result, err
+	}
 	if err := reconcileOpenRepairDuplicates(runCtx, config, lifecycle, options.GitHub, policy); err != nil {
 		return result, err
 	}
@@ -146,6 +149,42 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	}
 	result.CompletedAt = time.Now().UTC()
 	return result, nil
+}
+
+func reconcileApprovedBaselineBranches(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) error {
+	state, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		return err
+	}
+	snapshot := state.Snapshot()
+	keys := make([]string, 0, len(snapshot.Attempts))
+	for key := range snapshot.Attempts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		attempt := snapshot.Attempts[key]
+		if attempt == nil || attempt.BaselineReview == nil || attempt.BaselineReview.Status != repair.BaselineReviewApproved || attempt.BaselineReview.ProposalBranch == "" || attempt.BaselineReview.ProposalCommitSHA == "" {
+			continue
+		}
+		finding, exists := lifecycle.Finding(key)
+		if !exists {
+			return fmt.Errorf("approved baseline branch lost its finding lifecycle")
+		}
+		decision := policy.Authorize(automation.ActionRequest{Action: automation.ActionDeleteBaselineBranch, Agent: repairActor(finding.OwningAgentHint), Repository: config.Repository, RepairAttempts: finding.RepairAttempts})
+		lifecycle.RecordAuthorization(key, string(automation.ActionDeleteBaselineBranch), decision.Allowed, strings.Join(decision.Reasons, "; "))
+		if !decision.Allowed {
+			return fmt.Errorf("delete approved baseline branch %s denied: %s", attempt.BaselineReview.ProposalBranch, strings.Join(decision.Reasons, "; "))
+		}
+		deleted, err := client.DeleteBaselineBranchExact(ctx, config.Repository, attempt.BaselineReview.ProposalBranch, attempt.BaselineReview.ProposalCommitSHA)
+		if err != nil {
+			return err
+		}
+		if deleted {
+			lifecycle.RecordAuthorization(key, "approved_baseline_branch_reconciled", true, fmt.Sprintf("deleted %s at exact reviewed head %s from proposal PR #%d", attempt.BaselineReview.ProposalBranch, attempt.BaselineReview.ProposalCommitSHA, attempt.BaselineReview.ProposalPRNumber))
+		}
+	}
+	return nil
 }
 
 func reconcileOpenRepairDuplicates(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) error {

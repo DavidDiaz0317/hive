@@ -145,29 +145,42 @@ func (c *Client) MergePullRequestExact(ctx context.Context, repository string, n
 // still points at the exact head that passed merge gates. A moved branch is
 // preserved for investigation instead of being deleted by name alone.
 func (c *Client) DeleteRepairBranchExact(ctx context.Context, repository, branch, expectedHeadSHA string) error {
+	_, err := c.deleteHiveBranchExact(ctx, repository, branch, expectedHeadSHA, "hive/repair-")
+	return err
+}
+
+// DeleteBaselineBranchExact removes only a Hive baseline-review branch whose
+// current ref still points at the exact reviewed proposal head. The bool is
+// false when GitHub already removed the branch, making restart reconciliation
+// idempotent without obscuring whether a mutation occurred.
+func (c *Client) DeleteBaselineBranchExact(ctx context.Context, repository, branch, expectedHeadSHA string) (bool, error) {
+	return c.deleteHiveBranchExact(ctx, repository, branch, expectedHeadSHA, "hive/baseline-")
+}
+
+func (c *Client) deleteHiveBranchExact(ctx context.Context, repository, branch, expectedHeadSHA, requiredPrefix string) (bool, error) {
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
-		return err
+		return false, err
 	}
 	branch = strings.TrimSpace(branch)
 	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
-	if !strings.HasPrefix(branch, "hive/repair-") || expectedHeadSHA == "" {
-		return fmt.Errorf("exact Hive repair branch and expected head SHA are required")
+	if !strings.HasPrefix(branch, requiredPrefix) || expectedHeadSHA == "" {
+		return false, fmt.Errorf("exact Hive %s branch and expected head SHA are required", strings.TrimSuffix(strings.TrimPrefix(requiredPrefix, "hive/"), "-"))
 	}
 	ref, response, err := c.client.Git.GetRef(ctx, owner, repo, "heads/"+branch)
 	if err != nil {
 		if response != nil && response.StatusCode == http.StatusNotFound {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("read merged repair branch %s: %w", branch, err)
+		return false, fmt.Errorf("read Hive branch %s: %w", branch, err)
 	}
 	if ref.GetObject().GetSHA() != expectedHeadSHA {
-		return fmt.Errorf("refusing to delete moved repair branch %s: got %s, expected %s", branch, ref.GetObject().GetSHA(), expectedHeadSHA)
+		return false, fmt.Errorf("refusing to delete moved Hive branch %s: got %s, expected %s", branch, ref.GetObject().GetSHA(), expectedHeadSHA)
 	}
 	if _, err := c.client.Git.DeleteRef(ctx, owner, repo, "heads/"+branch); err != nil {
-		return fmt.Errorf("delete merged repair branch %s: %w", branch, err)
+		return false, fmt.Errorf("delete Hive branch %s: %w", branch, err)
 	}
-	return nil
+	return true, nil
 }
 
 func (c *Client) listPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]string, error) {

@@ -251,6 +251,71 @@ func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) 
 	}
 }
 
+func TestReconcileApprovedBaselineBranchDeletesExactReviewedRef(t *testing.T) {
+	deleted := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/baseline-reviewed":
+			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/baseline-reviewed","object":{"sha":"reviewed-head","type":"commit"}}`)
+		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/baseline-reviewed":
+			deleted++
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	stateDir := t.TempDir()
+	lifecycleState := visualhive.LifecycleState{
+		SchemaVersion: visualhive.LifecycleSchema,
+		Findings: map[string]*visualhive.FindingLifecycle{
+			"finding": {
+				Repository: "owner/repo", RepositoryFingerprint: "finding", Status: visualhive.StatusIssueClosed,
+				IssueNumber: 10, RepairAttempts: 2, OwningAgentHint: "quality",
+			},
+		},
+		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
+	}
+	data, err := json.Marshal(lifecycleState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycleDir := filepath.Join(stateDir, "visual-hive")
+	if err := os.MkdirAll(lifecycleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lifecycleDir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(lifecycleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairStore, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repairStore.Put(repair.Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: "finding", Attempt: 2,
+		BaselineReview: &repair.BaselineReview{
+			Status: repair.BaselineReviewApproved, ProposalBranch: "hive/baseline-reviewed",
+			ProposalCommitSHA: "reviewed-head", ProposalPRNumber: 29,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	policy := automation.Policy{ACMMLevel: 6, Mode: automation.ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 5}
+	if err := reconcileApprovedBaselineBranches(context.Background(), stateDir, Config{Repository: "owner/repo"}, lifecycle, client, policy); err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("approved baseline branch deletion count = %d, want 1", deleted)
+	}
+}
+
 func TestReconcileExternallyMergedRepairRecoversLegacyClosedState(t *testing.T) {
 	deleted := 0
 	server := newMergedRepairServer(t, &deleted)

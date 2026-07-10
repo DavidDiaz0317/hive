@@ -33,6 +33,7 @@ const (
 	ActionCreatePR             Action = "create_pr"
 	ActionCloseRepairPR        Action = "close_repair_pr"
 	ActionDeleteRepairBranch   Action = "delete_repair_branch"
+	ActionDeleteBaselineBranch Action = "delete_baseline_branch"
 	ActionCreateBaselineReview Action = "create_baseline_review"
 	ActionApplyBaselineReview  Action = "apply_baseline_review"
 	ActionMergePR              Action = "merge_pr"
@@ -125,7 +126,7 @@ func (p Policy) Authorize(request ActionRequest) Decision {
 		reasons = append(reasons, fmt.Sprintf("ACMM L%d does not permit agent %s to perform %s", p.ACMMLevel, valueOr(request.Agent, "unknown"), request.Action))
 	}
 
-	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionCloseRepairPR || request.Action == ActionDeleteRepairBranch || request.Action == ActionCreateBaselineReview || request.Action == ActionApplyBaselineReview || request.Action == ActionMergePR {
+	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionCloseRepairPR || request.Action == ActionDeleteRepairBranch || request.Action == ActionDeleteBaselineBranch || request.Action == ActionCreateBaselineReview || request.Action == ActionApplyBaselineReview || request.Action == ActionMergePR {
 		maxAttempts := p.MaxRepairAttempts
 		if maxAttempts <= 0 {
 			maxAttempts = 3
@@ -196,7 +197,7 @@ func modeForAction(action Action) Mode {
 		return ModeAdvisory
 	case ActionCreateIssue, ActionUpdateIssue, ActionCloseIssue, ActionReopenIssue:
 		return ModeIssues
-	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionCreateBaselineReview, ActionApplyBaselineReview:
+	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionDeleteBaselineBranch, ActionCreateBaselineReview, ActionApplyBaselineReview:
 		return ModeRepairPR
 	case ActionMergePR:
 		return ModeAutoMerge

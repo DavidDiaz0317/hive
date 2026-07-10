@@ -81,6 +81,34 @@ func TestDeleteRepairBranchRequiresExactUnmovedHead(t *testing.T) {
 	}
 }
 
+func TestDeleteBaselineBranchRequiresExactReviewedHead(t *testing.T) {
+	deleted := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/baseline-proof":
+			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/baseline-proof","object":{"sha":"reviewed-head","type":"commit"}}`)
+		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/baseline-proof":
+			deleted++
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	if _, err := client.DeleteBaselineBranchExact(context.Background(), "owner/repo", "hive/baseline-proof", "different"); err == nil || deleted != 0 {
+		t.Fatalf("moved baseline branch must be preserved: deleted=%d err=%v", deleted, err)
+	}
+	wasDeleted, err := client.DeleteBaselineBranchExact(context.Background(), "owner/repo", "hive/baseline-proof", "reviewed-head")
+	if err != nil || !wasDeleted || deleted != 1 {
+		t.Fatalf("exact baseline branch was not deleted: wasDeleted=%t deleted=%d err=%v", wasDeleted, deleted, err)
+	}
+	if _, err := client.DeleteBaselineBranchExact(context.Background(), "owner/repo", "hive/repair-proof", "reviewed-head"); err == nil {
+		t.Fatal("non-baseline branch deletion must be rejected")
+	}
+}
+
 func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
