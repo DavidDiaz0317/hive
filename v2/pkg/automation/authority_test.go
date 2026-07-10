@@ -87,6 +87,11 @@ func TestAutoMergeRequiresEveryProductionGate(t *testing.T) {
 	if decision := policy.Authorize(valid); !decision.Allowed {
 		t.Fatalf("valid merge was denied: %v", decision.Reasons)
 	}
+	finalAttempt := valid
+	finalAttempt.RepairAttempts = policy.MaxRepairAttempts
+	if decision := policy.Authorize(finalAttempt); !decision.Allowed {
+		t.Fatalf("the final configured repair attempt must remain merge-eligible: %v", decision.Reasons)
+	}
 
 	cases := map[string]func(*ActionRequest){
 		"stale SHA":        func(r *ActionRequest) { r.TestedHeadSHA = "old" },
@@ -98,7 +103,7 @@ func TestAutoMergeRequiresEveryProductionGate(t *testing.T) {
 		"baseline":         func(r *ActionRequest) { r.BaselineChanged = true },
 		"workflow":         func(r *ActionRequest) { r.WorkflowChanged = true },
 		"unsafe path":      func(r *ActionRequest) { r.ChangedFiles = []string{"src/auth/session.ts"} },
-		"budget exhausted": func(r *ActionRequest) { r.RepairAttempts = 3 },
+		"budget exhausted": func(r *ActionRequest) { r.RepairAttempts = 4 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

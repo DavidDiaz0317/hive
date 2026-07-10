@@ -119,7 +119,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			Branch: branch, Worktree: filepath.Join(w.Config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint)),
 			Stage: StagePrepared, Provider: w.Provider.Name(), PriorModelSummary: priorModelSummary, StartedAt: time.Now().UTC(),
 		}
-		if err := w.authorize(finding, automation.ActionCreateBranch, nil); err != nil {
+		if err := w.authorize(finding, automation.ActionCreateBranch, nil, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
 		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, discardDirtyBranch); err != nil {
@@ -131,7 +131,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	}
 
 	if attempt.Stage == StagePrepared {
-		if err := w.authorize(finding, automation.ActionRepairModel, nil); err != nil {
+		if err := w.authorize(finding, automation.ActionRepairModel, nil, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
 		for _, command := range w.Config.PreparationCommands {
@@ -200,7 +200,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				_ = w.State.Put(attempt)
 				return Result{}, err
 			}
-			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles); err != nil {
+			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
 				return Result{}, err
@@ -264,7 +264,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	}
 
 	if attempt.Stage == StageValidated {
-		if err := w.authorize(finding, automation.ActionCommit, attempt.ChangedFiles); err != nil {
+		if err := w.authorize(finding, automation.ActionCommit, attempt.ChangedFiles, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
 		sha, err := commitRepair(ctx, attempt.Worktree, attempt.ChangedFiles, finding.Title, finding.IssueNumber)
@@ -278,7 +278,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	}
 
 	if attempt.Stage == StageCommitted {
-		if err := w.authorize(finding, automation.ActionPush, attempt.ChangedFiles); err != nil {
+		if err := w.authorize(finding, automation.ActionPush, attempt.ChangedFiles, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
 		if _, err := runGit(ctx, attempt.Worktree, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+attempt.Branch); err != nil {
@@ -291,7 +291,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	}
 
 	if attempt.Stage == StagePushed {
-		if err := w.authorize(finding, automation.ActionCreatePR, attempt.ChangedFiles); err != nil {
+		if err := w.authorize(finding, automation.ActionCreatePR, attempt.ChangedFiles, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
 		marker := fmt.Sprintf("<!-- hive-repair: %s -->", finding.RepositoryFingerprint)
@@ -353,10 +353,10 @@ func (w *Worker) validate(finding visualhive.FindingLifecycle) error {
 	return os.MkdirAll(w.Config.WorktreeRoot, 0o700)
 }
 
-func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automation.Action, files []string) error {
+func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automation.Action, files []string, attemptNumber int) error {
 	decision := w.Config.Policy.Authorize(automation.ActionRequest{
 		Action: action, Agent: repairActor(finding.OwningAgentHint), Repository: finding.Repository,
-		RepairAttempts: finding.RepairAttempts, Risk: riskForFiles(files), ChangedFiles: files,
+		RepairAttempts: attemptNumber, Risk: riskForFiles(files), ChangedFiles: files,
 	})
 	w.Lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(action), decision.Allowed, strings.Join(decision.Reasons, "; "))
 	if !decision.Allowed {

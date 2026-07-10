@@ -128,7 +128,7 @@ func (p Policy) Authorize(request ActionRequest) Decision {
 		if maxAttempts <= 0 {
 			maxAttempts = 3
 		}
-		if request.RepairAttempts >= maxAttempts {
+		if request.RepairAttempts > maxAttempts {
 			reasons = append(reasons, "repair attempt budget is exhausted")
 		}
 	}
