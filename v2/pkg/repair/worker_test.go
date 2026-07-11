@@ -540,7 +540,7 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 			t.Fatalf("test adequacy scope allowed non-test files: %v", files)
 		}
 	}
-	prompt := repairPrompt(finding, "verified evidence", "")
+	prompt := repairPrompt(finding, "verified evidence", "", "")
 	if !strings.Contains(prompt, "test-adequacy repair") || !strings.Contains(prompt, "Change only focused files") || !strings.Contains(prompt, "fileURLToPath") {
 		t.Fatalf("test-only constraint missing from repair prompt: %s", prompt)
 	}
@@ -548,10 +548,21 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 
 func TestAPI500RepairPromptUsesFirstPartyMutationMarker(t *testing.T) {
 	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500", IssueKind: "missing_visual_coverage"}
-	prompt := repairPrompt(finding, "verified evidence", "")
+	prompt := repairPrompt(finding, "verified evidence", "", "")
 	for _, expected := range []string{"visual-hive api-500 mutation", "textMustNotExist", "Do not change the nominal server/data harness", "remove any added `[data-testid='api-data-area']`", "matching `mustExist`"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("api-500 repair guidance missing %q: %s", expected, prompt)
+		}
+	}
+}
+
+func TestRepairPromptIncludesCumulativeRevisionDiff(t *testing.T) {
+	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500", IssueKind: "missing_visual_coverage"}
+	diff := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1 @@\n-serve: npm run preview\n+serve: node scripts/testing/start-lhci-server.mjs\n"
+	prompt := repairPrompt(finding, "verified evidence", "prior response", diff)
+	for _, expected := range []string{"Current cumulative uncommitted repair diff", "start-lhci-server.mjs", "applied on top of this exact state", "do not repeat changes already present", "removal of an unsafe prior change"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("cumulative revision guidance missing %q: %s", expected, prompt)
 		}
 	}
 }
