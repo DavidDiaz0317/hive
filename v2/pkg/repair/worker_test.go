@@ -584,6 +584,31 @@ func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 	}
 }
 
+func TestNormalizeTrackedLineEndingsPreservesIndexAndPatchSemantics(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	worktree := filepath.Join(t.TempDir(), "worktrees", "line-endings")
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-eol-a1", "main", ""); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(worktree, "src", "value.txt")
+	if err := os.WriteFile(file, []byte("broken\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeTrackedLineEndings(context.Background(), worktree); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "broken\n" {
+		t.Fatalf("tracked text was not normalized to its LF index representation: %q", data)
+	}
+	if status := strings.TrimSpace(gitOutput(t, worktree, "status", "--short")); status != "" {
+		t.Fatalf("line-ending normalization changed repository semantics: %s", status)
+	}
+}
+
 func seedGitRepository(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()

@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -412,6 +413,9 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		return fmt.Errorf("configure deterministic repair line endings: %w", err)
 	}
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err == nil {
+		if err := normalizeTrackedLineEndings(ctx, worktree); err != nil {
+			return err
+		}
 		current, gitErr := runGit(ctx, worktree, "branch", "--show-current")
 		if gitErr != nil {
 			return gitErr
@@ -440,8 +444,8 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		if _, switchErr := runGit(ctx, worktree, "switch", "-C", branch, "origin/"+base); switchErr != nil {
 			return fmt.Errorf("reset clean repair worktree: %w", switchErr)
 		}
-		if _, checkoutErr := runGit(ctx, worktree, "checkout-index", "--all", "--force"); checkoutErr != nil {
-			return fmt.Errorf("normalize repair worktree from the exact index: %w", checkoutErr)
+		if err := normalizeTrackedLineEndings(ctx, worktree); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -453,6 +457,45 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 	}
 	if _, err := runGit(ctx, repositoryDir, "-c", "core.autocrlf=false", "worktree", "add", "-B", branch, worktree, "origin/"+base); err != nil {
 		return fmt.Errorf("create repair worktree: %w", err)
+	}
+	return normalizeTrackedLineEndings(ctx, worktree)
+}
+
+func normalizeTrackedLineEndings(ctx context.Context, worktree string) error {
+	output, err := runGit(ctx, worktree, "ls-files", "--eol", "-z")
+	if err != nil {
+		return fmt.Errorf("inspect repair worktree line endings: %w", err)
+	}
+	normalized := 0
+	for _, entry := range strings.Split(output, "\x00") {
+		metadata, name, ok := strings.Cut(entry, "\t")
+		if !ok || !strings.Contains(metadata, "i/lf") || !strings.Contains(metadata, "w/crlf") {
+			continue
+		}
+		name = filepath.ToSlash(strings.TrimSpace(name))
+		if name == "" || strings.HasPrefix(name, "../") || filepath.IsAbs(name) || normalized >= 10_000 {
+			return fmt.Errorf("tracked line-ending normalization encountered an unsafe or excessive path")
+		}
+		filePath := filepath.Join(worktree, filepath.FromSlash(name))
+		info, err := os.Lstat(filePath)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 16<<20 {
+			continue
+		}
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		if !bytes.Contains(data, []byte("\r\n")) || bytes.ContainsRune(data, '\x00') {
+			continue
+		}
+		data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		if err := os.WriteFile(filePath, data, info.Mode().Perm()); err != nil {
+			return err
+		}
+		normalized++
 	}
 	return nil
 }
