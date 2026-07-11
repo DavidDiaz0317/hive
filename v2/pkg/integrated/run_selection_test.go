@@ -102,6 +102,25 @@ func TestRetryableRepairAttemptClassification(t *testing.T) {
 	}
 }
 
+func TestNeedsHostedRevisionEvidenceOnlyForFailedVisualExactHead(t *testing.T) {
+	finding := visualhive.FindingLifecycle{
+		Status: visualhive.StatusNeedsRevision, PRNumber: 19, RepairCommitSHA: "head", Branch: "hive/repair-a1",
+		LastCheckRuns: []visualhive.CheckEvidence{{Name: "Private-safe lint", State: "success"}, {Name: "visual-hive", State: "failure"}},
+	}
+	if !needsHostedRevisionEvidence(finding) {
+		t.Fatal("failed exact-head Visual Hive check should supply revision evidence")
+	}
+	finding.LastCheckRuns[1].State = "success"
+	if needsHostedRevisionEvidence(finding) {
+		t.Fatal("green Visual Hive check must not be treated as failed revision evidence")
+	}
+	finding.LastCheckRuns[1].State = "failure"
+	finding.RepairCommitSHA = ""
+	if needsHostedRevisionEvidence(finding) {
+		t.Fatal("unbound PR evidence must never be fetched")
+	}
+}
+
 func TestDurableRepairAttemptsUsesWorkerCheckpointForCurrentRecurrence(t *testing.T) {
 	stateDir := t.TempDir()
 	store, err := repair.NewStore(filepath.Join(stateDir, "repair"))

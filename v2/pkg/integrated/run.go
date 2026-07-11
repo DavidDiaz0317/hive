@@ -970,7 +970,19 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		if len(commands) == 0 {
 			return nil, fmt.Errorf("validated repository test plan has no executable commands")
 		}
-		evidenceSummary, err := repair.LoadEvidenceSummary(evidenceRoot, *finding)
+		repairEvidenceRoot := evidenceRoot
+		if needsHostedRevisionEvidence(*finding) {
+			verified, fetchErr := client.FetchAndVerifyPullRequestArtifact(ctx, hivegithub.PullRequestArtifactRequest{
+				Repository: config.Repository, ExpectedHeadSHA: finding.RepairCommitSHA, ExpectedHeadBranch: finding.Branch,
+				ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
+				DestinationDir: filepath.Join(config.StateDir, "repair", "revision-artifacts", repairStateKey(finding.RepositoryFingerprint)),
+			})
+			if fetchErr != nil {
+				return nil, fmt.Errorf("fetch exact-head failed Visual Hive evidence for repair revision: %w", fetchErr)
+			}
+			repairEvidenceRoot = verified.ArtifactRoot
+		}
+		evidenceSummary, err := repair.LoadEvidenceSummary(repairEvidenceRoot, *finding)
 		if err != nil {
 			if errors.Is(err, repair.ErrNoActionableEvidence) {
 				reason := "Verified evidence does not contain a safe, repository-scoped repair contribution; keep the issue for operator review without dispatching a model or PR."
@@ -997,6 +1009,20 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		return []repair.Result{result}, nil // repository concurrency budget defaults to one repair
 	}
 	return nil, nil
+}
+
+func needsHostedRevisionEvidence(finding visualhive.FindingLifecycle) bool {
+	if finding.Status != visualhive.StatusNeedsRevision || finding.PRNumber <= 0 || strings.TrimSpace(finding.RepairCommitSHA) == "" || strings.TrimSpace(finding.Branch) == "" {
+		return false
+	}
+	for _, check := range finding.LastCheckRuns {
+		name := strings.NewReplacer("-", " ", "_", " ").Replace(strings.ToLower(strings.TrimSpace(check.Name)))
+		state := strings.ToLower(strings.TrimSpace(check.State))
+		if strings.Contains(name, "visual hive") && state != "success" && state != "skipped" && state != "neutral" {
+			return true
+		}
+	}
+	return false
 }
 
 // selectedRepairKey enforces the repository-wide concurrency budget before a
