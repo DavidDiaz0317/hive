@@ -100,7 +100,102 @@ func applyModelPatch(ctx context.Context, worktree, patchText string) error {
 }
 
 func modelPatchAlreadyApplied(ctx context.Context, worktree, patchText string) (bool, error) {
-	command := exec.CommandContext(ctx, "git", "apply", "--reverse", "--check", "--whitespace=error-all", "--recount", "-")
+	ok, _, err := checkModelPatch(ctx, worktree, patchText, true, false)
+	return ok, err
+}
+
+func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string) error {
+	files, err := patchChangedFiles(patchText)
+	if err != nil {
+		return err
+	}
+	addArgs := append([]string{"add", "--"}, files...)
+	if _, err := runGit(ctx, worktree, addArgs...); err != nil {
+		return fmt.Errorf("stage cumulative repair state for incremental patch: %w", err)
+	}
+	resetIndex := func() error {
+		resetArgs := append([]string{"reset", "--"}, files...)
+		_, resetErr := runGit(ctx, worktree, resetArgs...)
+		return resetErr
+	}
+	applyErr := func() error {
+		canApply, _, err := checkModelPatch(ctx, worktree, patchText, false, true)
+		if err != nil {
+			return err
+		}
+		if canApply {
+			return applyIndexedModelPatch(ctx, worktree, patchText)
+		}
+		hunks, err := splitModelPatchHunks(patchText)
+		if err != nil {
+			return err
+		}
+		pending := make([]string, 0, len(hunks))
+		for index, hunk := range hunks {
+			alreadyApplied, _, checkErr := checkModelPatch(ctx, worktree, hunk, true, true)
+			if checkErr != nil {
+				return checkErr
+			}
+			if alreadyApplied {
+				continue
+			}
+			applicable, detail, checkErr := checkModelPatch(ctx, worktree, hunk, false, true)
+			if checkErr != nil {
+				return checkErr
+			}
+			if !applicable {
+				return fmt.Errorf("incremental model patch hunk %d is neither applicable nor already present: %s", index+1, safeExcerpt(detail))
+			}
+			pending = append(pending, hunk)
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		return applyIndexedModelPatch(ctx, worktree, strings.Join(pending, ""))
+	}()
+	resetErr := resetIndex()
+	if applyErr != nil {
+		if resetErr != nil {
+			return fmt.Errorf("%v; restore repair index after rejected incremental patch: %w", applyErr, resetErr)
+		}
+		return applyErr
+	}
+	if resetErr != nil {
+		return fmt.Errorf("restore repair index after incremental patch: %w", resetErr)
+	}
+	return nil
+}
+
+func applyIndexedModelPatch(ctx context.Context, worktree, patchText string) error {
+	for _, check := range []bool{true, false} {
+		args := []string{"apply", "--index"}
+		if check {
+			args = append(args, "--check")
+		}
+		args = append(args, "--whitespace=error-all", "--recount", "-")
+		command := exec.CommandContext(ctx, "git", args...)
+		command.Dir = worktree
+		command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+		command.Stdin = strings.NewReader(patchText)
+		var output limitedBuffer
+		command.Stdout, command.Stderr = &output, &output
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("git %s incremental model patch failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+		}
+	}
+	return nil
+}
+
+func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, indexed bool) (bool, string, error) {
+	args := []string{"apply"}
+	if indexed {
+		args = append(args, "--index")
+	}
+	if reverse {
+		args = append(args, "--reverse")
+	}
+	args = append(args, "--check", "--whitespace=error-all", "--recount", "-")
+	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = worktree
 	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
 	command.Stdin = strings.NewReader(patchText)
@@ -108,11 +203,49 @@ func modelPatchAlreadyApplied(ctx context.Context, worktree, patchText string) (
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil {
 		if ctx.Err() != nil {
-			return false, ctx.Err()
+			return false, output.String(), ctx.Err()
 		}
-		return false, nil
+		return false, output.String(), nil
 	}
-	return true, nil
+	return true, output.String(), nil
+}
+
+func splitModelPatchHunks(patchText string) ([]string, error) {
+	if strings.Contains(patchText, "--- /dev/null") || strings.Contains(patchText, "+++ /dev/null") {
+		return nil, fmt.Errorf("incremental revision patches cannot partially apply file creation or deletion")
+	}
+	var header, current strings.Builder
+	hunks := []string{}
+	flush := func() {
+		if current.Len() > 0 {
+			hunks = append(hunks, current.String())
+			current.Reset()
+		}
+	}
+	for _, line := range strings.SplitAfter(strings.ReplaceAll(patchText, "\r\n", "\n"), "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			header.Reset()
+			header.WriteString(line)
+		case strings.HasPrefix(line, "@@ "):
+			flush()
+			if header.Len() == 0 {
+				return nil, fmt.Errorf("incremental model patch hunk is missing a file header")
+			}
+			current.WriteString(header.String())
+			current.WriteString(line)
+		case current.Len() > 0:
+			current.WriteString(line)
+		default:
+			header.WriteString(line)
+		}
+	}
+	flush()
+	if len(hunks) == 0 {
+		return nil, fmt.Errorf("incremental model patch contains no unified diff hunks")
+	}
+	return hunks, nil
 }
 
 func equalStringSets(left, right []string) bool {

@@ -55,6 +55,27 @@ func TestModelPatchAlreadyAppliedDetectsCrashResume(t *testing.T) {
 	}
 }
 
+func TestApplyIncrementalModelPatchSkipsAlreadyAppliedHunk(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	path := filepath.Join(repository, "src", "value.txt")
+	current := "target:\n  kind: command\n  build: npm run build\n  serve: node scripts/testing/start-lhci-server.mjs\n  url: http://127.0.0.1:4173\nselectors:\n  textMustExist: []\n  textMustNotExist:\n    - visual-hive api-500 mutation\nscreenshots: []\n"
+	if err := os.WriteFile(path, []byte(current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	patch := "diff --git a/src/value.txt b/src/value.txt\n--- a/src/value.txt\n+++ b/src/value.txt\n@@ -1,5 +1,5 @@\n target:\n   kind: command\n   build: npm run build\n-  serve: node scripts/testing/start-lhci-server.mjs\n+  serve: npm run preview\n   url: http://127.0.0.1:4173\n@@ -5,5 +5,6 @@\n   url: http://127.0.0.1:4173\n selectors:\n   textMustExist: []\n-  textMustNotExist: []\n+  textMustNotExist:\n+    - visual-hive api-500 mutation\n screenshots: []\n"
+	if err := applyIncrementalModelPatch(context.Background(), repository, patch); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := strings.Replace(current, "serve: node scripts/testing/start-lhci-server.mjs", "serve: npm run preview", 1)
+	if strings.ReplaceAll(string(data), "\r\n", "\n") != expected {
+		t.Fatalf("incremental patch did not apply only the missing hunk: %q", data)
+	}
+}
+
 func TestPatchChangedFilesRejectsUnsafeMetadata(t *testing.T) {
 	for name, patch := range map[string]string{
 		"traversal": "diff --git a/../outside b/../outside\n--- a/../outside\n+++ b/../outside\n@@ -0,0 +1 @@\n+x\n",

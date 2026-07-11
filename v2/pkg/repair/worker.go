@@ -201,7 +201,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if modelTimeout <= 0 {
 			modelTimeout = 20 * time.Minute
 		}
-		cumulativeDiff, diffErr := runGit(ctx, attempt.Worktree, "diff", "--no-ext-diff", "--")
+		cumulativeDiff, diffErr := runGit(ctx, attempt.Worktree, "diff", "HEAD", "--no-ext-diff", "--")
 		if diffErr != nil {
 			return Result{}, fmt.Errorf("inspect cumulative repair diff before model revision: %w", diffErr)
 		}
@@ -259,7 +259,11 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, appliedErr)
 			}
 			if !alreadyApplied {
-				if err := applyModelPatch(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
+				apply := applyModelPatch
+				if hadPreexistingChanges {
+					apply = applyIncrementalModelPatch
+				}
+				if err := apply(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
 					return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 				}
 			}
@@ -605,7 +609,7 @@ func validateFindingPatchSemantics(finding visualhive.FindingLifecycle, patchTex
 func validateAttemptPatchSemantics(ctx context.Context, finding visualhive.FindingLifecycle, attempt Attempt, files []string) error {
 	patchText := attempt.ModelPatch
 	if strings.TrimSpace(patchText) == "" && len(files) > 0 {
-		output, err := runGit(ctx, attempt.Worktree, "diff", "--no-ext-diff", "--")
+		output, err := runGit(ctx, attempt.Worktree, "diff", "HEAD", "--no-ext-diff", "--")
 		if err != nil {
 			return fmt.Errorf("inspect already-applied repair patch semantics: %w", err)
 		}
