@@ -173,6 +173,17 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	}
 }
 
+func TestComprehensiveCoverageKeepsNestedCIUnitSuiteWithoutNodeFallback(t *testing.T) {
+	inspection := RepositoryInspection{
+		Languages:    []string{"TypeScript/JavaScript"},
+		TestCommands: [][]string{{"npm", "--prefix", "dashboard", "run", "test:ci:lite"}},
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if len(commands) != 1 || strings.Join(commands[0], " ") != "npm --prefix dashboard run test:ci:lite" {
+		t.Fatalf("unexpected comprehensive commands: %+v", commands)
+	}
+}
+
 func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
 	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {

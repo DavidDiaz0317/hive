@@ -669,7 +669,7 @@ func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage)
 func hasRepositoryUnitCommand(commands [][]string) bool {
 	for _, command := range commands {
 		value := strings.ToLower(strings.Join(command, " "))
-		if value == "node --test" || strings.Contains(value, "vitest") || strings.Contains(value, "jest") || strings.HasSuffix(value, " run test") || strings.Contains(value, "test:unit") {
+		if value == "node --test" || strings.Contains(value, "vitest") || strings.Contains(value, "jest") || strings.HasSuffix(value, " run test") || strings.Contains(value, "test:unit") || strings.Contains(value, "test:ci") {
 			return true
 		}
 	}
