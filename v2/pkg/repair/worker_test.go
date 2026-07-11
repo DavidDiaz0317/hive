@@ -485,6 +485,44 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 	}
 }
 
+func TestNestedWorkspaceRepairPatternsMatchRecursively(t *testing.T) {
+	for _, test := range []struct {
+		pattern string
+		file    string
+	}{
+		{"**/src/**", "dashboard/src/components/ProjectDashboardView.tsx"},
+		{"**/tests/**", "packages/api/tests/contract_test.py"},
+		{"**/*.test.*", "dashboard/src/App.test.tsx"},
+		{"src/**", "src/main.ts"},
+		{"**", "dashboard/src/main.ts"},
+	} {
+		if !matchPathPattern(test.pattern, test.file) {
+			t.Fatalf("pattern %q did not match %q", test.pattern, test.file)
+		}
+	}
+	for _, file := range []string{"dashboard/source/main.ts", "src-other/main.ts"} {
+		if matchPathPattern("**/src/**", file) {
+			t.Fatalf("nested source pattern unexpectedly matched %q", file)
+		}
+	}
+}
+
+func TestCheckpointRetryableFailureIncludesRejectionFeedback(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := Attempt{RepositoryFingerprint: "owner/repo:retry", Stage: StageModelComplete, ModelSummary: "first patch", ModelPatch: "diff"}
+	err = checkpointRetryableFailure(store, &attempt, fmt.Errorf("dashboard/src/App.tsx is outside the configured repair allowlist"))
+	if !IsRetryableAttemptError(err) {
+		t.Fatalf("failure should remain explicitly retryable: %v", err)
+	}
+	saved, ok := store.Get(attempt.RepositoryFingerprint)
+	if !ok || saved.Stage != StageNoChange || saved.ModelPatch != "" || !strings.Contains(saved.ModelSummary, "outside the configured repair allowlist") || !strings.Contains(saved.ModelSummary, "Do not repeat") {
+		t.Fatalf("repair rejection feedback was not persisted: %+v", saved)
+	}
+}
+
 func TestCheckpointLocalValidationFailureCreatesBoundedRetryState(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {

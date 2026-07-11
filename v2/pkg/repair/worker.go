@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -211,9 +210,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, runErr
 		}
 		if err != nil {
-			attempt.Stage = StageNoChange
-			_ = w.State.Put(attempt)
-			return Result{}, retryableAttemptError(err)
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 		}
 		attempt.Stage = StageModelComplete
 		if err := w.State.Put(attempt); err != nil {
@@ -229,19 +226,13 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if len(files) == 0 && attempt.ModelPatch != "" {
 			patchFiles, patchErr := patchChangedFiles(attempt.ModelPatch)
 			if patchErr != nil {
-				attempt.Stage = StageNoChange
-				_ = w.State.Put(attempt)
-				return Result{}, retryableAttemptError(patchErr)
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, patchErr)
 			}
 			if err := validateChangedFiles(patchFiles, w.Config.AllowedRepairPaths); err != nil {
-				attempt.Stage = StageNoChange
-				_ = w.State.Put(attempt)
-				return Result{}, retryableAttemptError(err)
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := validateFindingScope(finding, patchFiles); err != nil {
-				attempt.Stage = StageNoChange
-				_ = w.State.Put(attempt)
-				return Result{}, retryableAttemptError(err)
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
 				attempt.Stage = StageNoChange
@@ -249,9 +240,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				return Result{}, err
 			}
 			if err := applyModelPatch(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
-				attempt.Stage = StageNoChange
-				_ = w.State.Put(attempt)
-				return Result{}, retryableAttemptError(err)
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			files, err = changedFiles(ctx, attempt.Worktree)
 			if err != nil {
@@ -263,11 +252,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 		if len(files) == 0 {
 			status, _ := runGit(ctx, attempt.Worktree, "status", "--short", "--untracked-files=all")
-			attempt.Stage = StageNoChange
-			if err := w.State.Put(attempt); err != nil {
-				return Result{}, err
-			}
-			return Result{}, retryableAttemptError(fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status)))
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status)))
 		}
 		if err := validateChangedFiles(files, w.Config.AllowedRepairPaths); err != nil {
 			return Result{}, err
@@ -363,10 +348,20 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 }
 
 func checkpointLocalValidationFailure(store *Store, attempt *Attempt, validationErr error) error {
-	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nLocal validation failed; revise the patch instead of repeating it:\n" + validationErr.Error())
+	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nHive rejected this attempt after local validation. Revise the patch instead of repeating it:\n" + validationErr.Error())
 	attempt.ModelPatch = ""
 	attempt.Stage = StageNoChange
 	return store.Put(*attempt)
+}
+
+func checkpointRetryableFailure(store *Store, attempt *Attempt, cause error) error {
+	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nHive rejected this attempt before application. Do not repeat the same patch:\n" + cause.Error())
+	attempt.ModelPatch = ""
+	attempt.Stage = StageNoChange
+	if err := store.Put(*attempt); err != nil {
+		return err
+	}
+	return retryableAttemptError(cause)
 }
 
 func cloneBaselineReview(review *BaselineReview) *BaselineReview {
@@ -514,16 +509,38 @@ func validateFindingScope(finding visualhive.FindingLifecycle, files []string) e
 
 func matchPathPattern(pattern, file string) bool {
 	pattern = strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(pattern)), "./")
-	if strings.HasPrefix(pattern, "**/") {
-		if matched, _ := path.Match(strings.TrimPrefix(pattern, "**/"), path.Base(file)); matched {
-			return true
+	file = strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(file)), "./")
+	if pattern == "" || file == "" {
+		return false
+	}
+	var expression strings.Builder
+	expression.WriteString("^")
+	for index := 0; index < len(pattern); {
+		switch pattern[index] {
+		case '*':
+			if index+1 < len(pattern) && pattern[index+1] == '*' {
+				index += 2
+				if index < len(pattern) && pattern[index] == '/' {
+					expression.WriteString("(?:.*/)?")
+					index++
+				} else {
+					expression.WriteString(".*")
+				}
+			} else {
+				expression.WriteString("[^/]*")
+				index++
+			}
+		case '?':
+			expression.WriteString("[^/]")
+			index++
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+			index++
 		}
 	}
-	if strings.HasSuffix(pattern, "/**") {
-		return strings.HasPrefix(file, strings.TrimSuffix(pattern, "**"))
-	}
-	matched, _ := path.Match(pattern, file)
-	return matched
+	expression.WriteString("$")
+	matched, err := regexp.MatchString(expression.String(), file)
+	return err == nil && matched
 }
 
 func runRepairCommand(ctx context.Context, worktree string, command Command, timeout time.Duration, environment map[string]string, phase string) error {
@@ -677,7 +694,8 @@ func riskForFiles(files []string) automation.RiskTier {
 		return automation.RiskAutomatic
 	}
 	for _, file := range files {
-		if strings.HasPrefix(file, "src/") {
+		normalized := "/" + strings.Trim(strings.ToLower(strings.ReplaceAll(file, "\\", "/")), "/") + "/"
+		if strings.Contains(normalized, "/src/") {
 			return automation.RiskLow
 		}
 	}

@@ -80,10 +80,16 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		store.Audit(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: "repository automation is paused"})
 		return result, fmt.Errorf("repository automation is paused")
 	}
-	store.Audit(AuditEntry{Action: "run", Allowed: true, Repository: config.Repository})
 	if options.Timeout <= 0 {
 		options.Timeout = 45 * time.Minute
 	}
+	releaseRun, err := acquireProductionRunLease(options.StateDir, options.Timeout+2*time.Minute)
+	if err != nil {
+		store.Audit(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: err.Error()})
+		return result, err
+	}
+	defer releaseRun()
+	store.Audit(AuditEntry{Action: "run", Allowed: true, Repository: config.Repository})
 	runCtx, cancel := context.WithTimeout(ctx, options.Timeout)
 	defer cancel()
 	lifecycle, err := visualhive.NewLifecycleStore(filepath.Join(options.StateDir, "visual-hive"))
@@ -1018,21 +1024,73 @@ func selectedRepairKey(state visualhive.LifecycleState) string {
 }
 
 func repairPreparationCommands(checkout string) []repair.Command {
-	for _, candidate := range []struct {
-		lockfile string
-		command  repair.Command
-	}{
-		{"package-lock.json", repair.Command{Name: "npm", Args: []string{"ci"}}},
-		{"pnpm-lock.yaml", repair.Command{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}}},
-		{"yarn.lock", repair.Command{Name: "yarn", Args: []string{"install", "--immutable"}}},
-		{"bun.lock", repair.Command{Name: "bun", Args: []string{"install", "--frozen-lockfile"}}},
-		{"bun.lockb", repair.Command{Name: "bun", Args: []string{"install", "--frozen-lockfile"}}},
-	} {
-		if _, err := os.Stat(filepath.Join(checkout, candidate.lockfile)); err == nil {
-			return []repair.Command{candidate.command}
+	type lockfile struct {
+		path string
+		name string
+	}
+	locks := []lockfile{}
+	_ = filepath.WalkDir(checkout, func(filePath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".visual-hive", "node_modules", "dist", "build", "coverage", "vendor":
+				if filePath != checkout {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		switch entry.Name() {
+		case "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb":
+			if len(locks) < 100 {
+				locks = append(locks, lockfile{path: filePath, name: entry.Name()})
+			}
+		}
+		return nil
+	})
+	sort.Slice(locks, func(i, j int) bool { return locks[i].path < locks[j].path })
+	commands := make([]repair.Command, 0, len(locks)+1)
+	for _, lock := range locks {
+		dir, _ := filepath.Rel(checkout, filepath.Dir(lock.path))
+		dir = filepath.ToSlash(dir)
+		if dir == "" {
+			dir = "."
+		}
+		switch lock.name {
+		case "package-lock.json":
+			args := []string{"ci"}
+			if dir != "." {
+				args = []string{"--prefix", dir, "ci"}
+			}
+			commands = append(commands, repair.Command{Name: "npm", Args: args})
+		case "pnpm-lock.yaml":
+			args := []string{"install", "--frozen-lockfile"}
+			if dir != "." {
+				args = []string{"--dir", dir, "install", "--frozen-lockfile"}
+			}
+			commands = append(commands, repair.Command{Name: "pnpm", Args: args})
+		case "yarn.lock":
+			args := []string{"install", "--immutable"}
+			if dir != "." {
+				args = []string{"--cwd", dir, "install", "--immutable"}
+			}
+			commands = append(commands, repair.Command{Name: "yarn", Args: args})
+		case "bun.lock", "bun.lockb":
+			args := []string{"install", "--frozen-lockfile"}
+			if dir != "." {
+				args = []string{"--cwd", dir, "install", "--frozen-lockfile"}
+			}
+			commands = append(commands, repair.Command{Name: "bun", Args: args})
 		}
 	}
-	return nil
+	if _, err := os.Stat(filepath.Join(checkout, "pyproject.toml")); err == nil {
+		commands = append(commands, repair.Command{Name: "python", Args: []string{"-m", "pip", "install", "."}})
+	} else if _, err := os.Stat(filepath.Join(checkout, "requirements.txt")); err == nil {
+		commands = append(commands, repair.Command{Name: "python", Args: []string{"-m", "pip", "install", "-r", "requirements.txt"}})
+	}
+	return commands
 }
 
 func repairValidationEnvironment(config Config) map[string]string {
@@ -1130,7 +1188,8 @@ func checkSummary(gate hivegithub.PullRequestGate) string {
 
 func mergeRisk(files []string) automation.RiskTier {
 	for _, file := range files {
-		if strings.HasPrefix(strings.ToLower(strings.ReplaceAll(file, "\\", "/")), "src/") {
+		normalized := "/" + strings.Trim(strings.ToLower(strings.ReplaceAll(file, "\\", "/")), "/") + "/"
+		if strings.Contains(normalized, "/src/") {
 			return automation.RiskLow
 		}
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -221,11 +222,15 @@ func runIntegratedDaemon(args []string) int {
 		now := time.Now().UTC()
 		wait := *interval
 		if cycleErr != nil {
-			status.LastError = sanitizeDaemonError(cycleErr)
-			if wait > time.Minute {
-				wait = time.Minute
+			if errors.Is(cycleErr, integrated.ErrRunInProgress) {
+				fmt.Printf("%s scheduler run skipped because another production run owns the repository lease\n", now.Format(time.RFC3339))
+			} else {
+				status.LastError = sanitizeDaemonError(cycleErr)
+				if wait > time.Minute {
+					wait = time.Minute
+				}
+				fmt.Fprintf(os.Stderr, "%s scheduler run failed: %s\n", now.Format(time.RFC3339), status.LastError)
 			}
-			fmt.Fprintf(os.Stderr, "%s scheduler run failed: %s\n", now.Format(time.RFC3339), status.LastError)
 		} else {
 			status.LastSuccessAt = now
 			status.LastRunURL = result.Workflow.RunURL

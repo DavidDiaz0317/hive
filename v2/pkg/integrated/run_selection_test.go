@@ -57,17 +57,35 @@ func TestSelectedRepairKeyEnforcesRepositoryConcurrencyBeforeSortOrder(t *testin
 
 func TestRepairPreparationAndPinnedCLIEnvironment(t *testing.T) {
 	checkout := t.TempDir()
-	if err := os.WriteFile(filepath.Join(checkout, "package-lock.json"), []byte("{}\n"), 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Join(checkout, "dashboard"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "dashboard", "package-lock.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "pyproject.toml"), []byte("[build-system]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	commands := repairPreparationCommands(checkout)
-	if len(commands) != 1 || commands[0].Name != "npm" || len(commands[0].Args) != 1 || commands[0].Args[0] != "ci" {
+	if len(commands) != 2 || commands[0].Name != "npm" || strings.Join(commands[0].Args, " ") != "--prefix dashboard ci" || commands[1].Name != "python" || strings.Join(commands[1].Args, " ") != "-m pip install ." {
 		t.Fatalf("unexpected preparation commands: %+v", commands)
 	}
 	cli := filepath.Join(checkout, "visual-hive", "dist", "index.js")
 	environment := repairValidationEnvironment(Config{VisualHiveArgs: []string{cli}})
 	if environment["VISUAL_HIVE_CLI"] != cli {
 		t.Fatalf("pinned CLI environment = %v", environment)
+	}
+}
+
+func TestNestedSourceChangesAreNeverAutomaticRisk(t *testing.T) {
+	if risk := mergeRisk([]string{"dashboard/src/App.tsx"}); risk != automation.RiskLow {
+		t.Fatalf("nested application source risk = %v, want low", risk)
+	}
+	if risk := mergeRisk([]string{"dashboard/src/App.test.tsx"}); risk != automation.RiskLow {
+		t.Fatalf("a source-tree test remains low path risk before the auto-merge allowlist is evaluated, got %v", risk)
+	}
+	if risk := mergeRisk([]string{"tests/App.test.tsx"}); risk != automation.RiskAutomatic {
+		t.Fatalf("dedicated test path risk = %v, want automatic", risk)
 	}
 }
 
