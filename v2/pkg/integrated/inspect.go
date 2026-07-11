@@ -18,9 +18,19 @@ type packageJSON struct {
 func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	inspection := RepositoryInspection{DefaultBranch: defaultBranch, Permissions: map[string]bool{}, Signals: map[string]string{}}
 	languages, frameworks, managers := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	var packageData packageJSON
-	if data, err := os.ReadFile(filepath.Join(root, "package.json")); err == nil {
-		_ = json.Unmarshal(data, &packageData)
+	packageFiles := findPackageJSONFiles(root)
+	for _, packageFile := range packageFiles {
+		var packageData packageJSON
+		data, err := os.ReadFile(packageFile)
+		if err != nil || json.Unmarshal(data, &packageData) != nil {
+			continue
+		}
+		packageRoot := filepath.Dir(packageFile)
+		packagePath, _ := filepath.Rel(root, packageRoot)
+		packagePath = filepath.ToSlash(packagePath)
+		if packagePath == "" {
+			packagePath = "."
+		}
 		languages["TypeScript/JavaScript"] = true
 		for name := range mergeMaps(packageData.Dependencies, packageData.DevDependencies) {
 			switch {
@@ -36,24 +46,26 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 				frameworks["Storybook"] = true
 			}
 		}
+		commands := packageScriptCommands(packagePath, packageData.Scripts)
+		inspection.TestCommands = append(inspection.TestCommands, commands...)
 		for name, script := range packageData.Scripts {
 			lowerName := strings.ToLower(name)
 			if name == "test" || name == "build" || name == "vh:plan" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
-				inspection.TestCommands = append(inspection.TestCommands, []string{"npm", "run", name})
-				inspection.Signals["script:"+name] = script
+				inspection.Signals["script:"+packagePath+":"+name] = script
 			}
 		}
-		inspection.TestCommands = preferGranularTestCommands(inspection.TestCommands)
+		switch {
+		case exists(filepath.Join(packageRoot, "package-lock.json")):
+			managers["npm"] = true
+		case exists(filepath.Join(packageRoot, "pnpm-lock.yaml")):
+			managers["pnpm"] = true
+		case exists(filepath.Join(packageRoot, "yarn.lock")):
+			managers["yarn"] = true
+		default:
+			managers["npm"] = true
+		}
 	}
-	if exists(filepath.Join(root, "package-lock.json")) {
-		managers["npm"] = true
-	}
-	if exists(filepath.Join(root, "pnpm-lock.yaml")) {
-		managers["pnpm"] = true
-	}
-	if exists(filepath.Join(root, "yarn.lock")) {
-		managers["yarn"] = true
-	}
+	inspection.TestCommands = preferGranularTestCommands(inspection.TestCommands)
 	if exists(filepath.Join(root, "go.mod")) {
 		languages["Go"] = true
 		managers["Go modules"] = true
@@ -62,6 +74,9 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	if exists(filepath.Join(root, "pyproject.toml")) || exists(filepath.Join(root, "requirements.txt")) {
 		languages["Python"] = true
 		managers["pip/pyproject"] = true
+		if exists(filepath.Join(root, "tests")) || fileContains(filepath.Join(root, "pyproject.toml"), "pytest") {
+			inspection.TestCommands = append(inspection.TestCommands, []string{"python", "-m", "pytest", "-q"})
+		}
 	}
 
 	count := 0
@@ -101,7 +116,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		if strings.Contains(lower, "dockerfile") || strings.HasPrefix(lower, "deploy/") || strings.HasPrefix(lower, "k8s/") || strings.HasSuffix(lower, "vercel.json") || strings.Contains(lower, "terraform") {
 			inspection.DeploymentFiles = append(inspection.DeploymentFiles, relative)
 		}
-		if strings.Contains(lower, "baseline") && (strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".json")) {
+		if (strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__")) && (strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".json")) {
 			inspection.BaselineFiles = append(inspection.BaselineFiles, relative)
 		}
 		if strings.Contains(lower, "auth") || strings.Contains(lower, "security") || strings.Contains(lower, "secret") || strings.HasPrefix(lower, ".github/workflows/") {
@@ -116,6 +131,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	inspection.DeploymentFiles = sortedUnique(inspection.DeploymentFiles)
 	inspection.BaselineFiles = sortedUnique(inspection.BaselineFiles)
 	inspection.HighRiskPaths = sortedUnique(inspection.HighRiskPaths)
+	inspection.TestCommands = uniqueTestCommands(inspection.TestCommands)
 	sort.SliceStable(inspection.TestCommands, func(i, j int) bool {
 		left, right := testCommandPriority(inspection.TestCommands[i]), testCommandPriority(inspection.TestCommands[j])
 		if left != right {
@@ -124,6 +140,69 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		return strings.Join(inspection.TestCommands[i], "\x00") < strings.Join(inspection.TestCommands[j], "\x00")
 	})
 	return inspection, nil
+}
+
+func findPackageJSONFiles(root string) []string {
+	result := []string{}
+	_ = filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".visual-hive", "node_modules", "dist", "build", "coverage", "vendor":
+				if filePath != root {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if entry.Name() == "package.json" && len(result) < 100 {
+			result = append(result, filePath)
+		}
+		return nil
+	})
+	sort.Strings(result)
+	return result
+}
+
+func packageScriptCommands(packagePath string, scripts map[string]string) [][]string {
+	if _, ok := scripts["test:ci:lite"]; ok {
+		return [][]string{npmScriptCommand(packagePath, "test:ci:lite")}
+	}
+	commands := [][]string{}
+	for name := range scripts {
+		lowerName := strings.ToLower(name)
+		if name == "test" || name == "build" || name == "vh:plan" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
+			commands = append(commands, npmScriptCommand(packagePath, name))
+		}
+	}
+	return commands
+}
+
+func npmScriptCommand(packagePath, name string) []string {
+	if packagePath == "." {
+		return []string{"npm", "run", name}
+	}
+	return []string{"npm", "--prefix", packagePath, "run", name}
+}
+
+func fileContains(path, value string) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && strings.Contains(strings.ToLower(string(data)), strings.ToLower(value))
+}
+
+func uniqueTestCommands(commands [][]string) [][]string {
+	seen := map[string]bool{}
+	result := make([][]string, 0, len(commands))
+	for _, command := range commands {
+		key := strings.Join(command, "\x00")
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, command)
+		}
+	}
+	return result
 }
 
 // testCommandPriority keeps generated repair validation plans dependency-safe.

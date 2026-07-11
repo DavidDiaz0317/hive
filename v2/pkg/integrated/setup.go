@@ -20,6 +20,7 @@ import (
 const (
 	checkoutActionSHA       = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" // actions/checkout v7.0.0
 	setupNodeActionSHA      = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" // actions/setup-node v6.4.0
+	setupPythonActionSHA    = "a309ff8b426b58ec0e2a45f0f869d46889d02405" // actions/setup-python v6.2.0
 	uploadArtifactActionSHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
 )
 
@@ -204,7 +205,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 }
 
 func defaultAllowedRepairPaths() []string {
-	return []string{"src/**", "public/**", "index.html", "visual-hive.config.yaml", "test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
+	return []string{"src/**", "**/src/**", "public/**", "**/public/**", "index.html", "**/index.html", "visual-hive.config.yaml", "test/**", "tests/**", "**/test/**", "**/tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
 }
 
 func defaultAllowedAutoMergePaths() []string {
@@ -446,6 +447,7 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 
 func workflow(config Config) string {
 	repositoryTests := repositoryTestShell(config)
+	targetDependencies := targetDependencyInstallShell()
 	return fmt.Sprintf(`name: Hive Visual Hive Production
 
 on:
@@ -481,6 +483,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: .hive-visual-tooling/package-lock.json
+      - uses: actions/setup-python@%s
+        with:
+          python-version: "3.11"
       - name: Build immutable Visual Hive tooling
         working-directory: .hive-visual-tooling
         run: npm ci && npm run build
@@ -492,22 +497,7 @@ jobs:
       - name: Install target dependencies and matching Playwright browser
         shell: bash
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f pnpm-lock.yaml ]; then
-            corepack enable
-            pnpm install --frozen-lockfile
-          elif [ -f yarn.lock ]; then
-            corepack enable
-            yarn install --immutable
-          elif [ -f package.json ]; then
-            npm install
-          fi
-          playwright_cli="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
-          if [ -f node_modules/@playwright/test/cli.js ]; then
-            playwright_cli="node_modules/@playwright/test/cli.js"
-          fi
-          node "$playwright_cli" install --with-deps chromium
+%s
       - name: Run complete deterministic production scan
         shell: bash
         run: |
@@ -572,11 +562,12 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
-`, config.DefaultBranch, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, repositoryTests, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA)
+`, config.DefaultBranch, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, repositoryTests, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA)
 }
 
 func pullRequestWorkflow(config Config) string {
 	repositoryTests := repositoryTestShell(config)
+	targetDependencies := targetDependencyInstallShell()
 	return fmt.Sprintf(`name: Visual Hive PR
 
 on:
@@ -609,6 +600,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: .hive-visual-tooling/package-lock.json
+      - uses: actions/setup-python@%s
+        with:
+          python-version: "3.11"
       - name: Build immutable Visual Hive tooling
         working-directory: .hive-visual-tooling
         run: npm ci && npm run build
@@ -620,22 +614,7 @@ jobs:
       - name: Install target dependencies and matching Playwright browser
         shell: bash
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f pnpm-lock.yaml ]; then
-            corepack enable
-            pnpm install --frozen-lockfile
-          elif [ -f yarn.lock ]; then
-            corepack enable
-            yarn install --immutable
-          elif [ -f package.json ]; then
-            npm install
-          fi
-          playwright_cli="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
-          if [ -f node_modules/@playwright/test/cli.js ]; then
-            playwright_cli="node_modules/@playwright/test/cli.js"
-          fi
-          node "$playwright_cli" install --with-deps chromium
+%s
       - name: Capture pull request scope
         shell: bash
         run: |
@@ -672,7 +651,7 @@ jobs:
         if: always()
         shell: bash
         run: exit "$(cat .visual-hive/pipeline-exit-code.txt)"
-`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, config.DefaultBranch, config.DefaultBranch, repositoryTests, uploadArtifactActionSHA)
+`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, config.DefaultBranch, config.DefaultBranch, repositoryTests, uploadArtifactActionSHA)
 }
 
 func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage) [][]string {
@@ -709,13 +688,58 @@ func sortTestCommands(commands [][]string) [][]string {
 	return commands
 }
 
+func targetDependencyInstallShell() string {
+	return `          npm_lock_count=0
+          while IFS= read -r lockfile; do
+            package_dir="$(dirname "$lockfile")"
+            npm --prefix "$package_dir" ci
+            npm_lock_count=$((npm_lock_count + 1))
+          done < <(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
+          if [ "$npm_lock_count" -eq 0 ]; then
+            while IFS= read -r manifest; do
+              npm --prefix "$(dirname "$manifest")" install
+            done < <(find . -name package.json -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
+          fi
+          while IFS= read -r lockfile; do
+            corepack enable
+            pnpm --dir "$(dirname "$lockfile")" install --frozen-lockfile
+          done < <(find . -name pnpm-lock.yaml -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
+          while IFS= read -r lockfile; do
+            corepack enable
+            yarn --cwd "$(dirname "$lockfile")" install --immutable
+          done < <(find . -name yarn.lock -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
+          if [ -f pyproject.toml ]; then
+            python -m pip install -e .
+          elif [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+          tooling_playwright="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
+          node "$tooling_playwright" install --with-deps chromium
+          while IFS= read -r playwright_cli; do
+            node "$playwright_cli" install chromium
+          done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.git/*' -print | sort)`
+}
+
 func repositoryTestShell(config Config) string {
-	for _, command := range config.TestCommands {
-		if len(command) == 2 && command[0] == "node" && command[1] == "--test" {
-			return "          node --test"
-		}
+	if len(config.TestCommands) == 0 {
+		return "          : # No additional repository unit-test bootstrap was required."
 	}
-	return "          : # No additional repository unit-test bootstrap was required."
+	lines := make([]string, 0, len(config.TestCommands))
+	for _, command := range config.TestCommands {
+		quoted := make([]string, 0, len(command))
+		for _, argument := range command {
+			quoted = append(quoted, shellQuote(argument))
+		}
+		lines = append(lines, "          "+strings.Join(quoted, " "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func shellQuote(value string) string {
+	if regexp.MustCompile(`^[A-Za-z0-9_./:@%+=,-]+$`).MatchString(value) {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
 func containsValue(values []string, target string) bool {

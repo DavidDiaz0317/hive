@@ -26,6 +26,36 @@ func TestInspectCheckoutBuildsRepositorySpecificSignals(t *testing.T) {
 	}
 }
 
+func TestInspectCheckoutDiscoversNestedDashboardAndPythonTests(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]")
+	writeFixture(t, root, "tests/test_app.py", "def test_app(): assert True")
+	writeFixture(t, root, "dashboard/package.json", `{"scripts":{"build":"vite build","test:unit":"vitest run","test:ci:lite":"npm run build && npm run test:unit"},"dependencies":{"react":"19.0.0","vite":"7.0.0"},"devDependencies":{"@playwright/test":"1.60.0"}}`)
+	writeFixture(t, root, "dashboard/package-lock.json", `{"lockfileVersion":3}`)
+	writeFixture(t, root, "dashboard/playwright.config.ts", "export default {}")
+	writeFixture(t, root, "tests/__screenshots__/home.png", "baseline")
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(inspection.Languages, "Python") || !contains(inspection.Languages, "TypeScript/JavaScript") || !contains(inspection.Frameworks, "React") || !contains(inspection.Frameworks, "Playwright") {
+		t.Fatalf("nested stack was not detected: %+v", inspection)
+	}
+	want := [][]string{{"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}
+	if len(inspection.TestCommands) != len(want) {
+		t.Fatalf("unexpected nested commands: %+v", inspection.TestCommands)
+	}
+	for index := range want {
+		if strings.Join(inspection.TestCommands[index], " ") != strings.Join(want[index], " ") {
+			t.Fatalf("command %d = %v, want %v", index, inspection.TestCommands[index], want[index])
+		}
+	}
+	if len(inspection.BaselineFiles) != 1 || inspection.BaselineFiles[0] != "tests/__screenshots__/home.png" {
+		t.Fatalf("nested screenshot baseline was not detected: %+v", inspection.BaselineFiles)
+	}
+}
+
 func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T) {
 	root := t.TempDir()
 	writeFixture(t, root, "package.json", `{"scripts":{"vh:test-creation":"node test-creation.js","vh:suite":"node suite.js","vh:mutation-proof":"node proof.js","vh:mutate":"node mutate.js","vh:run":"node run.js","vh:plan":"node plan.js","typecheck":"tsc --noEmit","build":"vite build"}}`)
@@ -113,9 +143,9 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 }
 
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
-	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}}}
+	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}, {"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "--github-step-summary"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "--github-step-summary"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}
@@ -145,7 +175,7 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 
 func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow missing %q", required)
 		}
