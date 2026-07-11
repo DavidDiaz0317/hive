@@ -235,6 +235,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			if err := validateFindingScope(finding, patchFiles); err != nil {
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
+			if err := validateFindingPatchSemantics(finding, attempt.ModelPatch); err != nil {
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
@@ -556,6 +559,25 @@ func validateFindingScope(finding visualhive.FindingLifecycle, files []string) e
 	testOnly := []string{"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
 	if err := validateChangedFiles(files, testOnly); err != nil {
 		return fmt.Errorf("test adequacy repair must change test files only: %w", err)
+	}
+	return nil
+}
+
+func validateFindingPatchSemantics(finding visualhive.FindingLifecycle, patchText string) error {
+	if !strings.Contains(strings.ToLower(finding.Title+" "+finding.Body), "api-500") {
+		return nil
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(patchText, "\r\n", "\n"), "\n") {
+		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+		added := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "+")))
+		if strings.HasPrefix(added, "serve:") {
+			return fmt.Errorf("api-500 repair must not change the nominal target serve command; use the first-party textMustNotExist marker oracle")
+		}
+		if strings.Contains(added, "data-testid") && strings.Contains(added, "api-data-area") {
+			return fmt.Errorf("api-500 repair must not add the obsolete api-data-area selector; use the first-party textMustNotExist marker oracle")
+		}
 	}
 	return nil
 }

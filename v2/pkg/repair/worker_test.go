@@ -495,6 +495,22 @@ func TestAPI500RepairPromptUsesFirstPartyMutationMarker(t *testing.T) {
 	}
 }
 
+func TestAPI500PatchSemanticsRejectHarnessAndSelectorWorkarounds(t *testing.T) {
+	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500"}
+	for _, patch := range []string{
+		"diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1 @@\n-serve: npm run preview\n+serve: node scripts/testing/start-lhci-server.mjs\n",
+		"diff --git a/src/App.tsx b/src/App.tsx\n--- a/src/App.tsx\n+++ b/src/App.tsx\n@@ -1 +1 @@\n-<main>\n+<main data-testid=\"api-data-area\">\n",
+	} {
+		if err := validateFindingPatchSemantics(finding, patch); err == nil {
+			t.Fatalf("unsafe api-500 workaround was accepted: %s", patch)
+		}
+	}
+	safe := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1,2 @@\n-textMustNotExist: []\n+textMustNotExist:\n+  - visual-hive api-500 mutation\n"
+	if err := validateFindingPatchSemantics(finding, safe); err != nil {
+		t.Fatalf("marker assertion was rejected: %v", err)
+	}
+}
+
 func TestNestedWorkspaceRepairPatternsMatchRecursively(t *testing.T) {
 	for _, test := range []struct {
 		pattern string
