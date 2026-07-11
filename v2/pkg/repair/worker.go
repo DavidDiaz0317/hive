@@ -224,6 +224,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err != nil {
 			return Result{}, err
 		}
+		if err := validateAttemptPatchSemantics(ctx, finding, attempt, files); err != nil {
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+		}
 		if len(files) == 0 && attempt.ModelPatch != "" {
 			patchFiles, patchErr := patchChangedFiles(attempt.ModelPatch)
 			if patchErr != nil {
@@ -233,9 +236,6 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := validateFindingScope(finding, patchFiles); err != nil {
-				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
-			}
-			if err := validateFindingPatchSemantics(finding, attempt.ModelPatch); err != nil {
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
@@ -580,6 +580,18 @@ func validateFindingPatchSemantics(finding visualhive.FindingLifecycle, patchTex
 		}
 	}
 	return nil
+}
+
+func validateAttemptPatchSemantics(ctx context.Context, finding visualhive.FindingLifecycle, attempt Attempt, files []string) error {
+	patchText := attempt.ModelPatch
+	if strings.TrimSpace(patchText) == "" && len(files) > 0 {
+		output, err := runGit(ctx, attempt.Worktree, "diff", "--no-ext-diff", "--")
+		if err != nil {
+			return fmt.Errorf("inspect already-applied repair patch semantics: %w", err)
+		}
+		patchText = output
+	}
+	return validateFindingPatchSemantics(finding, patchText)
 }
 
 func matchPathPattern(pattern, file string) bool {

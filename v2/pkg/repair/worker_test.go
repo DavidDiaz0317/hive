@@ -511,6 +511,14 @@ func TestAPI500PatchSemanticsRejectHarnessAndSelectorWorkarounds(t *testing.T) {
 	}
 }
 
+func TestResumedModelCompleteAttemptRevalidatesSavedPatchSemantics(t *testing.T) {
+	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500"}
+	attempt := Attempt{Stage: StageModelComplete, ModelPatch: "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1 @@\n-serve: npm run preview\n+serve: node scripts/testing/start-lhci-server.mjs\n"}
+	if err := validateAttemptPatchSemantics(context.Background(), finding, attempt, []string{"visual-hive.config.yaml"}); err == nil || !strings.Contains(err.Error(), "must not change") {
+		t.Fatalf("resumed already-applied patch bypassed semantic validation: %v", err)
+	}
+}
+
 func TestNestedWorkspaceRepairPatternsMatchRecursively(t *testing.T) {
 	for _, test := range []struct {
 		pattern string
