@@ -680,6 +680,9 @@ func repairPrompt(finding visualhive.FindingLifecycle, evidenceSummary, priorMod
 	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
 		findingScope = "\n- This is a test-adequacy repair. Change only focused files under test/ or tests/, or files matching *.test.*, *.spec.*, or *_test.go. Do not change application source or configuration.\n- Test process and path handling must be portable across Windows and Linux. Convert file URLs with fileURLToPath before passing them to child_process; never pass URL.pathname as a Windows script path. Avoid shell-quoting assumptions for executable paths.\n"
 	}
+	if strings.Contains(strings.ToLower(finding.Title+" "+finding.Body), "api-500") {
+		findingScope += "\n- The first-party Visual Hive api-500 runtime mutation returns the deterministic marker `visual-hive api-500 mutation`. Prefer a narrow `textMustNotExist` contract assertion for that marker. Do not change the nominal server/data harness or visual baselines merely to make this mutation observable. Remove earlier attempt changes that are unnecessary once the marker assertion is present.\n"
+	}
 	return fmt.Sprintf(`You are a Hive repair worker inspecting an isolated Git worktree in an intentionally read-only provider process. Produce the smallest production-quality source or test patch that resolves the confirmed finding below. Hive alone will authorize and apply the patch, validate it, commit it, push it, and open the pull request.
 
 Finding: %s
