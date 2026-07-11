@@ -39,6 +39,22 @@ HIVE_PATCH_END`
 	}
 }
 
+func TestModelPatchAlreadyAppliedDetectsCrashResume(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	patch := "diff --git a/src/value.txt b/src/value.txt\n--- a/src/value.txt\n+++ b/src/value.txt\n@@ -1 +1 @@\n-broken\n+fixed\n"
+	applied, err := modelPatchAlreadyApplied(context.Background(), repository, patch)
+	if err != nil || applied {
+		t.Fatalf("fresh patch reported already applied: applied=%t err=%v", applied, err)
+	}
+	if err := applyModelPatch(context.Background(), repository, patch); err != nil {
+		t.Fatal(err)
+	}
+	applied, err = modelPatchAlreadyApplied(context.Background(), repository, patch)
+	if err != nil || !applied {
+		t.Fatalf("applied patch was not recognized after resume: applied=%t err=%v", applied, err)
+	}
+}
+
 func TestPatchChangedFilesRejectsUnsafeMetadata(t *testing.T) {
 	for name, patch := range map[string]string{
 		"traversal": "diff --git a/../outside b/../outside\n--- a/../outside\n+++ b/../outside\n@@ -0,0 +1 @@\n+x\n",

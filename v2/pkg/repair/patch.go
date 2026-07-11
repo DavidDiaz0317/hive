@@ -99,6 +99,22 @@ func applyModelPatch(ctx context.Context, worktree, patchText string) error {
 	return nil
 }
 
+func modelPatchAlreadyApplied(ctx context.Context, worktree, patchText string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "apply", "--reverse", "--check", "--whitespace=error-all", "--recount", "-")
+	command.Dir = worktree
+	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	command.Stdin = strings.NewReader(patchText)
+	var output limitedBuffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
 func equalStringSets(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

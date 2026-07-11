@@ -224,10 +224,17 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err != nil {
 			return Result{}, err
 		}
-		if err := validateAttemptPatchSemantics(ctx, finding, attempt, files); err != nil {
-			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+		// A revision patch may be the operation that removes an unsafe change
+		// from the prior failed attempt. Validate the existing worktree only when
+		// there is no pending patch; otherwise validate the cumulative diff after
+		// the corrective patch has been applied.
+		if attempt.ModelPatch == "" {
+			if err := validateAttemptPatchSemantics(ctx, finding, attempt, files); err != nil {
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+			}
 		}
-		if len(files) == 0 && attempt.ModelPatch != "" {
+		hadPreexistingChanges := len(files) > 0
+		if attempt.ModelPatch != "" {
 			patchFiles, patchErr := patchChangedFiles(attempt.ModelPatch)
 			if patchErr != nil {
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, patchErr)
@@ -243,15 +250,24 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				_ = w.State.Put(attempt)
 				return Result{}, err
 			}
-			if err := applyModelPatch(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
-				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+			alreadyApplied, appliedErr := modelPatchAlreadyApplied(ctx, attempt.Worktree, attempt.ModelPatch)
+			if appliedErr != nil {
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, appliedErr)
+			}
+			if !alreadyApplied {
+				if err := applyModelPatch(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
+					return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
+				}
 			}
 			files, err = changedFiles(ctx, attempt.Worktree)
 			if err != nil {
 				return Result{}, err
 			}
-			if !equalStringSets(files, patchFiles) {
+			if !hadPreexistingChanges && !equalStringSets(files, patchFiles) {
 				return Result{}, fmt.Errorf("applied model patch changed unexpected files")
+			}
+			if err := validateAttemptPatchSemantics(ctx, finding, Attempt{Worktree: attempt.Worktree}, files); err != nil {
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 		}
 		if len(files) == 0 {
@@ -572,7 +588,7 @@ func validateFindingPatchSemantics(finding visualhive.FindingLifecycle, patchTex
 			continue
 		}
 		added := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "+")))
-		if strings.HasPrefix(added, "serve:") {
+		if strings.HasPrefix(added, "serve:") && strings.Contains(added, "start-lhci-server.mjs") {
 			return fmt.Errorf("api-500 repair must not change the nominal target serve command; use the first-party textMustNotExist marker oracle")
 		}
 		if strings.Contains(added, "data-testid") && strings.Contains(added, "api-data-area") {

@@ -452,6 +452,67 @@ func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
 	}
 }
 
+func TestWorkerAppliesCorrectivePatchOverDirtyFailedAttempt(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	configPath := filepath.Join(repository, "visual-hive.config.yaml")
+	if err := os.WriteFile(configPath, []byte("serve: npm run preview\ntextMustNotExist: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "visual-hive.config.yaml")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "add visual config")
+	runCommand(t, repository, "git", "push", "origin", "main")
+
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	worktree := filepath.Join(worktreeRoot, "api-500")
+	branch := "hive/repair-api-500-a2"
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+		t.Fatal(err)
+	}
+	failedPatch := "serve: node scripts/testing/start-lhci-server.mjs\ntextMustNotExist:\n  - visual-hive api-500 mutation\n"
+	if err := os.WriteFile(filepath.Join(worktree, "visual-hive.config.yaml"), []byte(failedPatch), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	correction := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1,3 +1,3 @@\n-serve: node scripts/testing/start-lhci-server.mjs\n+serve: npm run preview\n textMustNotExist:\n   - visual-hive api-500 mutation\n"
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := "owner/repo:api-500"
+	if err := state.Put(Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Attempt: 2,
+		Branch: branch, Worktree: worktree, Stage: StageModelComplete, Provider: "patch-model",
+		LifecycleStarted: true, ModelSummary: "restore nominal serve command", ModelPatch: correction,
+		StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"visual-hive.config.yaml"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
+			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: &patchProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{},
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Status: visualhive.StatusRepairRunning,
+		Title: "Repair api-500 mutation survivor", Body: "The api-500 operator survived.", IssueKind: "mutation_survivor",
+		Severity: "high", OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9", RepairAttempts: 1,
+	}
+	result, err := worker.Run(context.Background(), finding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PRNumber != 17 || !result.Resumed {
+		t.Fatalf("corrective revision did not finish the existing attempt: %+v", result)
+	}
+	content := gitOutput(t, remote, "show", result.Branch+":visual-hive.config.yaml")
+	if strings.Contains(content, "start-lhci-server.mjs") || !strings.Contains(content, "visual-hive api-500 mutation") {
+		t.Fatalf("corrective revision did not preserve only the valid cumulative change: %q", content)
+	}
+}
+
 func containsDecision(values []string, expected string) bool {
 	for _, value := range values {
 		if value == expected {
@@ -504,6 +565,10 @@ func TestAPI500PatchSemanticsRejectHarnessAndSelectorWorkarounds(t *testing.T) {
 		if err := validateFindingPatchSemantics(finding, patch); err == nil {
 			t.Fatalf("unsafe api-500 workaround was accepted: %s", patch)
 		}
+	}
+	correctiveServeRevert := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1 @@\n-serve: node scripts/testing/start-lhci-server.mjs\n+serve: npm --prefix dashboard run preview -- --port 4173 --strictPort\n"
+	if err := validateFindingPatchSemantics(finding, correctiveServeRevert); err != nil {
+		t.Fatalf("corrective nominal serve restoration was rejected: %v", err)
 	}
 	safe := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1,2 @@\n-textMustNotExist: []\n+textMustNotExist:\n+  - visual-hive api-500 mutation\n"
 	if err := validateFindingPatchSemantics(finding, safe); err != nil {
