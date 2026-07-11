@@ -488,7 +488,7 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 func TestAPI500RepairPromptUsesFirstPartyMutationMarker(t *testing.T) {
 	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500", IssueKind: "missing_visual_coverage"}
 	prompt := repairPrompt(finding, "verified evidence", "")
-	for _, expected := range []string{"visual-hive api-500 mutation", "textMustNotExist", "Do not change the nominal server/data harness", "Remove earlier attempt changes"} {
+	for _, expected := range []string{"visual-hive api-500 mutation", "textMustNotExist", "Do not change the nominal server/data harness", "remove any added `[data-testid='api-data-area']`", "matching `mustExist`"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("api-500 repair guidance missing %q: %s", expected, prompt)
 		}
