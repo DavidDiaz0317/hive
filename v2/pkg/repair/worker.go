@@ -404,6 +404,13 @@ func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automatio
 }
 
 func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base, discardDirtyBranch string) error {
+	// Repair validation must observe the repository's committed bytes, not the
+	// operator machine's global line-ending preference. In particular, a
+	// Windows core.autocrlf=true setting makes deterministic format checks report
+	// every tracked file as changed even when the model touched only one file.
+	if _, err := runGit(ctx, repositoryDir, "config", "core.autocrlf", "false"); err != nil {
+		return fmt.Errorf("configure deterministic repair line endings: %w", err)
+	}
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err == nil {
 		current, gitErr := runGit(ctx, worktree, "branch", "--show-current")
 		if gitErr != nil {
@@ -433,6 +440,9 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		if _, switchErr := runGit(ctx, worktree, "switch", "-C", branch, "origin/"+base); switchErr != nil {
 			return fmt.Errorf("reset clean repair worktree: %w", switchErr)
 		}
+		if _, checkoutErr := runGit(ctx, worktree, "checkout-index", "--all", "--force"); checkoutErr != nil {
+			return fmt.Errorf("normalize repair worktree from the exact index: %w", checkoutErr)
+		}
 		return nil
 	}
 	if _, err := runGit(ctx, repositoryDir, "fetch", "--prune", "origin", base); err != nil {
@@ -441,7 +451,7 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, repositoryDir, "worktree", "add", "-B", branch, worktree, "origin/"+base); err != nil {
+	if _, err := runGit(ctx, repositoryDir, "-c", "core.autocrlf=false", "worktree", "add", "-B", branch, worktree, "origin/"+base); err != nil {
 		return fmt.Errorf("create repair worktree: %w", err)
 	}
 	return nil

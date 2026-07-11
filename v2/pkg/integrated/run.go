@@ -335,11 +335,15 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		result.Repairs = append(result.Repairs, repairs...)
 		if err != nil {
 			finding, ok := activeRepairFinding(lifecycle.Snapshot())
-			if repair.IsRetryableAttemptError(err) && ok && finding.RepairAttempts < maxAttempts {
-				continue
-			}
 			if repair.IsRetryableAttemptError(err) && ok {
-				return result, fmt.Errorf("repair attempt budget exhausted for %s after retryable failure: %w", finding.RepositoryFingerprint, err)
+				spent, countErr := durableRepairAttempts(stateDir, finding)
+				if countErr != nil {
+					return result, countErr
+				}
+				if spent < maxAttempts {
+					continue
+				}
+				return result, fmt.Errorf("repair attempt budget exhausted for %s after %d attempts and retryable failure: %w", finding.RepositoryFingerprint, spent, err)
 			}
 			return result, err
 		}
@@ -496,6 +500,19 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		return result, verifyErr
 	}
 	return result, fmt.Errorf("repair orchestration exceeded its bounded iteration budget")
+}
+
+func durableRepairAttempts(stateDir string, finding visualhive.FindingLifecycle) (int, error) {
+	spent := finding.RepairAttempts
+	state, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		return 0, err
+	}
+	attempt, exists := state.Get(finding.RepositoryFingerprint)
+	if exists && attempt.Recurrence == finding.Recurrences && attempt.Attempt > spent {
+		spent = attempt.Attempt
+	}
+	return spent, nil
 }
 
 func markMergePolicyHold(lifecycle *visualhive.LifecycleStore, finding visualhive.FindingLifecycle, decision automation.Decision) error {

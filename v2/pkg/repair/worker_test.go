@@ -579,6 +579,9 @@ func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 	if branch := strings.TrimSpace(gitOutput(t, worktree, "branch", "--show-current")); branch != "hive/repair-test-a2" {
 		t.Fatalf("worktree branch = %q, want attempt 2", branch)
 	}
+	if autocrlf := strings.TrimSpace(gitOutput(t, worktree, "config", "--get", "core.autocrlf")); autocrlf != "false" {
+		t.Fatalf("repair worktree core.autocrlf = %q, want false", autocrlf)
+	}
 }
 
 func seedGitRepository(t *testing.T) (string, string) {

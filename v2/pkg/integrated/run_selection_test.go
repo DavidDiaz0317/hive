@@ -102,6 +102,25 @@ func TestRetryableRepairAttemptClassification(t *testing.T) {
 	}
 }
 
+func TestDurableRepairAttemptsUsesWorkerCheckpointForCurrentRecurrence(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := repair.NewStore(filepath.Join(stateDir, "repair"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(repair.Attempt{RepositoryFingerprint: "finding", Attempt: 4, Recurrence: 2, Stage: repair.StageNoChange}); err != nil {
+		t.Fatal(err)
+	}
+	spent, err := durableRepairAttempts(stateDir, visualhive.FindingLifecycle{RepositoryFingerprint: "finding", RepairAttempts: 3, Recurrences: 2})
+	if err != nil || spent != 4 {
+		t.Fatalf("durable attempts = %d, err=%v, want 4", spent, err)
+	}
+	spent, err = durableRepairAttempts(stateDir, visualhive.FindingLifecycle{RepositoryFingerprint: "finding", RepairAttempts: 1, Recurrences: 3})
+	if err != nil || spent != 1 {
+		t.Fatalf("prior recurrence leaked into retry budget: attempts=%d err=%v", spent, err)
+	}
+}
+
 func TestApprovedMergedBaselineProposalUsesReadyAndMergeAsApproval(t *testing.T) {
 	gate := hivegithub.PullRequestGate{
 		Merged: true, MergeSHA: "merge-sha", Draft: false, Hold: true,
