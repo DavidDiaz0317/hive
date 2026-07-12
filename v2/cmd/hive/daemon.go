@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +23,16 @@ import (
 )
 
 const daemonStatusSchema = "hive.integrated-daemon.v1"
+const daemonLeaseSchema = "hive.integrated-daemon-lease.v1"
+
+var errDaemonLeaseHeld = errors.New("hive scheduler lease is already held")
+
+type integratedDaemonLease struct {
+	SchemaVersion string    `json:"schema_version"`
+	PID           int       `json:"pid"`
+	Executable    string    `json:"executable"`
+	AcquiredAt    time.Time `json:"acquired_at"`
+}
 
 type integratedDaemonStatus struct {
 	SchemaVersion   string    `json:"schema_version"`
@@ -83,16 +92,6 @@ func ensureIntegratedDaemonStarted(stateDir string, interval time.Duration) (int
 	if status := readIntegratedDaemonStatus(stateDir); status.Running {
 		return status, nil
 	}
-	startingPath := filepath.Join(stateDir, "integrated", "daemon.starting")
-	starting, err := os.OpenFile(startingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return integratedDaemonStatus{}, fmt.Errorf("another Hive start is in progress")
-	}
-	_ = starting.Close()
-	defer os.Remove(startingPath)
-	if status := readIntegratedDaemonStatus(stateDir); status.Running {
-		return status, nil
-	}
 	executable, err := os.Executable()
 	if err != nil {
 		return integratedDaemonStatus{}, err
@@ -117,8 +116,8 @@ func ensureIntegratedDaemonStarted(stateDir string, interval time.Duration) (int
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		status := readIntegratedDaemonStatus(stateDir)
-		if status.Running && status.PID == pid {
-			store.Audit(integrated.AuditEntry{Action: "daemon_start", Allowed: true, Repository: config.Repository, Detail: fmt.Sprintf("pid=%d interval=%s", pid, interval)})
+		if status.Running {
+			store.Audit(integrated.AuditEntry{Action: "daemon_start", Allowed: true, Repository: config.Repository, Detail: fmt.Sprintf("pid=%d interval=%s", status.PID, time.Duration(status.IntervalSeconds)*time.Second)})
 			return status, nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -133,37 +132,44 @@ func runIntegratedStop(args []string) int {
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	status := readIntegratedDaemonStatus(*stateDir)
-	if status.Running {
-		if err := terminateProcess(status.PID); err != nil {
-			fmt.Fprintln(os.Stderr, "stop Hive:", err)
-			return 1
-		}
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) && processIsAlive(status.PID) {
-			time.Sleep(100 * time.Millisecond)
-		}
-		if processIsAlive(status.PID) {
-			fmt.Fprintln(os.Stderr, "stop Hive: scheduler did not exit within 10 seconds")
-			return 1
-		}
-	}
-	status = readIntegratedDaemonStatus(*stateDir)
-	status.Running = false
-	if status.StoppedAt.IsZero() {
-		status.StoppedAt = time.Now().UTC()
-	}
-	_ = writeIntegratedDaemonStatus(*stateDir, status)
-	if store, err := integrated.NewStore(filepath.Join(*stateDir, "integrated")); err == nil {
-		if config, loadErr := store.Load(); loadErr == nil {
-			store.Audit(integrated.AuditEntry{Action: "daemon_stop", Allowed: true, Repository: config.Repository, Detail: fmt.Sprintf("pid=%d", status.PID)})
-		}
+	status, err := stopIntegratedDaemon(*stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "stop Hive:", err)
+		return 1
 	}
 	if *jsonOutput {
 		return encodeJSON(status)
 	}
 	fmt.Println("Hive scheduler is stopped; persistent lifecycle state is preserved.")
 	return 0
+}
+
+func stopIntegratedDaemon(stateDir string) (integratedDaemonStatus, error) {
+	status := readIntegratedDaemonStatus(stateDir)
+	if status.Running {
+		if err := terminateProcess(status.PID); err != nil && processIsAlive(status.PID) {
+			return status, err
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) && processIsAlive(status.PID) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if processIsAlive(status.PID) {
+			return status, fmt.Errorf("scheduler did not exit within 10 seconds")
+		}
+	}
+	status = readIntegratedDaemonStatus(stateDir)
+	status.Running = false
+	if status.StoppedAt.IsZero() {
+		status.StoppedAt = time.Now().UTC()
+	}
+	_ = writeIntegratedDaemonStatus(stateDir, status)
+	if store, err := integrated.NewStore(filepath.Join(stateDir, "integrated")); err == nil {
+		if config, loadErr := store.Load(); loadErr == nil {
+			store.Audit(integrated.AuditEntry{Action: "daemon_stop", Allowed: true, Repository: config.Repository, Detail: fmt.Sprintf("pid=%d", status.PID)})
+		}
+	}
+	return status, nil
 }
 
 func runIntegratedDaemon(args []string) int {
@@ -193,21 +199,30 @@ func runIntegratedDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if err := claimDaemonPID(stateDirAbs); err != nil {
+	lease, err := claimDaemonLease(stateDirAbs)
+	if errors.Is(err, errDaemonLeaseHeld) {
+		// Concurrent and repeated starts are idempotent. The caller that spawned
+		// this process will observe the scheduler which won the lease.
+		return 0
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	defer releaseDaemonLease(lease)
 	started := time.Now().UTC()
 	executable, _ := os.Executable()
 	status := integratedDaemonStatus{SchemaVersion: daemonStatusSchema, PID: os.Getpid(), Running: true, Repository: config.Repository, StateDir: stateDirAbs, Executable: executable, StartedAt: started, IntervalSeconds: int64(interval.Seconds())}
-	_ = writeIntegratedDaemonStatus(stateDirAbs, status)
+	if err := writeIntegratedDaemonStatus(stateDirAbs, status); err != nil {
+		fmt.Fprintln(os.Stderr, "write scheduler status:", err)
+		return 1
+	}
 	store.Audit(integrated.AuditEntry{Action: "daemon_claim", Allowed: true, Repository: config.Repository, Detail: fmt.Sprintf("pid=%d", os.Getpid())})
 	defer func() {
 		status.Running = false
 		status.StoppedAt = time.Now().UTC()
 		status.NextRunAt = time.Time{}
 		_ = writeIntegratedDaemonStatus(stateDirAbs, status)
-		releaseDaemonPID(stateDirAbs, os.Getpid())
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -277,53 +292,199 @@ func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time
 		return integrated.RunResult{}, providerErr
 	}
 	for _, check := range liveRepositoryChecks(ctx, client, config) {
-		if !check.OK {
-			return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %s", check.Name, check.Message)
+		if check.OK {
+			continue
 		}
+		if check.Name == "branch_protection" && config.Automation == integrated.AutomationAutoMerge {
+			pending, pendingErr := daemonCanRunProtectionActivation(ctx, client, config)
+			if pendingErr != nil {
+				return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %w", check.Name, pendingErr)
+			}
+			if pending {
+				// RunOnce is the only writer allowed to activate protection. Doctor
+				// remains strict, but the scheduler must be able to enter that exact
+				// two-phase transition after the managed setup PR is installed.
+				continue
+			}
+		}
+		return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %s", check.Name, check.Message)
 	}
 	return integrated.RunOnce(ctx, integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client})
 }
 
-func claimDaemonPID(stateDir string) error {
-	path := filepath.Join(stateDir, "integrated", "daemon.pid")
-	if data, err := os.ReadFile(path); err == nil {
-		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-		status := readIntegratedDaemonStatus(stateDir)
-		if pid > 0 && status.Running && status.PID == pid {
-			return fmt.Errorf("Hive scheduler is already running with pid %d", pid)
-		}
-		_ = os.Remove(path)
+func daemonCanRunProtectionActivation(ctx context.Context, client *hivegithub.Client, config integrated.Config) (bool, error) {
+	if client == nil || config.Automation != integrated.AutomationAutoMerge {
+		return false, nil
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	protection, err := client.BranchProtection(ctx, config.Repository, config.DefaultBranch)
 	if err != nil {
-		return fmt.Errorf("claim Hive scheduler state: %w", err)
+		return false, fmt.Errorf("inspect pending protection activation: %w", err)
 	}
-	if _, err := fmt.Fprintf(file, "%d\n", os.Getpid()); err != nil {
-		_ = file.Close()
-		return err
+	expectedAppID, err := client.ExpectedGitHubAppID(ctx, "github-actions")
+	if err != nil {
+		return false, fmt.Errorf("resolve pending protection activation producer: %w", err)
 	}
-	return file.Close()
+	activation, exists, err := integrated.ReadProtectionActivation(config.StateDir)
+	if err != nil {
+		return false, fmt.Errorf("read pending protection activation state: %w", err)
+	}
+	activationDurable := exists && integrated.ProtectionActivationMatchesConfig(activation, config) && activation.CheckAppID == expectedAppID
+	return daemonProtectionActivationRunnable(config.Automation, protection, expectedAppID, activationDurable), nil
 }
 
-func releaseDaemonPID(stateDir string, pid int) {
-	path := filepath.Join(stateDir, "integrated", "daemon.pid")
-	data, err := os.ReadFile(path)
-	if err == nil && strings.TrimSpace(string(data)) == strconv.Itoa(pid) {
-		_ = os.Remove(path)
+func daemonProtectionActivationRunnable(automation integrated.Automation, protection hivegithub.BranchProtectionSummary, expectedAppID int64, activationDurable bool) bool {
+	if automation != integrated.AutomationAutoMerge || expectedAppID <= 0 {
+		return false
 	}
+	if !protection.Enabled {
+		// No repository-owned policy exists, so RunOnce may perform the trusted
+		// scan and create Hive's conservative minimum protection.
+		return true
+	}
+	if !protection.Strict || !protection.AdminEnforced {
+		return false
+	}
+	visualRequired := false
+	for _, check := range protection.RequiredCheckIdentities {
+		if strings.EqualFold(strings.TrimSpace(check.Context), "visual-hive") && check.AppID == expectedAppID {
+			visualRequired = true
+			break
+		}
+	}
+	// Existing policy is never modified. It is safe to enter RunOnce only when
+	// that policy is already exact and the remaining work is the trusted-run
+	// activation checkpoint (including a new digest after an upgrade).
+	return visualRequired && !activationDurable
+}
+
+func claimDaemonLease(stateDir string) (*os.File, error) {
+	dir := filepath.Join(stateDir, "integrated")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "daemon.lease")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open Hive scheduler lease: %w", err)
+	}
+	locked, err := tryLockDaemonLease(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("claim Hive scheduler lease: %w", err)
+	}
+	if !locked {
+		_ = file.Close()
+		return nil, errDaemonLeaseHeld
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, err
+	}
+	lease := integratedDaemonLease{SchemaVersion: daemonLeaseSchema, PID: os.Getpid(), Executable: executable, AcquiredAt: time.Now().UTC()}
+	data, err := json.MarshalIndent(lease, "", "  ")
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, err
+	}
+	if err := file.Truncate(0); err == nil {
+		_, err = file.Seek(0, 0)
+	}
+	if err == nil {
+		_, err = file.Write(append(data, '\n'))
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, fmt.Errorf("persist Hive scheduler lease: %w", err)
+	}
+	// These files are from the pre-lease implementation. They are never
+	// consulted after the lease is held and are safe to clean up here.
+	_ = os.Remove(filepath.Join(dir, "daemon.pid"))
+	_ = os.Remove(filepath.Join(dir, "daemon.starting"))
+	return file, nil
+}
+
+func releaseDaemonLease(file *os.File) {
+	if file == nil {
+		return
+	}
+	_ = unlockDaemonLease(file)
+	_ = file.Close()
+}
+
+func readIntegratedDaemonLease(stateDir string) (integratedDaemonLease, bool) {
+	path := filepath.Join(stateDir, "integrated", "daemon.lease")
+	for attempt := 0; attempt < 5; attempt++ {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return integratedDaemonLease{}, false
+		}
+		var lease integratedDaemonLease
+		if json.Unmarshal(data, &lease) == nil && lease.SchemaVersion == daemonLeaseSchema && lease.PID > 0 && lease.Executable != "" {
+			file, openErr := os.OpenFile(path, os.O_RDWR, 0o600)
+			if openErr != nil {
+				return integratedDaemonLease{}, false
+			}
+			locked, lockErr := tryReadDaemonLease(file)
+			if locked {
+				_ = unlockDaemonLease(file)
+			}
+			_ = file.Close()
+			if lockErr != nil || locked {
+				return lease, false
+			}
+			// The record is immutable while its owner holds the lock. Confirm
+			// that ownership did not change between the read and lock probe.
+			current, readErr := os.ReadFile(path)
+			if readErr == nil && string(current) == string(data) {
+				return lease, true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return integratedDaemonLease{}, false
 }
 
 func readIntegratedDaemonStatus(stateDir string) integratedDaemonStatus {
 	stateDir, _ = filepath.Abs(stateDir)
+	leasePath := filepath.Join(stateDir, "integrated", "daemon.lease")
+	_, leaseErr := os.Stat(leasePath)
+	leasePresent := leaseErr == nil || !errors.Is(leaseErr, os.ErrNotExist)
+	lease, leaseHeld := integratedDaemonLease{}, false
+	if leaseErr == nil {
+		lease, leaseHeld = readIntegratedDaemonLease(stateDir)
+	}
+	leaseStatus := func(lastError string) integratedDaemonStatus {
+		status := integratedDaemonStatus{SchemaVersion: daemonStatusSchema, StateDir: stateDir, LastError: lastError}
+		if leaseHeld && processIsAlive(lease.PID) {
+			status.PID = lease.PID
+			status.Executable = lease.Executable
+			status.StartedAt = lease.AcquiredAt
+			status.Running = true
+		}
+		return status
+	}
 	data, err := os.ReadFile(filepath.Join(stateDir, "integrated", "daemon.json"))
 	if err != nil {
-		return integratedDaemonStatus{SchemaVersion: daemonStatusSchema, StateDir: stateDir, Running: false}
+		return leaseStatus("")
 	}
 	var status integratedDaemonStatus
 	if json.Unmarshal(data, &status) != nil || status.SchemaVersion != daemonStatusSchema {
-		return integratedDaemonStatus{SchemaVersion: daemonStatusSchema, StateDir: stateDir, Running: false, LastError: "daemon status is invalid"}
+		return leaseStatus("daemon status is invalid")
 	}
-	status.Running = status.PID > 0 && status.Executable != "" && processIsAlive(status.PID) && processMatchesExecutable(status.PID, status.Executable)
+	if leasePresent {
+		// The live OS lock is the ownership proof. The executable on disk may
+		// legitimately have been atomically replaced by an installer while the
+		// old daemon keeps running from a deleted/backup inode.
+		status.Running = leaseHeld && lease.PID == status.PID && processIsAlive(status.PID)
+	} else {
+		// Legacy status without a lease needs the stronger executable check to
+		// avoid treating a reused PID as Hive.
+		status.Running = status.PID > 0 && status.Executable != "" && processIsAlive(status.PID) && processMatchesExecutable(status.PID, status.Executable)
+	}
 	return status
 }
 

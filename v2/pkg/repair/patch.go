@@ -2,6 +2,7 @@ package repair
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path"
@@ -9,6 +10,26 @@ import (
 	"sort"
 	"strings"
 )
+
+type patchEngineInfrastructureError struct{ cause error }
+
+func (e *patchEngineInfrastructureError) Error() string { return e.cause.Error() }
+func (e *patchEngineInfrastructureError) Unwrap() error { return e.cause }
+
+func patchEngineInfrastructureFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isPatchEngineInfrastructureFailure(err) {
+		return err
+	}
+	return &patchEngineInfrastructureError{cause: err}
+}
+
+func isPatchEngineInfrastructureFailure(err error) bool {
+	var infrastructure *patchEngineInfrastructureError
+	return errors.As(err, &infrastructure)
+}
 
 const (
 	modelPatchBegin = "HIVE_PATCH_BEGIN"
@@ -93,7 +114,8 @@ func applyModelPatch(ctx context.Context, worktree, patchText string) error {
 		var output limitedBuffer
 		command.Stdout, command.Stderr = &output, &output
 		if err := command.Run(); err != nil {
-			return fmt.Errorf("git %s model patch failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+			failure := fmt.Errorf("git %s model patch failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+			return classifyPatchCommandFailure(ctx, err, output.String(), failure)
 		}
 	}
 	return nil
@@ -111,7 +133,7 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 	}
 	addArgs := append([]string{"add", "--"}, files...)
 	if _, err := runGit(ctx, worktree, addArgs...); err != nil {
-		return fmt.Errorf("stage cumulative repair state for incremental patch: %w", err)
+		return patchEngineInfrastructureFailure(fmt.Errorf("stage cumulative repair state for incremental patch: %w", err))
 	}
 	resetIndex := func() error {
 		resetArgs := append([]string{"reset", "--"}, files...)
@@ -121,7 +143,7 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 	applyErr := func() error {
 		canApply, _, err := checkModelPatch(ctx, worktree, patchText, false, true)
 		if err != nil {
-			return err
+			return patchEngineInfrastructureFailure(err)
 		}
 		if canApply {
 			return applyIndexedModelPatch(ctx, worktree, patchText)
@@ -134,14 +156,14 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 		for index, hunk := range hunks {
 			alreadyApplied, _, checkErr := checkModelPatch(ctx, worktree, hunk, true, true)
 			if checkErr != nil {
-				return checkErr
+				return patchEngineInfrastructureFailure(checkErr)
 			}
 			if alreadyApplied {
 				continue
 			}
 			applicable, detail, checkErr := checkModelPatch(ctx, worktree, hunk, false, true)
 			if checkErr != nil {
-				return checkErr
+				return patchEngineInfrastructureFailure(checkErr)
 			}
 			if !applicable {
 				return fmt.Errorf("incremental model patch hunk %d is neither applicable nor already present: %s", index+1, safeExcerpt(detail))
@@ -156,12 +178,12 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 	resetErr := resetIndex()
 	if applyErr != nil {
 		if resetErr != nil {
-			return fmt.Errorf("%v; restore repair index after rejected incremental patch: %w", applyErr, resetErr)
+			return patchEngineInfrastructureFailure(fmt.Errorf("%v; restore repair index after rejected incremental patch: %w", applyErr, resetErr))
 		}
 		return applyErr
 	}
 	if resetErr != nil {
-		return fmt.Errorf("restore repair index after incremental patch: %w", resetErr)
+		return patchEngineInfrastructureFailure(fmt.Errorf("restore repair index after incremental patch: %w", resetErr))
 	}
 	return nil
 }
@@ -180,10 +202,29 @@ func applyIndexedModelPatch(ctx context.Context, worktree, patchText string) err
 		var output limitedBuffer
 		command.Stdout, command.Stderr = &output, &output
 		if err := command.Run(); err != nil {
-			return fmt.Errorf("git %s incremental model patch failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+			failure := fmt.Errorf("git %s incremental model patch failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+			return classifyPatchCommandFailure(ctx, err, output.String(), failure)
 		}
 	}
 	return nil
+}
+
+func classifyPatchCommandFailure(ctx context.Context, commandErr error, output string, failure error) error {
+	var launchError *exec.Error
+	if ctx.Err() != nil || errors.As(commandErr, &launchError) {
+		return patchEngineInfrastructureFailure(failure)
+	}
+	detail := strings.ToLower(output + "\n" + commandErr.Error())
+	for _, marker := range []string{
+		"permission denied", "access is denied", "read-only file system", "no space left on device", "input/output error",
+		"index.lock", "index file corrupt", "unable to write", "could not write", "cannot create",
+		"fatal: not a git repository", "fatal: detected dubious ownership", "fatal: unable to", "fatal: cannot", "fatal: could not",
+	} {
+		if strings.Contains(detail, marker) {
+			return patchEngineInfrastructureFailure(failure)
+		}
+	}
+	return failure
 }
 
 func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, indexed bool) (bool, string, error) {
@@ -202,8 +243,10 @@ func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, i
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil {
-		if ctx.Err() != nil {
-			return false, output.String(), ctx.Err()
+		failure := fmt.Errorf("git %s model patch check failed: %w: %s", strings.Join(args[:len(args)-1], " "), err, safeExcerpt(output.String()))
+		classified := classifyPatchCommandFailure(ctx, err, output.String(), failure)
+		if isPatchEngineInfrastructureFailure(classified) {
+			return false, output.String(), classified
 		}
 		return false, output.String(), nil
 	}

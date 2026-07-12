@@ -9,10 +9,12 @@ import (
 )
 
 type fakeLifecycleIssueClient struct {
-	upserts int
-	updates int
-	state   string
-	labels  []string
+	upserts        int
+	updates        int
+	state          string
+	labels         []string
+	canonicalIssue int
+	canonicalURL   string
 }
 
 func (client *fakeLifecycleIssueClient) UpsertLifecycleIssue(_ context.Context, _, _, _, _ string, labels []string) (int, string, bool, error) {
@@ -26,6 +28,9 @@ func (client *fakeLifecycleIssueClient) UpdateLifecycleIssue(_ context.Context, 
 	client.updates++
 	client.state = state
 	client.labels = append([]string(nil), labels...)
+	if client.canonicalIssue > 0 {
+		return client.canonicalIssue, client.canonicalURL, nil
+	}
 	return number, "https://github.test/owner/repo/issues/17", nil
 }
 
@@ -118,6 +123,56 @@ func TestProcessOutboxSkipsSupersededClose(t *testing.T) {
 	result := ProcessOutbox(context.Background(), lifecycle, beadStore, automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}, client)
 	if result.StaleSkipped != 1 || result.Succeeded != 1 || client.state != "open" {
 		t.Fatalf("superseded close was not skipped: result=%+v client=%+v", result, client)
+	}
+}
+
+func TestCloseOutboxReplayAfterLifecycleCloseIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-close-present", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLifecycleIssueClient{}
+	policy := automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}
+	if opened := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); opened.Succeeded != 1 {
+		t.Fatalf("open issue failed: %+v", opened)
+	}
+	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-close-absent", "absent", "main", true))
+	if _, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate GitHub finding a lower-numbered duplicate after the original
+	// state directory had already persisted issue #17.
+	client.canonicalIssue = 16
+	client.canonicalURL = "https://github.test/owner/repo/issues/16"
+	pending := lifecycle.PendingOutbox()
+	if len(pending) != 1 || pending[0].Action != OutboxCloseIssue {
+		t.Fatalf("expected one pending close, got %+v", pending)
+	}
+	finding, exists := lifecycle.Finding(pending[0].RepositoryFingerprint)
+	if !exists {
+		t.Fatal("resolved finding is missing")
+	}
+	// Simulate a crash after the remote close and durable IssueClosed transition,
+	// but before ProcessOutbox can persist the outbox completion bit.
+	if err := processOutboxEntry(context.Background(), lifecycle, beadStore, client, finding, pending[0]); err != nil {
+		t.Fatal(err)
+	}
+	if finding, _ = lifecycle.Finding(pending[0].RepositoryFingerprint); finding.Status != StatusIssueClosed || finding.IssueNumber != 16 || finding.IssueURL != client.canonicalURL || len(lifecycle.PendingOutbox()) != 1 {
+		t.Fatalf("fault injection did not reach the close/completion crash window: finding=%+v pending=%+v", finding, lifecycle.PendingOutbox())
+	}
+	remoteUpdates := client.updates
+	replayed := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client)
+	if replayed.Succeeded != 1 || replayed.Failed != 0 || len(lifecycle.PendingOutbox()) != 0 {
+		t.Fatalf("pending close did not recover idempotently: result=%+v pending=%+v", replayed, lifecycle.PendingOutbox())
+	}
+	if client.updates != remoteUpdates {
+		t.Fatalf("idempotent close replay repeated the remote mutation: before=%d after=%d", remoteUpdates, client.updates)
 	}
 }
 

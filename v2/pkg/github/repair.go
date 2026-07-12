@@ -34,25 +34,41 @@ type MergedBaselineBranch struct {
 	HeadSHA               string `json:"head_sha"`
 }
 
+type managedRepositoryIdentity struct {
+	ID       int64
+	FullName string
+}
+
 // UpsertRepairPullRequest creates or updates exactly one open repair PR for a
 // Hive-owned branch. The marker makes a retry after an ambiguous API response
 // idempotent without relying on the local lifecycle transaction having
 // completed.
-func (c *Client) UpsertRepairPullRequest(ctx context.Context, repository, branch, base, title, body, marker string) (RepairPullRequest, error) {
-	return c.upsertHivePullRequest(ctx, repository, branch, base, title, body, marker, false)
+func (c *Client) UpsertRepairPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
+	return c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false)
 }
 
 // UpsertReviewPullRequest creates a draft, hold-labeled PR for an operation
 // that requires explicit human authority, such as adding visual baselines.
 // Hive never promotes the draft or merges it automatically.
-func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch, base, title, body, marker string) (RepairPullRequest, error) {
-	pull, err := c.upsertHivePullRequest(ctx, repository, branch, base, title, body, marker, true)
+func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
+	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, true)
 	if err != nil {
 		return RepairPullRequest{}, err
 	}
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
 		return RepairPullRequest{}, err
+	}
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return RepairPullRequest{}, err
+	}
+	live, _, err := c.client.PullRequests.Get(ctx, owner, repo, pull.Number)
+	if err != nil {
+		return RepairPullRequest{}, fmt.Errorf("verify review pull request before labeling: %w", err)
+	}
+	if err := validateManagedPullRequest(live, identity, repository, pull.Number, branch, expectedHeadSHA, base, marker, title, body); err != nil {
+		return RepairPullRequest{}, fmt.Errorf("refusing to label inexact review pull request #%d: %w", pull.Number, err)
 	}
 	for name, color := range map[string]string{"hold": "B60205", "hive/baseline-review": "D4C5F9"} {
 		if err := c.ensureLabel(ctx, owner, repo, name, color); err != nil {
@@ -65,36 +81,76 @@ func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch
 	return pull, nil
 }
 
-func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, base, title, body, marker string, draft bool) (RepairPullRequest, error) {
+func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string, draft bool) (RepairPullRequest, error) {
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
 		return RepairPullRequest{}, err
 	}
-	if strings.TrimSpace(branch) == "" || strings.TrimSpace(base) == "" || strings.TrimSpace(marker) == "" {
-		return RepairPullRequest{}, fmt.Errorf("repair branch, base branch, and marker are required")
+	if strings.TrimSpace(branch) == "" || strings.TrimSpace(base) == "" || strings.TrimSpace(title) == "" || strings.TrimSpace(marker) == "" ||
+		!exactManagedSHA(expectedHeadSHA) || exactMarkerLineCount(body, marker) != 1 {
+		return RepairPullRequest{}, fmt.Errorf("repair branch, exact head SHA, base branch, title, and exactly one marker line are required")
 	}
-	pulls, err := c.listOpenPullRequests(ctx, owner, repo, base)
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return RepairPullRequest{}, err
+	}
+	if err := c.verifyManagedBranchHead(ctx, owner, repo, branch, expectedHeadSHA); err != nil {
+		return RepairPullRequest{}, err
+	}
+	// Search every open PR, not only the requested base. A marker claimant on a
+	// fork or another base is an ambiguity to stop on, never a candidate to
+	// silently ignore before creating a second PR.
+	pulls, err := c.listPullRequestsByState(ctx, owner, repo, "", "open")
 	if err != nil {
 		return RepairPullRequest{}, fmt.Errorf("list repair pull requests: %w", err)
 	}
 	var matched *gh.PullRequest
 	for _, pull := range pulls {
-		if strings.Contains(pull.GetBody(), marker) {
-			if matched != nil {
-				return RepairPullRequest{}, fmt.Errorf("multiple open repair pull requests contain marker %q", marker)
-			}
-			matched = pull
+		markerCount := exactMarkerLineCount(pull.GetBody(), marker)
+		if markerCount == 0 {
+			continue
 		}
+		if !managedPullRepositoriesMatch(pull, identity, repository) {
+			c.logIgnoredForeignMarkerClaim(repository, pull, marker)
+			continue
+		}
+		if markerCount != 1 {
+			return RepairPullRequest{}, fmt.Errorf("open repair pull request #%d contains marker %q more than once", pull.GetNumber(), marker)
+		}
+		if err := validateManagedPullRequest(pull, identity, repository, pull.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); err != nil {
+			return RepairPullRequest{}, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not the exact managed PR: %w", pull.GetNumber(), marker, err)
+		}
+		if matched != nil {
+			return RepairPullRequest{}, fmt.Errorf("multiple exact open repair pull requests contain marker %q", marker)
+		}
+		matched = pull
 	}
 	if matched != nil {
-		if matched.GetHead().GetRef() != branch {
-			return RepairPullRequest{}, fmt.Errorf("open repair pull request #%d already owns marker %q on branch %s; refusing duplicate branch %s", matched.GetNumber(), marker, matched.GetHead().GetRef(), branch)
+		live, _, err := c.client.PullRequests.Get(ctx, owner, repo, matched.GetNumber())
+		if err != nil {
+			return RepairPullRequest{}, fmt.Errorf("re-read repair pull request #%d before update: %w", matched.GetNumber(), err)
 		}
-		updated, _, err := c.client.PullRequests.Edit(ctx, owner, repo, matched.GetNumber(), &gh.PullRequest{Title: gh.Ptr(title), Body: gh.Ptr(body), Base: &gh.PullRequestBranch{Ref: gh.Ptr(base)}})
+		if live.GetHead().GetSHA() != matched.GetHead().GetSHA() {
+			return RepairPullRequest{}, fmt.Errorf("repair pull request #%d head changed during discovery", matched.GetNumber())
+		}
+		if err := validateManagedPullRequest(live, identity, repository, matched.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); err != nil {
+			return RepairPullRequest{}, fmt.Errorf("repair pull request #%d changed before update: %w", matched.GetNumber(), err)
+		}
+		_, _, err = c.client.PullRequests.Edit(ctx, owner, repo, matched.GetNumber(), &gh.PullRequest{Title: gh.Ptr(title), Body: gh.Ptr(body), Base: &gh.PullRequestBranch{Ref: gh.Ptr(base)}})
 		if err != nil {
 			return RepairPullRequest{}, fmt.Errorf("update repair pull request: %w", err)
 		}
-		return RepairPullRequest{Number: updated.GetNumber(), URL: updated.GetHTMLURL(), HeadSHA: updated.GetHead().GetSHA()}, nil
+		updated, _, err := c.client.PullRequests.Get(ctx, owner, repo, matched.GetNumber())
+		if err != nil {
+			return RepairPullRequest{}, fmt.Errorf("verify repair pull request #%d after update: %w", matched.GetNumber(), err)
+		}
+		if err := validateManagedPullRequest(updated, identity, repository, matched.GetNumber(), branch, expectedHeadSHA, base, marker, title, body); err != nil {
+			return RepairPullRequest{}, fmt.Errorf("repair pull request #%d was not updated exactly: %w", matched.GetNumber(), err)
+		}
+		if err := c.verifyManagedBranchHead(ctx, owner, repo, branch, expectedHeadSHA); err != nil {
+			return RepairPullRequest{}, err
+		}
+		return repairPullRequestResult(updated, false), nil
 	}
 	created, _, err := c.client.PullRequests.Create(ctx, owner, repo, &gh.NewPullRequest{
 		Title: gh.Ptr(title), Head: gh.Ptr(branch), Base: gh.Ptr(base), Body: gh.Ptr(body), Draft: gh.Ptr(draft), MaintainerCanModify: gh.Ptr(true),
@@ -102,7 +158,20 @@ func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, 
 	if err != nil {
 		return RepairPullRequest{}, fmt.Errorf("create repair pull request: %w", err)
 	}
-	return RepairPullRequest{Number: created.GetNumber(), URL: created.GetHTMLURL(), HeadSHA: created.GetHead().GetSHA(), Created: true}, nil
+	if created.GetNumber() <= 0 {
+		return RepairPullRequest{}, fmt.Errorf("create repair pull request returned no PR identity")
+	}
+	live, _, err := c.client.PullRequests.Get(ctx, owner, repo, created.GetNumber())
+	if err != nil {
+		return RepairPullRequest{}, fmt.Errorf("verify created repair pull request #%d: %w", created.GetNumber(), err)
+	}
+	if err := validateManagedPullRequest(live, identity, repository, created.GetNumber(), branch, expectedHeadSHA, base, marker, title, body); err != nil {
+		return RepairPullRequest{}, fmt.Errorf("created repair pull request #%d is not exact: %w", created.GetNumber(), err)
+	}
+	if err := c.verifyManagedBranchHead(ctx, owner, repo, branch, expectedHeadSHA); err != nil {
+		return RepairPullRequest{}, err
+	}
+	return repairPullRequestResult(live, true), nil
 }
 
 // ListOpenRepairPullRequests returns every open PR carrying one exact Hive
@@ -116,15 +185,35 @@ func (c *Client) ListOpenRepairPullRequests(ctx context.Context, repository, bas
 	if strings.TrimSpace(base) == "" || strings.TrimSpace(marker) == "" {
 		return nil, fmt.Errorf("base branch and repair marker are required")
 	}
-	pulls, err := c.listOpenPullRequests(ctx, owner, repo, base)
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return nil, err
+	}
+	pulls, err := c.listPullRequestsByState(ctx, owner, repo, "", "open")
 	if err != nil {
 		return nil, err
 	}
 	result := make([]OpenRepairPullRequest, 0)
 	for _, pull := range pulls {
-		if strings.Contains(pull.GetBody(), marker) {
-			result = append(result, OpenRepairPullRequest{Number: pull.GetNumber(), URL: pull.GetHTMLURL(), Branch: pull.GetHead().GetRef(), HeadSHA: pull.GetHead().GetSHA()})
+		markerCount := exactMarkerLineCount(pull.GetBody(), marker)
+		if markerCount == 0 {
+			continue
 		}
+		if !managedPullRepositoriesMatch(pull, identity, repository) {
+			c.logIgnoredForeignMarkerClaim(repository, pull, marker)
+			continue
+		}
+		if markerCount != 1 {
+			return nil, fmt.Errorf("open repair pull request #%d contains marker %q more than once", pull.GetNumber(), marker)
+		}
+		branch, head := pull.GetHead().GetRef(), pull.GetHead().GetSHA()
+		if err := validateManagedPullRequest(pull, identity, repository, pull.GetNumber(), branch, head, base, marker, "", ""); err != nil {
+			return nil, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not repository-owned: %w", pull.GetNumber(), marker, err)
+		}
+		if err := c.verifyManagedBranchHead(ctx, owner, repo, branch, head); err != nil {
+			return nil, fmt.Errorf("verify exact branch for repair pull request #%d: %w", pull.GetNumber(), err)
+		}
+		result = append(result, OpenRepairPullRequest{Number: pull.GetNumber(), URL: pull.GetHTMLURL(), Branch: branch, HeadSHA: head})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Number < result[j].Number })
 	return result, nil
@@ -140,12 +229,19 @@ func (c *Client) CloseRepairPullRequestExact(ctx context.Context, repository str
 	if number <= 0 || strings.TrimSpace(marker) == "" || strings.TrimSpace(expectedBranch) == "" || strings.TrimSpace(expectedHeadSHA) == "" {
 		return fmt.Errorf("repair PR number, marker, branch, and exact head are required")
 	}
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return err
+	}
 	pull, _, err := c.client.PullRequests.Get(ctx, owner, repo, number)
 	if err != nil {
 		return fmt.Errorf("get repair pull request #%d: %w", number, err)
 	}
-	if !strings.Contains(pull.GetBody(), marker) || pull.GetHead().GetRef() != expectedBranch || pull.GetHead().GetSHA() != expectedHeadSHA {
-		return fmt.Errorf("refusing to close repair pull request #%d because its marker, branch, or head changed", number)
+	if err := validateManagedPullRequest(pull, identity, repository, number, expectedBranch, expectedHeadSHA, pull.GetBase().GetRef(), marker, "", ""); err != nil {
+		return fmt.Errorf("refusing to close repair pull request #%d: %w", number, err)
+	}
+	if err := c.verifyManagedBranchHead(ctx, owner, repo, expectedBranch, expectedHeadSHA); err != nil {
+		return fmt.Errorf("refusing to close repair pull request #%d: %w", number, err)
 	}
 	if pull.GetState() != "open" {
 		return nil
@@ -153,11 +249,17 @@ func (c *Client) CloseRepairPullRequestExact(ctx context.Context, repository str
 	if _, _, err := c.client.PullRequests.Edit(ctx, owner, repo, number, &gh.PullRequest{State: gh.Ptr("closed")}); err != nil {
 		return fmt.Errorf("close repair pull request #%d: %w", number, err)
 	}
+	closed, _, err := c.client.PullRequests.Get(ctx, owner, repo, number)
+	if err != nil {
+		return fmt.Errorf("verify closed repair pull request #%d: %w", number, err)
+	}
+	if err := validateManagedPullRequest(closed, identity, repository, number, expectedBranch, expectedHeadSHA, pull.GetBase().GetRef(), marker, "", ""); err != nil || closed.GetState() != "closed" {
+		if err == nil {
+			err = fmt.Errorf("state is %q", closed.GetState())
+		}
+		return fmt.Errorf("repair pull request #%d did not close exactly: %w", number, err)
+	}
 	return nil
-}
-
-func (c *Client) listOpenPullRequests(ctx context.Context, owner, repo, base string) ([]*gh.PullRequest, error) {
-	return c.listPullRequestsByState(ctx, owner, repo, base, "open")
 }
 
 // ListMergedBaselineBranches returns only still-existing Hive baseline refs
@@ -166,6 +268,10 @@ func (c *Client) listOpenPullRequests(ctx context.Context, owner, repo, base str
 // repair checkpoint was later superseded.
 func (c *Client) ListMergedBaselineBranches(ctx context.Context, repository, base string) ([]MergedBaselineBranch, error) {
 	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return nil, err
+	}
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
 	if err != nil {
 		return nil, err
 	}
@@ -202,13 +308,24 @@ func (c *Client) ListMergedBaselineBranches(ctx context.Context, repository, bas
 		if !exists || !hasExactLabel(summary.Labels, "hive/baseline-review") {
 			continue
 		}
+		if !managedPullRepositoriesMatch(summary, identity, repository) {
+			c.logIgnoredForeignMarkerClaim(repository, summary, "hive/baseline-review")
+			continue
+		}
+		if err := validateManagedPullRequest(summary, identity, repository, summary.GetNumber(), branch, expectedSHA, base, "", "", ""); err != nil {
+			return nil, fmt.Errorf("closed baseline review pull request #%d is not repository-owned: %w", summary.GetNumber(), err)
+		}
 		pull, _, err := c.client.PullRequests.Get(ctx, owner, repo, summary.GetNumber())
 		if err != nil {
 			return nil, fmt.Errorf("get baseline review pull request #%d: %w", summary.GetNumber(), err)
 		}
 		fingerprint, marked := baselineReviewFingerprint(pull.GetBody())
-		if !pull.GetMerged() || pull.GetHead().GetRef() != branch || pull.GetHead().GetSHA() != expectedSHA || !hasExactLabel(pull.Labels, "hive/baseline-review") || !marked {
+		if !pull.GetMerged() || !hasExactLabel(pull.Labels, "hive/baseline-review") || !marked {
 			continue
+		}
+		marker := strings.TrimSpace(strings.SplitN(pull.GetBody(), "\n", 2)[0])
+		if err := validateManagedPullRequest(pull, identity, repository, summary.GetNumber(), branch, expectedSHA, base, marker, "", ""); err != nil {
+			return nil, fmt.Errorf("merged baseline review pull request #%d changed identity: %w", summary.GetNumber(), err)
 		}
 		if _, duplicate := byBranch[branch]; duplicate {
 			return nil, fmt.Errorf("multiple merged baseline review PRs claim branch %s", branch)
@@ -240,6 +357,123 @@ func (c *Client) listPullRequestsByState(ctx context.Context, owner, repo, base,
 		}
 		options.Page = response.NextPage
 	}
+}
+
+func (c *Client) resolveManagedRepositoryIdentity(ctx context.Context, owner, repo, requested string) (managedRepositoryIdentity, error) {
+	metadata, _, err := c.client.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return managedRepositoryIdentity{}, fmt.Errorf("verify managed repository identity: %w", err)
+	}
+	identity := managedRepositoryIdentity{ID: metadata.GetID(), FullName: strings.TrimSpace(metadata.GetFullName())}
+	if identity.ID <= 0 || identity.FullName == "" || !strings.EqualFold(identity.FullName, strings.TrimSpace(requested)) {
+		return managedRepositoryIdentity{}, fmt.Errorf("managed repository must resolve to a positive ID and exact full_name")
+	}
+	return identity, nil
+}
+
+func (c *Client) verifyManagedBranchHead(ctx context.Context, owner, repo, branch, expectedHeadSHA string) error {
+	branch = strings.TrimSpace(branch)
+	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+	if branch == "" || expectedHeadSHA == "" {
+		return fmt.Errorf("managed branch and exact head SHA are required")
+	}
+	ref, _, err := c.client.Git.GetRef(ctx, owner, repo, "heads/"+branch)
+	if err != nil {
+		return fmt.Errorf("verify managed branch %s: %w", branch, err)
+	}
+	if ref.GetRef() != "refs/heads/"+branch || !strings.EqualFold(ref.GetObject().GetSHA(), expectedHeadSHA) {
+		return fmt.Errorf("managed branch %s no longer points to exact head %s", branch, expectedHeadSHA)
+	}
+	return nil
+}
+
+func validateManagedPullRequest(pull *gh.PullRequest, identity managedRepositoryIdentity, repository string, number int, branch, headSHA, base, marker, exactTitle, exactBody string) error {
+	if pull == nil || identity.ID <= 0 || strings.TrimSpace(identity.FullName) == "" || number <= 0 || pull.GetNumber() != number {
+		return fmt.Errorf("positive repository and pull request identities are required")
+	}
+	head, target := pull.GetHead(), pull.GetBase()
+	if !managedPullRepositoriesMatch(pull, identity, repository) {
+		return fmt.Errorf("head and base repositories must match target repository %s at positive ID %d", identity.FullName, identity.ID)
+	}
+	if strings.TrimSpace(branch) == "" || head.GetRef() != branch {
+		return fmt.Errorf("head branch is %q, expected %q", head.GetRef(), branch)
+	}
+	if strings.TrimSpace(headSHA) == "" || !strings.EqualFold(head.GetSHA(), headSHA) {
+		return fmt.Errorf("head SHA is %q, expected %q", head.GetSHA(), headSHA)
+	}
+	if strings.TrimSpace(base) == "" || target.GetRef() != base {
+		return fmt.Errorf("base branch is %q, expected %q", target.GetRef(), base)
+	}
+	if marker != "" && exactMarkerLineCount(pull.GetBody(), marker) != 1 {
+		return fmt.Errorf("body does not contain exactly one exact Hive marker line")
+	}
+	if exactTitle != "" && pull.GetTitle() != exactTitle {
+		return fmt.Errorf("title changed after managed update")
+	}
+	if exactBody != "" && pull.GetBody() != exactBody {
+		return fmt.Errorf("body changed after managed update")
+	}
+	return nil
+}
+
+func managedPullRepositoriesMatch(pull *gh.PullRequest, identity managedRepositoryIdentity, repository string) bool {
+	if pull == nil || identity.ID <= 0 || strings.TrimSpace(identity.FullName) == "" {
+		return false
+	}
+	head, base := pull.GetHead().GetRepo(), pull.GetBase().GetRepo()
+	requested := strings.TrimSpace(repository)
+	return head.GetID() > 0 && base.GetID() > 0 && head.GetID() == identity.ID && base.GetID() == identity.ID &&
+		strings.EqualFold(head.GetFullName(), identity.FullName) && strings.EqualFold(base.GetFullName(), identity.FullName) &&
+		strings.EqualFold(head.GetFullName(), requested) && strings.EqualFold(base.GetFullName(), requested)
+}
+
+func (c *Client) logIgnoredForeignMarkerClaim(repository string, pull *gh.PullRequest, marker string) {
+	if c == nil || c.logger == nil {
+		return
+	}
+	c.logger.Warn("ignoring foreign pull request that claims a Hive marker",
+		"repository", repository,
+		"pull_request", pull.GetNumber(),
+		"head_repository_id", pull.GetHead().GetRepo().GetID(),
+		"head_repository", pull.GetHead().GetRepo().GetFullName(),
+		"base_repository_id", pull.GetBase().GetRepo().GetID(),
+		"base_repository", pull.GetBase().GetRepo().GetFullName(),
+		"marker", marker,
+	)
+}
+
+func exactMarkerLineCount(body, marker string) int {
+	marker = strings.TrimSpace(marker)
+	if marker == "" {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		if strings.TrimSpace(line) == marker {
+			count++
+		}
+	}
+	return count
+}
+
+func exactManagedSHA(value string) bool {
+	if strings.TrimSpace(value) != value || len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if character >= '0' && character <= '9' {
+			continue
+		}
+		lower := character | 0x20
+		if lower < 'a' || lower > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func repairPullRequestResult(pull *gh.PullRequest, created bool) RepairPullRequest {
+	return RepairPullRequest{Number: pull.GetNumber(), URL: pull.GetHTMLURL(), HeadSHA: pull.GetHead().GetSHA(), Created: created}
 }
 
 func hasExactLabel(labels []*gh.Label, expected string) bool {

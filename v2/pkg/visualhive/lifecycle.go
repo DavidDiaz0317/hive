@@ -130,6 +130,7 @@ type LifecycleAuditEntry struct {
 
 type ApplyLifecycleOptions struct {
 	TargetRef                        string
+	CurrentTargetCommitSHA           string
 	VerificationRunID                string
 	VerificationURL                  string
 	VerificationCommitSHA            string
@@ -335,7 +336,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		sort.Strings(keys)
 		for _, key := range keys {
 			finding := s.state.Findings[key]
-			if finding == nil || !strings.EqualFold(finding.Repository, manifest.Source.Repository) || observedFingerprints[key] || finding.Status == StatusIssueClosed || finding.Status == StatusResolved {
+			if finding == nil || !strings.EqualFold(finding.Repository, manifest.Source.Repository) || observedFingerprints[key] || finding.Status == StatusIssueClosed {
 				continue
 			}
 			if allowed, reason := resolutionAllowed(finding, manifest, targetRef, options); !allowed {
@@ -557,6 +558,23 @@ func (s *LifecycleStore) MarkIssueOpened(repositoryFingerprint string, number in
 	})
 }
 
+// RebindResolvedIssue records GitHub's canonical exact-marker issue after a
+// duplicate-issue reconciliation without reopening the already verified
+// finding. The identity is persisted before the local closed transition so a
+// crash can safely retry the remote close against the canonical issue.
+func (s *LifecycleStore) RebindResolvedIssue(repositoryFingerprint string, number int, issueURL string) error {
+	return s.updateFinding(repositoryFingerprint, "resolved_issue_rebound", func(finding *FindingLifecycle) error {
+		if finding.Status != StatusResolved {
+			return fmt.Errorf("cannot rebind issue identity from %s", finding.Status)
+		}
+		if number <= 0 || strings.TrimSpace(issueURL) == "" {
+			return fmt.Errorf("canonical GitHub issue number and URL are required")
+		}
+		finding.IssueNumber, finding.IssueURL = number, issueURL
+		return nil
+	})
+}
+
 func (s *LifecycleStore) MarkRepairStarted(repositoryFingerprint, branch string) error {
 	return s.updateFinding(repositoryFingerprint, "repair_started", func(finding *FindingLifecycle) error {
 		if finding.Status == StatusRepairRunning && strings.TrimSpace(finding.Branch) == strings.TrimSpace(branch) {
@@ -711,6 +729,73 @@ func (s *LifecycleStore) MarkPostMergeVerifying(repositoryFingerprint, runID, ru
 		finding.ValidationRunID, finding.ValidationRunURL, finding.Status = runID, runURL, StatusPostMergeVerifying
 		return nil
 	})
+}
+
+// ResetStalePostMergeVerification restores the durable merge state after Hive
+// proves that a bound verification run is no longer the live default head. The
+// reset is exact-run bound so it cannot undo a different verification, and any
+// close prepared by that stale run is completed locally without reaching
+// GitHub. A subsequent exact-head run can then start from StatusMerged.
+func (s *LifecycleStore) ResetStalePostMergeVerification(repositoryFingerprint, runID, commitSHA string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backup := cloneLifecycleState(s.state)
+	finding := s.state.Findings[repositoryFingerprint]
+	if finding == nil {
+		return fmt.Errorf("finding %s not found", repositoryFingerprint)
+	}
+	runID = strings.TrimSpace(runID)
+	commitSHA = strings.TrimSpace(commitSHA)
+	if runID == "" || commitSHA == "" || strings.TrimSpace(finding.MergeSHA) == "" {
+		return fmt.Errorf("stale post-merge reset requires an exact run, commit, and recorded merge")
+	}
+	if finding.Status != StatusPostMergeVerifying && finding.Status != StatusResolved {
+		return fmt.Errorf("cannot reset stale post-merge verification from %s", finding.Status)
+	}
+	if finding.ValidationRunID != runID {
+		return fmt.Errorf("stale post-merge run %s does not match recorded verification %s", runID, finding.ValidationRunID)
+	}
+	if finding.Status == StatusResolved && finding.LastWorkflowRunID != runID {
+		return fmt.Errorf("resolved finding was not produced by stale post-merge run %s", runID)
+	}
+
+	now := time.Now().UTC()
+	matchingCloses := 0
+	for _, entry := range s.state.Outbox {
+		if entry == nil || entry.CompletedAt != nil || entry.Action != OutboxCloseIssue || entry.RepositoryFingerprint != repositoryFingerprint || entry.BundleDigest != finding.LastBundleDigest {
+			continue
+		}
+		if entry.Evidence["workflow_run_id"] != runID || !strings.EqualFold(strings.TrimSpace(entry.Evidence["commit_sha"]), commitSHA) {
+			continue
+		}
+		matchingCloses++
+		entry.CompletedAt = &now
+		entry.LastError = ""
+	}
+	if finding.Status == StatusResolved && matchingCloses != 1 {
+		s.state = backup
+		return fmt.Errorf("resolved stale post-merge run must match exactly one pending close; matched %d", matchingCloses)
+	}
+	if matchingCloses > 1 {
+		s.state = backup
+		return fmt.Errorf("stale post-merge run matched multiple pending closes")
+	}
+	finding.Status = StatusMerged
+	finding.ResolvedAt = nil
+	finding.ClosedAt = nil
+	finding.ValidationRunID = ""
+	finding.ValidationRunURL = ""
+	s.auditLocked(LifecycleAuditEntry{
+		Action: "reset_stale_post_merge_verification", Allowed: true, Repository: finding.Repository,
+		RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID,
+		Detail: fmt.Sprintf("discarded stale verification run %s at %s", runID, commitSHA),
+	})
+	s.state.UpdatedAt = now
+	if err := s.persistLocked(); err != nil {
+		s.state = backup
+		return err
+	}
+	return nil
 }
 
 func (s *LifecycleStore) MarkPostMergeFailed(repositoryFingerprint, summary string) error {
@@ -1013,6 +1098,9 @@ func refsEquivalent(left, right string) bool {
 func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions) (bool, string) {
 	if !manifest.Scan.AuthoritativeForResolution || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, targetRef) {
 		return false, "absence was not from an authoritative target-ref scan"
+	}
+	if options.CurrentTargetCommitSHA != "" && !strings.EqualFold(options.CurrentTargetCommitSHA, manifest.Source.CommitSHA) {
+		return false, "absence came from a stale target-branch commit"
 	}
 	if finding == nil {
 		return false, "finding has no affected contract that can be proven evaluated"

@@ -56,7 +56,7 @@ func TestInspectCheckoutDiscoversNestedDashboardAndPythonTests(t *testing.T) {
 	}
 }
 
-func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T) {
+func TestInspectCheckoutKeepsOnlyBoundedNonInteractiveAutomation(t *testing.T) {
 	root := t.TempDir()
 	writeFixture(t, root, "package.json", `{"scripts":{"vh:test-creation":"node test-creation.js","vh:suite":"node suite.js","vh:mutation-proof":"node proof.js","vh:mutate":"node mutate.js","vh:run":"node run.js","vh:plan":"node plan.js","typecheck":"tsc --noEmit","build":"vite build"}}`)
 	writeFixture(t, root, "package-lock.json", `{}`)
@@ -65,7 +65,7 @@ func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"build", "typecheck", "vh:plan", "vh:run", "vh:mutate", "vh:mutation-proof", "vh:test-creation"}
+	want := []string{"build", "typecheck", "vh:mutate", "vh:mutation-proof"}
 	if len(inspection.TestCommands) != len(want) {
 		t.Fatalf("unexpected commands: %+v", inspection.TestCommands)
 	}
@@ -75,6 +75,41 @@ func TestInspectCheckoutOrdersEvidenceProducersBeforeProofConsumers(t *testing.T
 			t.Fatalf("command %d = %v, want npm run %s", index, command, name)
 		}
 	}
+}
+
+func TestCoverageDepthFiltersExpensiveAndUnsafeScripts(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:unit":"vitest run","test:e2e":"playwright test","test:e2e:update":"playwright test --update-snapshots","test:perf":"node perf.js","test:watch":"vitest --watch"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	essential := testCommandsForCoverage(inspection, CoverageEssential)
+	standard := testCommandsForCoverage(inspection, CoverageStandard)
+	comprehensive := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if hasCommandNamed(essential, "test:e2e") || hasCommandNamed(essential, "test:perf") || !hasCommandNamed(essential, "test:unit") {
+		t.Fatalf("essential depth was not bounded: %+v", essential)
+	}
+	if !hasCommandNamed(standard, "test:e2e") || hasCommandNamed(standard, "test:perf") {
+		t.Fatalf("standard depth was not distinct: %+v", standard)
+	}
+	if !hasCommandNamed(comprehensive, "test:perf") {
+		t.Fatalf("comprehensive depth omitted bounded deep checks: %+v", comprehensive)
+	}
+	for _, commands := range [][][]string{essential, standard, comprehensive} {
+		if hasCommandNamed(commands, "test:e2e:update") || hasCommandNamed(commands, "test:watch") {
+			t.Fatalf("unsafe interactive/update script was admitted: %+v", commands)
+		}
+	}
+}
+
+func hasCommandNamed(commands [][]string, name string) bool {
+	for _, command := range commands {
+		if commandScriptName(command) == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestInspectCheckoutRetainsSuiteWhenItIsOnlyProducer(t *testing.T) {
@@ -153,6 +188,9 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	if !containsString(value, "pipeline-exit-code.txt") || !containsString(value, "set +e") {
 		t.Fatal("workflow must publish evidence after a deterministic red verdict")
 	}
+	if strings.Count(value, "persist-credentials: false") != 3 {
+		t.Fatal("production workflow must remove credentials from target, tooling, and guarded seed checkouts")
+	}
 	if strings.Count(value, "include-hidden-files: true") != 2 {
 		t.Fatal("both hidden .visual-hive artifact uploads must opt in explicitly")
 	}
@@ -170,6 +208,9 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	}
 	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
 		t.Fatalf("workflow has an unsafe write lane:\n%s", value)
+	}
+	if containsString(value, "schedule:") || containsString(value, "push:") {
+		t.Fatalf("production workflow must be dispatch-only so every run has exactly one Hive consumer:\n%s", value)
 	}
 }
 
@@ -193,6 +234,17 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	}
 	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
 		t.Fatalf("pull request workflow has an unsafe write lane:\n%s", value)
+	}
+	if strings.Count(value, "persist-credentials: false") != 2 {
+		t.Fatal("pull request workflow must remove credentials from both target and tooling checkouts")
+	}
+	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`} {
+		if !containsString(value, required) {
+			t.Fatalf("pull request workflow does not pass untrusted event data through quoted environment variables: missing %q", required)
+		}
+	}
+	if containsString(value, "HIVE_FRESH_SETUP") {
+		t.Fatal("pull request workflow must not let an inconsistent installation self-certify through a reduced fresh-setup lane")
 	}
 }
 

@@ -3,7 +3,7 @@ package automation
 import "testing"
 
 func TestACMMLowerLevelsCannotWriteWithCredentialsAvailable(t *testing.T) {
-	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionDeleteBaselineBranch, ActionCreateBaselineReview, ActionApplyBaselineReview, ActionMergePR}
+	actions := []Action{ActionCreateIssue, ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionRefreshRepairBranch, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionDeleteBaselineBranch, ActionCreateBaselineReview, ActionApplyBaselineReview, ActionMergePR}
 	for _, level := range []int{1, 2} {
 		policy := Policy{ACMMLevel: level, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}}
 		for _, action := range actions {
@@ -12,6 +12,17 @@ func TestACMMLowerLevelsCannotWriteWithCredentialsAvailable(t *testing.T) {
 				t.Fatalf("ACMM L%d unexpectedly allowed %s", level, action)
 			}
 		}
+	}
+}
+
+func TestRefreshExistingRepairBranchDoesNotSpendOrObeyModelAttemptBudget(t *testing.T) {
+	policy := Policy{ACMMLevel: 6, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 2}
+	decision := policy.Authorize(ActionRequest{
+		Action: ActionRefreshRepairBranch, Agent: "quality", Repository: "owner/repo",
+		RepairAttempts: 99, ChangedFiles: []string{"tests/example.test.ts"},
+	})
+	if !decision.Allowed {
+		t.Fatalf("state-bound branch refresh was incorrectly treated as another model attempt: %+v", decision)
 	}
 }
 
@@ -82,6 +93,7 @@ func TestAutoMergeRequiresEveryProductionGate(t *testing.T) {
 		ChangedFiles: []string{"src/__tests__/app.test.ts"}, RepairAttempts: 1,
 		ExpectedHeadSHA: "abc", TestedHeadSHA: "abc", VisualHiveVerdictGreen: true,
 		MergeableKnown: true, Mergeable: true,
+		ExpectedBaseBranch: "main", TestedBaseBranch: "main", RequiredCheckNames: []string{"visual-hive", "unit"},
 		RequiredCheckStates: []string{"success", "success"}, BranchProtectionEnabled: true,
 	}
 	if decision := policy.Authorize(valid); !decision.Allowed {
@@ -92,29 +104,46 @@ func TestAutoMergeRequiresEveryProductionGate(t *testing.T) {
 	if decision := policy.Authorize(finalAttempt); !decision.Allowed {
 		t.Fatalf("the final configured repair attempt must remain merge-eligible: %v", decision.Reasons)
 	}
+	exhaustedExistingPR := valid
+	exhaustedExistingPR.RepairAttempts = policy.MaxRepairAttempts + 7
+	if decision := policy.Authorize(exhaustedExistingPR); !decision.Allowed {
+		t.Fatalf("repair budget stranded an already-created exact-head green PR: %v", decision.Reasons)
+	}
 
 	cases := map[string]func(*ActionRequest){
-		"stale SHA":        func(r *ActionRequest) { r.TestedHeadSHA = "old" },
-		"merge conflict":   func(r *ActionRequest) { r.Mergeable = false },
-		"red visual":       func(r *ActionRequest) { r.VisualHiveVerdictGreen = false },
-		"pending check":    func(r *ActionRequest) { r.RequiredCheckStates = []string{"success", "pending"} },
-		"no protection":    func(r *ActionRequest) { r.BranchProtectionEnabled = false },
-		"hold":             func(r *ActionRequest) { r.Hold = true },
-		"baseline":         func(r *ActionRequest) { r.BaselineChanged = true },
-		"workflow":         func(r *ActionRequest) { r.WorkflowChanged = true },
-		"unsafe path":      func(r *ActionRequest) { r.ChangedFiles = []string{"src/auth/session.ts"} },
-		"budget exhausted": func(r *ActionRequest) { r.RepairAttempts = 4 },
+		"stale SHA":       func(r *ActionRequest) { r.TestedHeadSHA = "old" },
+		"retargeted base": func(r *ActionRequest) { r.TestedBaseBranch = "release" },
+		"visual optional": func(r *ActionRequest) { r.RequiredCheckNames = []string{"unit"} },
+		"merge conflict":  func(r *ActionRequest) { r.Mergeable = false },
+		"red visual":      func(r *ActionRequest) { r.VisualHiveVerdictGreen = false },
+		"pending check":   func(r *ActionRequest) { r.RequiredCheckStates = []string{"success", "pending"} },
+		"no protection":   func(r *ActionRequest) { r.BranchProtectionEnabled = false },
+		"hold":            func(r *ActionRequest) { r.Hold = true },
+		"baseline":        func(r *ActionRequest) { r.BaselineChanged = true },
+		"workflow":        func(r *ActionRequest) { r.WorkflowChanged = true },
+		"unsafe path":     func(r *ActionRequest) { r.ChangedFiles = []string{"src/auth/session.ts"} },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			request := valid
 			request.ChangedFiles = append([]string(nil), valid.ChangedFiles...)
 			request.RequiredCheckStates = append([]string(nil), valid.RequiredCheckStates...)
+			request.RequiredCheckNames = append([]string(nil), valid.RequiredCheckNames...)
 			mutate(&request)
 			if decision := policy.Authorize(request); decision.Allowed {
 				t.Fatalf("unsafe merge was allowed: %+v", request)
 			}
 		})
+	}
+}
+
+func TestRepairAttemptBudgetStillBlocksNewRepairWrites(t *testing.T) {
+	policy := Policy{ACMMLevel: 6, Mode: ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3}
+	for _, action := range []Action{ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCreateBaselineReview} {
+		decision := policy.Authorize(ActionRequest{Action: action, Agent: "quality", Repository: "owner/repo", RepairAttempts: 4})
+		if decision.Allowed {
+			t.Fatalf("repair attempt budget did not block new %s work", action)
+		}
 	}
 }
 

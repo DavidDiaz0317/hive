@@ -99,10 +99,10 @@ func TestWorkerPreparesIsolatedWorktreeBeforeModel(t *testing.T) {
 			ValidationCommands:  []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout:        time.Minute, CommandTimeout: time.Minute,
 		},
-		Provider: provider, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{},
+		Provider: provider, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:prepared", Fingerprint: "prepared",
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:prepared", Fingerprint: "prepared",
 		Status: visualhive.StatusIssueOpen, Title: "Repair prepared value", Body: "Value should be fixed.",
 		IssueKind: "functional", Severity: "medium", OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -120,6 +120,7 @@ type fakeLifecycle struct {
 	pr          int
 	starts      int
 	retries     int
+	prOpens     int
 	decisions   []string
 }
 
@@ -135,17 +136,30 @@ func (f *fakeLifecycle) MarkRepairRetry(_ string, branch string) error {
 }
 func (f *fakeLifecycle) MarkPROpen(_ string, sha string, number int, _ string) error {
 	f.sha, f.pr = sha, number
+	f.prOpens++
 	return nil
 }
 func (f *fakeLifecycle) RecordAuthorization(_ string, action string, allowed bool, _ string) {
 	f.decisions = append(f.decisions, fmt.Sprintf("%s:%t", action, allowed))
 }
 
-type fakePRClient struct{ calls int }
+type fakePRClient struct {
+	calls int
+	state *Store
+}
 
-func (f *fakePRClient) UpsertRepairPullRequest(_ context.Context, _, _, _, _, _, _ string) (hivegithub.RepairPullRequest, error) {
+func (f *fakePRClient) UpsertRepairPullRequest(_ context.Context, _, branch, _, _, _, _, _ string) (hivegithub.RepairPullRequest, error) {
 	f.calls++
-	return hivegithub.RepairPullRequest{Number: 17, URL: "https://example.test/pull/17"}, nil
+	head := ""
+	if f.state != nil {
+		for _, attempt := range f.state.Snapshot().Attempts {
+			if attempt != nil && attempt.Branch == branch {
+				head = attempt.CommitSHA
+				break
+			}
+		}
+	}
+	return hivegithub.RepairPullRequest{Number: 17, URL: "https://example.test/pull/17", HeadSHA: head}, nil
 }
 
 func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
@@ -156,7 +170,7 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 	}
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -167,7 +181,7 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:stable-finding", Fingerprint: "stable-finding",
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:stable-finding", Fingerprint: "stable-finding",
 		Status: visualhive.StatusIssueOpen, Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional",
 		Severity: "medium", OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -201,7 +215,7 @@ func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
 	}
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -212,7 +226,7 @@ func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:recurrence", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:recurrence", Status: visualhive.StatusIssueOpen,
 		Title: "Repair recurring value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
 		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -259,9 +273,9 @@ func TestWorkerDeniesModelAtLowerACMMBeforeRun(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config:   Config{RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", Policy: automation.Policy{ACMMLevel: 2, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}}},
-		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{},
+		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{state: state},
 	}
-	_, err := worker.Run(context.Background(), visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryFingerprint: "fp", IssueNumber: 1, IssueURL: "https://example.test/1"})
+	_, err := worker.Run(context.Background(), visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "fp", IssueNumber: 1, IssueURL: "https://example.test/1"})
 	if err == nil || !strings.Contains(err.Error(), "denied") || provider.runs != 0 {
 		t.Fatalf("expected pre-provider denial, got %v runs=%d", err, provider.runs)
 	}
@@ -272,7 +286,7 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -283,7 +297,7 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:revision", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:revision", Status: visualhive.StatusIssueOpen,
 		Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
 		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -310,7 +324,7 @@ func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -321,7 +335,7 @@ func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:no-change-open", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:no-change-open", Status: visualhive.StatusIssueOpen,
 		Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
 		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -350,7 +364,7 @@ func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -361,7 +375,7 @@ func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:post-merge", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:post-merge", Status: visualhive.StatusIssueOpen,
 		Title: "Repair the value", Body: "Value should be fixed.", IssueKind: "functional", Severity: "medium",
 		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -388,7 +402,7 @@ func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &noChangeThenFixProvider{}
 	lifecycle := &fakeLifecycle{}
-	pulls := &fakePRClient{}
+	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
@@ -400,7 +414,7 @@ func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls,
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:no-change", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:no-change", Status: visualhive.StatusIssueOpen,
 		Title: "Repair deploy-preview-smoke: console_error", Body: "Evidence-backed failure.", IssueKind: "functional", Severity: "high",
 		AffectedContracts: []string{"deploy-preview-smoke"}, OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -433,10 +447,10 @@ func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
-		Provider: &patchProvider{}, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{},
+		Provider: &patchProvider{}, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{state: state},
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:patch", Status: visualhive.StatusIssueOpen,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:patch", Status: visualhive.StatusIssueOpen,
 		Title: "Repair value", Body: "Value is broken.", IssueKind: "functional", Severity: "high",
 		OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
 	}
@@ -493,10 +507,10 @@ func TestWorkerAppliesCorrectivePatchOverDirtyFailedAttempt(t *testing.T) {
 			AllowedRepairPaths: []string{"visual-hive.config.yaml"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
-		Provider: &patchProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{},
+		Provider: &patchProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
 	}
 	finding := visualhive.FindingLifecycle{
-		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Status: visualhive.StatusRepairRunning,
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: fingerprint, Status: visualhive.StatusRepairRunning,
 		Title: "Repair api-500 mutation survivor", Body: "The api-500 operator survived.", IssueKind: "mutation_survivor",
 		Severity: "high", OwningAgentHint: "quality", IssueNumber: 9, IssueURL: "https://example.test/issues/9", RepairAttempts: 1,
 	}

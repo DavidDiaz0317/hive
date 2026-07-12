@@ -31,6 +31,21 @@ func (c *Client) GoGitHub() *gh.Client {
 	return c.client
 }
 
+func (c *Client) AuthenticatedLogin(ctx context.Context) (string, error) {
+	if c == nil || c.client == nil {
+		return "", fmt.Errorf("GitHub client is required")
+	}
+	user, _, err := c.client.Users.Get(ctx, "")
+	if err != nil {
+		return "", fmt.Errorf("read authenticated GitHub identity: %w", err)
+	}
+	login := strings.TrimSpace(user.GetLogin())
+	if login == "" {
+		return "", fmt.Errorf("authenticated GitHub identity has no login")
+	}
+	return login, nil
+}
+
 type Issue struct {
 	Repo           string    `json:"repo"`
 	Number         int       `json:"number"`

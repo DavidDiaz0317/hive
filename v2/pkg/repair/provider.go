@@ -3,6 +3,7 @@ package repair
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,28 @@ type Provider interface {
 	Name() string
 	Health(ctx context.Context) error
 	Run(ctx context.Context, worktree, prompt string) (ProviderResult, error)
+}
+
+// ProviderRunError records whether the provider process was successfully
+// launched. Once launched, a timeout or non-zero exit is an ambiguous model
+// invocation and must consume exactly one bounded model ordinal. A launch
+// failure is infrastructure and can resume the same uncounted ordinal.
+type ProviderRunError struct {
+	Launched bool
+	Cause    error
+}
+
+func (e *ProviderRunError) Error() string { return e.Cause.Error() }
+func (e *ProviderRunError) Unwrap() error { return e.Cause }
+
+func providerRunWasLaunched(err error) bool {
+	var runErr *ProviderRunError
+	if errors.As(err, &runErr) {
+		return runErr.Launched
+	}
+	// Third-party Provider implementations cannot prove a failure happened
+	// before launch. Fail closed by charging an invocation that may have run.
+	return true
 }
 
 // CodexProvider invokes the stable non-interactive Codex CLI surface. Prefix
@@ -65,9 +88,15 @@ func (p CodexProvider) Run(ctx context.Context, worktree, prompt string) (Provid
 	var stderr limitedBuffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
+		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("start Codex repair run: %w", err)}
+	}
+	if err := command.Wait(); err != nil {
 		output := safeProviderOutput(stdout.String())
-		return ProviderResult{Summary: safeExcerpt(output), Output: output}, fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String()))
+		return ProviderResult{Summary: safeExcerpt(output), Output: output}, &ProviderRunError{
+			Launched: true,
+			Cause:    fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String())),
+		}
 	}
 	output := safeProviderOutput(stdout.String())
 	return ProviderResult{Summary: safeExcerpt(output), Output: output}, nil

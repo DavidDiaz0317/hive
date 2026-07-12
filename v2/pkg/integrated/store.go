@@ -2,6 +2,7 @@ package integrated
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,25 +61,40 @@ func (s *Store) Save(config Config) error {
 	if err != nil {
 		return err
 	}
-	temporary := s.configPath + ".tmp"
-	if err := os.WriteFile(temporary, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(temporary, s.configPath)
+	return writeDurableStateFile(s.configPath, append(data, '\n'))
 }
 
 func (s *Store) Audit(entry AuditEntry) {
+	_ = s.AuditStrict(entry)
+}
+
+func (s *Store) AuditStrict(entry AuditEntry) error {
 	entry.Timestamp = time.Now().UTC()
 	data, err := json.Marshal(entry)
 	if err != nil {
-		return
+		return err
 	}
+	_, statErr := os.Stat(s.auditPath)
+	created := errors.Is(statErr, os.ErrNotExist)
 	file, err := os.OpenFile(s.auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return
+		return err
 	}
-	defer file.Close()
-	_, _ = file.Write(append(data, '\n'))
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if created {
+		return syncStateParentDirectory(s.auditPath)
+	}
+	return nil
 }
 
 func (s *Store) Dir() string { return s.dir }

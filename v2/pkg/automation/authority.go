@@ -31,6 +31,7 @@ const (
 	ActionCommit               Action = "commit"
 	ActionPush                 Action = "push"
 	ActionCreatePR             Action = "create_pr"
+	ActionRefreshRepairBranch  Action = "refresh_repair_branch"
 	ActionCloseRepairPR        Action = "close_repair_pr"
 	ActionDeleteRepairBranch   Action = "delete_repair_branch"
 	ActionDeleteBaselineBranch Action = "delete_baseline_branch"
@@ -72,9 +73,12 @@ type ActionRequest struct {
 	RepairAttempts          int
 	ExpectedHeadSHA         string
 	TestedHeadSHA           string
+	ExpectedBaseBranch      string
+	TestedBaseBranch        string
 	MergeableKnown          bool
 	Mergeable               bool
 	VisualHiveVerdictGreen  bool
+	RequiredCheckNames      []string
 	RequiredCheckStates     []string
 	BranchProtectionEnabled bool
 	Hold                    bool
@@ -126,7 +130,10 @@ func (p Policy) Authorize(request ActionRequest) Decision {
 		reasons = append(reasons, fmt.Sprintf("ACMM L%d does not permit agent %s to perform %s", p.ACMMLevel, valueOr(request.Agent, "unknown"), request.Action))
 	}
 
-	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionCloseRepairPR || request.Action == ActionDeleteRepairBranch || request.Action == ActionDeleteBaselineBranch || request.Action == ActionCreateBaselineReview || request.Action == ActionApplyBaselineReview || request.Action == ActionMergePR {
+	// The budget limits creation/revision work that can spend another repair
+	// attempt. It must not strand an already-created exact-head green PR, nor
+	// block post-merge cleanup, merely because the limit was later lowered.
+	if request.Action == ActionRepairModel || request.Action == ActionApplyPatch || request.Action == ActionCreateBranch || request.Action == ActionCommit || request.Action == ActionPush || request.Action == ActionCreatePR || request.Action == ActionCreateBaselineReview {
 		maxAttempts := p.MaxRepairAttempts
 		if maxAttempts <= 0 {
 			maxAttempts = 3
@@ -153,11 +160,26 @@ func validateMerge(policy Policy, request ActionRequest) []string {
 	if request.ExpectedHeadSHA == "" || request.TestedHeadSHA == "" || request.ExpectedHeadSHA != request.TestedHeadSHA {
 		reasons = append(reasons, "required checks and Visual Hive verdict must apply to the exact PR head SHA")
 	}
-	if request.MergeableKnown && !request.Mergeable {
+	if strings.TrimSpace(request.ExpectedBaseBranch) == "" || !strings.EqualFold(strings.TrimSpace(request.ExpectedBaseBranch), strings.TrimSpace(request.TestedBaseBranch)) {
+		reasons = append(reasons, "pull request base branch must match the configured default branch")
+	}
+	if !request.MergeableKnown {
+		reasons = append(reasons, "GitHub pull request mergeability is not yet known")
+	} else if !request.Mergeable {
 		reasons = append(reasons, "GitHub reports that the pull request is not mergeable")
 	}
 	if !request.VisualHiveVerdictGreen {
 		reasons = append(reasons, "Visual Hive deterministic verdict is not green")
+	}
+	visualHiveRequired := false
+	for _, name := range request.RequiredCheckNames {
+		if strings.EqualFold(strings.TrimSpace(name), "visual-hive") {
+			visualHiveRequired = true
+			break
+		}
+	}
+	if !visualHiveRequired {
+		reasons = append(reasons, "branch protection must require the exact visual-hive check")
 	}
 	if len(request.RequiredCheckStates) == 0 {
 		reasons = append(reasons, "no required GitHub checks were observed")
@@ -197,7 +219,7 @@ func modeForAction(action Action) Mode {
 		return ModeAdvisory
 	case ActionCreateIssue, ActionUpdateIssue, ActionCloseIssue, ActionReopenIssue:
 		return ModeIssues
-	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionDeleteBaselineBranch, ActionCreateBaselineReview, ActionApplyBaselineReview:
+	case ActionRepairModel, ActionApplyPatch, ActionCreateBranch, ActionCommit, ActionPush, ActionCreatePR, ActionRefreshRepairBranch, ActionCloseRepairPR, ActionDeleteRepairBranch, ActionDeleteBaselineBranch, ActionCreateBaselineReview, ActionApplyBaselineReview:
 		return ModeRepairPR
 	case ActionMergePR:
 		return ModeAutoMerge

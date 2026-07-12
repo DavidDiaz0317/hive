@@ -28,7 +28,7 @@ type Lifecycle interface {
 }
 
 type PullRequestClient interface {
-	UpsertRepairPullRequest(ctx context.Context, repository, branch, base, title, body, marker string) (hivegithub.RepairPullRequest, error)
+	UpsertRepairPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (hivegithub.RepairPullRequest, error)
 }
 
 type Command struct {
@@ -95,32 +95,49 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		return Result{}, err
 	}
 	attempt, resumed := w.State.Get(finding.RepositoryFingerprint)
+	prCreatedThisRun := false
 	discardDirtyBranch := ""
-	if resumed && attempt.Stage == StageModelComplete {
-		files, changedErr := changedFiles(ctx, attempt.Worktree)
-		if changedErr != nil {
-			return Result{}, changedErr
-		}
-		if len(files) == 0 && attempt.ModelPatch == "" {
-			attempt.Stage = StageNoChange
-			if err := w.State.Put(attempt); err != nil {
-				return Result{}, err
-			}
+	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
+	if resumed && !recurrenceChanged && attempt.Stage == StageFailed {
+		return Result{}, &ResumableFailureError{
+			RepositoryFingerprint: attempt.RepositoryFingerprint, Recurrence: attempt.Recurrence, Attempt: attempt.Attempt,
+			Class: attempt.LastFailureClass, FailureID: attempt.LastFailureID, Cause: errors.New(attempt.LastFailure),
 		}
 	}
-	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
+	if resumed && !recurrenceChanged && attempt.Stage == StageModelRunning {
+		attempt.ModelSummary = safeExcerpt("Hive recovered an ambiguous model invocation after the worker stopped before its result was durably checkpointed. Do not repeat the same response.")
+		attempt.ModelPatch = ""
+		attempt.Stage = StageModelComplete
+		if err := w.State.Put(attempt); err != nil {
+			return Result{}, err
+		}
+		if err := w.ensureAttemptCounted(finding, &attempt); err != nil {
+			return Result{}, err
+		}
+		return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model invocation %s ended ambiguously during worker recovery", attempt.ModelInvocationID))
+	}
+	if resumed && !recurrenceChanged && attempt.Stage == StageModelComplete {
+		if err := w.ensureAttemptCounted(finding, &attempt); err != nil {
+			return Result{}, err
+		}
+		files, changedErr := changedFiles(ctx, attempt.Worktree)
+		if changedErr != nil {
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, changedErr)
+		}
+		if len(files) == 0 && attempt.ModelPatch == "" {
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model completed without a source or test change"))
+		}
+	}
 	startNewAttempt := !resumed || recurrenceChanged
-	if resumed && attempt.Stage == StageNoChange {
-		if attempt.PRNumber > 0 && attempt.PRNumber == finding.PRNumber && finding.MergeSHA == "" && !recurrenceChanged {
+	if resumed && !recurrenceChanged && attempt.Stage == StageNoChange {
+		if attempt.PRNumber > 0 && attempt.PRNumber == finding.PRNumber && finding.MergeSHA == "" {
 			attempt.Attempt = max(finding.RepairAttempts+1, attempt.Attempt+1)
 			attempt.PriorModelSummary = attempt.ModelSummary
 			attempt.ModelPatch = ""
 			attempt.Stage = StagePrepared
+			attempt.AttemptCounted = false
+			attempt.LifecycleStarted = false
 			attempt.StartedAt = time.Now().UTC()
-			if err := w.Lifecycle.MarkRepairRetry(finding.RepositoryFingerprint, attempt.Branch); err != nil {
-				return Result{}, err
-			}
-			attempt.LifecycleStarted = true
 			if err := w.State.Put(attempt); err != nil {
 				return Result{}, err
 			}
@@ -128,23 +145,29 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			startNewAttempt = true
 		}
 	}
-	if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision && finding.MergeSHA != "" {
+	if resumed && !recurrenceChanged && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision && finding.MergeSHA != "" {
 		startNewAttempt = true
-	} else if resumed && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision {
+	} else if resumed && !recurrenceChanged && attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision {
 		// A failed check iterates on the same Hive branch and PR. Creating a new
 		// branch here would violate the one-active-PR invariant and strand review
 		// history. Reset only the durable worker stage.
 		attempt.Attempt = max(finding.RepairAttempts+1, attempt.Attempt+1)
 		attempt.LifecycleStarted = false
+		attempt.AttemptCounted = false
 		attempt.PriorModelSummary = attempt.ModelSummary
 		attempt.Stage = StagePrepared
 		attempt.StartedAt = time.Now().UTC()
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
-	} else if resumed && attempt.Stage == StagePROpen && finding.RepairAttempts >= attempt.Attempt &&
+	} else if resumed && !recurrenceChanged && attempt.Stage == StagePROpen && finding.RepairAttempts >= attempt.Attempt &&
 		(finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued) {
 		startNewAttempt = true
+	}
+	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted || attempt.Stage == StagePushed) {
+		if err := validateResumedSideEffectCheckpoint(finding, attempt); err != nil {
+			return Result{}, err
+		}
 	}
 	if startNewAttempt {
 		if recurrenceChanged || resumed && attempt.Stage == StageNoChange {
@@ -160,14 +183,22 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, Attempt: attemptNumber,
 			Recurrence: finding.Recurrences,
 			Branch:     branch, Worktree: filepath.Join(w.Config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint)),
-			Stage: StagePrepared, Provider: w.Provider.Name(), PriorModelSummary: priorModelSummary, StartedAt: time.Now().UTC(),
+			DiscardDirtyBranch: discardDirtyBranch,
+			Stage:              StagePreparing, Provider: w.Provider.Name(), PriorModelSummary: priorModelSummary, StartedAt: time.Now().UTC(),
 		}
 		if err := w.authorize(finding, automation.ActionCreateBranch, nil, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
-		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, discardDirtyBranch); err != nil {
+		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
+	}
+	if attempt.Stage == StagePreparing {
+		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, attempt.DiscardDirtyBranch); err != nil {
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePreparing, err)
+		}
+		attempt.DiscardDirtyBranch = ""
+		attempt.Stage = StagePrepared
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
@@ -179,23 +210,14 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 		for _, command := range w.Config.PreparationCommands {
 			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "preparation"); err != nil {
-				return Result{}, err
-			}
-		}
-		if !attempt.LifecycleStarted {
-			if err := w.Lifecycle.MarkRepairStarted(finding.RepositoryFingerprint, attempt.Branch); err != nil {
-				return Result{}, err
-			}
-			attempt.LifecycleStarted = true
-			if err := w.State.Put(attempt); err != nil {
-				return Result{}, err
+				return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePrepared, err)
 			}
 		}
 		healthCtx, cancelHealth := context.WithTimeout(ctx, 45*time.Second)
 		err := w.Provider.Health(healthCtx)
 		cancelHealth()
 		if err != nil {
-			return Result{}, err
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePrepared, err)
 		}
 		modelTimeout := w.Config.ModelTimeout
 		if modelTimeout <= 0 {
@@ -203,21 +225,44 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 		cumulativeDiff, diffErr := runGit(ctx, attempt.Worktree, "diff", "HEAD", "--no-ext-diff", "--")
 		if diffErr != nil {
-			return Result{}, fmt.Errorf("inspect cumulative repair diff before model revision: %w", diffErr)
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePrepared, fmt.Errorf("inspect cumulative repair diff before model revision: %w", diffErr))
 		}
 		modelCtx, cancelModel := context.WithTimeout(ctx, modelTimeout)
+		attempt.ModelInvocationID = failureCheckpointID(attempt, FailureInfrastructure, fmt.Errorf("model invocation"))
+		attempt.Stage = StageModelRunning
+		if err := w.State.Put(attempt); err != nil {
+			cancelModel()
+			return Result{}, err
+		}
 		providerResult, runErr := w.Provider.Run(modelCtx, attempt.Worktree, repairPrompt(finding, w.Config.EvidenceSummary, attempt.PriorModelSummary, cumulativeDiff))
 		cancelModel()
 		attempt.ModelSummary = safeExcerpt(providerResult.Summary)
-		attempt.ModelPatch, err = extractModelPatch(providerResult.Output)
 		if runErr != nil {
-			_ = w.State.Put(attempt)
-			return Result{}, runErr
+			if !providerRunWasLaunched(runErr) {
+				return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePrepared, runErr)
+			}
+			attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nHive observed an ambiguous post-launch provider failure: " + runErr.Error())
+			attempt.ModelPatch = ""
+			attempt.Stage = StageModelComplete
+			if err := w.State.Put(attempt); err != nil {
+				return Result{}, err
+			}
+			if err := w.ensureAttemptCounted(finding, &attempt); err != nil {
+				return Result{}, err
+			}
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model invocation %s ended ambiguously after launch: %w", attempt.ModelInvocationID, runErr))
+		}
+		attempt.ModelPatch, err = extractModelPatch(providerResult.Output)
+		attempt.Stage = StageModelComplete
+		if putErr := w.State.Put(attempt); putErr != nil {
+			return Result{}, putErr
+		}
+		if countErr := w.ensureAttemptCounted(finding, &attempt); countErr != nil {
+			return Result{}, countErr
 		}
 		if err != nil {
 			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 		}
-		attempt.Stage = StageModelComplete
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
@@ -226,7 +271,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	if attempt.Stage == StageModelComplete {
 		files, err := changedFiles(ctx, attempt.Worktree)
 		if err != nil {
-			return Result{}, err
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
 		}
 		// A revision patch may be the operation that removes an unsafe change
 		// from the prior failed attempt. Validate the existing worktree only when
@@ -234,6 +279,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		// the corrective patch has been applied.
 		if attempt.ModelPatch == "" {
 			if err := validateAttemptPatchSemantics(ctx, finding, attempt, files); err != nil {
+				if isPatchEngineInfrastructureFailure(err) {
+					return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
+				}
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 		}
@@ -250,13 +298,18 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := w.authorize(finding, automation.ActionApplyPatch, patchFiles, attempt.Attempt); err != nil {
+				attempt.LastFailureClass = FailureModel
+				attempt.LastFailureID = failureCheckpointID(attempt, FailureModel, err)
+				attempt.LastFailure = safeExcerpt(err.Error())
+				attempt.ResumeStage = ""
+				clearRetryTransaction(&attempt)
 				attempt.Stage = StageNoChange
 				_ = w.State.Put(attempt)
 				return Result{}, err
 			}
 			alreadyApplied, appliedErr := modelPatchAlreadyApplied(ctx, attempt.Worktree, attempt.ModelPatch)
 			if appliedErr != nil {
-				return Result{}, checkpointRetryableFailure(w.State, &attempt, appliedErr)
+				return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, appliedErr)
 			}
 			if !alreadyApplied {
 				apply := applyModelPatch
@@ -264,17 +317,23 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 					apply = applyIncrementalModelPatch
 				}
 				if err := apply(ctx, attempt.Worktree, attempt.ModelPatch); err != nil {
+					if isPatchEngineInfrastructureFailure(err) {
+						return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
+					}
 					return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 				}
 			}
 			files, err = changedFiles(ctx, attempt.Worktree)
 			if err != nil {
-				return Result{}, err
+				return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
 			}
 			if !hadPreexistingChanges && !equalStringSets(files, patchFiles) {
-				return Result{}, fmt.Errorf("applied model patch changed unexpected files")
+				return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("applied model patch changed unexpected files"))
 			}
 			if err := validateAttemptPatchSemantics(ctx, finding, Attempt{Worktree: attempt.Worktree}, files); err != nil {
+				if isPatchEngineInfrastructureFailure(err) {
+					return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
+				}
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 		}
@@ -283,13 +342,16 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status)))
 		}
 		if err := validateChangedFiles(files, w.Config.AllowedRepairPaths); err != nil {
-			return Result{}, err
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 		}
 		if err := validateFindingScope(finding, files); err != nil {
-			return Result{}, err
+			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 		}
 		for _, command := range w.Config.ValidationCommands {
 			if err := runRepairCommand(ctx, attempt.Worktree, command, w.Config.CommandTimeout, w.Config.Environment, "validation"); err != nil {
+				if isPatchEngineInfrastructureFailure(err) {
+					return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
+				}
 				if !isVisualHiveRunCommand(command) {
 					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
 						return Result{}, saveErr
@@ -298,7 +360,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				}
 				review, recognized, reviewErr := DetectBaselineReview(attempt.Worktree)
 				if reviewErr != nil {
-					return Result{}, fmt.Errorf("classify baseline review after %w: %v", err, reviewErr)
+					return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, fmt.Errorf("classify baseline review after %w: %v", err, reviewErr))
 				}
 				if !recognized {
 					if saveErr := checkpointLocalValidationFailure(w.State, &attempt, err); saveErr != nil {
@@ -323,9 +385,15 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err := w.authorize(finding, automation.ActionCommit, attempt.ChangedFiles, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
-		sha, err := commitRepair(ctx, attempt.Worktree, attempt.ChangedFiles, finding.Title, finding.IssueNumber)
+		sha, recovered, err := recoverCommittedRepair(ctx, attempt.Worktree, attempt.ChangedFiles, finding.Title, finding.IssueNumber, finding.RepositoryID)
 		if err != nil {
 			return Result{}, err
+		}
+		if !recovered {
+			sha, err = commitRepair(ctx, attempt.Worktree, attempt.ChangedFiles, finding.Title, finding.IssueNumber, finding.RepositoryID)
+			if err != nil {
+				return Result{}, err
+			}
 		}
 		attempt.CommitSHA, attempt.Stage = sha, StageCommitted
 		if err := w.State.Put(attempt); err != nil {
@@ -337,7 +405,14 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if err := w.authorize(finding, automation.ActionPush, attempt.ChangedFiles, attempt.Attempt); err != nil {
 			return Result{}, err
 		}
-		if _, err := runGit(ctx, attempt.Worktree, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+attempt.Branch); err != nil {
+		localHead, err := runGit(ctx, attempt.Worktree, "rev-parse", "HEAD")
+		if err != nil {
+			return Result{}, fmt.Errorf("verify local repair head before push: %w", err)
+		}
+		if strings.TrimSpace(localHead) != attempt.CommitSHA {
+			return Result{}, fmt.Errorf("local repair head %s does not match checkpoint commit %s", strings.TrimSpace(localHead), attempt.CommitSHA)
+		}
+		if err := pushRepairBranchExact(ctx, attempt.Worktree, attempt.Branch, attempt.CommitSHA, finding.RepositoryID, "repair"); err != nil {
 			return Result{}, fmt.Errorf("push repair branch: %w", err)
 		}
 		attempt.Stage = StagePushed
@@ -352,18 +427,28 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 		marker := fmt.Sprintf("<!-- hive-repair: %s -->", finding.RepositoryFingerprint)
 		body := repairPRBody(marker, finding, attempt)
-		pull, err := w.GitHub.UpsertRepairPullRequest(ctx, finding.Repository, attempt.Branch, w.Config.BaseBranch, "Hive repair: "+finding.Title, body, marker)
+		pull, err := w.GitHub.UpsertRepairPullRequest(ctx, finding.Repository, attempt.Branch, attempt.CommitSHA, w.Config.BaseBranch, "Hive repair: "+finding.Title, body, marker)
 		if err != nil {
 			return Result{}, err
 		}
-		if pull.HeadSHA != "" && pull.HeadSHA != attempt.CommitSHA {
+		if strings.TrimSpace(pull.HeadSHA) == "" || !strings.EqualFold(strings.TrimSpace(pull.HeadSHA), attempt.CommitSHA) {
 			return Result{}, fmt.Errorf("GitHub repair PR head %s does not match pushed commit %s", pull.HeadSHA, attempt.CommitSHA)
 		}
 		attempt.PRNumber, attempt.PRURL, attempt.Stage = pull.Number, pull.URL, StagePROpen
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
-		if err := w.Lifecycle.MarkPROpen(finding.RepositoryFingerprint, attempt.CommitSHA, pull.Number, pull.URL); err != nil {
+		prCreatedThisRun = true
+	}
+	if attempt.Stage == StagePROpen && !attempt.LifecyclePROpen {
+		alreadyRecorded := !prCreatedThisRun && finding.PRNumber == attempt.PRNumber && finding.RepairCommitSHA == attempt.CommitSHA
+		if !alreadyRecorded {
+			if err := w.Lifecycle.MarkPROpen(finding.RepositoryFingerprint, attempt.CommitSHA, attempt.PRNumber, attempt.PRURL); err != nil {
+				return Result{}, err
+			}
+		}
+		attempt.LifecyclePROpen = true
+		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
 	}
@@ -378,6 +463,11 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 func checkpointLocalValidationFailure(store *Store, attempt *Attempt, validationErr error) error {
 	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nHive rejected this attempt after local validation. Revise the patch instead of repeating it:\n" + validationErr.Error())
 	attempt.ModelPatch = ""
+	attempt.LastFailureClass = FailureModel
+	attempt.LastFailureID = failureCheckpointID(*attempt, FailureModel, validationErr)
+	attempt.LastFailure = safeExcerpt(validationErr.Error())
+	attempt.ResumeStage = ""
+	clearRetryTransaction(attempt)
 	attempt.Stage = StageNoChange
 	return store.Put(*attempt)
 }
@@ -385,11 +475,125 @@ func checkpointLocalValidationFailure(store *Store, attempt *Attempt, validation
 func checkpointRetryableFailure(store *Store, attempt *Attempt, cause error) error {
 	attempt.ModelSummary = safeExcerpt(attempt.ModelSummary + "\n\nHive rejected this attempt before application. Do not repeat the same patch:\n" + cause.Error())
 	attempt.ModelPatch = ""
+	attempt.LastFailureClass = FailureModel
+	attempt.LastFailureID = failureCheckpointID(*attempt, FailureModel, cause)
+	attempt.LastFailure = safeExcerpt(cause.Error())
+	attempt.ResumeStage = ""
+	clearRetryTransaction(attempt)
 	attempt.Stage = StageNoChange
 	if err := store.Put(*attempt); err != nil {
 		return err
 	}
 	return retryableAttemptError(cause)
+}
+
+func checkpointResumableFailure(store *Store, attempt *Attempt, class FailureClass, resume Stage, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("unknown repair failure")
+	}
+	attempt.LastFailureClass = class
+	attempt.LastFailureID = failureCheckpointID(*attempt, class, cause)
+	attempt.LastFailure = safeExcerpt(cause.Error())
+	attempt.ResumeStage = resume
+	clearRetryTransaction(attempt)
+	attempt.Stage = StageFailed
+	if err := store.Put(*attempt); err != nil {
+		return err
+	}
+	return &ResumableFailureError{
+		RepositoryFingerprint: attempt.RepositoryFingerprint, Recurrence: attempt.Recurrence, Attempt: attempt.Attempt,
+		Class: class, FailureID: attempt.LastFailureID, Cause: cause,
+	}
+}
+
+func clearRetryTransaction(attempt *Attempt) {
+	attempt.RetryAuthorizedAt = time.Time{}
+	attempt.RetryActor = ""
+	attempt.RetryReason = ""
+	attempt.RetryTransactionID = ""
+	attempt.RetryResumeStage = ""
+}
+
+func failureCheckpointID(attempt Attempt, class FailureClass, cause error) string {
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%d", attempt.RepositoryFingerprint, attempt.Attempt, class, detail, time.Now().UTC().UnixNano())))
+	return hex.EncodeToString(digest[:16])
+}
+
+// ensureAttemptCounted reconciles a durable successful model result with the
+// lifecycle counter. The model result is always persisted before this method.
+// If the process stops after the lifecycle write but before the repair-state
+// write, the next run observes finding.RepairAttempts >= attempt.Attempt and
+// marks the local checkpoint counted without invoking the lifecycle again.
+func (w *Worker) ensureAttemptCounted(finding visualhive.FindingLifecycle, attempt *Attempt) error {
+	if finding.Recurrences != attempt.Recurrence {
+		return fmt.Errorf("repair attempt recurrence drift: finding=%d checkpoint=%d", finding.Recurrences, attempt.Recurrence)
+	}
+	if attempt.AttemptCounted {
+		if finding.RepairAttempts != attempt.Attempt {
+			return fmt.Errorf("counted repair attempt drift: lifecycle=%d checkpoint=%d", finding.RepairAttempts, attempt.Attempt)
+		}
+		if finding.Status != visualhive.StatusRepairRunning || strings.TrimSpace(finding.Branch) != strings.TrimSpace(attempt.Branch) {
+			return fmt.Errorf("counted repair attempt does not match lifecycle branch/status")
+		}
+		return nil
+	}
+	if attempt.Stage != StageModelComplete {
+		return fmt.Errorf("cannot count repair attempt %d from stage %s", attempt.Attempt, attempt.Stage)
+	}
+	priorAttempt := attempt.Attempt - 1
+	if finding.RepairAttempts == attempt.Attempt {
+		if finding.Status != visualhive.StatusRepairRunning || strings.TrimSpace(finding.Branch) != strings.TrimSpace(attempt.Branch) {
+			return fmt.Errorf("repair attempt count recovery does not match lifecycle branch/status")
+		}
+	} else if finding.RepairAttempts == priorAttempt {
+		inPlaceRetry := attempt.PRNumber > 0 && finding.PRNumber == attempt.PRNumber &&
+			strings.TrimSpace(finding.Branch) == strings.TrimSpace(attempt.Branch) && finding.Status == visualhive.StatusRepairRunning
+		var err error
+		if inPlaceRetry {
+			err = w.Lifecycle.MarkRepairRetry(finding.RepositoryFingerprint, attempt.Branch)
+		} else {
+			err = w.Lifecycle.MarkRepairStarted(finding.RepositoryFingerprint, attempt.Branch)
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("repair attempt counter drift: lifecycle=%d expected=%d or %d", finding.RepairAttempts, priorAttempt, attempt.Attempt)
+	}
+	attempt.AttemptCounted = true
+	attempt.LifecycleStarted = true
+	return w.State.Put(*attempt)
+}
+
+// validateResumedSideEffectCheckpoint binds a crash-resumed commit, push, or
+// PR creation to the current durable lifecycle snapshot before any external
+// side effect. A stale worker checkpoint can never act for another recurrence,
+// model ordinal, lifecycle status, or branch.
+func validateResumedSideEffectCheckpoint(finding visualhive.FindingLifecycle, attempt Attempt) error {
+	if strings.TrimSpace(attempt.Repository) == "" || !strings.EqualFold(strings.TrimSpace(finding.Repository), strings.TrimSpace(attempt.Repository)) ||
+		finding.RepositoryFingerprint != attempt.RepositoryFingerprint {
+		return fmt.Errorf("resumed repair checkpoint does not match lifecycle repository identity")
+	}
+	if finding.Recurrences != attempt.Recurrence {
+		return fmt.Errorf("resumed repair checkpoint recurrence drift: lifecycle=%d checkpoint=%d", finding.Recurrences, attempt.Recurrence)
+	}
+	if !attempt.AttemptCounted || finding.RepairAttempts != attempt.Attempt {
+		return fmt.Errorf("resumed repair checkpoint attempt drift: lifecycle=%d checkpoint=%d counted=%t", finding.RepairAttempts, attempt.Attempt, attempt.AttemptCounted)
+	}
+	if finding.Status != visualhive.StatusRepairRunning || strings.TrimSpace(finding.Branch) != strings.TrimSpace(attempt.Branch) {
+		return fmt.Errorf("resumed repair checkpoint does not match lifecycle branch/status")
+	}
+	if finding.MergeSHA != "" {
+		return fmt.Errorf("resumed repair checkpoint cannot mutate an already merged lifecycle")
+	}
+	if attempt.PRNumber > 0 && finding.PRNumber != attempt.PRNumber {
+		return fmt.Errorf("resumed repair checkpoint PR drift: lifecycle=%d checkpoint=%d", finding.PRNumber, attempt.PRNumber)
+	}
+	return nil
 }
 
 func cloneBaselineReview(review *BaselineReview) *BaselineReview {
@@ -410,11 +614,17 @@ func (w *Worker) validate(finding visualhive.FindingLifecycle) error {
 	if w.Provider == nil || w.State == nil || w.Lifecycle == nil || w.GitHub == nil {
 		return fmt.Errorf("provider, state, lifecycle, and GitHub client are required")
 	}
+	if err := w.State.Err(); err != nil {
+		return fmt.Errorf("repair state store is unavailable: %w", err)
+	}
 	if strings.TrimSpace(w.Config.RepositoryDir) == "" || strings.TrimSpace(w.Config.WorktreeRoot) == "" || strings.TrimSpace(w.Config.BaseBranch) == "" {
 		return fmt.Errorf("repository directory, worktree root, and base branch are required")
 	}
 	if finding.Repository == "" || finding.RepositoryFingerprint == "" || finding.IssueNumber <= 0 || finding.IssueURL == "" {
 		return fmt.Errorf("repair requires a persisted finding and GitHub issue")
+	}
+	if !positiveRepositoryID(finding.RepositoryID) {
+		return fmt.Errorf("repair requires a trusted positive repository ID")
 	}
 	return os.MkdirAll(w.Config.WorktreeRoot, 0o700)
 }
@@ -611,7 +821,7 @@ func validateAttemptPatchSemantics(ctx context.Context, finding visualhive.Findi
 	if strings.TrimSpace(patchText) == "" && len(files) > 0 {
 		output, err := runGit(ctx, attempt.Worktree, "diff", "HEAD", "--no-ext-diff", "--")
 		if err != nil {
-			return fmt.Errorf("inspect already-applied repair patch semantics: %w", err)
+			return patchEngineInfrastructureFailure(fmt.Errorf("inspect already-applied repair patch semantics: %w", err))
 		}
 		patchText = output
 	}
@@ -656,7 +866,7 @@ func matchPathPattern(pattern, file string) bool {
 
 func runRepairCommand(ctx context.Context, worktree string, command Command, timeout time.Duration, environment map[string]string, phase string) error {
 	if strings.TrimSpace(command.Name) == "" {
-		return fmt.Errorf("%s command executable is required", phase)
+		return patchEngineInfrastructureFailure(fmt.Errorf("%s command executable is required", phase))
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -669,9 +879,28 @@ func runRepairCommand(ctx context.Context, worktree string, command Command, tim
 	var output limitedBuffer
 	process.Stdout, process.Stderr = &output, &output
 	if err := process.Run(); err != nil {
-		return fmt.Errorf("%s %s failed: %w: %s", phase, command.Name, err, safeExcerpt(output.String()))
+		failure := fmt.Errorf("%s %s failed: %w: %s", phase, command.Name, err, safeExcerpt(output.String()))
+		return classifyRepairCommandFailure(commandCtx, err, output.String(), failure)
 	}
 	return nil
+}
+
+func classifyRepairCommandFailure(ctx context.Context, commandErr error, output string, failure error) error {
+	var launchError *exec.Error
+	var pathError *os.PathError
+	if ctx.Err() != nil || errors.As(commandErr, &launchError) || errors.As(commandErr, &pathError) {
+		return patchEngineInfrastructureFailure(failure)
+	}
+	detail := strings.ToLower(output + "\n" + commandErr.Error())
+	for _, marker := range []string{
+		"permission denied", "access is denied", "operation not permitted", "read-only file system",
+		"no space left on device", "input/output error", "cannot execute", "executable file not found",
+	} {
+		if strings.Contains(detail, marker) {
+			return patchEngineInfrastructureFailure(failure)
+		}
+	}
+	return failure
 }
 
 func commandEnvironment(overrides map[string]string) []string {
@@ -701,17 +930,171 @@ func commandEnvironment(overrides map[string]string) []string {
 	return result
 }
 
-func commitRepair(ctx context.Context, worktree string, files []string, title string, issue int) (string, error) {
+func recoverCommittedRepair(ctx context.Context, worktree string, files []string, title string, issue int, repositoryID string) (string, bool, error) {
+	dirty, err := changedFiles(ctx, worktree)
+	if err != nil {
+		return "", false, err
+	}
+	if len(dirty) != 0 {
+		return "", false, nil
+	}
+	metadata, err := runGit(ctx, worktree, "log", "-1", "--format=%H%x00%B")
+	if err != nil {
+		return "", false, err
+	}
+	sha, message, ok := strings.Cut(metadata, "\x00")
+	expectedMessage := repairCommitMessage(title, issue, repositoryID)
+	if !ok || strings.TrimSpace(message) != expectedMessage {
+		return "", false, nil
+	}
+	changed, err := runGit(ctx, worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")
+	if err != nil {
+		return "", false, err
+	}
+	committedFiles := []string{}
+	for _, file := range strings.Split(strings.ReplaceAll(changed, "\r\n", "\n"), "\n") {
+		if file = strings.TrimSpace(file); file != "" {
+			committedFiles = append(committedFiles, filepath.ToSlash(file))
+		}
+	}
+	if !equalStringSets(committedFiles, files) {
+		return "", false, nil
+	}
+	sha = strings.TrimSpace(sha)
+	if !validGitCommitSHA(sha) {
+		return "", false, fmt.Errorf("recovered repair commit has invalid SHA %q", sha)
+	}
+	return sha, true, nil
+}
+
+func remoteRepairBranchHead(ctx context.Context, worktree, branch string) (string, error) {
+	if !validHiveRepairBranch(branch) {
+		return "", fmt.Errorf("inspect remote repair branch: invalid Hive-owned branch %q", branch)
+	}
+	output, err := runGit(ctx, worktree, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
+	if err != nil {
+		return "", fmt.Errorf("inspect remote repair branch: %w", err)
+	}
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	if len(fields) != 2 || fields[1] != "refs/heads/"+branch || !validGitCommitSHA(fields[0]) {
+		return "", fmt.Errorf("remote repair branch returned unexpected ref data")
+	}
+	return fields[0], nil
+}
+
+func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, repositoryID, operation string) error {
+	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
+	if !validHiveRepairBranch(branch) {
+		return fmt.Errorf("repair push requires a generated Hive-owned branch")
+	}
+	if !validGitCommitSHA(commitSHA) {
+		return fmt.Errorf("repair push requires an exact 40-character commit SHA")
+	}
+	repositoryID, operation = strings.TrimSpace(repositoryID), strings.ToLower(strings.TrimSpace(operation))
+	if !positiveRepositoryID(repositoryID) {
+		return fmt.Errorf("repair push requires a positive repository ID")
+	}
+	expectedOperation := "repair"
+	if strings.HasPrefix(branch, "hive/baseline-") {
+		expectedOperation = "baseline"
+	}
+	if operation != expectedOperation {
+		return fmt.Errorf("repair push operation %q does not match generated branch %s", operation, branch)
+	}
+	if err := verifyRepairCommitOwnership(ctx, worktree, commitSHA, repositoryID, operation); err != nil {
+		return err
+	}
+	remoteHead, err := remoteRepairBranchHead(ctx, worktree, branch)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(remoteHead, commitSHA) {
+		return nil
+	}
+	if remoteHead != "" {
+		fetchedRef := "refs/hive/ownership/" + strings.ToLower(remoteHead)
+		defer func() { _, _ = runGit(context.Background(), worktree, "update-ref", "-d", fetchedRef) }()
+		if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", "origin", "refs/heads/"+branch+":"+fetchedRef); err != nil {
+			return fmt.Errorf("fetch observed remote repair branch %s: %w", branch, err)
+		}
+		fetchedHead, err := runGit(ctx, worktree, "rev-parse", "--verify", fetchedRef)
+		if err != nil || !strings.EqualFold(strings.TrimSpace(fetchedHead), remoteHead) {
+			return fmt.Errorf("remote repair branch %s changed while Hive verified ownership", branch)
+		}
+		if err := verifyRepairCommitOwnership(ctx, worktree, remoteHead, repositoryID, operation); err != nil {
+			return fmt.Errorf("refusing to overwrite remote branch %s: %w", branch, err)
+		}
+		if _, err := runGit(ctx, worktree, "merge-base", "--is-ancestor", remoteHead, commitSHA); err != nil {
+			return fmt.Errorf("refusing to overwrite remote branch %s because owned remote tip %s is not an ancestor of local checkpoint %s", branch, remoteHead, commitSHA)
+		}
+	}
+	lease := repairForceLease(branch, remoteHead)
+	if _, err := runGit(ctx, worktree, "push", lease, "origin", commitSHA+":refs/heads/"+branch); err != nil {
+		return err
+	}
+	remoteHead, err = remoteRepairBranchHead(ctx, worktree, branch)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(remoteHead, commitSHA) {
+		return fmt.Errorf("remote repair branch %s does not match pushed checkpoint %s", remoteHead, commitSHA)
+	}
+	return nil
+}
+
+func verifyRepairCommitOwnership(ctx context.Context, worktree, commitSHA, repositoryID, operation string) error {
+	message, err := runGit(ctx, worktree, "show", "-s", "--format=%B", commitSHA)
+	if err != nil {
+		return fmt.Errorf("inspect Hive branch commit ownership: %w", err)
+	}
+	if !hasExactRepairTrailer(message, "Hive-Repository-ID", repositoryID) || !hasExactRepairTrailer(message, "Hive-Operation", operation) {
+		return fmt.Errorf("commit %s lacks exact Hive ownership for repository ID %s and operation %s", commitSHA, repositoryID, operation)
+	}
+	return nil
+}
+
+func hasExactRepairTrailer(message, key, value string) bool {
+	want := strings.TrimSpace(key) + ": " + strings.TrimSpace(value)
+	for _, line := range strings.Split(strings.ReplaceAll(message, "\r\n", "\n"), "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func repairForceLease(branch, expectedRemoteSHA string) string {
+	return "--force-with-lease=refs/heads/" + branch + ":" + strings.ToLower(strings.TrimSpace(expectedRemoteSHA))
+}
+
+func validHiveRepairBranch(branch string) bool {
+	matched, _ := regexp.MatchString(`^hive/(?:repair|baseline)-[a-z0-9]+(?:-[a-z0-9]+)*$`, strings.TrimSpace(branch))
+	return matched && strings.TrimSpace(branch) == branch
+}
+
+func validGitCommitSHA(value string) bool {
+	matched, _ := regexp.MatchString(`^[0-9a-fA-F]{40}$`, strings.TrimSpace(value))
+	return matched && strings.TrimSpace(value) == value
+}
+
+func commitRepair(ctx context.Context, worktree string, files []string, title string, issue int, repositoryID string) (string, error) {
 	args := append([]string{"add", "--"}, files...)
 	if _, err := runGit(ctx, worktree, args...); err != nil {
 		return "", fmt.Errorf("stage repair: %w", err)
 	}
-	message := fmt.Sprintf("fix: %s\n\nRefs #%d", strings.TrimSpace(title), issue)
+	message := repairCommitMessage(title, issue, repositoryID)
 	if _, err := runGit(ctx, worktree, "-c", "user.name=Hive Repair Agent", "-c", "user.email=hive-repair@users.noreply.github.com", "commit", "-m", message); err != nil {
 		return "", fmt.Errorf("commit repair: %w", err)
 	}
 	sha, err := runGit(ctx, worktree, "rev-parse", "HEAD")
 	return strings.TrimSpace(sha), err
+}
+
+func repairCommitMessage(title string, issue int, repositoryID string) string {
+	return fmt.Sprintf("fix: %s\n\nRefs #%d\n\nHive-Repository-ID: %s\nHive-Operation: repair", strings.TrimSpace(title), issue, strings.TrimSpace(repositoryID))
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {

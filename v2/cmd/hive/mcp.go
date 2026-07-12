@@ -26,28 +26,71 @@ func runMCPServer() int {
 	return 0
 }
 
-func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any, error) {
+func mcpCLIArgs(name string, arguments map[string]any) ([]string, error) {
 	stateDir := stringArgument(arguments, "state_dir", defaultIntegratedStateDir())
 	var args []string
 	switch name {
 	case "hive_setup_plan", "hive_setup_apply":
-		args = []string{"setup", "--repo", stringArgument(arguments, "repo", ""), "--coverage", stringArgument(arguments, "coverage", ""), "--automation", stringArgument(arguments, "automation", ""), "--provider", stringArgument(arguments, "provider", "codex"), "--state-dir", stateDir, "--json"}
-		args = append(args, "--max-active-issues", fmt.Sprint(integerArgument(arguments, "max_active_issues", 5)))
-		args = append(args, "--max-repair-attempts", fmt.Sprint(integerArgument(arguments, "max_repair_attempts", 3)))
+		args = []string{"setup", "--json"}
+		if explicitState, ok := arguments["state_dir"].(string); ok && strings.TrimSpace(explicitState) != "" {
+			args = append(args, "--state-dir", explicitState)
+		}
+		for _, argument := range []struct {
+			name string
+			flag string
+		}{{"repo", "--repo"}, {"coverage", "--coverage"}, {"automation", "--automation"}, {"provider", "--provider"}} {
+			if value, ok := arguments[argument.name].(string); ok && strings.TrimSpace(value) != "" {
+				args = append(args, argument.flag, value)
+			}
+		}
+		for _, argument := range []struct {
+			name string
+			flag string
+		}{{"max_active_issues", "--max-active-issues"}, {"max_repair_attempts", "--max-repair-attempts"}} {
+			if value, ok := arguments[argument.name]; ok {
+				args = append(args, argument.flag, fmt.Sprint(value))
+			}
+		}
+		if value, ok := arguments["run_interval_seconds"]; ok {
+			args = append(args, "--run-interval", fmt.Sprint(value)+"s")
+		}
 		if name == "hive_setup_plan" {
 			args = append(args, "--plan")
 		} else {
-			args = append(args, "--start")
+			start := true
+			if value, ok := arguments["start"].(bool); ok {
+				start = value
+			}
+			if start {
+				args = append(args, "--start")
+			}
 		}
-		if booleanArgument(arguments, "visual_hive", true) {
-			args = append(args, "--visual-hive")
+		if value, ok := arguments["visual_hive"].(bool); ok {
+			args = append(args, fmt.Sprintf("--visual-hive=%t", value))
 		}
 	case "hive_doctor":
 		args = []string{"doctor", "--state-dir", stateDir, "--json"}
 	case "hive_status":
 		args = []string{"status", "--state-dir", stateDir, "--json"}
 	case "hive_run":
-		args = []string{"run", "--state-dir", stateDir, "--json"}
+		timeoutSeconds := integerArgument(arguments, "timeout_seconds", 2700)
+		args = []string{"run", "--state-dir", stateDir, "--timeout", fmt.Sprintf("%ds", timeoutSeconds), "--json"}
+	case "hive_start":
+		args = []string{"start", "--state-dir", stateDir, "--interval", fmt.Sprintf("%ds", integerArgument(arguments, "interval_seconds", 900)), "--json"}
+	case "hive_stop":
+		args = []string{"stop", "--state-dir", stateDir, "--json"}
+	case "hive_plan_merge_approval":
+		args = []string{"approve-merge", "--state-dir", stateDir, "--pr", fmt.Sprint(integerArgument(arguments, "pr_number", 0)), "--head", stringArgument(arguments, "head_sha", ""), "--plan", "--json"}
+	case "hive_approve_merge":
+		args = []string{"approve-merge", "--state-dir", stateDir, "--pr", fmt.Sprint(integerArgument(arguments, "pr_number", 0)), "--head", stringArgument(arguments, "head_sha", ""), "--base", stringArgument(arguments, "base_sha", ""), "--diff-digest", stringArgument(arguments, "diff_digest", ""), "--reason", stringArgument(arguments, "reason", ""), "--json"}
+	case "hive_revoke_merge_approval":
+		args = []string{"revoke-merge-approval", "--state-dir", stateDir, "--reason", stringArgument(arguments, "reason", ""), "--json"}
+	case "hive_retry_repair":
+		args = []string{"retry-repair", "--state-dir", stateDir, "--finding", stringArgument(arguments, "finding", ""), "--recurrence", fmt.Sprint(integerArgument(arguments, "recurrence", -1)), "--attempt", fmt.Sprint(integerArgument(arguments, "attempt", 0)), "--failure-class", stringArgument(arguments, "failure_class", ""), "--failure-id", stringArgument(arguments, "failure_id", ""), "--reason", stringArgument(arguments, "reason", ""), "--json"}
+	case "hive_plan_dispatch_recovery":
+		args = []string{"recover-dispatch", "--state-dir", stateDir, "--action", stringArgument(arguments, "action", ""), "--correlation", stringArgument(arguments, "correlation", ""), "--plan", "--json"}
+	case "hive_recover_dispatch":
+		args = []string{"recover-dispatch", "--state-dir", stateDir, "--action", stringArgument(arguments, "action", ""), "--correlation", stringArgument(arguments, "correlation", ""), "--request-digest", stringArgument(arguments, "request_digest", ""), "--plan-digest", stringArgument(arguments, "plan_digest", ""), "--planned-at", stringArgument(arguments, "planned_at", ""), "--reason", stringArgument(arguments, "reason", ""), "--json"}
 	case "hive_set_coverage":
 		args = []string{"set-coverage", "--state-dir", stateDir, "--value", stringArgument(arguments, "value", ""), "--json"}
 	case "hive_set_automation":
@@ -66,10 +109,28 @@ func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any
 		args = []string{"rollback", "--state-dir", stateDir, "--version", stringArgument(arguments, "value", ""), "--json"}
 	case "hive_uninstall":
 		args = []string{"uninstall", "--state-dir", stateDir, "--json"}
+		if value, ok := arguments["delete_state"].(bool); ok && value {
+			args = append(args, "--delete-state")
+		}
 	default:
 		return nil, fmt.Errorf("unknown Hive MCP tool %s", name)
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	return args, nil
+}
+
+func runMCPTool(ctx context.Context, name string, arguments map[string]any) (any, error) {
+	args, err := mcpCLIArgs(name, arguments)
+	if err != nil {
+		return nil, err
+	}
+	deadline := 30 * time.Minute
+	if name == "hive_run" {
+		// The MCP supervisor must always outlive the CLI's bounded production
+		// run so it can return the CLI's structured result instead of killing a
+		// healthy 45-minute default run at minute 30.
+		deadline = time.Duration(integerArgument(arguments, "timeout_seconds", 2700))*time.Second + 5*time.Minute
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	return runCLIJSON(requestCtx, args)
 }
@@ -84,16 +145,20 @@ func runCLIJSON(ctx context.Context, args []string) (map[string]any, error) {
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	runErr := command.Run()
+	return decodeCLIResult(args, stdout.Bytes(), stderr.Bytes(), runErr)
+}
+
+func decodeCLIResult(args []string, stdout, stderr []byte, runErr error) (map[string]any, error) {
 	var value map[string]any
-	decodeErr := json.Unmarshal(stdout.Bytes(), &value)
+	decodeErr := json.Unmarshal(stdout, &value)
 	if decodeErr == nil {
 		if runErr != nil {
-			value["command_exit_error"] = runErr.Error()
+			return nil, fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), runErr, strings.TrimSpace(string(stdout)))
 		}
 		return value, nil
 	}
 	if runErr != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), runErr, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), runErr, strings.TrimSpace(string(stderr)))
 	}
 	return nil, fmt.Errorf("%s returned invalid JSON: %w", strings.Join(args, " "), decodeErr)
 }

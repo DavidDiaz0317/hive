@@ -16,7 +16,7 @@ import (
 )
 
 type ReviewPullRequestClient interface {
-	UpsertReviewPullRequest(ctx context.Context, repository, branch, base, title, body, marker string) (hivegithub.RepairPullRequest, error)
+	UpsertReviewPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (hivegithub.RepairPullRequest, error)
 }
 
 type BaselineProposalConfig struct {
@@ -38,6 +38,9 @@ type BaselineProposalSource struct {
 // It never alters the repair PR, marks a candidate approved, or merges either
 // PR. Checkpoints in repair state make ambiguous push/PR responses retry-safe.
 func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, finding visualhive.FindingLifecycle, source BaselineProposalSource, hosted *BaselineReview, state *Store, github ReviewPullRequestClient) (Attempt, error) {
+	if !positiveRepositoryID(finding.RepositoryID) {
+		return Attempt{}, fmt.Errorf("baseline proposal requires a trusted positive repository ID")
+	}
 	attempt, ok := state.Get(finding.RepositoryFingerprint)
 	if !ok || attempt.Stage != StagePROpen || attempt.BaselineReview == nil || attempt.PRNumber <= 0 || attempt.CommitSHA == "" {
 		return Attempt{}, fmt.Errorf("baseline proposal requires a persisted open repair PR and candidate review")
@@ -114,7 +117,7 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 		if _, err := runGit(ctx, worktree, args...); err != nil {
 			return Attempt{}, fmt.Errorf("stage baseline proposal: %w", err)
 		}
-		message := fmt.Sprintf("test(visual): propose baseline review\n\nRefs #%d", finding.IssueNumber)
+		message := fmt.Sprintf("test(visual): propose baseline review\n\nRefs #%d\n\nHive-Repository-ID: %s\nHive-Operation: baseline", finding.IssueNumber, strings.TrimSpace(finding.RepositoryID))
 		if _, err := runGit(ctx, worktree, "-c", "user.name=Hive Baseline Review", "-c", "user.email=hive-review@users.noreply.github.com", "commit", "-m", message); err != nil {
 			return Attempt{}, fmt.Errorf("commit baseline proposal: %w", err)
 		}
@@ -128,16 +131,16 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 	if err := state.Put(attempt); err != nil {
 		return Attempt{}, err
 	}
-	if _, err := runGit(ctx, worktree, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+review.ProposalBranch); err != nil {
+	if err := pushRepairBranchExact(ctx, worktree, review.ProposalBranch, review.ProposalCommitSHA, finding.RepositoryID, "baseline"); err != nil {
 		return Attempt{}, fmt.Errorf("push baseline proposal: %w", err)
 	}
 	marker := fmt.Sprintf("<!-- hive-baseline-review: %s:%s -->", finding.RepositoryFingerprint, review.RepairHeadSHA)
-	pull, err := github.UpsertReviewPullRequest(ctx, finding.Repository, review.ProposalBranch, config.BaseBranch,
+	pull, err := github.UpsertReviewPullRequest(ctx, finding.Repository, review.ProposalBranch, review.ProposalCommitSHA, config.BaseBranch,
 		fmt.Sprintf("Review Visual Hive baselines for #%d", finding.IssueNumber), baselineProposalBody(marker, finding, attempt, review), marker)
 	if err != nil {
 		return Attempt{}, err
 	}
-	if pull.HeadSHA != "" && pull.HeadSHA != review.ProposalCommitSHA {
+	if strings.TrimSpace(pull.HeadSHA) == "" || !strings.EqualFold(strings.TrimSpace(pull.HeadSHA), review.ProposalCommitSHA) {
 		return Attempt{}, fmt.Errorf("baseline proposal PR head %s does not match pushed commit %s", pull.HeadSHA, review.ProposalCommitSHA)
 	}
 	review.ProposalPRNumber, review.ProposalPRURL, review.Status = pull.Number, pull.URL, BaselineReviewProposalOpen
@@ -153,6 +156,9 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 // original repair branch, reruns every required local command, pushes the new
 // exact head, and updates the existing repair PR without creating a new one.
 func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalConfig, finding visualhive.FindingLifecycle, proposalMergeSHA string, state *Store, github PullRequestClient) (Attempt, error) {
+	if !positiveRepositoryID(finding.RepositoryID) {
+		return Attempt{}, fmt.Errorf("baseline approval requires a trusted positive repository ID")
+	}
 	attempt, ok := state.Get(finding.RepositoryFingerprint)
 	if !ok || attempt.Stage != StagePROpen || attempt.BaselineReview == nil || attempt.BaselineReview.Status != BaselineReviewProposalOpen {
 		return Attempt{}, fmt.Errorf("baseline approval requires a pending proposal and open repair PR")
@@ -163,7 +169,9 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 	if _, err := runGit(ctx, attempt.Worktree, "fetch", "--prune", "origin", config.BaseBranch); err != nil {
 		return Attempt{}, fmt.Errorf("fetch approved baseline: %w", err)
 	}
-	if _, err := runGit(ctx, attempt.Worktree, "merge", "--no-edit", "origin/"+config.BaseBranch); err != nil {
+	mergeMessage := fmt.Sprintf("test(visual): sync approved baselines\n\nHive-Repository-ID: %s\nHive-Operation: repair", strings.TrimSpace(finding.RepositoryID))
+	if _, err := runGit(ctx, attempt.Worktree, "-c", "user.name=Hive Repair Agent", "-c", "user.email=hive-repair@users.noreply.github.com", "merge", "--no-ff", "-m", mergeMessage, "origin/"+config.BaseBranch); err != nil {
+		_, _ = runGit(context.Background(), attempt.Worktree, "merge", "--abort")
 		return Attempt{}, fmt.Errorf("merge approved baseline into repair branch: %w", err)
 	}
 	for _, command := range config.ValidationCommands {
@@ -176,18 +184,18 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 		return Attempt{}, err
 	}
 	sha = strings.TrimSpace(sha)
-	if _, err := runGit(ctx, attempt.Worktree, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+attempt.Branch); err != nil {
+	if err := pushRepairBranchExact(ctx, attempt.Worktree, attempt.Branch, sha, finding.RepositoryID, "repair"); err != nil {
 		return Attempt{}, fmt.Errorf("push repair after baseline approval: %w", err)
 	}
 	attempt.CommitSHA = sha
 	attempt.BaselineReview.ProposalMergeSHA = proposalMergeSHA
 	attempt.BaselineReview.Status = BaselineReviewApproved
 	marker := fmt.Sprintf("<!-- hive-repair: %s -->", finding.RepositoryFingerprint)
-	pull, err := github.UpsertRepairPullRequest(ctx, finding.Repository, attempt.Branch, config.BaseBranch, "Hive repair: "+finding.Title, repairPRBody(marker, finding, attempt), marker)
+	pull, err := github.UpsertRepairPullRequest(ctx, finding.Repository, attempt.Branch, attempt.CommitSHA, config.BaseBranch, "Hive repair: "+finding.Title, repairPRBody(marker, finding, attempt), marker)
 	if err != nil {
 		return Attempt{}, err
 	}
-	if pull.Number != attempt.PRNumber || pull.HeadSHA != "" && pull.HeadSHA != sha {
+	if pull.Number != attempt.PRNumber || strings.TrimSpace(pull.HeadSHA) == "" || !strings.EqualFold(strings.TrimSpace(pull.HeadSHA), sha) {
 		return Attempt{}, fmt.Errorf("updated repair PR does not match the persisted PR and exact head")
 	}
 	attempt.PRURL = pull.URL
@@ -195,6 +203,22 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 		return Attempt{}, err
 	}
 	return attempt, nil
+}
+
+func positiveRepositoryID(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if value[0] < '1' || value[0] > '9' {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func combineBaselineCandidates(local, hosted []BaselineCandidate) ([]BaselineCandidate, error) {

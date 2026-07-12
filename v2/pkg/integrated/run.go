@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -26,6 +28,7 @@ type RunOptions struct {
 }
 
 type WorkflowRunEvidence struct {
+	CorrelationID    string `json:"correlation_id"`
 	RunID            int64  `json:"run_id"`
 	RunURL           string `json:"run_url"`
 	HeadSHA          string `json:"head_sha"`
@@ -35,18 +38,19 @@ type WorkflowRunEvidence struct {
 }
 
 type RunResult struct {
-	SchemaVersion      string                           `json:"schema_version"`
-	Repository         string                           `json:"repository"`
-	Workflow           WorkflowRunEvidence              `json:"workflow"`
-	PostMergeWorkflow  *WorkflowRunEvidence             `json:"post_merge_workflow,omitempty"`
-	Validation         visualhive.Validation            `json:"validation"`
-	Lifecycle          visualhive.ApplyLifecycleResult  `json:"lifecycle"`
-	PostMergeLifecycle *visualhive.ApplyLifecycleResult `json:"post_merge_lifecycle,omitempty"`
-	Outbox             visualhive.OutboxProcessorResult `json:"outbox"`
-	Repairs            []repair.Result                  `json:"repairs,omitempty"`
-	Gates              []GateEvaluation                 `json:"gates,omitempty"`
-	StartedAt          time.Time                        `json:"started_at"`
-	CompletedAt        time.Time                        `json:"completed_at"`
+	SchemaVersion        string                           `json:"schema_version"`
+	Repository           string                           `json:"repository"`
+	Workflow             WorkflowRunEvidence              `json:"workflow"`
+	ProtectionActivation *ProtectionActivationResult      `json:"protection_activation,omitempty"`
+	PostMergeWorkflow    *WorkflowRunEvidence             `json:"post_merge_workflow,omitempty"`
+	Validation           visualhive.Validation            `json:"validation"`
+	Lifecycle            visualhive.ApplyLifecycleResult  `json:"lifecycle"`
+	PostMergeLifecycle   *visualhive.ApplyLifecycleResult `json:"post_merge_lifecycle,omitempty"`
+	Outbox               visualhive.OutboxProcessorResult `json:"outbox"`
+	Repairs              []repair.Result                  `json:"repairs,omitempty"`
+	Gates                []GateEvaluation                 `json:"gates,omitempty"`
+	StartedAt            time.Time                        `json:"started_at"`
+	CompletedAt          time.Time                        `json:"completed_at"`
 }
 
 type GateEvaluation struct {
@@ -54,7 +58,19 @@ type GateEvaluation struct {
 	Purpose               string                     `json:"purpose,omitempty"`
 	Gate                  hivegithub.PullRequestGate `json:"gate"`
 	Decision              *automation.Decision       `json:"merge_decision,omitempty"`
+	Approval              *MergeApproval             `json:"merge_approval,omitempty"`
 	MergeSHA              string                     `json:"merge_sha,omitempty"`
+}
+
+const staleWorkflowRedispatchLimit = 3
+
+type staleWorkflowHeadError struct {
+	WorkflowHead string
+	CurrentHead  string
+}
+
+func (e *staleWorkflowHeadError) Error() string {
+	return fmt.Sprintf("completed Visual Hive workflow head %s is stale; current default head is %s", e.WorkflowHead, e.CurrentHead)
 }
 
 func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
@@ -62,38 +78,74 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if options.GitHub == nil || options.StateDir == "" {
 		return result, fmt.Errorf("GitHub client and persistent state directory are required")
 	}
+	if options.Timeout <= 0 {
+		options.Timeout = 45 * time.Minute
+	}
 	store, err := NewStore(filepath.Join(options.StateDir, "integrated"))
 	if err != nil {
 		return result, err
 	}
+	releaseRun, err := acquireProductionRunLease(options.StateDir, options.Timeout+2*time.Minute)
+	if err != nil {
+		return result, err
+	}
+	defer releaseRun()
 	config, err := store.Load()
 	if err != nil {
 		return result, err
 	}
-	result.Repository = config.Repository
-	policy := automation.Policy{
-		ACMMLevel: config.ACMMLevel, Mode: automationMode(config.Automation), Paused: config.Paused,
-		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
-		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
-	}
-	if config.Paused {
-		store.Audit(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: "repository automation is paused"})
-		return result, fmt.Errorf("repository automation is paused")
-	}
-	if options.Timeout <= 0 {
-		options.Timeout = 45 * time.Minute
-	}
-	releaseRun, err := acquireProductionRunLease(options.StateDir, options.Timeout+2*time.Minute)
-	if err != nil {
-		store.Audit(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: err.Error()})
+	if _, err := verifyLiveRepositoryIdentity(ctx, options.GitHub, config); err != nil {
 		return result, err
 	}
-	defer releaseRun()
-	store.Audit(AuditEntry{Action: "run", Allowed: true, Repository: config.Repository})
-	runCtx, cancel := context.WithTimeout(ctx, options.Timeout)
-	defer cancel()
+	if err := VerifyInstalledSetup(ctx, options.GitHub, config); err != nil {
+		return result, err
+	}
+	result.Repository = config.Repository
+	policy := integratedPolicy(config)
+	pauseRequested, pauseRequestErr := PauseRequested(options.StateDir)
+	if pauseRequestErr != nil {
+		return result, fmt.Errorf("read pause request: %w", pauseRequestErr)
+	}
+	if config.Paused || pauseRequested {
+		if auditErr := store.AuditStrict(AuditEntry{Action: "run", Allowed: false, Repository: config.Repository, Detail: "repository automation is paused"}); auditErr != nil {
+			return result, auditErr
+		}
+		return result, fmt.Errorf("repository automation is paused")
+	}
+	if err := store.AuditStrict(AuditEntry{Action: "run", Allowed: true, Repository: config.Repository}); err != nil {
+		return result, err
+	}
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, options.Timeout)
+	defer timeoutCancel()
+	runCtx, pauseCancel := context.WithCancel(timeoutCtx)
+	defer pauseCancel()
+	go watchPauseRequest(runCtx, options.StateDir, pauseCancel)
+	workflow := WorkflowRunEvidence{}
+	if config.Automation == AutomationAutoMerge {
+		workflow, err = dispatchAndWait(runCtx, options.GitHub, config)
+		if err != nil {
+			return result, err
+		}
+		result.Workflow = workflow
+		activation, activationErr := ActivateAutoMergeProtection(runCtx, store, options.GitHub, config, workflow)
+		result.ProtectionActivation = &activation
+		if activationErr != nil {
+			if errors.Is(activationErr, ErrProtectionActivationRunStale) {
+				if consumeErr := consumeWorkflowDispatch(options.StateDir, workflow); consumeErr != nil {
+					return result, fmt.Errorf("%v; discard stale activation workflow: %w", activationErr, consumeErr)
+				}
+				if auditErr := store.AuditStrict(AuditEntry{Action: "discard_stale_protection_activation_run", Allowed: false, Repository: config.Repository, Detail: activationErr.Error()}); auditErr != nil {
+					return result, auditErr
+				}
+			}
+			return result, activationErr
+		}
+	}
 	lifecycle, err := visualhive.NewLifecycleStore(filepath.Join(options.StateDir, "visual-hive"))
 	if err != nil {
+		return result, err
+	}
+	if err := reconcileStaleMergeApproval(runCtx, options.StateDir, config, lifecycle, options.GitHub); err != nil {
 		return result, err
 	}
 	if _, err := recoverCompletedPostMergeVerification(lifecycle); err != nil {
@@ -105,31 +157,69 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	if err := reconcileOpenRepairDuplicates(runCtx, config, lifecycle, options.GitHub, policy); err != nil {
 		return result, err
 	}
-	externalMerge, err := reconcileExternallyMergedRepair(runCtx, lifecycle, options.GitHub)
+	externalMerge, err := reconcileExternallyMergedRepair(runCtx, options.StateDir, config, lifecycle, options.GitHub, policy)
 	if err != nil {
 		return result, err
 	}
-	workflow, err := dispatchAndWait(runCtx, options.GitHub, config)
-	if err != nil {
-		return result, err
-	}
-	result.Workflow = workflow
-	if externalMerge {
-		finding, ok := mergedRepairFinding(lifecycle.Snapshot())
-		if !ok || finding.MergeSHA != workflow.HeadSHA {
-			return result, fmt.Errorf("post-merge verification ran at %s without a matching reconciled merge", workflow.HeadSHA)
-		}
-		if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", workflow.RunID), workflow.RunURL); err != nil {
+	if config.Automation != AutomationAutoMerge {
+		workflow, err = dispatchAndWait(runCtx, options.GitHub, config)
+		if err != nil {
 			return result, err
 		}
+		result.Workflow = workflow
 	}
 	beadStore, err := beads.NewStore(filepath.Join(options.StateDir, "beads", "quality"))
 	if err != nil {
 		return result, err
 	}
-	validation, apply, outbox, verifiedArtifact, err := applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, policy, visualhive.ApplyLifecycleOptions{})
-	if err != nil {
-		return result, err
+	var validation visualhive.Validation
+	var apply visualhive.ApplyLifecycleResult
+	var outbox visualhive.OutboxProcessorResult
+	var verifiedArtifact hivegithub.VerifiedVisualHiveArtifact
+	for staleAttempt := 0; ; staleAttempt++ {
+		applyOptions := visualhive.ApplyLifecycleOptions{}
+		postMergeFingerprint := ""
+		if externalMerge {
+			finding, ok := mergedRepairFinding(lifecycle.Snapshot())
+			if !ok {
+				return result, fmt.Errorf("post-merge verification has no matching reconciled merge")
+			}
+			applyOptions, err = verifyPostMergeTarget(runCtx, options.StateDir, config, finding, workflow.HeadSHA, options.GitHub)
+			if err != nil {
+				return result, err
+			}
+			if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", workflow.RunID), workflow.RunURL); err != nil {
+				return result, err
+			}
+			postMergeFingerprint = finding.RepositoryFingerprint
+		}
+		validation, apply, outbox, verifiedArtifact, err = applyWorkflowEvidence(runCtx, options.StateDir, config, workflow, lifecycle, beadStore, options.GitHub, policy, applyOptions)
+		if err == nil {
+			if err := consumeWorkflowDispatch(options.StateDir, workflow); err != nil {
+				return result, fmt.Errorf("consume exact workflow dispatch: %w", err)
+			}
+			break
+		}
+		var stale *staleWorkflowHeadError
+		if !errors.As(err, &stale) {
+			return result, err
+		}
+		if postMergeFingerprint != "" {
+			if resetErr := lifecycle.ResetStalePostMergeVerification(postMergeFingerprint, fmt.Sprintf("%d", workflow.RunID), workflow.HeadSHA); resetErr != nil {
+				return result, fmt.Errorf("reset stale post-merge verification: %w", resetErr)
+			}
+		}
+		if discardErr := discardStaleWorkflowDispatch(options.StateDir, config, workflow, stale); discardErr != nil {
+			return result, discardErr
+		}
+		if staleAttempt+1 >= staleWorkflowRedispatchLimit {
+			return result, fmt.Errorf("default branch advanced during %d consecutive Visual Hive evidence applications: %w", staleWorkflowRedispatchLimit, err)
+		}
+		workflow, err = dispatchAndWait(runCtx, options.GitHub, config)
+		if err != nil {
+			return result, err
+		}
+		result.Workflow = workflow
 	}
 	result.Validation, result.Lifecycle, result.Outbox = validation, apply, outbox
 	if externalMerge {
@@ -297,7 +387,12 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 	if err != nil {
 		return visualhive.Validation{}, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, hivegithub.VerifiedVisualHiveArtifact{}, err
 	}
+	currentHead, err := requireLiveInstalledWorkflowHead(ctx, client, config, workflow.HeadSHA)
+	if err != nil {
+		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, verified, err
+	}
 	applyOptions.TargetRef = config.DefaultBranch
+	applyOptions.CurrentTargetCommitSHA = currentHead
 	applyOptions.VerificationRunID = fmt.Sprintf("%d", workflow.RunID)
 	applyOptions.VerificationURL = workflow.RunURL
 	applyOptions.VerificationCommitSHA = workflow.HeadSHA
@@ -307,11 +402,80 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 	if err != nil {
 		return bundle.Validation, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, verified, err
 	}
-	outbox := visualhive.ProcessOutbox(ctx, lifecycle, beadStore, policy, client)
-	if outbox.Failed > 0 {
-		return bundle.Validation, apply, outbox, verified, fmt.Errorf("GitHub lifecycle outbox failed: %s", strings.Join(outbox.Errors, "; "))
+	outbox, err := processWorkflowOutboxAtCurrentHead(ctx, config, workflow, lifecycle, beadStore, client, client, policy)
+	if err != nil {
+		return bundle.Validation, apply, outbox, verified, err
 	}
 	return bundle.Validation, apply, outbox, verified, nil
+}
+
+// processWorkflowOutboxAtCurrentHead closes the apply/side-effect race window.
+// ApplyBundle is deliberately durable before remote issue mutations; therefore
+// the default branch must be rebound after that write and immediately before
+// any pending lifecycle mutation is sent to GitHub. A stale apply remains
+// recoverable: its pending entries are never sent, and the next exact-head
+// bundle supersedes them by digest before ProcessOutbox runs again.
+func processWorkflowOutboxAtCurrentHead(ctx context.Context, config Config, workflow WorkflowRunEvidence, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, issueClient visualhive.LifecycleIssueClient, policy automation.Policy) (visualhive.OutboxProcessorResult, error) {
+	if _, err := requireLiveDefaultWorkflowHead(ctx, client, config, workflow.HeadSHA); err != nil {
+		return visualhive.OutboxProcessorResult{}, err
+	}
+	outbox := visualhive.ProcessOutbox(ctx, lifecycle, beadStore, policy, issueClient)
+	if outbox.Failed > 0 {
+		return outbox, fmt.Errorf("GitHub lifecycle outbox failed: %s", strings.Join(outbox.Errors, "; "))
+	}
+	return outbox, nil
+}
+
+func requireLiveDefaultWorkflowHead(ctx context.Context, client *hivegithub.Client, config Config, workflowHead string) (string, error) {
+	if client == nil || client.GoGitHub() == nil {
+		return "", fmt.Errorf("GitHub client is required to bind workflow evidence to the live default head")
+	}
+	owner, repo, ok := strings.Cut(strings.TrimSpace(config.Repository), "/")
+	if !ok || owner == "" || repo == "" || strings.TrimSpace(config.DefaultBranch) == "" {
+		return "", fmt.Errorf("configured repository and default branch are required to bind workflow evidence")
+	}
+	branch, _, err := client.GoGitHub().Repositories.GetBranch(ctx, owner, repo, config.DefaultBranch, 0)
+	if err != nil {
+		return "", fmt.Errorf("read live default head before applying workflow evidence: %w", err)
+	}
+	currentHead := strings.ToLower(strings.TrimSpace(branch.GetCommit().GetSHA()))
+	workflowHead = strings.ToLower(strings.TrimSpace(workflowHead))
+	if !immutableCommit.MatchString(currentHead) || !immutableCommit.MatchString(workflowHead) {
+		return "", fmt.Errorf("live default head or workflow head is not an immutable commit SHA")
+	}
+	if currentHead != workflowHead {
+		return currentHead, &staleWorkflowHeadError{WorkflowHead: workflowHead, CurrentHead: currentHead}
+	}
+	return currentHead, nil
+}
+
+func requireLiveInstalledWorkflowHead(ctx context.Context, client *hivegithub.Client, config Config, workflowHead string) (string, error) {
+	currentHead, err := requireLiveDefaultWorkflowHead(ctx, client, config, workflowHead)
+	if err != nil {
+		return currentHead, err
+	}
+	if err := VerifyInstalledSetupAtCommit(ctx, client, config, currentHead); err != nil {
+		return currentHead, fmt.Errorf("reverify managed setup at exact workflow head before applying evidence: %w", err)
+	}
+	return currentHead, nil
+}
+
+func discardStaleWorkflowDispatch(stateDir string, config Config, workflow WorkflowRunEvidence, stale *staleWorkflowHeadError) error {
+	if stale == nil {
+		return fmt.Errorf("stale workflow evidence is required")
+	}
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		return err
+	}
+	detail := fmt.Sprintf("run=%d workflow_head=%s current_default_head=%s", workflow.RunID, stale.WorkflowHead, stale.CurrentHead)
+	if err := store.AuditStrict(AuditEntry{Action: "discard_stale_workflow_evidence", Allowed: false, Repository: config.Repository, Detail: detail}); err != nil {
+		return err
+	}
+	if err := consumeWorkflowDispatch(stateDir, workflow); err != nil {
+		return fmt.Errorf("discard exact stale workflow dispatch: %w", err)
+	}
+	return nil
 }
 
 func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) (repairOrchestrationResult, error) {
@@ -335,6 +499,10 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		result.Repairs = append(result.Repairs, repairs...)
 		if err != nil {
 			finding, ok := activeRepairFinding(lifecycle.Snapshot())
+			var resumable *repair.ResumableFailureError
+			if errors.As(err, &resumable) {
+				return result, fmt.Errorf("%w; next command: hive retry-repair --state-dir %q --finding %q --recurrence %d --attempt %d --failure-class %s --failure-id %q --reason <reason>", err, stateDir, resumable.RepositoryFingerprint, resumable.Recurrence, resumable.Attempt, resumable.Class, resumable.FailureID)
+			}
 			if repair.IsRetryableAttemptError(err) && ok {
 				spent, countErr := durableRepairAttempts(stateDir, finding)
 				if countErr != nil {
@@ -347,7 +515,10 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			}
 			return result, err
 		}
-		finding, ok := activeRepairFinding(lifecycle.Snapshot())
+		finding, ok, findingErr := repairFindingForOrchestration(stateDir, lifecycle.Snapshot())
+		if findingErr != nil {
+			return result, findingErr
+		}
 		if !ok {
 			return result, nil
 		}
@@ -374,6 +545,11 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 				continue
 			}
 		}
+		refreshedFinding, _, refreshErr := refreshOwnedRepairBranchIfBehind(ctx, stateDir, config, finding, lifecycle, client, policy)
+		if refreshErr != nil {
+			return result, refreshErr
+		}
+		finding = refreshedFinding
 		gate, err := waitForPullRequestGate(ctx, client, config.Repository, finding)
 		if err != nil {
 			return result, err
@@ -446,15 +622,19 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			}
 		}
 		if gate.Merged {
-			if strings.TrimSpace(gate.MergeSHA) == "" {
-				return result, fmt.Errorf("merged pull request #%d did not report a merge commit", finding.PRNumber)
+			reconciled, reconcileErr := reconcileExternallyMergedRepair(ctx, stateDir, config, lifecycle, client, policy)
+			if reconcileErr != nil {
+				return result, reconcileErr
 			}
-			if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
-				return result, err
+			if !reconciled {
+				return result, fmt.Errorf("merged pull request #%d was not backed by a consumable Hive merge intent", finding.PRNumber)
 			}
-			cleanupMergedRepairBranch(ctx, lifecycle, client, config.Repository, finding, gate.HeadSHA)
 			result.Gates = append(result.Gates, evaluation)
-			finding.MergeSHA, finding.Status = gate.MergeSHA, visualhive.StatusMerged
+			updated, exists := lifecycle.Finding(finding.RepositoryFingerprint)
+			if !exists || updated.Status != visualhive.StatusMerged || updated.MergeSHA == "" {
+				return result, fmt.Errorf("merged pull request #%d was not durably reconciled", finding.PRNumber)
+			}
+			finding = updated
 			postMerge, postApply, postOutbox, verifyErr := verifyMergedFinding(ctx, stateDir, config, finding, lifecycle, beadStore, client, policy)
 			result.PostMergeWorkflow, result.PostMergeLifecycle, result.Outbox = &postMerge, &postApply, postOutbox
 			return result, verifyErr
@@ -466,17 +646,59 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			result.Gates = append(result.Gates, evaluation)
 			return result, nil
 		}
-		decision := policy.Authorize(automation.ActionRequest{
-			Action: automation.ActionMergePR, Agent: repairActor(finding.OwningAgentHint), Repository: config.Repository,
-			Risk: mergeRisk(gate.ChangedFiles), ChangedFiles: gate.ChangedFiles, RepairAttempts: finding.RepairAttempts,
-			ExpectedHeadSHA: finding.RepairCommitSHA, TestedHeadSHA: gate.HeadSHA,
-			MergeableKnown: gate.MergeableKnown, Mergeable: gate.Mergeable, VisualHiveVerdictGreen: gate.VisualHiveVerdictGreen,
-			RequiredCheckStates: gate.RequiredCheckStates, BranchProtectionEnabled: gate.BranchProtectionEnabled,
-			Hold: gate.Hold, HumanReviewRequired: gate.HumanReviewRequired, BaselineChanged: gate.BaselineChanged,
-			WorkflowChanged: gate.WorkflowChanged, SecuritySensitive: gate.SecuritySensitive, DeploymentChanged: gate.DeploymentChanged,
-		})
+		request := mergeActionRequest(config, finding, gate)
+		decision := policy.Authorize(request)
+		var appliedApproval *MergeApproval
+		approvalStore, storeErr := NewStore(filepath.Join(stateDir, "integrated"))
+		if storeErr != nil {
+			return result, storeErr
+		}
+		approval, approvalExists, approvalErr := approvalStore.LoadMergeApproval()
+		if approvalErr != nil {
+			return result, approvalErr
+		}
+		if approvalExists {
+			currentDiffDigest, digestErr := client.PullRequestDiffDigest(ctx, config.Repository, gate.Number)
+			if digestErr != nil {
+				return result, digestErr
+			}
+			if approvalErr := ValidateMergeApproval(approval, config.Repository, config.RepositoryID, currentDiffDigest, gate); approvalErr != nil {
+				if auditErr := approvalStore.AuditStrict(AuditEntry{Action: "apply_merge_approval", Allowed: false, Repository: config.Repository, Detail: approvalErr.Error()}); auditErr != nil {
+					return result, auditErr
+				}
+				lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "apply_merge_approval", false, approvalErr.Error())
+				if deleteErr := approvalStore.DeleteMergeApproval(); deleteErr != nil {
+					return result, deleteErr
+				}
+			} else {
+				approvalAllowed := decision.Allowed
+				if !approvalAllowed {
+					if approvedDecision, eligible := authorizePathApprovedMerge(policy, request, decision); eligible && approvedDecision.Allowed {
+						decision, approvalAllowed = approvedDecision, true
+					}
+				}
+				if approvalAllowed {
+					appliedApproval = &approval
+					detail := fmt.Sprintf("actor=%s pr=%d head=%s diff=%s reason=%s", approval.Actor, approval.PRNumber, approval.HeadSHA, approval.DiffDigest, approval.Reason)
+					if auditErr := approvalStore.AuditStrict(AuditEntry{Action: "apply_merge_approval", Allowed: true, Repository: config.Repository, Detail: detail}); auditErr != nil {
+						return result, auditErr
+					}
+					lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "apply_merge_approval", true, detail)
+				} else {
+					detail := "approval cannot override non-path merge gates: " + strings.Join(decision.Reasons, "; ")
+					if auditErr := approvalStore.AuditStrict(AuditEntry{Action: "apply_merge_approval", Allowed: false, Repository: config.Repository, Detail: detail}); auditErr != nil {
+						return result, auditErr
+					}
+					lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "apply_merge_approval", false, detail)
+					if deleteErr := approvalStore.DeleteMergeApproval(); deleteErr != nil {
+						return result, deleteErr
+					}
+				}
+			}
+		}
 		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(automation.ActionMergePR), decision.Allowed, strings.Join(decision.Reasons, "; "))
 		evaluation.Decision = &decision
+		evaluation.Approval = appliedApproval
 		if !decision.Allowed {
 			if err := markMergePolicyHold(lifecycle, finding, decision); err != nil {
 				return result, err
@@ -484,16 +706,45 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 			result.Gates = append(result.Gates, evaluation)
 			return result, nil
 		}
-		mergeSHA, err := client.MergePullRequestExact(ctx, config.Repository, finding.PRNumber, gate.HeadSHA)
+		boundary, err := mergeReadyFindingAtBoundary(ctx, stateDir, config, finding, lifecycle, gate, appliedApproval, client)
+		if boundary.Gate.Number > 0 {
+			evaluation.Gate = boundary.Gate
+		}
+		if boundary.Decision.Action == automation.ActionMergePR {
+			evaluation.Decision = &boundary.Decision
+			evaluation.Approval = boundary.Approval
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "final_live_merge_gate", boundary.Decision.Allowed, strings.Join(boundary.Decision.Reasons, "; "))
+		}
 		if err != nil {
+			var denied *mergeBoundaryDeniedError
+			if errors.As(err, &denied) {
+				if err := markMergePolicyHold(lifecycle, finding, denied.Decision); err != nil {
+					return result, err
+				}
+				result.Gates = append(result.Gates, evaluation)
+				return result, nil
+			}
 			return result, err
 		}
+		intent, mergeSHA := boundary.Intent, boundary.MergeSHA
 		evaluation.MergeSHA = mergeSHA
 		result.Gates = append(result.Gates, evaluation)
+		if appliedApproval != nil && finding.ManualReviewKind == "merge_policy" {
+			if err := lifecycle.MarkManualReviewComplete(finding.RepositoryFingerprint, "merge_policy"); err != nil {
+				return result, err
+			}
+		}
 		if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, mergeSHA); err != nil {
 			return result, err
 		}
-		cleanupMergedRepairBranch(ctx, lifecycle, client, config.Repository, finding, gate.HeadSHA)
+		intentStore, storeErr := NewStore(filepath.Join(stateDir, "integrated"))
+		if storeErr != nil {
+			return result, storeErr
+		}
+		if err := consumeMergeIntent(intentStore, config, intent, mergeSHA, false); err != nil {
+			return result, err
+		}
+		cleanupMergedRepairBranch(ctx, lifecycle, client, policy, config.Repository, finding, gate.HeadSHA)
 		finding.MergeSHA, finding.Status = mergeSHA, visualhive.StatusMerged
 		postMerge, postApply, postOutbox, verifyErr := verifyMergedFinding(ctx, stateDir, config, finding, lifecycle, beadStore, client, policy)
 		result.PostMergeWorkflow, result.PostMergeLifecycle, result.Outbox = &postMerge, &postApply, postOutbox
@@ -509,18 +760,23 @@ func durableRepairAttempts(stateDir string, finding visualhive.FindingLifecycle)
 		return 0, err
 	}
 	attempt, exists := state.Get(finding.RepositoryFingerprint)
-	if exists && attempt.Recurrence == finding.Recurrences && attempt.Attempt > spent {
-		spent = attempt.Attempt
+	if exists && attempt.Recurrence == finding.Recurrences && attempt.CountedModelAttempts() > spent {
+		spent = attempt.CountedModelAttempts()
 	}
 	return spent, nil
 }
 
 func markMergePolicyHold(lifecycle *visualhive.LifecycleStore, finding visualhive.FindingLifecycle, decision automation.Decision) error {
-	reason := fmt.Sprintf("Hive cannot auto-merge pull request #%d under the configured policy: %s. Review and merge the exact tested head manually, or change repository authority explicitly.", finding.PRNumber, strings.Join(decision.Reasons, "; "))
+	reason := fmt.Sprintf("Hive cannot auto-merge pull request #%d under the configured policy: %s. Do not merge it directly. Review the exact diff, then run `hive approve-merge --pr %d --head %s --plan --json`; repeat the returned exact base and diff digest in its apply command with your reason. Hive will revalidate every gate and perform the merge.", finding.PRNumber, strings.Join(decision.Reasons, "; "), finding.PRNumber, finding.RepairCommitSHA)
 	return lifecycle.MarkManualReviewRequired(finding.RepositoryFingerprint, "merge_policy", reason)
 }
 
-func cleanupMergedRepairBranch(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, repository string, finding visualhive.FindingLifecycle, expectedHeadSHA string) {
+func cleanupMergedRepairBranch(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, repository string, finding visualhive.FindingLifecycle, expectedHeadSHA string) {
+	decision := policy.Authorize(automation.ActionRequest{Action: automation.ActionDeleteRepairBranch, Agent: repairActor(finding.OwningAgentHint), Repository: repository, RepairAttempts: finding.RepairAttempts})
+	if !decision.Allowed {
+		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "delete_repair_branch", false, strings.Join(decision.Reasons, "; "))
+		return
+	}
 	err := client.DeleteRepairBranchExact(ctx, repository, finding.Branch, expectedHeadSHA)
 	if err != nil {
 		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "delete_repair_branch", false, err.Error())
@@ -683,16 +939,37 @@ func repairStateKey(value string) string {
 	return fmt.Sprintf("%x", digest[:6])
 }
 
-func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client) (bool, error) {
-	finding, ok := repairPullRequestFinding(lifecycle.Snapshot())
-	if !ok {
-		return false, nil
-	}
-	gate, err := client.InspectPullRequestGate(ctx, finding.Repository, finding.PRNumber)
+func reconcileExternallyMergedRepair(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy) (bool, error) {
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
 	if err != nil {
 		return false, err
 	}
-	if gate.HeadSHA != finding.RepairCommitSHA {
+	intent, hasIntent, err := store.LoadMergeIntent()
+	if err != nil {
+		return false, err
+	}
+	var finding visualhive.FindingLifecycle
+	var ok bool
+	if hasIntent {
+		var mappingErr error
+		finding, ok, mappingErr = findingForPullRequest(lifecycle.Snapshot(), intent.PRNumber)
+		if mappingErr != nil {
+			return false, mappingErr
+		}
+		if !ok || !strings.EqualFold(finding.RepairCommitSHA, intent.HeadSHA) {
+			return false, fmt.Errorf("durable merge intent does not match exactly one Hive repair finding")
+		}
+	} else {
+		finding, ok = repairPullRequestFinding(lifecycle.Snapshot())
+		if !ok {
+			return false, nil
+		}
+	}
+	gate, err := client.InspectPullRequestGate(ctx, config.Repository, finding.PRNumber)
+	if err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(gate.HeadSHA, finding.RepairCommitSHA) {
 		return false, fmt.Errorf("pull request #%d head %s does not match Hive repair commit %s", finding.PRNumber, gate.HeadSHA, finding.RepairCommitSHA)
 	}
 	if !gate.Merged {
@@ -704,36 +981,79 @@ func reconcileExternallyMergedRepair(ctx context.Context, lifecycle *visualhive.
 	if strings.TrimSpace(gate.MergeSHA) == "" {
 		return false, fmt.Errorf("merged pull request #%d did not report a merge commit", finding.PRNumber)
 	}
-	green := gateChecksGreen(gate)
-	if !green {
-		return false, fmt.Errorf("externally merged pull request #%d lacks green exact-head gates", finding.PRNumber)
-	}
-	if finding.Status == visualhive.StatusResolved || finding.Status == visualhive.StatusIssueClosed {
-		if err := lifecycle.MarkRecoveredMerge(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
-			return false, err
+	if !hasIntent {
+		detail := fmt.Sprintf("pull request #%d at %s was merged without a durable Hive merge intent; restore or investigate the repository before running again", gate.Number, gate.HeadSHA)
+		if auditErr := store.AuditStrict(AuditEntry{Action: "reconcile_external_merge", Allowed: false, Repository: config.Repository, Detail: detail}); auditErr != nil {
+			return false, auditErr
 		}
-		cleanupMergedRepairBranch(ctx, lifecycle, client, finding.Repository, finding, gate.HeadSHA)
-		return false, nil
+		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "reconcile_external_merge", false, detail)
+		return false, fmt.Errorf("%s", detail)
 	}
-	if finding.Status != visualhive.StatusReady {
-		checkEvidence := make([]visualhive.CheckEvidence, 0, len(gate.Checks))
-		for _, check := range gate.Checks {
-			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
-		}
-		if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, gate.HeadSHA, true, checkSummary(gate), checkEvidence); err != nil {
-			return false, err
-		}
-	}
-	if finding.ManualReviewKind == "merge_policy" {
-		if err := lifecycle.MarkManualReviewComplete(finding.RepositoryFingerprint, "merge_policy"); err != nil {
-			return false, err
-		}
-	}
-	if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
+	digest, err := client.PullRequestDiffDigest(ctx, config.Repository, gate.Number)
+	if err != nil {
 		return false, err
 	}
-	cleanupMergedRepairBranch(ctx, lifecycle, client, finding.Repository, finding, gate.HeadSHA)
-	return true, nil
+	if err := validateRecoveredMergeIntent(intent, config.Repository, config.RepositoryID, digest, gate); err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(gate.MergedBy), strings.TrimSpace(intent.WriterActor)) {
+		return false, fmt.Errorf("merged pull request #%d writer %q does not match Hive intent writer %q", gate.Number, gate.MergedBy, intent.WriterActor)
+	}
+	wasMerged := finding.Status == visualhive.StatusMerged || finding.Status == visualhive.StatusPostMergeVerifying
+	if !wasMerged {
+		if finding.Status != visualhive.StatusReady {
+			checkEvidence := make([]visualhive.CheckEvidence, 0, len(intent.Gate.Checks))
+			for _, check := range intent.Gate.Checks {
+				checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
+			}
+			if err := lifecycle.MarkChecksWithEvidence(finding.RepositoryFingerprint, intent.HeadSHA, true, checkSummary(intent.Gate), checkEvidence); err != nil {
+				return false, err
+			}
+		}
+		if intent.Approval != nil && finding.ManualReviewKind == "merge_policy" {
+			if err := lifecycle.MarkManualReviewComplete(finding.RepositoryFingerprint, "merge_policy"); err != nil {
+				return false, err
+			}
+		}
+		if err := lifecycle.MarkMerged(finding.RepositoryFingerprint, gate.MergeSHA); err != nil {
+			return false, err
+		}
+	}
+	if err := consumeMergeIntent(store, config, intent, gate.MergeSHA, true); err != nil {
+		return false, err
+	}
+	cleanupMergedRepairBranch(ctx, lifecycle, client, policy, config.Repository, finding, gate.HeadSHA)
+	return !wasMerged, nil
+}
+
+func consumeMergeIntent(store *Store, config Config, intent MergeIntent, mergeSHA string, recovered bool) error {
+	action := "consume_merge_intent"
+	if recovered {
+		action += "_recovered"
+	}
+	detail := fmt.Sprintf("pr=%d base=%s head=%s diff=%s writer=%s authorization=%s merge=%s", intent.PRNumber, intent.BaseSHA, intent.HeadSHA, intent.DiffDigest, intent.WriterActor, intent.Authorization, mergeSHA)
+	if err := store.AuditStrict(AuditEntry{Action: action, Allowed: true, Repository: config.Repository, Detail: detail}); err != nil {
+		return err
+	}
+	if intent.Approval != nil {
+		approval, exists, err := store.LoadMergeApproval()
+		if err != nil {
+			return err
+		}
+		if exists && approval != *intent.Approval {
+			return fmt.Errorf("active merge approval changed after the merge intent was authorized")
+		}
+		approvalDetail := fmt.Sprintf("actor=%s pr=%d base=%s head=%s diff=%s merge=%s reason=%s", intent.Approval.Actor, intent.Approval.PRNumber, intent.Approval.BaseSHA, intent.Approval.HeadSHA, intent.Approval.DiffDigest, mergeSHA, intent.Approval.Reason)
+		if err := store.AuditStrict(AuditEntry{Action: "consume_merge_approval", Allowed: true, Repository: config.Repository, Detail: approvalDetail}); err != nil {
+			return err
+		}
+		if exists {
+			if err := store.DeleteMergeApproval(); err != nil {
+				return err
+			}
+		}
+	}
+	return store.DeleteMergeIntent()
 }
 
 func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.FindingLifecycle, bool) {
@@ -748,7 +1068,7 @@ func repairPullRequestFinding(state visualhive.LifecycleState) (visualhive.Findi
 			continue
 		}
 		switch finding.Status {
-		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusNeedsRevision, visualhive.StatusReady, visualhive.StatusResolved, visualhive.StatusIssueClosed:
+		case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusNeedsRevision, visualhive.StatusReady:
 			return *finding, true
 		}
 	}
@@ -790,20 +1110,44 @@ func verifyMergedFinding(ctx context.Context, stateDir string, config Config, fi
 	if err != nil {
 		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
 	}
-	applyOptions, err := verifyPostMergeTarget(ctx, stateDir, config, finding, postMerge.HeadSHA, client)
-	if err != nil {
-		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", false, err.Error())
-		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
-	}
-	if postMerge.HeadSHA != finding.MergeSHA {
-		lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", true, fmt.Sprintf("repair merge %s is an unchanged-file ancestor of target head %s", finding.MergeSHA, postMerge.HeadSHA))
-	}
-	if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", postMerge.RunID), postMerge.RunURL); err != nil {
-		return postMerge, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, err
-	}
-	_, postApply, postOutbox, _, err := applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy, applyOptions)
-	if err != nil {
-		return postMerge, postApply, postOutbox, err
+	var postApply visualhive.ApplyLifecycleResult
+	var postOutbox visualhive.OutboxProcessorResult
+	for staleAttempt := 0; ; staleAttempt++ {
+		applyOptions, verifyErr := verifyPostMergeTarget(ctx, stateDir, config, finding, postMerge.HeadSHA, client)
+		if verifyErr != nil {
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", false, verifyErr.Error())
+			return postMerge, postApply, postOutbox, verifyErr
+		}
+		if postMerge.HeadSHA != finding.MergeSHA {
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "post_merge_descendant", true, fmt.Sprintf("repair merge %s is an unchanged-file ancestor of target head %s", finding.MergeSHA, postMerge.HeadSHA))
+		}
+		if err := lifecycle.MarkPostMergeVerifying(finding.RepositoryFingerprint, fmt.Sprintf("%d", postMerge.RunID), postMerge.RunURL); err != nil {
+			return postMerge, postApply, postOutbox, err
+		}
+		_, postApply, postOutbox, _, err = applyWorkflowEvidence(ctx, stateDir, config, postMerge, lifecycle, beadStore, client, policy, applyOptions)
+		if err == nil {
+			if err := consumeWorkflowDispatch(stateDir, postMerge); err != nil {
+				return postMerge, postApply, postOutbox, fmt.Errorf("consume exact post-merge workflow dispatch: %w", err)
+			}
+			break
+		}
+		var stale *staleWorkflowHeadError
+		if !errors.As(err, &stale) {
+			return postMerge, postApply, postOutbox, err
+		}
+		if resetErr := lifecycle.ResetStalePostMergeVerification(finding.RepositoryFingerprint, fmt.Sprintf("%d", postMerge.RunID), postMerge.HeadSHA); resetErr != nil {
+			return postMerge, postApply, postOutbox, fmt.Errorf("reset stale post-merge verification: %w", resetErr)
+		}
+		if discardErr := discardStaleWorkflowDispatch(stateDir, config, postMerge, stale); discardErr != nil {
+			return postMerge, postApply, postOutbox, discardErr
+		}
+		if staleAttempt+1 >= staleWorkflowRedispatchLimit {
+			return postMerge, postApply, postOutbox, fmt.Errorf("default branch advanced during %d consecutive post-merge verifications: %w", staleWorkflowRedispatchLimit, err)
+		}
+		postMerge, err = dispatchAndWait(ctx, client, config)
+		if err != nil {
+			return postMerge, postApply, postOutbox, err
+		}
 	}
 	verified, exists := lifecycle.Finding(finding.RepositoryFingerprint)
 	if !exists || verified.Status != visualhive.StatusIssueClosed {
@@ -863,27 +1207,48 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 	}
 	const workflowFile = "hive-visual-hive.yml"
 	const dispatchAttemptLimit = 3
+	store, err := NewStore(filepath.Join(config.StateDir, "integrated"))
+	if err != nil {
+		return WorkflowRunEvidence{}, err
+	}
 	for attempt := 1; attempt <= dispatchAttemptLimit; attempt++ {
-		selected, err := dispatchAndWaitAttempt(ctx, client, owner, repo, workflowFile, config.DefaultBranch)
+		selected, intent, err := dispatchAndWaitAttempt(ctx, client, store, config, owner, repo, workflowFile, config.DefaultBranch)
 		if err != nil {
 			return WorkflowRunEvidence{}, err
 		}
+		if intent.RecoveryCount > 0 {
+			unique, discoveryErr := findCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, config.DefaultBranch, intent)
+			if discoveryErr != nil {
+				return WorkflowRunEvidence{}, fmt.Errorf("revalidate recovered workflow correlation uniqueness: %w", discoveryErr)
+			}
+			if unique == nil || unique.GetID() != selected.GetID() {
+				return WorkflowRunEvidence{}, fmt.Errorf("recovered workflow run %d is not the sole exact correlation match", selected.GetID())
+			}
+		}
 		if retryCancelledDispatch(selected.GetConclusion(), attempt, dispatchAttemptLimit) {
+			if err := discardWorkflowDispatch(store, intent, selected.GetID()); err != nil {
+				return WorkflowRunEvidence{}, err
+			}
 			continue
 		}
 		if selected.GetConclusion() != "success" {
+			if err := discardWorkflowDispatch(store, intent, selected.GetID()); err != nil {
+				return WorkflowRunEvidence{}, err
+			}
 			return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow %s concluded %s", selected.GetHTMLURL(), selected.GetConclusion())
 		}
 		artifacts, _, err := client.GoGitHub().Actions.ListWorkflowRunArtifacts(ctx, owner, repo, selected.GetID(), &gh.ListOptions{PerPage: 100})
 		if err != nil {
 			return WorkflowRunEvidence{}, fmt.Errorf("list production evidence artifacts: %w", err)
 		}
-		workflow := WorkflowRunEvidence{RunID: selected.GetID(), RunURL: selected.GetHTMLURL(), HeadSHA: selected.GetHeadSHA(), Conclusion: selected.GetConclusion()}
+		workflow := WorkflowRunEvidence{CorrelationID: intent.CorrelationID, RunID: selected.GetID(), RunURL: selected.GetHTMLURL(), HeadSHA: selected.GetHeadSHA(), Conclusion: selected.GetConclusion()}
+		evidenceName := fmt.Sprintf("visual-hive-evidence-%d", selected.GetID())
+		bundleName := fmt.Sprintf("visual-hive-bundle-%d", selected.GetID())
 		for _, artifact := range artifacts.Artifacts {
 			switch {
-			case strings.HasPrefix(artifact.GetName(), "visual-hive-evidence-"):
+			case artifact.GetName() == evidenceName:
 				workflow.EvidenceArtifact = artifact.GetID()
-			case strings.HasPrefix(artifact.GetName(), "visual-hive-bundle-"):
+			case artifact.GetName() == bundleName:
 				workflow.BundleArtifact = artifact.GetID()
 			}
 		}
@@ -895,51 +1260,254 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 	return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow was cancelled by concurrency %d consecutive times", dispatchAttemptLimit)
 }
 
-func dispatchAndWaitAttempt(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref string) (*gh.WorkflowRun, error) {
-	started := time.Now().UTC().Add(-5 * time.Second)
-	_, err := client.GoGitHub().Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, workflowFile, gh.CreateWorkflowDispatchEventRequest{Ref: ref})
+func dispatchAndWaitAttempt(ctx context.Context, client *hivegithub.Client, store *Store, config Config, owner, repo, workflowFile, ref string) (*gh.WorkflowRun, WorkflowDispatchIntent, error) {
+	intent, exists, err := store.LoadWorkflowDispatchIntent()
 	if err != nil {
-		return nil, fmt.Errorf("dispatch Visual Hive production workflow: %w", err)
+		return nil, WorkflowDispatchIntent{}, err
 	}
-	var selected *gh.WorkflowRun
+	if exists {
+		if err := validateWorkflowDispatchBinding(intent, config, workflowFile, ref); err != nil {
+			return nil, intent, err
+		}
+	} else {
+		intent, err = newWorkflowDispatchIntent(config, workflowFile, ref)
+		if err != nil {
+			return nil, WorkflowDispatchIntent{}, err
+		}
+		if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+			return nil, intent, fmt.Errorf("persist workflow dispatch intent: %w", err)
+		}
+	}
+
+	if intent.RunID > 0 {
+		selected, err := waitForExactWorkflowRun(ctx, client, owner, repo, intent, nil)
+		return selected, intent, err
+	}
+	if WorkflowDispatchNeedsRecovery(intent) {
+		recovered, _, _, discoveryErr := discoverCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, ref, intent)
+		if discoveryErr != nil {
+			return nil, intent, fmt.Errorf("recheck ambiguous workflow dispatch %s: %w", intent.CorrelationID, discoveryErr)
+		}
+		if recovered == nil {
+			planCommand := fmt.Sprintf("hive recover-dispatch --state-dir %q --action retry --correlation %s --plan --json", config.StateDir, intent.CorrelationID)
+			return nil, intent, fmt.Errorf("workflow dispatch %s has an ambiguous transport outcome and no exact run was found; state remains fail-closed; review and authorize recovery with %s", intent.CorrelationID, planCommand)
+		}
+		intent.RunID, intent.RunURL, intent.MatchedAt = recovered.GetID(), recovered.GetHTMLURL(), time.Now().UTC()
+		if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+			return nil, intent, fmt.Errorf("persist exact workflow match after ambiguous transport: %w", err)
+		}
+		selected, waitErr := waitForExactWorkflowRun(ctx, client, owner, repo, intent, recovered)
+		return selected, intent, waitErr
+	}
+	if intent.DispatchAttemptedAt.IsZero() {
+		if intent.RecoveryAction == string(WorkflowDispatchRecoveryRetry) {
+			recovered, discoveryErr := findCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, ref, intent)
+			if discoveryErr != nil {
+				return nil, intent, fmt.Errorf("recheck recovered dispatch correlation before retry: %w", discoveryErr)
+			}
+			if recovered != nil {
+				intent.RunID, intent.RunURL, intent.MatchedAt = recovered.GetID(), recovered.GetHTMLURL(), time.Now().UTC()
+				// The recovered run came from the original ambiguous request, whose
+				// digest remains bound in RecoveryRequestDigest. Restore that attempt
+				// metadata so the run binding remains structurally complete.
+				intent.DispatchAttemptedAt = intent.RecoveryOriginalAttemptedAt
+				intent.RequestDigest = intent.RecoveryRequestDigest
+				if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+					return nil, intent, fmt.Errorf("persist delayed exact workflow match: %w", err)
+				}
+				selected, waitErr := waitForExactWorkflowRun(ctx, client, owner, repo, intent, recovered)
+				return selected, intent, waitErr
+			}
+		}
+		intent.DispatchAttemptedAt = time.Now().UTC()
+		intent.RequestDigest = ""
+		digest, digestErr := workflowDispatchRequestDigest(intent)
+		if digestErr != nil {
+			return nil, intent, digestErr
+		}
+		intent.RequestDigest = digest
+		if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+			return nil, intent, fmt.Errorf("persist workflow dispatch mutation checkpoint: %w", err)
+		}
+		dispatch, response, dispatchErr := createExactWorkflowDispatch(ctx, client, owner, repo, workflowFile, ref, intent.CorrelationID)
+		if dispatchErr != nil {
+			// A GitHub response proves the mutation was rejected. A transport error
+			// is ambiguous, so retain the pre-mutation checkpoint for exact recovery.
+			if response != nil {
+				if deleteErr := store.DeleteWorkflowDispatchIntent(); deleteErr != nil {
+					return nil, intent, fmt.Errorf("dispatch Visual Hive production workflow: %v; remove rejected dispatch intent: %w", dispatchErr, deleteErr)
+				}
+			}
+			return nil, intent, fmt.Errorf("dispatch Visual Hive production workflow: %w", dispatchErr)
+		}
+		intent.DispatchAcknowledgedAt = time.Now().UTC()
+		if dispatch.WorkflowRunID > 0 {
+			intent.RunID = dispatch.WorkflowRunID
+			intent.RunURL = dispatch.HTMLURL
+			intent.MatchedAt = time.Now().UTC()
+		}
+		if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+			return nil, intent, fmt.Errorf("persist acknowledged workflow dispatch: %w", err)
+		}
+	}
+	if intent.RunID > 0 {
+		selected, err := waitForExactWorkflowRun(ctx, client, owner, repo, intent, nil)
+		return selected, intent, err
+	}
+
+	selected, err := waitForCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, ref, intent)
+	if err != nil {
+		return nil, intent, err
+	}
+	intent.RunID = selected.GetID()
+	intent.RunURL = selected.GetHTMLURL()
+	intent.MatchedAt = time.Now().UTC()
+	if err := store.SaveWorkflowDispatchIntent(intent); err != nil {
+		return nil, intent, fmt.Errorf("persist exact workflow run binding: %w", err)
+	}
+	selected, err = waitForExactWorkflowRun(ctx, client, owner, repo, intent, selected)
+	return selected, intent, err
+}
+
+type exactWorkflowDispatchResponse struct {
+	WorkflowRunID int64  `json:"workflow_run_id"`
+	RunURL        string `json:"run_url"`
+	HTMLURL       string `json:"html_url"`
+}
+
+func createExactWorkflowDispatch(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref, correlation string) (exactWorkflowDispatchResponse, *gh.Response, error) {
+	body := struct {
+		Ref    string                 `json:"ref"`
+		Inputs map[string]interface{} `json:"inputs"`
+	}{
+		Ref: ref,
+		Inputs: map[string]interface{}{
+			workflowDispatchInput: correlation,
+		},
+	}
+	endpoint := fmt.Sprintf("repos/%s/%s/actions/workflows/%s/dispatches", owner, repo, workflowFile)
+	request, err := client.GoGitHub().NewRequest(http.MethodPost, endpoint, body)
+	if err != nil {
+		return exactWorkflowDispatchResponse{}, nil, err
+	}
+	// GitHub REST API 2026-03-10 returns the created workflow run ID. Do not
+	// request an unsupported API version from self-hosted GHES; its 204 response
+	// is handled by the exact correlation fallback.
+	if usesCurrentWorkflowDispatchAPI(client.GoGitHub().BaseURL.Hostname()) {
+		request.Header.Set("X-GitHub-Api-Version", "2026-03-10")
+	}
+	var dispatch exactWorkflowDispatchResponse
+	response, err := client.GoGitHub().Do(ctx, request, &dispatch)
+	return dispatch, response, err
+}
+
+func usesCurrentWorkflowDispatchAPI(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "api.github.com" || strings.HasSuffix(host, ".ghe.com")
+}
+
+func waitForCorrelatedWorkflowRun(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref string, intent WorkflowDispatchIntent) (*gh.WorkflowRun, error) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for selected == nil {
-		runs, _, listErr := client.GoGitHub().Actions.ListWorkflowRunsByFileName(ctx, owner, repo, workflowFile, &gh.ListWorkflowRunsOptions{
-			Branch: ref, Event: "workflow_dispatch", ExcludePullRequests: true, ListOptions: gh.ListOptions{PerPage: 20},
-		})
-		if listErr == nil {
-			for _, candidate := range runs.WorkflowRuns {
-				if candidate.GetCreatedAt().Time.Before(started) {
-					continue
-				}
-				if selected == nil || candidate.GetCreatedAt().Time.After(selected.GetCreatedAt().Time) {
-					selected = candidate
-				}
+	for {
+		selected, err := findCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, ref, intent)
+		if err != nil {
+			return nil, err
+		}
+		if selected != nil {
+			return selected, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for exactly correlated workflow dispatch %s: %w", intent.CorrelationID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func findCorrelatedWorkflowRun(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref string, intent WorkflowDispatchIntent) (*gh.WorkflowRun, error) {
+	selected, _, _, err := discoverCorrelatedWorkflowRun(ctx, client, owner, repo, workflowFile, ref, intent)
+	return selected, err
+}
+
+func discoverCorrelatedWorkflowRun(ctx context.Context, client *hivegithub.Client, owner, repo, workflowFile, ref string, intent WorkflowDispatchIntent) (*gh.WorkflowRun, int, int, error) {
+	options := &gh.ListWorkflowRunsOptions{
+		Branch: ref, Event: "workflow_dispatch", ExcludePullRequests: true,
+		ListOptions: gh.ListOptions{PerPage: 100},
+	}
+	var selected *gh.WorkflowRun
+	pages, scanned := 0, 0
+	for {
+		runs, response, err := client.GoGitHub().Actions.ListWorkflowRunsByFileName(ctx, owner, repo, workflowFile, options)
+		if err != nil {
+			return nil, pages, scanned, fmt.Errorf("list exactly correlated workflow dispatches: %w", err)
+		}
+		pages++
+		scanned += len(runs.WorkflowRuns)
+		for _, candidate := range runs.WorkflowRuns {
+			if candidate.GetDisplayTitle() != intent.ExpectedDisplayTitle {
+				continue
+			}
+			if candidate.GetID() <= 0 || candidate.GetEvent() != "workflow_dispatch" || candidate.GetHeadBranch() != ref {
+				return nil, pages, scanned, fmt.Errorf("workflow dispatch correlation %s matched a run with an invalid event or ref binding", intent.CorrelationID)
+			}
+			if selected != nil && selected.GetID() != candidate.GetID() {
+				return nil, pages, scanned, fmt.Errorf("workflow dispatch correlation %s matched multiple run IDs; refusing to consume either", intent.CorrelationID)
+			}
+			selected = candidate
+		}
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+		options.Page = response.NextPage
+	}
+	return selected, pages, scanned, nil
+}
+
+func waitForExactWorkflowRun(ctx context.Context, client *hivegithub.Client, owner, repo string, intent WorkflowDispatchIntent, selected *gh.WorkflowRun) (*gh.WorkflowRun, error) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		if selected == nil {
+			current, _, err := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, intent.RunID)
+			if err == nil {
+				selected = current
 			}
 		}
 		if selected != nil {
-			break
+			if err := validateExactWorkflowRun(selected, intent); err != nil {
+				return nil, err
+			}
+			if selected.GetStatus() == "completed" {
+				return selected, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("wait for dispatched workflow: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for exact workflow run %d: %w", intent.RunID, ctx.Err())
 		case <-ticker.C:
 		}
+		selected = nil
 	}
-	for selected.GetStatus() != "completed" {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("wait for workflow completion: %w", ctx.Err())
-		case <-ticker.C:
-		}
-		current, _, getErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, selected.GetID())
-		if getErr != nil {
-			continue
-		}
-		selected = current
+}
+
+func validateExactWorkflowRun(run *gh.WorkflowRun, intent WorkflowDispatchIntent) error {
+	if run == nil || run.GetID() != intent.RunID || run.GetDisplayTitle() != intent.ExpectedDisplayTitle ||
+		run.GetEvent() != "workflow_dispatch" || run.GetHeadBranch() != intent.Ref {
+		return fmt.Errorf("workflow run does not match its exact durable dispatch binding")
 	}
-	return selected, nil
+	return nil
+}
+
+func discardWorkflowDispatch(store *Store, intent WorkflowDispatchIntent, runID int64) error {
+	current, exists, err := store.LoadWorkflowDispatchIntent()
+	if err != nil {
+		return err
+	}
+	if !exists || current.CorrelationID != intent.CorrelationID || current.RunID != runID {
+		return fmt.Errorf("refusing to discard a workflow run without its exact durable dispatch binding")
+	}
+	return store.DeleteWorkflowDispatchIntent()
 }
 
 func retryCancelledDispatch(conclusion string, attempt, limit int) bool {
@@ -970,6 +1538,21 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		if len(commands) == 0 {
 			return nil, fmt.Errorf("validated repository test plan has no executable commands")
 		}
+		commands = append(commands, repair.Command{Name: "git", Args: []string{"diff", "--check"}})
+		commands, deferredValidation := availableRepairCommands(commands)
+		preparation, deferredPreparation := availableRepairCommands(repairPreparationCommands(config.CheckoutDir))
+		deferred := append(deferredPreparation, deferredValidation...)
+		if len(deferred) > 0 {
+			integratedStore, storeErr := NewStore(filepath.Join(config.StateDir, "integrated"))
+			if storeErr != nil {
+				return nil, storeErr
+			}
+			detail := fmt.Sprintf("local executables unavailable for %s; deferred to mandatory exact-head hosted checks: %s", finding.RepositoryFingerprint, strings.Join(deferred, ", "))
+			if auditErr := integratedStore.AuditStrict(AuditEntry{Action: "defer_local_repair_validation", Allowed: true, Repository: config.Repository, Detail: detail}); auditErr != nil {
+				return nil, auditErr
+			}
+			lifecycle.RecordAuthorization(finding.RepositoryFingerprint, "defer_local_repair_validation", true, detail)
+		}
 		repairEvidenceRoot := evidenceRoot
 		if needsHostedRevisionEvidence(*finding) {
 			verified, fetchErr := client.FetchAndVerifyPullRequestArtifact(ctx, hivegithub.PullRequestArtifactRequest{
@@ -996,7 +1579,7 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
-				Policy: policy, AllowedRepairPaths: config.AllowedRepairPaths, PreparationCommands: repairPreparationCommands(config.CheckoutDir), ValidationCommands: commands,
+				Policy: policy, AllowedRepairPaths: config.AllowedRepairPaths, PreparationCommands: preparation, ValidationCommands: commands,
 				Environment: repairValidationEnvironment(config), EvidenceSummary: evidenceSummary,
 				ModelTimeout: 20 * time.Minute, CommandTimeout: 15 * time.Minute,
 			},
@@ -1009,6 +1592,29 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		return []repair.Result{result}, nil // repository concurrency budget defaults to one repair
 	}
 	return nil, nil
+}
+
+func availableRepairCommands(commands []repair.Command) ([]repair.Command, []string) {
+	available := make([]repair.Command, 0, len(commands))
+	deferred := []string{}
+	seen := map[string]bool{}
+	for _, command := range commands {
+		name := strings.TrimSpace(command.Name)
+		if name == "" {
+			continue
+		}
+		key := name + "\x00" + strings.Join(command.Args, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, err := exec.LookPath(name); err != nil {
+			deferred = append(deferred, strings.Join(append([]string{name}, command.Args...), " "))
+			continue
+		}
+		available = append(available, command)
+	}
+	return available, deferred
 }
 
 func needsHostedRevisionEvidence(finding visualhive.FindingLifecycle) bool {
@@ -1167,6 +1773,42 @@ func activeRepairFinding(state visualhive.LifecycleState) (visualhive.FindingLif
 	return visualhive.FindingLifecycle{}, false
 }
 
+func repairFindingForOrchestration(stateDir string, state visualhive.LifecycleState) (visualhive.FindingLifecycle, bool, error) {
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		return visualhive.FindingLifecycle{}, false, err
+	}
+	approval, exists, err := store.LoadMergeApproval()
+	if err != nil {
+		return visualhive.FindingLifecycle{}, false, err
+	}
+	if !exists {
+		if finding, ok := activeRepairFinding(state); ok {
+			return finding, true, nil
+		}
+		return visualhive.FindingLifecycle{}, false, nil
+	}
+	keys := make([]string, 0, len(state.Findings))
+	for key := range state.Findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	matched := []visualhive.FindingLifecycle{}
+	for _, key := range keys {
+		finding := state.Findings[key]
+		if finding == nil || finding.Status != visualhive.StatusReady || !finding.HumanReviewRequired || finding.ManualReviewKind != "merge_policy" {
+			continue
+		}
+		if finding.PRNumber == approval.PRNumber && strings.EqualFold(finding.RepairCommitSHA, approval.HeadSHA) {
+			matched = append(matched, *finding)
+		}
+	}
+	if len(matched) != 1 {
+		return visualhive.FindingLifecycle{}, false, fmt.Errorf("merge approval must match exactly one ready merge-policy-held finding; matched %d", len(matched))
+	}
+	return matched[0], true, nil
+}
+
 func waitForPullRequestGate(ctx context.Context, client *hivegithub.Client, repository string, finding visualhive.FindingLifecycle) (hivegithub.PullRequestGate, error) {
 	if finding.PRNumber <= 0 || finding.RepairCommitSHA == "" {
 		return hivegithub.PullRequestGate{}, fmt.Errorf("finding %s has no persisted repair PR and exact head SHA", finding.RepositoryFingerprint)
@@ -1197,13 +1839,11 @@ func waitForPullRequestGate(ctx context.Context, client *hivegithub.Client, repo
 }
 
 func hasVisualHiveCheck(gate hivegithub.PullRequestGate) bool {
-	for _, check := range gate.Checks {
-		name := strings.NewReplacer("-", " ", "_", " ").Replace(strings.ToLower(check.Name))
-		if strings.Contains(name, "visual hive") && check.State != "pending" && check.State != "queued" && check.State != "in_progress" {
-			return true
-		}
+	if !gate.VisualHiveProvenanceVerified {
+		return false
 	}
-	return false
+	state := strings.ToLower(strings.TrimSpace(gate.VisualHiveCheckState))
+	return state != "" && state != "pending" && state != "queued" && state != "in_progress"
 }
 
 func gateChecksGreen(gate hivegithub.PullRequestGate) bool {

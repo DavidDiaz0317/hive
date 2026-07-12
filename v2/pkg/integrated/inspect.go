@@ -74,7 +74,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	if exists(filepath.Join(root, "pyproject.toml")) || exists(filepath.Join(root, "requirements.txt")) {
 		languages["Python"] = true
 		managers["pip/pyproject"] = true
-		if exists(filepath.Join(root, "tests")) || fileContains(filepath.Join(root, "pyproject.toml"), "pytest") {
+		if (exists(filepath.Join(root, "tests")) || fileContains(filepath.Join(root, "pyproject.toml"), "pytest")) && !commandsContain(inspection.TestCommands, "pytest") && !commandsContain(inspection.TestCommands, "test:python") {
 			inspection.TestCommands = append(inspection.TestCommands, []string{"python", "-m", "pytest", "-q"})
 		}
 	}
@@ -142,6 +142,16 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	return inspection, nil
 }
 
+func commandsContain(commands [][]string, fragment string) bool {
+	fragment = strings.ToLower(strings.TrimSpace(fragment))
+	for _, command := range commands {
+		if strings.Contains(strings.ToLower(strings.Join(command, " ")), fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func findPackageJSONFiles(root string) []string {
 	result := []string{}
 	_ = filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, err error) error {
@@ -167,17 +177,44 @@ func findPackageJSONFiles(root string) []string {
 }
 
 func packageScriptCommands(packagePath string, scripts map[string]string) [][]string {
-	if _, ok := scripts["test:ci:lite"]; ok {
-		return [][]string{npmScriptCommand(packagePath, "test:ci:lite")}
-	}
 	commands := [][]string{}
+	names := make([]string, 0, len(scripts))
 	for name := range scripts {
-		lowerName := strings.ToLower(name)
-		if name == "test" || name == "build" || name == "vh:plan" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
-			commands = append(commands, npmScriptCommand(packagePath, name))
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	_, hasLite := scripts["test:ci:lite"]
+	if hasLite && safeAutomationScript("test:ci:lite", scripts["test:ci:lite"]) {
+		commands = append(commands, npmScriptCommand(packagePath, "test:ci:lite"))
+	}
+	for _, name := range names {
+		if name == "test:ci:lite" || !safeAutomationScript(name, scripts[name]) {
+			continue
 		}
+		if hasLite && commandCoverageRank(npmScriptCommand(packagePath, name)) == 1 {
+			continue
+		}
+		commands = append(commands, npmScriptCommand(packagePath, name))
 	}
 	return commands
+}
+
+func safeAutomationScript(name, body string) bool {
+	name, body = strings.ToLower(strings.TrimSpace(name)), strings.ToLower(strings.TrimSpace(body))
+	if name == "" || name == "vh:plan" || name == "vh:run" {
+		return false
+	}
+	for _, unsafe := range []string{"watch", "update", "snapshot:update", "interactive", "headed", "open", "dev", "serve", "preview"} {
+		if strings.Contains(name, unsafe) {
+			return false
+		}
+	}
+	for _, unsafe := range []string{"--watch", "--watchall", "--update", "--update-snapshots", "--ui", "--open", "--headed"} {
+		if strings.Contains(body, unsafe) {
+			return false
+		}
+	}
+	return commandCoverageRank([]string{"npm", "run", name}) > 0
 }
 
 func npmScriptCommand(packagePath, name string) []string {

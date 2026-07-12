@@ -2,6 +2,7 @@ package visualhive
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/beads"
 )
 
@@ -558,6 +560,162 @@ func TestIssuePublicationSelectionPrefersTestOnlyRepairOverUnrepairableBacklog(t
 	selected = selectIssuePublications(observations, nil, 1, false)
 	if len(selected) != 1 || !selected["onboarding"] {
 		t.Fatalf("issues-only mode should preserve severity ordering: %v", selected)
+	}
+}
+
+func TestLifecycleRefusesResolutionFromStaleDefaultHead(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-stale-present", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-stale-absent", "absent", "main", true))
+	if absent.Manifest.Source.CommitSHA == "new-default-head" {
+		t.Fatal("test fixture unexpectedly uses the adversarial live head")
+	}
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main", CurrentTargetCommitSHA: "new-default-head"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Resolved != 0 || result.IgnoredAbsent != 1 {
+		t.Fatalf("stale authoritative absence was accepted: %+v", result)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if finding.Status != StatusIssueOpen {
+		t.Fatalf("stale default-head evidence changed lifecycle status: %+v", finding)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if entry.Action == OutboxCloseIssue {
+			t.Fatalf("stale default-head evidence enqueued issue closure: %+v", entry)
+		}
+	}
+}
+
+func TestAuthoritativeRescanRefreshesPendingInferredClose(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-rescan-present", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 18, "https://github.test/owner/repo/issues/18"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldHead := strings.Repeat("a", 40)
+	oldAbsent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "old-absent"), "bundle-rescan-old", "absent", "main", true))
+	oldAbsent.Manifest.Source.CommitSHA = oldHead
+	oldAbsent.Manifest.Observations = nil
+	if result, err := lifecycle.ApplyBundle(oldAbsent, beadStore, ApplyLifecycleOptions{TargetRef: "main", CurrentTargetCommitSHA: oldHead}); err != nil || result.Resolved != 1 {
+		t.Fatalf("first inferred absence was not applied: result=%+v err=%v", result, err)
+	}
+	oldClose := lifecycle.PendingOutbox()[0]
+
+	newHead := strings.Repeat("b", 40)
+	newAbsent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "new-absent"), "bundle-rescan-new", "absent", "main", true))
+	newAbsent.Manifest.Source.CommitSHA = newHead
+	newAbsent.Manifest.Observations = nil
+	if result, err := lifecycle.ApplyBundle(newAbsent, beadStore, ApplyLifecycleOptions{TargetRef: "main", CurrentTargetCommitSHA: newHead}); err != nil || result.Resolved != 1 || result.OutboxCreated != 1 {
+		t.Fatalf("current inferred absence did not refresh the pending close: result=%+v err=%v", result, err)
+	}
+	pending := lifecycle.PendingOutbox()
+	if len(pending) != 2 || pending[0].ID != oldClose.ID || pending[1].BundleDigest != newAbsent.Manifest.OverallDigest {
+		t.Fatalf("rescan did not retain stale close for deterministic supersession and enqueue current close: %+v", pending)
+	}
+	client := &fakeLifecycleIssueClient{}
+	policy := automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}
+	processed := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client)
+	if processed.StaleSkipped != 1 || processed.Succeeded != 1 || processed.Failed != 0 || client.updates != 1 {
+		t.Fatalf("only the current close should reach GitHub: result=%+v updates=%d", processed, client.updates)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if finding.Status != StatusIssueClosed || finding.LastBundleDigest != newAbsent.Manifest.OverallDigest {
+		t.Fatalf("finding was not closed by current-head evidence: %+v", finding)
+	}
+}
+
+func TestResetStalePostMergeVerificationRestoresMergeAndDiscardsClose(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-reset-present", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 19, "https://github.test/owner/repo/issues/19"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair-reset"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(fingerprint, "repair-reset-head", 29, "https://github.test/owner/repo/pull/29"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkChecks(fingerprint, "repair-reset-head", true); err != nil {
+		t.Fatal(err)
+	}
+	staleHead := strings.Repeat("c", 40)
+	if err := lifecycle.MarkMerged(fingerprint, staleHead); err != nil {
+		t.Fatal(err)
+	}
+	const staleRun = "700"
+	if err := lifecycle.MarkPostMergeVerifying(fingerprint, staleRun, "https://github.test/owner/repo/actions/runs/700"); err != nil {
+		t.Fatal(err)
+	}
+	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-reset-absent", "absent", "main", true))
+	absent.Manifest.Source.CommitSHA = staleHead
+	absent.Manifest.Source.WorkflowRunID = staleRun
+	if result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{
+		TargetRef: "main", CurrentTargetCommitSHA: staleHead, VerificationRunID: staleRun, VerificationCommitSHA: staleHead,
+	}); err != nil || result.Resolved != 1 {
+		t.Fatalf("stale post-merge absence was not durably applied: result=%+v err=%v", result, err)
+	}
+	if err := lifecycle.ResetStalePostMergeVerification(fingerprint, "wrong-run", staleHead); err == nil {
+		t.Fatal("mismatched run reset was accepted")
+	}
+	if err := lifecycle.ResetStalePostMergeVerification(fingerprint, staleRun, staleHead); err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if finding.Status != StatusMerged || finding.ValidationRunID != "" || finding.ResolvedAt != nil || len(lifecycle.PendingOutbox()) != 0 {
+		t.Fatalf("stale post-merge state was not restored atomically: finding=%+v pending=%+v", finding, lifecycle.PendingOutbox())
+	}
+	if err := lifecycle.MarkPostMergeVerifying(fingerprint, "701", "https://github.test/owner/repo/actions/runs/701"); err != nil {
+		t.Fatalf("fresh verification could not restart: %v", err)
+	}
+	if err := lifecycle.ResetStalePostMergeVerification(fingerprint, "701", strings.Repeat("d", 40)); err != nil {
+		t.Fatalf("pre-apply stale verification could not reset: %v", err)
+	}
+	if finding, _ = lifecycle.Finding(fingerprint); finding.Status != StatusMerged {
+		t.Fatalf("pre-apply reset did not restore merged state: %+v", finding)
 	}
 }
 

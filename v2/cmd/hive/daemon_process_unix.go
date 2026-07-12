@@ -15,6 +15,26 @@ func configureDetachedProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
 
+func tryLockDaemonLease(file *os.File) (bool, error) {
+	err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func tryReadDaemonLease(file *os.File) (bool, error) {
+	err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func unlockDaemonLease(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+}
+
 func processMatchesExecutable(pid int, expected string) bool {
 	if runtime.GOOS != "linux" {
 		return processIsAlive(pid)

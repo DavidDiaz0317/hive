@@ -7,37 +7,58 @@ on:
         description: Immutable 40-character Visual Hive commit
         required: true
         type: string
-      release_tag:
-        description: Optional Hive fork release tag (for example v0.3.0-integrated.1)
-        required: false
-        type: string
   push:
     tags:
       - "v*-integrated.*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 jobs:
   build:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.metadata.outputs.release_version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || 'f67f936fe9a75c250a908e16806ef3b714a1478a' }}
-      RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
-      RELEASE_VERSION: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || github.sha }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '13410bd566a54bdc71b5b39efd773b02533a8e8b' }}
+      RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || '' }}
+      RELEASE_VERSION: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Validate immutable inputs
+        id: metadata
         shell: bash
         run: |
           set -euo pipefail
           [[ "$VISUAL_HIVE_REF" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          if [[ -n "$RELEASE_TAG" ]]; then
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$ ]] || {
+              echo "Invalid integrated release tag: $RELEASE_TAG" >&2
+              exit 1
+            }
+            [[ "$RELEASE_VERSION" == "$RELEASE_TAG" ]]
+            git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null || {
+              echo "Publishable releases must be triggered by an existing integrated release tag." >&2
+              exit 1
+            }
+            tag_target="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+            [[ "$tag_target" == "$GITHUB_SHA" ]] || {
+              echo "Release tag $RELEASE_TAG targets $tag_target, not $GITHUB_SHA." >&2
+              exit 1
+            }
+          else
+            [[ "$RELEASE_VERSION" =~ ^[a-f0-9]{40}$ ]]
+          fi
+          printf 'release_version=%s\n' "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: DavidDiaz0317/visual-hive
@@ -46,7 +67,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
           cache-dependency-path: .release/visual-hive-source/package-lock.json
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -60,17 +81,33 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm run typecheck
+          npm test
+          npm run lint
+          npm run demo:all
           node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
+
+      - name: Verify Hive source gates
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build ./...
+          go test ./...
+          go vet ./...
       - name: Download and verify Node 22 runtimes
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .release/node .release/dist
           base="https://nodejs.org/dist/v${NODE_VERSION}"
-          curl --fail --location --silent --show-error "$base/SHASUMS256.txt" -o .release/node/SHASUMS256.txt
-          for archive in "node-v${NODE_VERSION}-linux-x64.tar.xz" "node-v${NODE_VERSION}-win-x64.zip"; do
+          declare -A expected=(
+            ["node-v${NODE_VERSION}-linux-x64.tar.xz"]="9749e988f437343b7fa832c69ded82a312e41a03116d766797ac14f6f9eee578"
+            ["node-v${NODE_VERSION}-win-x64.zip"]="7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29"
+          )
+          for archive in "${!expected[@]}"; do
             curl --fail --location --silent --show-error "$base/$archive" -o ".release/node/$archive"
-            (cd .release/node && grep "  $archive$" SHASUMS256.txt | sha256sum --check --strict -)
+            printf '%s  %s\n' "${expected[$archive]}" "$archive" | (cd .release/node && sha256sum --check --strict -)
           done
           tar -xJf ".release/node/node-v${NODE_VERSION}-linux-x64.tar.xz" -C .release/node
           unzip -q ".release/node/node-v${NODE_VERSION}-win-x64.zip" -d .release/node
@@ -115,14 +152,16 @@ jobs:
           zip -qr "${windows_dir}.zip" "$windows_dir"
           sha256sum "${linux_dir}.tar.gz" > "${linux_dir}.tar.gz.sha256"
           sha256sum "${windows_dir}.zip" > "${windows_dir}.zip.sha256"
-      - name: Sign build provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          subject-path: |
-            .release/dist/hive-integrated-*.tar.gz
-            .release/dist/hive-integrated-*.tar.gz.sha256
-            .release/dist/hive-integrated-*.zip
-            .release/dist/hive-integrated-*.zip.sha256
+          cp "$GITHUB_WORKSPACE/v2/install-integrated.sh" "$GITHUB_WORKSPACE/v2/install-integrated.ps1" .
+          sha256sum install-integrated.sh > install-integrated.sh.sha256
+          sha256sum install-integrated.ps1 > install-integrated.ps1.sha256
+      - name: Smoke the actual Linux release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof="$RUNNER_TEMP/hive-linux-release-smoke"
+          HIVE_RELEASE_DIR="$GITHUB_WORKSPACE/.release/dist" HIVE_SKIP_ATTESTATION=1 \
+            sh v2/test/integrated-installer-linux-release-smoke.sh .release/dist/install-integrated.sh "$RELEASE_VERSION" "$proof"
       - name: Retain installer artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -132,14 +171,100 @@ jobs:
             .release/dist/hive-integrated-*.tar.gz.sha256
             .release/dist/hive-integrated-*.zip
             .release/dist/hive-integrated-*.zip.sha256
+            .release/dist/install-integrated.sh
+            .release/dist/install-integrated.sh.sha256
+            .release/dist/install-integrated.ps1
+            .release/dist/install-integrated.ps1.sha256
+
+  windows-smoke:
+    permissions:
+      contents: read
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hive-integrated-${{ github.sha }}
+          path: .release/dist
+      - name: Smoke the actual Windows release archive
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "hive-windows-release-smoke"
+          $install = Join-Path $work "installed"
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          & ./.release/dist/install-integrated.ps1 -Version $env:RELEASE_VERSION -ReleaseDir .release/dist -SkipAttestation -NoPath -NoCodexSkill -InstallDir $install
+          & (Join-Path $install "runtime/node.exe") (Join-Path $install "visual-hive/visual-hive.mjs") --version
+          $plan = & (Join-Path $install "hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $work "state") --json | ConvertFrom-Json
+          if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Release Hive did not produce a valid setup plan." }
+          & ./v2/test/integrated-installer-windows-failure-smoke.ps1 -Installer ./.release/dist/install-integrated.ps1 -ReleaseDir .release/dist -Version $env:RELEASE_VERSION -WorkRoot (Join-Path $work "failure-smoke")
+
+  publish:
+    needs: [build, windows-smoke]
+    if: github.event_name == 'push' && needs.build.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hive-integrated-${{ github.sha }}
+          path: .release/dist
+      - name: Sign build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            .release/dist/hive-integrated-*.tar.gz
+            .release/dist/hive-integrated-*.tar.gz.sha256
+            .release/dist/hive-integrated-*.zip
+            .release/dist/hive-integrated-*.zip.sha256
+            .release/dist/install-integrated.sh
+            .release/dist/install-integrated.sh.sha256
+            .release/dist/install-integrated.ps1
+            .release/dist/install-integrated.ps1.sha256
       - name: Publish fork release
-        if: env.RELEASE_TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
         run: |
+          set -euo pipefail
+          resolve_tag_target() {
+            local object_type="$1"
+            local object_sha="$2"
+            local depth=0
+            while [[ "$object_type" == "tag" ]]; do
+              depth=$((depth + 1))
+              [[ "$depth" -le 8 ]] || { echo "Annotated tag chain is too deep." >&2; return 1; }
+              tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+              object_type="$(jq -r '.object.type' <<<"$tag_object")"
+              object_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+            done
+            [[ "$object_type" == "commit" ]] || { echo "Release tag resolves to unsupported object type: $object_type" >&2; return 1; }
+            printf '%s\n' "$object_sha"
+          }
+
+          # The tag push is the release authorization and the attestation's
+          # immutable source ref. Never create a release tag from a branch-run
+          # workflow, because consumers require refs/tags/$RELEASE_TAG.
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_target="$(resolve_tag_target "$(jq -r '.object.type' <<<"$tag_ref")" "$(jq -r '.object.sha' <<<"$tag_ref")")"
+          [[ "$tag_target" == "$GITHUB_SHA" ]] || {
+            echo "Refusing to publish: $RELEASE_TAG no longer targets $GITHUB_SHA." >&2
+            exit 1
+          }
           gh release create "$RELEASE_TAG" \
             .release/dist/hive-integrated-*.tar.gz \
             .release/dist/hive-integrated-*.tar.gz.sha256 \
             .release/dist/hive-integrated-*.zip \
             .release/dist/hive-integrated-*.zip.sha256 \
-            --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes
+            .release/dist/install-integrated.sh \
+            .release/dist/install-integrated.sh.sha256 \
+            .release/dist/install-integrated.ps1 \
+            .release/dist/install-integrated.ps1.sha256 \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes

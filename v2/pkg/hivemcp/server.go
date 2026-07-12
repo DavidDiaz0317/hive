@@ -136,16 +136,24 @@ func Tools() []Tool {
 		tool("hive_setup_apply", "Apply Hive setup", "Requires explicit repository setup authority. Creates or updates one setup branch and PR, initializes persistent state, and records every allowed or denied write.", false, false, setupSchema()),
 		tool("hive_doctor", "Check Hive readiness", "Read-only. Verifies config, checkout, immutable Visual Hive pin, provider authentication, and production gates.", true, false, stateSchema()),
 		tool("hive_status", "Read Hive status", "Read-only. Returns persistent repository, queue, finding, issue, PR, policy, and pause state.", true, false, stateSchema()),
-		tool("hive_run", "Run Hive now", "Requires configured run authority. Launches a complete Visual Hive scan and processes trusted evidence through Hive lifecycle policy.", false, false, stateSchema()),
+		tool("hive_run", "Run Hive now", "Requires configured run authority. Launches a complete Visual Hive scan and processes trusted evidence through Hive lifecycle policy.", false, false, runSchema()),
+		tool("hive_start", "Start Hive scheduler", "Requires operator authority. Starts the persistent scheduler using the configured immutable runtime.", false, false, startSchema()),
+		tool("hive_stop", "Stop Hive scheduler", "Requires operator authority. Stops the persistent scheduler while preserving state.", false, false, stateSchema()),
+		tool("hive_plan_merge_approval", "Plan an exact held-repair approval", "Read-only. Returns the live base SHA and raw diff digest that the accountable apply call must repeat.", true, false, planMergeApprovalSchema()),
+		tool("hive_approve_merge", "Approve an exact held repair", "Requires accountable operator authority. Applies only when the caller repeats the reviewed PR, base, head, diff digest, and reason; Hive rechecks all gates and performs the merge on the next run.", false, false, approveMergeSchema()),
+		tool("hive_revoke_merge_approval", "Revoke an exact merge approval", "Requires accountable operator authority. Durably revokes the active approval and records actor and reason.", false, false, reasonSchema()),
+		tool("hive_retry_repair", "Resume an exact failed repair checkpoint", "Requires accountable operator authority. Resumes only a matching infrastructure or patch-engine failure without consuming another model attempt; all decisions are durable and audited.", false, false, retryRepairSchema()),
+		tool("hive_plan_dispatch_recovery", "Plan ambiguous dispatch recovery", "Read-only. Exhaustively searches for the exact durable workflow correlation and returns actor-, request-, action-, and time-bound apply values only when no matching run exists.", true, false, planDispatchRecoverySchema()),
+		tool("hive_recover_dispatch", "Recover an ambiguous workflow dispatch", "Requires accountable operator authority. Repeats a fresh exhaustive run search, then either authorizes one same-correlation retry or revokes the old intent so Hive can create a fresh correlation. All decisions are fail-closed and audited.", false, false, dispatchRecoverySchema()),
 		tool("hive_set_coverage", "Set coverage depth", "Requires configuration authority. Changes testing depth without changing GitHub write authority.", false, false, valueSchema([]string{"essential", "standard", "comprehensive", "custom"})),
 		tool("hive_set_automation", "Set automation authority", "Requires configuration authority. Changes issue/PR/merge authority without changing testing coverage.", false, false, valueSchema([]string{"advisory", "issues", "repair-pr", "auto-merge"})),
 		tool("hive_set_issue_limit", "Set active issue limit", "Requires configuration authority. Changes the repository work-in-progress limit without changing coverage or write authority.", false, false, integerValueSchema(1, 100)),
 		tool("hive_set_retry_limit", "Set repair retry limit", "Requires configuration authority. Changes the bounded per-finding model repair limit and records the change in the audit log.", false, false, integerValueSchema(1, 10)),
-		tool("hive_pause", "Pause repository automation", "Requires operator authority. Immediately denies repository lifecycle writes while preserving durable state.", false, false, stateSchema()),
-		tool("hive_resume", "Resume repository automation", "Requires operator authority. Re-enables only the previously configured automation level.", false, false, stateSchema()),
-		tool("hive_upgrade", "Upgrade immutable components", "Requires setup authority. Opens a reviewed upgrade PR and preserves rollback metadata; never changes a mutable tag in place.", false, false, valueSchema(nil)),
-		tool("hive_rollback", "Rollback immutable components", "Requires setup authority. Opens a reviewed rollback PR to a previously known immutable Visual Hive commit.", false, false, valueSchema(nil)),
-		tool("hive_uninstall", "Uninstall Hive", "Destructive and requires explicit uninstall authority. Opens a cleanup PR, stops automation, and preserves or deletes state according to the request.", false, true, stateSchema()),
+		tool("hive_pause", "Pause repository automation", "Requires operator authority. Signals active production contexts to cancel, waits for their exclusive lease, durably denies lifecycle writes, and stops scheduling while preserving state.", false, false, stateSchema()),
+		tool("hive_resume", "Resume repository automation", "Requires operator authority. Re-enables only the previously configured automation level and restarts the persistent scheduler.", false, false, stateSchema()),
+		tool("hive_upgrade", "Upgrade immutable components", "Requires setup authority. Opens a reviewed upgrade PR and preserves rollback metadata; never changes a mutable tag in place.", false, false, immutableValueSchema()),
+		tool("hive_rollback", "Rollback immutable components", "Requires setup authority. Opens a reviewed rollback PR to a previously known immutable Visual Hive commit.", false, false, optionalValueSchema()),
+		tool("hive_uninstall", "Uninstall Hive", "Destructive and requires explicit uninstall authority. Opens a cleanup PR, stops automation, and preserves or deletes state according to the request.", false, true, uninstallSchema()),
 	}
 	return tools
 }
@@ -157,20 +165,29 @@ func tool(name, title, description string, readOnly, destructive bool, schema ma
 }
 
 func setupSchema() map[string]any {
-	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"repo", "coverage", "automation"}, "properties": map[string]any{
-		"repo":                map[string]any{"type": "string", "pattern": `^[^/]+/[^/]+$`},
-		"coverage":            map[string]any{"type": "string", "enum": []string{"essential", "standard", "comprehensive", "custom"}},
-		"automation":          map[string]any{"type": "string", "enum": []string{"advisory", "issues", "repair-pr", "auto-merge"}},
-		"provider":            map[string]any{"type": "string", "default": "codex"},
-		"visual_hive":         map[string]any{"type": "boolean", "default": true},
-		"max_active_issues":   map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 5},
-		"max_repair_attempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
-		"state_dir":           map[string]any{"type": "string"},
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"repo":                 map[string]any{"type": "string", "pattern": `^[^/]+/[^/]+$`},
+		"coverage":             map[string]any{"type": "string", "enum": []string{"essential", "standard", "comprehensive", "custom"}},
+		"automation":           map[string]any{"type": "string", "enum": []string{"advisory", "issues", "repair-pr", "auto-merge"}},
+		"provider":             map[string]any{"type": "string"},
+		"visual_hive":          map[string]any{"type": "boolean", "const": true, "default": true},
+		"max_active_issues":    map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
+		"max_repair_attempts":  map[string]any{"type": "integer", "minimum": 1, "maximum": 10},
+		"start":                map[string]any{"type": "boolean", "default": true},
+		"run_interval_seconds": map[string]any{"type": "integer", "minimum": 60, "maximum": 86400, "default": 900},
+		"state_dir":            map[string]any{"type": "string"},
 	}}
 }
 
 func stateSchema() map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"state_dir": map[string]any{"type": "string"}}}
+}
+
+func runSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"state_dir":       map[string]any{"type": "string"},
+		"timeout_seconds": map[string]any{"type": "integer", "minimum": 60, "maximum": 86400, "default": 2700},
+	}}
 }
 
 func valueSchema(values []string) map[string]any {
@@ -181,10 +198,96 @@ func valueSchema(values []string) map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"value"}, "properties": map[string]any{"state_dir": map[string]any{"type": "string"}, "value": value}}
 }
 
+func optionalValueSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"state_dir": map[string]any{"type": "string"},
+		"value":     map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{40}$`},
+	}}
+}
+
+func immutableValueSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"value"}, "properties": map[string]any{
+		"state_dir": map[string]any{"type": "string"},
+		"value":     map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{40}$`},
+	}}
+}
+
+func uninstallSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"state_dir":    map[string]any{"type": "string"},
+		"delete_state": map[string]any{"type": "boolean", "default": false},
+	}}
+}
+
 func integerValueSchema(minimum, maximum int) map[string]any {
 	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"value"}, "properties": map[string]any{
 		"state_dir": map[string]any{"type": "string"},
 		"value":     map[string]any{"type": "integer", "minimum": minimum, "maximum": maximum},
+	}}
+}
+
+func startSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+		"state_dir":        map[string]any{"type": "string"},
+		"interval_seconds": map[string]any{"type": "integer", "minimum": 60, "maximum": 86400, "default": 900},
+	}}
+}
+
+func approveMergeSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"pr_number", "head_sha", "base_sha", "diff_digest", "reason"}, "properties": map[string]any{
+		"state_dir":   map[string]any{"type": "string"},
+		"pr_number":   map[string]any{"type": "integer", "minimum": 1},
+		"head_sha":    map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{40}$`},
+		"base_sha":    map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{40}$`},
+		"diff_digest": map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{64}$`},
+		"reason":      map[string]any{"type": "string", "minLength": 1, "maxLength": 2048},
+	}}
+}
+
+func planMergeApprovalSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"pr_number", "head_sha"}, "properties": map[string]any{
+		"state_dir": map[string]any{"type": "string"},
+		"pr_number": map[string]any{"type": "integer", "minimum": 1},
+		"head_sha":  map[string]any{"type": "string", "pattern": `^[a-fA-F0-9]{40}$`},
+	}}
+}
+
+func reasonSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"reason"}, "properties": map[string]any{
+		"state_dir": map[string]any{"type": "string"},
+		"reason":    map[string]any{"type": "string", "minLength": 1, "maxLength": 2048},
+	}}
+}
+
+func retryRepairSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"finding", "recurrence", "attempt", "failure_class", "failure_id", "reason"}, "properties": map[string]any{
+		"state_dir":     map[string]any{"type": "string"},
+		"finding":       map[string]any{"type": "string", "minLength": 1},
+		"recurrence":    map[string]any{"type": "integer", "minimum": 0},
+		"attempt":       map[string]any{"type": "integer", "minimum": 1},
+		"failure_class": map[string]any{"type": "string", "enum": []string{"infrastructure", "patch_engine"}},
+		"failure_id":    map[string]any{"type": "string", "minLength": 1},
+		"reason":        map[string]any{"type": "string", "minLength": 1, "maxLength": 2048},
+	}}
+}
+
+func planDispatchRecoverySchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"action", "correlation"}, "properties": map[string]any{
+		"state_dir":   map[string]any{"type": "string"},
+		"action":      map[string]any{"type": "string", "enum": []string{"retry", "revoke"}},
+		"correlation": map[string]any{"type": "string", "pattern": `^[a-f0-9]{64}$`},
+	}}
+}
+
+func dispatchRecoverySchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false, "required": []string{"action", "correlation", "request_digest", "plan_digest", "planned_at", "reason"}, "properties": map[string]any{
+		"state_dir":      map[string]any{"type": "string"},
+		"action":         map[string]any{"type": "string", "enum": []string{"retry", "revoke"}},
+		"correlation":    map[string]any{"type": "string", "pattern": `^[a-f0-9]{64}$`},
+		"request_digest": map[string]any{"type": "string", "pattern": `^[a-f0-9]{64}$`},
+		"plan_digest":    map[string]any{"type": "string", "pattern": `^[a-f0-9]{64}$`},
+		"planned_at":     map[string]any{"type": "string", "format": "date-time"},
+		"reason":         map[string]any{"type": "string", "minLength": 1, "maxLength": 2048},
 	}}
 }
 

@@ -33,19 +33,40 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 		t.Fatalf("bad initialize response: %+v", initialize)
 	}
 	tools := list["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 14 {
-		t.Fatalf("expected production tool set, got %d", len(tools))
+	requiredTools := map[string]bool{
+		"hive_setup_plan": false, "hive_setup_apply": false, "hive_doctor": false,
+		"hive_status": false, "hive_run": false, "hive_start": false,
+		"hive_stop": false, "hive_plan_merge_approval": false, "hive_approve_merge": false,
+		"hive_revoke_merge_approval": false, "hive_retry_repair": false, "hive_pause": false,
+		"hive_plan_dispatch_recovery": false, "hive_recover_dispatch": false,
+		"hive_resume": false, "hive_upgrade": false, "hive_rollback": false,
+		"hive_uninstall": false,
 	}
-	var issueLimit map[string]any
+	var issueLimit, uninstall, upgrade map[string]any
 	for _, candidate := range tools {
 		value := candidate.(map[string]any)
+		if name, ok := value["name"].(string); ok {
+			if _, required := requiredTools[name]; required {
+				requiredTools[name] = true
+			}
+		}
 		if value["name"] == "hive_set_issue_limit" {
 			issueLimit = value
-			break
+		}
+		if value["name"] == "hive_uninstall" {
+			uninstall = value
+		}
+		if value["name"] == "hive_upgrade" {
+			upgrade = value
 		}
 	}
 	if issueLimit == nil {
 		t.Fatal("hive_set_issue_limit is missing")
+	}
+	for name, found := range requiredTools {
+		if !found {
+			t.Fatalf("%s is missing", name)
+		}
 	}
 	properties := issueLimit["inputSchema"].(map[string]any)["properties"].(map[string]any)
 	value := properties["value"].(map[string]any)
@@ -54,6 +75,17 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 	}
 	if !knownTool("hive_set_retry_limit") {
 		t.Fatal("hive_set_retry_limit is missing")
+	}
+	if uninstall == nil || upgrade == nil {
+		t.Fatal("upgrade or uninstall schema is missing")
+	}
+	uninstallProperties := uninstall["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := uninstallProperties["delete_state"]; !ok {
+		t.Fatal("hive_uninstall cannot express --delete-state")
+	}
+	upgradeProperties := upgrade["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	if upgradeProperties["value"].(map[string]any)["pattern"] != `^[a-fA-F0-9]{40}$` {
+		t.Fatalf("hive_upgrade schema does not require an immutable commit: %+v", upgradeProperties["value"])
 	}
 	result := call["result"].(map[string]any)
 	if result["isError"] != false || result["structuredContent"].(map[string]any)["tool"] != "hive_status" {

@@ -3,18 +3,25 @@ package integrated
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	gh "github.com/google/go-github/v72/github"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -46,7 +53,7 @@ type SetupOptions struct {
 }
 
 type setupPRClient interface {
-	UpsertRepairPullRequest(context.Context, string, string, string, string, string, string) (hivegithub.RepairPullRequest, error)
+	UpsertRepairPullRequest(context.Context, string, string, string, string, string, string, string) (hivegithub.RepairPullRequest, error)
 }
 
 func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
@@ -58,12 +65,25 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if err := validateSetupOptions(options); err != nil {
 		return SetupResult{}, err
 	}
+	if options.Apply {
+		release, leaseErr := acquireProductionRunLease(options.StateDir, 25*time.Minute)
+		if leaseErr != nil {
+			return SetupResult{}, fmt.Errorf("serialize setup with production runs: %w", leaseErr)
+		}
+		defer release()
+	}
 	store, err := NewStore(filepath.Join(options.StateDir, "integrated"))
 	if err != nil {
 		return SetupResult{}, err
 	}
 	prior, priorErr := store.Load()
-	hasPrior := priorErr == nil && strings.EqualFold(prior.Repository, options.Repository)
+	hasPrior := priorErr == nil
+	if priorErr != nil && !errors.Is(priorErr, os.ErrNotExist) {
+		return SetupResult{}, fmt.Errorf("load existing integrated configuration: %w", priorErr)
+	}
+	if hasPrior && !strings.EqualFold(prior.Repository, options.Repository) {
+		return SetupResult{}, fmt.Errorf("state directory %s is already bound to %s; use a different --state-dir for %s", options.StateDir, prior.Repository, options.Repository)
+	}
 	checkout := filepath.Join(store.Dir(), "checkouts", safeRepoName(options.Repository))
 	defaultBranch, err := ensureCheckout(ctx, options.Repository, checkout)
 	if err != nil {
@@ -77,19 +97,27 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		enrichRemoteInspection(ctx, options.GitHub, options.Repository, &inspection)
 	}
 	plan := buildSetupPlan(options, inspection)
-	result := SetupResult{Plan: plan}
+	result := SetupResult{Plan: plan, ProtectionActivationPending: options.Automation == AutomationAutoMerge, ActivationMessage: setupActivationMessage(options.Automation, options.Start, true)}
 	if !options.Apply {
 		return result, nil
 	}
 	if options.GitHub == nil {
 		return result, fmt.Errorf("GitHub client is required to apply setup")
 	}
+	if strings.TrimSpace(inspection.RepositoryID) == "" {
+		return result, fmt.Errorf("GitHub did not return the immutable repository ID for %s; refusing setup mutations", options.Repository)
+	}
+	if hasPrior {
+		if _, err := verifyLiveRepositoryIdentity(ctx, options.GitHub, prior); err != nil {
+			return result, fmt.Errorf("verify existing setup repository identity before mutation: %w", err)
+		}
+	}
 	if options.VisualHive {
 		if err := VerifyVisualHiveCommit(ctx, options.GitHub, options.VisualHiveRepo, options.VisualHiveRef); err != nil {
 			return result, err
 		}
 	}
-	branch := "hive/setup"
+	branch := managedOperationBranch("setup", inspection.RepositoryID)
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupBranch); err != nil {
 		return result, err
 	}
@@ -119,20 +147,43 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,
 		InstalledAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
+	if options.VisualHive {
+		config.VisualHiveConfigDigest, err = visualHiveConfigDigest(checkout)
+		if err != nil {
+			return result, err
+		}
+	}
 	if hasPrior {
 		config.InstalledAt = prior.InstalledAt
-		config.SetupPRNumber, config.SetupPRURL = prior.SetupPRNumber, prior.SetupPRURL
+		config.SetupBranch, config.SetupPRNumber, config.SetupPRURL = prior.SetupBranch, prior.SetupPRNumber, prior.SetupPRURL
 		config.PreviousVersion, config.Paused = prior.PreviousVersion, prior.Paused
+		config.AllowedRepairPaths = append([]string(nil), prior.AllowedRepairPaths...)
+		config.AllowedAutoMergePaths = append([]string(nil), prior.AllowedAutoMergePaths...)
+		config.AllowedAutoMergeRisk = append([]automation.RiskTier(nil), prior.AllowedAutoMergeRisk...)
 	}
 	if err := writeManagedFiles(checkout, config, inspection); err != nil {
 		return result, err
 	}
 	managed := append([]string(nil), plan.FilesToManage...)
+	baselineFiles, baselineErr := visualBaselineFiles(checkout)
+	if baselineErr != nil {
+		return result, baselineErr
+	}
+	if len(baselineFiles) > 0 {
+		plan.FilesToManage = sortedUnique(append(plan.FilesToManage, baselineFiles...))
+		result.Plan = plan
+	}
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupCommit); err != nil {
 		return result, err
 	}
 	if err := stageManagedPaths(ctx, checkout, managed); err != nil {
 		return result, err
+	}
+	if len(baselineFiles) > 0 {
+		args := append([]string{"add", "-f", "--"}, baselineFiles...)
+		if _, err := git(ctx, checkout, args...); err != nil {
+			return result, fmt.Errorf("stage explicitly reviewed baseline candidates: %w", err)
+		}
 	}
 	diff, err := git(ctx, checkout, "diff", "--cached", "--name-only")
 	if err != nil {
@@ -147,7 +198,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 			return result, matchErr
 		}
 		if matches {
-			idempotent, reuseRemoteSetup, sha = true, true, remoteSHA
+			idempotent, reuseRemoteSetup, sha, branch = true, true, remoteSHA, prior.SetupBranch
 		}
 	}
 	if idempotent && hasPrior && !reuseRemoteSetup {
@@ -161,10 +212,13 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		result.Applied, result.Idempotent, result.Config = true, true, &config
 		result.Branch, result.PRNumber, result.PRURL = prior.SetupBranch, prior.SetupPRNumber, prior.SetupPRURL
 		result.CommitSHA = strings.TrimSpace(sha)
+		if err := setSetupActivationStatus(&result, store, config, options.Start); err != nil {
+			return result, err
+		}
 		return result, nil
 	}
 	if !idempotent {
-		if _, err := git(ctx, checkout, "-c", "user.name=Hive Setup", "-c", "user.email=hive-setup@users.noreply.github.com", "commit", "-m", "chore: install Hive and Visual Hive"); err != nil {
+		if _, err := git(ctx, checkout, "-c", "user.name=Hive Setup", "-c", "user.email=hive-setup@users.noreply.github.com", "commit", "-m", "chore: install Hive and Visual Hive", "-m", managedCommitTrailers(inspection.RepositoryID, "setup")); err != nil {
 			return result, err
 		}
 	}
@@ -175,11 +229,12 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		}
 		sha = strings.TrimSpace(sha)
 	}
+	config.SetupBranch = branch
 	if !reuseRemoteSetup {
 		if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPush); err != nil {
 			return result, err
 		}
-		if _, err := git(ctx, checkout, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+branch); err != nil {
+		if err := pushManagedBranch(ctx, checkout, branch, inspection.RepositoryID, "setup", sha); err != nil {
 			return result, err
 		}
 	}
@@ -191,8 +246,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	marker := "<!-- hive-setup: " + strings.ToLower(options.Repository) + " -->"
 	body := setupPRBody(marker, plan)
-	pull, err := options.GitHub.UpsertRepairPullRequest(ctx, options.Repository, branch, defaultBranch, "Install Hive + Visual Hive production automation", body, marker)
+	pull, err := options.GitHub.UpsertRepairPullRequest(ctx, options.Repository, branch, sha, defaultBranch, "Install Hive + Visual Hive production automation", body, marker)
 	if err != nil {
+		return result, err
+	}
+	if err := verifyManagedPullHead("setup", pull, sha); err != nil {
 		return result, err
 	}
 	config.SetupPRNumber, config.SetupPRURL = pull.Number, pull.URL
@@ -201,7 +259,36 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	result.Applied, result.Idempotent, result.Config = true, idempotent, &config
 	result.Branch, result.CommitSHA, result.PRNumber, result.PRURL = branch, sha, pull.Number, pull.URL
+	if err := setSetupActivationStatus(&result, store, config, options.Start); err != nil {
+		return result, err
+	}
 	return result, nil
+}
+
+func setSetupActivationStatus(result *SetupResult, store *Store, config Config, started bool) error {
+	if result == nil || config.Automation != AutomationAutoMerge {
+		return nil
+	}
+	state, exists, err := store.LoadProtectionActivation()
+	if err != nil {
+		return fmt.Errorf("read protection activation status: %w", err)
+	}
+	result.ProtectionActivationPending = !exists || !ProtectionActivationMatchesConfig(state, config)
+	result.ActivationMessage = setupActivationMessage(config.Automation, started, result.ProtectionActivationPending)
+	return nil
+}
+
+func setupActivationMessage(automation Automation, started, pending bool) string {
+	if automation != AutomationAutoMerge {
+		return ""
+	}
+	if !pending {
+		return "Exact GitHub-Actions-App-bound PR visual-hive protection is durably activated; Hive verifies the producing PR workflow provenance before merge and hive doctor verifies live policy without changing it."
+	}
+	if started {
+		return "Merge the exact managed setup PR. The already-started Hive scheduler will verify the installed files, complete one trusted default-branch Visual Hive run, and then activate exact GitHub-Actions-App-bound protection before any lifecycle write."
+	}
+	return "Merge the exact managed setup PR, then run hive start or hive run. Hive will complete one trusted default-branch Visual Hive run and activate exact GitHub-Actions-App-bound protection before any lifecycle write."
 }
 
 func defaultAllowedRepairPaths() []string {
@@ -226,6 +313,148 @@ func VerifyVisualHiveCommit(ctx context.Context, client *hivegithub.Client, repo
 	}
 	if !exactCommitPin(ref, commit.GetSHA()) {
 		return fmt.Errorf("Visual Hive ref resolved to %s instead of exact commit %s", commit.GetSHA(), ref)
+	}
+	return nil
+}
+
+type installedRepositoryConfig struct {
+	SchemaVersion          string                `json:"schema_version"`
+	Repository             string                `json:"repository"`
+	RepositoryID           string                `json:"repository_id"`
+	DefaultBranch          string                `json:"default_branch"`
+	Coverage               Coverage              `json:"coverage"`
+	Automation             Automation            `json:"automation"`
+	Provider               string                `json:"provider"`
+	ACMMLevel              int                   `json:"acmm_level"`
+	MaxActiveIssues        int                   `json:"max_active_issues"`
+	MaxRepairAttempts      int                   `json:"max_repair_attempts"`
+	VisualHive             bool                  `json:"visual_hive"`
+	VisualHiveRepo         string                `json:"visual_hive_repository"`
+	VisualHiveRef          string                `json:"visual_hive_ref"`
+	VisualHiveConfigDigest string                `json:"visual_hive_config_digest,omitempty"`
+	TestCommands           [][]string            `json:"test_commands"`
+	AllowedRepairPaths     []string              `json:"allowed_repair_paths"`
+	AllowedAutoMergePaths  []string              `json:"allowed_auto_merge_paths"`
+	AllowedAutoMergeRisk   []automation.RiskTier `json:"allowed_auto_merge_risk"`
+}
+
+// VerifyInstalledSetup proves that the exact durable policy and immutable pin
+// are already present on the target branch. It is stronger than trusting a
+// historical setup PR number, and makes a no-diff rerun recover cleanly when a
+// redundant or stale setup PR was closed.
+func VerifyInstalledSetup(ctx context.Context, client *hivegithub.Client, config Config) error {
+	return verifyInstalledSetupAtRef(ctx, client, config, config.DefaultBranch)
+}
+
+// VerifyInstalledSetupAtCommit binds every managed-file read to one immutable
+// target commit. Production evidence must pass this check after its hosted run
+// and before any durable lifecycle application; a branch-ref preflight alone
+// cannot authorize artifacts produced after an out-of-band policy change.
+func VerifyInstalledSetupAtCommit(ctx context.Context, client *hivegithub.Client, config Config, commitSHA string) error {
+	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
+	if !immutableCommit.MatchString(commitSHA) {
+		return fmt.Errorf("exact 40-character target commit is required to verify installed setup")
+	}
+	return verifyInstalledSetupAtRef(ctx, client, config, commitSHA)
+}
+
+func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, config Config, ref string) error {
+	if client == nil || client.GoGitHub() == nil {
+		return fmt.Errorf("GitHub client is required to verify installed setup")
+	}
+	owner, repo, ok := strings.Cut(config.Repository, "/")
+	if !ok || owner == "" || repo == "" || config.DefaultBranch == "" || strings.TrimSpace(ref) == "" {
+		return fmt.Errorf("installed repository identity or default branch is incomplete")
+	}
+	content, _, _, err := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, ".hive/integrated.json", &gh.RepositoryContentGetOptions{Ref: ref})
+	if err != nil || content == nil {
+		return fmt.Errorf("read managed setup from target branch: %w", err)
+	}
+	value, err := content.GetContent()
+	if err != nil {
+		return fmt.Errorf("decode managed setup from target branch: %w", err)
+	}
+	var installed installedRepositoryConfig
+	if err := json.Unmarshal([]byte(value), &installed); err != nil {
+		return fmt.Errorf("parse managed setup from target branch: %w", err)
+	}
+	expected := installedRepositoryConfig{
+		SchemaVersion: ConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
+		Coverage: config.Coverage, Automation: config.Automation, Provider: config.Provider, ACMMLevel: config.ACMMLevel,
+		MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
+		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, VisualHiveConfigDigest: config.VisualHiveConfigDigest, TestCommands: config.TestCommands,
+		AllowedRepairPaths: config.AllowedRepairPaths, AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
+	}
+	if !reflect.DeepEqual(installed, expected) {
+		return fmt.Errorf("target branch managed setup does not match the durable local policy; merge the current setup/upgrade PR before running Hive")
+	}
+	if !config.VisualHive {
+		return fmt.Errorf("integrated Hive installations require Visual Hive; rerun setup with --visual-hive")
+	}
+	for relative, expected := range map[string]string{
+		".github/workflows/hive-visual-hive.yml": workflow(config),
+		".github/workflows/visual-hive-pr.yml":   pullRequestWorkflow(config),
+	} {
+		actual, readErr := readTargetFile(ctx, client, owner, repo, ref, relative)
+		if readErr != nil {
+			return fmt.Errorf("verify managed production file %s: %w", relative, readErr)
+		}
+		if normalizeManagedText(actual) != normalizeManagedText(expected) {
+			return fmt.Errorf("managed production file %s does not match the durable immutable pin and policy; rerun setup and merge its exact reviewed PR", relative)
+		}
+	}
+	visualConfig, readErr := readTargetFile(ctx, client, owner, repo, ref, "visual-hive.config.yaml")
+	if readErr != nil {
+		return fmt.Errorf("verify managed Visual Hive config: %w", readErr)
+	}
+	if err := verifyVisualHiveCoverageProfile([]byte(visualConfig), profileForCoverage(config.Coverage)); err != nil {
+		return err
+	}
+	if config.VisualHiveConfigDigest != "" {
+		digest := sha256.Sum256([]byte(normalizeManagedText(visualConfig)))
+		if !strings.EqualFold(config.VisualHiveConfigDigest, hex.EncodeToString(digest[:])) {
+			return fmt.Errorf("managed Visual Hive configuration does not match the exact repository-specific coverage plan; rerun setup and merge its reviewed PR")
+		}
+	}
+	for _, forbidden := range []string{".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml"} {
+		content, _, response, forbiddenErr := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, forbidden, &gh.RepositoryContentGetOptions{Ref: ref})
+		if forbiddenErr == nil || content != nil {
+			return fmt.Errorf("standalone Visual Hive lifecycle writer %s must be removed; Hive is the sole lifecycle writer", forbidden)
+		}
+		if response == nil || response.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("verify absence of standalone lifecycle writer %s: %w", forbidden, forbiddenErr)
+		}
+	}
+	return nil
+}
+
+func readTargetFile(ctx context.Context, client *hivegithub.Client, owner, repo, branch, relative string) (string, error) {
+	content, _, _, err := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, relative, &gh.RepositoryContentGetOptions{Ref: branch})
+	if err != nil || content == nil {
+		return "", fmt.Errorf("read %s from target branch: %w", relative, err)
+	}
+	value, err := content.GetContent()
+	if err != nil {
+		return "", fmt.Errorf("decode %s from target branch: %w", relative, err)
+	}
+	return value, nil
+}
+
+func normalizeManagedText(value string) string {
+	return strings.TrimSpace(strings.ReplaceAll(value, "\r\n", "\n")) + "\n"
+}
+
+func verifyVisualHiveCoverageProfile(data []byte, expected string) error {
+	var value struct {
+		Project struct {
+			SetupProfile string `yaml:"setupProfile"`
+		} `yaml:"project"`
+	}
+	if err := yaml.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("parse managed Visual Hive config: %w", err)
+	}
+	if value.Project.SetupProfile != expected {
+		return fmt.Errorf("Visual Hive setup profile %q does not match coverage depth %q (expected %q); rerun setup and merge its exact reviewed PR", value.Project.SetupProfile, expected, expected)
 	}
 	return nil
 }
@@ -256,6 +485,60 @@ func stagedTreeMatchesRemoteBranch(ctx context.Context, checkout, branch string)
 	return strings.TrimSpace(desiredTree) == strings.TrimSpace(remoteTree), strings.TrimSpace(remoteSHA), nil
 }
 
+func managedOperationBranch(operation, repositoryID string) string {
+	operation = strings.ToLower(strings.TrimSpace(operation))
+	repositoryID = regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(strings.TrimSpace(repositoryID), "-")
+	repositoryID = strings.Trim(repositoryID, "-")
+	return fmt.Sprintf("hive/%s-%s", operation, repositoryID)
+}
+
+func managedCommitTrailers(repositoryID, operation string) string {
+	return fmt.Sprintf("Hive-Repository-ID: %s\nHive-Operation: %s", strings.TrimSpace(repositoryID), strings.ToLower(strings.TrimSpace(operation)))
+}
+
+func pushManagedBranch(ctx context.Context, checkout, branch, repositoryID, operation, localSHA string) error {
+	remoteRef := "refs/remotes/origin/" + branch
+	remoteSHA, remoteErr := git(ctx, checkout, "rev-parse", "--verify", remoteRef)
+	remoteSHA = strings.TrimSpace(remoteSHA)
+	lease := "--force-with-lease=refs/heads/" + branch + ":"
+	if remoteErr == nil {
+		message, err := git(ctx, checkout, "show", "-s", "--format=%B", remoteRef)
+		if err != nil {
+			return fmt.Errorf("verify existing managed branch %s: %w", branch, err)
+		}
+		if !hasExactCommitTrailer(message, "Hive-Repository-ID", repositoryID) || !hasExactCommitTrailer(message, "Hive-Operation", operation) {
+			return fmt.Errorf("refusing to overwrite remote branch %s because its latest commit lacks exact Hive ownership for repository ID %s and operation %s", branch, repositoryID, operation)
+		}
+		lease += remoteSHA
+	}
+	localSHA = strings.TrimSpace(localSHA)
+	if localSHA == "" {
+		return fmt.Errorf("exact local commit SHA is required before pushing managed branch %s", branch)
+	}
+	if _, err := git(ctx, checkout, "push", lease, "origin", localSHA+":refs/heads/"+branch); err != nil {
+		return fmt.Errorf("push exact managed branch %s: %w", branch, err)
+	}
+	return nil
+}
+
+func hasExactCommitTrailer(message, key, value string) bool {
+	want := strings.TrimSpace(key) + ": " + strings.TrimSpace(value)
+	for _, line := range strings.Split(strings.ReplaceAll(message, "\r\n", "\n"), "\n") {
+		if strings.EqualFold(strings.TrimSpace(line), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyManagedPullHead(operation string, pull hivegithub.RepairPullRequest, expectedSHA string) error {
+	actual, expected := strings.TrimSpace(pull.HeadSHA), strings.TrimSpace(expectedSHA)
+	if actual == "" || expected == "" || !strings.EqualFold(actual, expected) {
+		return fmt.Errorf("%s PR head %q does not match exact pushed commit %q; refusing to record managed readiness", operation, actual, expected)
+	}
+	return nil
+}
+
 func validateSetupOptions(options SetupOptions) error {
 	if !regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`).MatchString(options.Repository) {
 		return fmt.Errorf("repository must be owner/name")
@@ -275,6 +558,9 @@ func validateSetupOptions(options SetupOptions) error {
 	if options.MaxRepairAttempts < 1 || options.MaxRepairAttempts > 10 {
 		return fmt.Errorf("maximum repair attempts must be from 1 through 10")
 	}
+	if !options.VisualHive {
+		return fmt.Errorf("integrated Hive requires Visual Hive deterministic testing; disabling --visual-hive is not supported")
+	}
 	if options.Apply && options.VisualHive && (options.VisualHiveCommand == "" || options.VisualHiveRepo == "" || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(options.VisualHiveRef)) {
 		return fmt.Errorf("Visual Hive setup requires a command, repository, and immutable 40-character commit SHA")
 	}
@@ -283,16 +569,13 @@ func validateSetupOptions(options SetupOptions) error {
 
 func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) SetupPlan {
 	warnings := []string{}
-	if !inspection.BranchProtection {
-		warnings = append(warnings, "Default-branch protection was not detected; auto-merge remains technically disabled until protection or an equivalent ruleset is verified.")
+	if options.Automation == AutomationAutoMerge && !inspection.BranchProtection {
+		warnings = append(warnings, "Default-branch protection was not detected. Hive will create its conservative exact-App-bound protection only after the setup PR is merged and one trusted default-branch Visual Hive run succeeds.")
 	}
 	if len(inspection.BaselineFiles) == 0 && options.VisualHive {
 		warnings = append(warnings, "No reviewed visual baselines were detected; setup must prepare and review baselines before the first production scan.")
 	}
-	managedFiles := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
-	if options.VisualHive {
-		managedFiles = append(managedFiles, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml", ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
-	}
+	managedFiles := managedSetupFiles(options.VisualHive)
 	return SetupPlan{
 		SchemaVersion: PlanSchema, GeneratedAt: time.Now().UTC(), Repository: options.Repository,
 		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
@@ -301,9 +584,25 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		MaxRepairAttempts: options.MaxRepairAttempts,
 		TestingLayers:     layersForCoverage(options.Coverage),
 		FilesToManage:     managedFiles,
-		RequiredActions:   []string{"Review and merge the setup PR", "Run hive doctor", "Launch the first complete production scan"},
+		RequiredActions:   setupRequiredActions(options.Automation),
 		Warnings:          warnings, ReadOnly: true,
 	}
+}
+
+func setupRequiredActions(automation Automation) []string {
+	actions := []string{"Review and merge the exact setup PR"}
+	if automation == AutomationAutoMerge {
+		actions = append(actions, "Leave the started scheduler running, or run hive start/hive run; Hive will complete one trusted scan and activate exact-App-bound protection before lifecycle writes")
+	}
+	return append(actions, "Run hive doctor and confirm production_ready=true")
+}
+
+func managedSetupFiles(visualHive bool) []string {
+	files := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
+	if visualHive {
+		files = append(files, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml", ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
+	}
+	return files
 }
 
 func layersForCoverage(coverage Coverage) []string {
@@ -372,7 +671,8 @@ func checkoutDefaultBranch(ctx context.Context, checkout, branch string) (string
 func runVisualHiveSetup(ctx context.Context, options SetupOptions, checkout string) error {
 	args := append([]string(nil), options.VisualHiveArgs...)
 	args = append(args, "recommend", "--repo", checkout, "--profile", profileForCoverage(options.Coverage), "--format", "json")
-	if !exists(filepath.Join(checkout, "visual-hive.config.yaml")) {
+	configExisted := exists(filepath.Join(checkout, "visual-hive.config.yaml"))
+	if !configExisted {
 		args = append(args, "--write-config")
 	}
 	if !exists(filepath.Join(checkout, "docs", "visual-hive.md")) {
@@ -386,6 +686,13 @@ func runVisualHiveSetup(ctx context.Context, options SetupOptions, checkout stri
 	if err := command.Run(); err != nil {
 		return fmt.Errorf("generate repository-specific Visual Hive setup: %w: %s", err, safeOutput(output.String()))
 	}
+	if configExisted {
+		if err := mergeVisualHiveRecommendation(checkout, profileForCoverage(options.Coverage)); err != nil {
+			return fmt.Errorf("migrate existing Visual Hive coverage profile: %w", err)
+		}
+	} else if err := markVisualHiveConfigOrigin(checkout, "generated", profileForCoverage(options.Coverage)); err != nil {
+		return fmt.Errorf("mark generated Visual Hive coverage ownership: %w", err)
+	}
 	doctorArgs := append([]string(nil), options.VisualHiveArgs...)
 	doctorArgs = append(doctorArgs, "doctor", "--config", filepath.Join(checkout, "visual-hive.config.yaml"))
 	doctor := exec.CommandContext(ctx, options.VisualHiveCommand, doctorArgs...)
@@ -395,7 +702,183 @@ func runVisualHiveSetup(ctx context.Context, options SetupOptions, checkout stri
 	if err := doctor.Run(); err != nil {
 		return fmt.Errorf("validate generated Visual Hive configuration: %w: %s", err, safeOutput(output.String()))
 	}
+	if len(existingVisualBaselines(checkout)) == 0 {
+		bootstrapArgs := append([]string(nil), options.VisualHiveArgs...)
+		bootstrapArgs = append(bootstrapArgs, "pipeline", "--config", filepath.Join(checkout, "visual-hive.config.yaml"), "--mode", "pr", "--bootstrap-baselines", "--continue-on-error", "--format", "json")
+		bootstrap := exec.CommandContext(ctx, options.VisualHiveCommand, bootstrapArgs...)
+		bootstrap.Dir, bootstrap.Env = checkout, safeEnvironment()
+		output.Reset()
+		bootstrap.Stdout, bootstrap.Stderr = &output, &output
+		// A target defect may make the bootstrap pipeline non-zero. Any created
+		// snapshots are still explicit setup-PR review candidates; the first
+		// production run will turn the remaining deterministic defect into a
+		// Hive finding after setup is merged.
+		_ = bootstrap.Run()
+	}
 	return nil
+}
+
+// mergeVisualHiveRecommendation reconciles every coverage-owned section to the
+// deterministic recommendation. This makes upgrades and downgrades exact; the
+// resulting setup PR remains the review boundary for repository-specific edits.
+func mergeVisualHiveRecommendation(checkout, expectedProfile string) error {
+	configPath := filepath.Join(checkout, "visual-hive.config.yaml")
+	recommendationPath := filepath.Join(checkout, ".visual-hive", "recommendations.json")
+	existingData, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var current map[string]any
+	if err := yaml.Unmarshal(existingData, &current); err != nil {
+		return fmt.Errorf("parse existing config: %w", err)
+	}
+	project := ensureStringMap(current, "project")
+	origin := ""
+	if rawOrigin, exists := project["hiveConfigOrigin"]; exists && rawOrigin != nil {
+		origin = strings.ToLower(strings.TrimSpace(fmt.Sprint(rawOrigin)))
+	}
+	// Legacy repository-owned plans predate Hive's origin marker. When their
+	// effective coverage profile is unchanged, preserve the YAML byte-for-byte:
+	// an immutable runtime/workflow upgrade must not create a cosmetic config
+	// conflict with an in-flight repair. A later explicit profile change remains
+	// a reviewed repository diff and records the ownership marker then.
+	if origin == "" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(project["setupProfile"])), strings.TrimSpace(expectedProfile)) {
+		return nil
+	}
+	var report struct {
+		RecommendedConfig map[string]any `json:"recommendedConfig"`
+	}
+	recommendationData, err := os.ReadFile(recommendationPath)
+	if err != nil {
+		return fmt.Errorf("read deterministic recommendation: %w", err)
+	}
+	if err := json.Unmarshal(recommendationData, &report); err != nil || len(report.RecommendedConfig) == 0 {
+		return fmt.Errorf("parse deterministic recommendation: %w", err)
+	}
+	project["setupProfile"] = expectedProfile
+	project["hiveManagedBy"] = "hive-integrated"
+	if origin == "" || origin == "existing" {
+		// A pre-existing Visual Hive plan belongs to the repository. Preserve its
+		// domain-specific targets/contracts and record that generic profile
+		// recommendations must not replace them on future coverage changes.
+		project["hiveConfigOrigin"] = "existing"
+		updated, err := yaml.Marshal(current)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(existingData, updated) {
+			return nil
+		}
+		return os.WriteFile(configPath, updated, 0o600)
+	}
+	project["hiveConfigOrigin"] = "generated"
+	for _, key := range []string{"targets", "contracts", "viewports", "visual", "selection", "mutation", "flows"} {
+		if value, exists := report.RecommendedConfig[key]; exists {
+			current[key] = value
+		} else {
+			delete(current, key)
+		}
+	}
+	if recommendedCost, exists := report.RecommendedConfig["costPolicy"]; exists {
+		current["costPolicy"] = recommendedCost
+	}
+	updated, err := yaml.Marshal(current)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(existingData, updated) {
+		return nil
+	}
+	return os.WriteFile(configPath, updated, 0o600)
+}
+
+func markVisualHiveConfigOrigin(checkout, origin, profile string) error {
+	path := filepath.Join(checkout, "visual-hive.config.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var current map[string]any
+	if err := yaml.Unmarshal(data, &current); err != nil {
+		return err
+	}
+	project := ensureStringMap(current, "project")
+	project["setupProfile"] = profile
+	project["hiveManagedBy"] = "hive-integrated"
+	project["hiveConfigOrigin"] = origin
+	updated, err := yaml.Marshal(current)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, updated, 0o600)
+}
+
+func ensureStringMap(parent map[string]any, key string) map[string]any {
+	if value := anyStringMap(parent[key]); value != nil {
+		parent[key] = value
+		return value
+	}
+	value := map[string]any{}
+	parent[key] = value
+	return value
+}
+
+func anyStringMap(value any) map[string]any {
+	if result, ok := value.(map[string]any); ok {
+		return result
+	}
+	return nil
+}
+
+func anySlice(value any) []any {
+	if result, ok := value.([]any); ok {
+		return result
+	}
+	return nil
+}
+
+func mergeMissingMap(current, recommended map[string]any) {
+	for key, value := range recommended {
+		if _, exists := current[key]; !exists {
+			current[key] = value
+		}
+	}
+}
+
+func mergeObjectListByID(current, recommended []any) []any {
+	return mergeObjectListByKey(current, recommended, "id")
+}
+
+func mergeObjectListByKey(current, recommended []any, key string) []any {
+	seen := map[string]bool{}
+	for _, item := range current {
+		if value := fmt.Sprint(anyStringMap(item)[key]); value != "" {
+			seen[value] = true
+		}
+	}
+	for _, item := range recommended {
+		value := fmt.Sprint(anyStringMap(item)[key])
+		if value != "" && !seen[value] {
+			current = append(current, item)
+			seen[value] = true
+		}
+	}
+	return current
+}
+
+func mergeScalarList(current, recommended []any) []any {
+	seen := map[string]bool{}
+	for _, item := range current {
+		seen[fmt.Sprint(item)] = true
+	}
+	for _, item := range recommended {
+		value := fmt.Sprint(item)
+		if !seen[value] {
+			current = append(current, item)
+			seen[value] = true
+		}
+	}
+	return current
 }
 
 func profileForCoverage(coverage Coverage) string {
@@ -405,13 +888,57 @@ func profileForCoverage(coverage Coverage) string {
 	return "free-local"
 }
 
+func visualHiveConfigDigest(checkout string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(checkout, "visual-hive.config.yaml"))
+	if err != nil {
+		return "", fmt.Errorf("read repository-specific Visual Hive config for digest: %w", err)
+	}
+	digest := sha256.Sum256([]byte(normalizeManagedText(string(data))))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func existingVisualBaselines(checkout string) []string {
+	files, _ := visualBaselineFiles(checkout)
+	return files
+}
+
+func visualBaselineFiles(checkout string) ([]string, error) {
+	root := filepath.Join(checkout, ".visual-hive", "snapshots")
+	files := []string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".png") {
+			return nil
+		}
+		relative, err := filepath.Rel(checkout, path)
+		if err != nil || strings.HasPrefix(relative, "..") {
+			return fmt.Errorf("baseline path escaped the managed checkout")
+		}
+		files = append(files, filepath.ToSlash(relative))
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list Visual Hive baseline candidates: %w", err)
+	}
+	return sortedUnique(files), nil
+}
+
 func writeManagedFiles(root string, config Config, inspection RepositoryInspection) error {
 	repositoryConfig := map[string]any{
 		"schema_version": ConfigSchema, "repository": config.Repository, "repository_id": config.RepositoryID,
 		"default_branch": config.DefaultBranch, "coverage": config.Coverage, "automation": config.Automation,
 		"provider": config.Provider, "acmm_level": config.ACMMLevel, "max_active_issues": config.MaxActiveIssues, "max_repair_attempts": config.MaxRepairAttempts, "visual_hive": config.VisualHive,
 		"visual_hive_repository": config.VisualHiveRepo, "visual_hive_ref": config.VisualHiveRef,
-		"test_commands": config.TestCommands, "allowed_repair_paths": config.AllowedRepairPaths,
+		"visual_hive_config_digest": config.VisualHiveConfigDigest,
+		"test_commands":             config.TestCommands, "allowed_repair_paths": config.AllowedRepairPaths,
 		"allowed_auto_merge_paths": config.AllowedAutoMergePaths, "allowed_auto_merge_risk": config.AllowedAutoMergeRisk,
 	}
 	configData, err := json.MarshalIndent(repositoryConfig, "", "  ")
@@ -452,10 +979,13 @@ func workflow(config Config) string {
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 4 * * *"
-  push:
-    branches: [%s]
+    inputs:
+      hive_dispatch_id:
+        description: Opaque durable Hive dispatch correlation
+        required: true
+        type: string
+
+run-name: "Hive Visual Hive Production [${{ inputs.hive_dispatch_id }}]"
 
 permissions:
   contents: read
@@ -466,21 +996,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  visual-hive:
+  visual-hive-production:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@%s
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/checkout@%s
         with:
           repository: %s
           ref: %s
           path: .hive-visual-tooling
+          persist-credentials: false
       - uses: actions/setup-node@%s
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
           cache-dependency-path: .hive-visual-tooling/package-lock.json
       - uses: actions/setup-python@%s
@@ -562,7 +1094,38 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
-`, config.DefaultBranch, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, repositoryTests, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA)
+
+  # GitHub allows an App-bound context to become required only after that
+  # context has completed successfully in the repository within seven days. This
+  # seed uses the future PR context, but actively fails on every non-default or
+  # stale dispatch. Hive independently verifies both jobs before protection.
+  visual-hive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Reject a non-default production dispatch
+        shell: bash
+        env:
+          HIVE_EVENT_NAME: ${{ github.event_name }}
+          HIVE_REF: ${{ github.ref }}
+          HIVE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$HIVE_EVENT_NAME" = "workflow_dispatch"
+          test "$HIVE_REF" = "refs/heads/$HIVE_DEFAULT_BRANCH"
+      - uses: actions/checkout@%s
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify dispatch SHA is the current default head
+        shell: bash
+        env:
+          HIVE_DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HIVE_DISPATCH_SHA"
+`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, repositoryTests, uploadArtifactActionSHA, config.ACMMLevel, uploadArtifactActionSHA, checkoutActionSHA)
 }
 
 func pullRequestWorkflow(config Config) string {
@@ -572,14 +1135,13 @@ func pullRequestWorkflow(config Config) string {
 
 on:
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: visual-hive-pr-${{ github.event.pull_request.number || github.ref }}
+  group: visual-hive-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -590,14 +1152,16 @@ jobs:
       - uses: actions/checkout@%s
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/checkout@%s
         with:
           repository: %s
           ref: %s
           path: .hive-visual-tooling
+          persist-credentials: false
       - uses: actions/setup-node@%s
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
           cache-dependency-path: .hive-visual-tooling/package-lock.json
       - uses: actions/setup-python@%s
@@ -617,14 +1181,12 @@ jobs:
 %s
       - name: Capture pull request scope
         shell: bash
+        env:
+          HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p .visual-hive
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > .visual-hive/changed-files.pr.txt
-          else
-            git fetch origin %s --depth=1
-            git diff --name-only "origin/%s"...HEAD > .visual-hive/changed-files.pr.txt
-          fi
+          git diff --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA" > .visual-hive/changed-files.pr.txt
       - name: Run deterministic repository and Visual Hive gates
         shell: bash
         run: |
@@ -651,19 +1213,58 @@ jobs:
         if: always()
         shell: bash
         run: exit "$(cat .visual-hive/pipeline-exit-code.txt)"
-`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, config.DefaultBranch, config.DefaultBranch, repositoryTests, uploadArtifactActionSHA)
+`, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, repositoryTests, uploadArtifactActionSHA)
 }
 
 func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage) [][]string {
-	commands := cloneCommands(inspection.TestCommands)
-	if coverage != CoverageComprehensive && coverage != CoverageCustom {
-		return commands
+	maximumRank := 1
+	if coverage == CoverageStandard {
+		maximumRank = 2
+	} else if coverage == CoverageComprehensive || coverage == CoverageCustom {
+		maximumRank = 3
 	}
-	if !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(commands) {
+	commands := make([][]string, 0, len(inspection.TestCommands))
+	for _, command := range inspection.TestCommands {
+		rank := commandCoverageRank(command)
+		if rank > 0 && rank <= maximumRank {
+			commands = append(commands, append([]string(nil), command...))
+		}
+	}
+	if maximumRank < 3 || !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(commands) {
 		return commands
 	}
 	commands = append(commands, []string{"node", "--test"})
 	return sortTestCommands(commands)
+}
+
+func commandCoverageRank(command []string) int {
+	if len(command) == 0 {
+		return 0
+	}
+	value := strings.ToLower(strings.Join(command, " "))
+	name := commandScriptName(command)
+	if strings.Contains(value, "python -m pytest") || strings.HasPrefix(value, "go test") || value == "node --test" {
+		return 1
+	}
+	for _, unsafe := range []string{"watch", "update", "--ui", "--open", "headed", " dev", " serve", " preview"} {
+		if strings.Contains(name, unsafe) || strings.Contains(value, unsafe) {
+			return 0
+		}
+	}
+	for _, deep := range []string{"performance", "perf", "load", "cross-browser", "responsive", "theme", "suite", "proof", "verify", "validation"} {
+		if strings.Contains(name, deep) {
+			return 3
+		}
+	}
+	for _, standard := range []string{"integration", "e2e", "api", "visual", "a11y", "accessibility", "mutation", "mutate", "security"} {
+		if strings.Contains(name, standard) {
+			return 2
+		}
+	}
+	if name == "test" || name == "build" || strings.Contains(name, "unit") || strings.Contains(name, "test:ci") || strings.Contains(name, "test:") || strings.Contains(name, "lint") || strings.Contains(name, "typecheck") || strings.Contains(name, "check") || strings.Contains(name, "build") {
+		return 1
+	}
+	return 0
 }
 
 func hasRepositoryUnitCommand(commands [][]string) bool {
@@ -752,16 +1353,26 @@ func containsValue(values []string, target string) bool {
 }
 
 func quickstart(config Config, inspection RepositoryInspection) string {
-	return fmt.Sprintf("# Hive + Visual Hive\n\nThis repository is managed by Hive with `%s` coverage and `%s` automation authority. Visual Hive runs deterministic checks; Hive alone owns issues, repair branches, pull requests, merges, and closure. Hive keeps at most %d managed findings active as GitHub issues at once and permits at most %d bounded repair attempts per finding; every additional finding remains durable as a bead until capacity is available.\n\n## Operator commands\n\nSet `HIVE_STATE_DIR` to the persistent Hive data directory, then run:\n\n```sh\nhive doctor --json\nhive status --json\nhive run --json\nhive pause\nhive resume\n```\n\nDefault branch: `%s`. Detected languages: %s.\n", config.Coverage, config.Automation, config.MaxActiveIssues, config.MaxRepairAttempts, config.DefaultBranch, strings.Join(inspection.Languages, ", "))
+	activation := ""
+	if config.Automation == AutomationAutoMerge {
+		activation = "\n\nAuto-merge protection uses two-phase activation: merge the exact managed setup/upgrade PR first. The next started Hive run verifies the installed files and exact production workflow path/event/head, completes both `visual-hive-production` and the actively guarded `visual-hive` eligibility seed on the current default head, and only then creates or verifies strict protection with the PR `visual-hive` context bound to the GitHub Actions App ID. Merge gating accepts that context only from `.github/workflows/visual-hive-pr.yml` on the exact pull-request head. No issue, repair, or merge lifecycle write occurs before activation."
+	}
+	return fmt.Sprintf("# Hive + Visual Hive\n\nThis repository is managed by Hive with `%s` coverage and `%s` automation authority. Visual Hive runs deterministic checks; Hive alone owns issues, repair branches, pull requests, merges, and closure. Hive keeps at most %d managed findings active as GitHub issues at once and permits at most %d bounded repair attempts per finding; every additional finding remains durable as a bead until capacity is available.%s\n\n## Operator commands\n\nHive automatically selects this repository's isolated persistent state. Run:\n\n```sh\nhive doctor --json\nhive status --json\nhive run --json\nhive start --json\nhive stop --json\nhive pause\nhive resume\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --plan --json\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --base EXACT_BASE_SHA --diff-digest EXACT_DIFF_SHA256 --reason \"reviewed exact path-held repair\" --json\nhive revoke-merge-approval --reason \"review withdrawn\" --json\nhive retry-repair --finding FINGERPRINT --recurrence N --attempt N --failure-class infrastructure --failure-id FAILURE_ID --reason \"dependency restored\" --json\n```\n\nIf status reports `workflow_dispatch_recovery`, use its exact `revoke_plan_command` (preferred for uncertain transport) or `retry_plan_command`; never delete the dispatch state manually.\n\nDefault branch: `%s`. Detected languages: %s.\n", config.Coverage, config.Automation, config.MaxActiveIssues, config.MaxRepairAttempts, activation, config.DefaultBranch, strings.Join(inspection.Languages, ", "))
 }
 
 func setupPRBody(marker string, plan SetupPlan) string {
-	return fmt.Sprintf("%s\n\nInstalls Hive + Visual Hive as one production testing and repair experience.\n\n- Coverage: **%s**\n- Automation authority: **%s**\n- ACMM enforcement: **L%d**\n- Active issue WIP limit: **%d**\n- Repair attempt limit: **%d**\n- Provider: **%s**\n- Detected languages: %s\n- Testing layers: %s\n\nThe Visual workflow is read-only and uploads provenance-bound evidence. Hive is the only GitHub lifecycle writer. Review tracked baselines and branch protection before enabling auto-merge.", marker, plan.Coverage, plan.Automation, plan.ACMMLevel, plan.MaxActiveIssues, plan.MaxRepairAttempts, plan.Provider, strings.Join(plan.Inspection.Languages, ", "), strings.Join(plan.TestingLayers, ", "))
+	activation := ""
+	if plan.Automation == AutomationAutoMerge {
+		activation = " After this exact PR is merged, the already-started scheduler (or the next `hive start`/`hive run`) verifies these files and the exact production workflow provenance, completes the production verdict plus actively guarded PR-context eligibility seed, and only then activates exact GitHub-Actions-App-bound branch protection. Merge gating still accepts `visual-hive` only from the exact PR workflow; no lifecycle write occurs before activation."
+	}
+	return fmt.Sprintf("%s\n\nInstalls Hive + Visual Hive as one production testing and repair experience.\n\n- Coverage: **%s**\n- Automation authority: **%s**\n- ACMM enforcement: **L%d**\n- Active issue WIP limit: **%d**\n- Repair attempt limit: **%d**\n- Provider: **%s**\n- Detected languages: %s\n- Testing layers: %s\n\nThe Visual workflow is read-only and uploads provenance-bound evidence. Hive is the only GitHub lifecycle writer.%s", marker, plan.Coverage, plan.Automation, plan.ACMMLevel, plan.MaxActiveIssues, plan.MaxRepairAttempts, plan.Provider, strings.Join(plan.Inspection.Languages, ", "), strings.Join(plan.TestingLayers, ", "), activation)
 }
 
 func authorizeSetup(store *Store, policy automation.Policy, repository string, action automation.Action) error {
 	decision := policy.Authorize(automation.ActionRequest{Action: action, Agent: "setup", Repository: repository, SetupApproved: true})
-	store.Audit(AuditEntry{Action: string(action), Allowed: decision.Allowed, Repository: repository, Detail: strings.Join(decision.Reasons, "; ")})
+	if err := store.AuditStrict(AuditEntry{Action: string(action), Allowed: decision.Allowed, Repository: repository, Detail: strings.Join(decision.Reasons, "; ")}); err != nil {
+		return fmt.Errorf("persist setup authorization audit: %w", err)
+	}
 	if !decision.Allowed {
 		return fmt.Errorf("%s denied: %s", action, strings.Join(decision.Reasons, "; "))
 	}

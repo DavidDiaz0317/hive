@@ -16,12 +16,22 @@ import (
 type fakeReviewPRClient struct {
 	calls int
 	body  string
+	state *Store
 }
 
-func (f *fakeReviewPRClient) UpsertReviewPullRequest(_ context.Context, _, _, _, _ string, body, _ string) (hivegithub.RepairPullRequest, error) {
+func (f *fakeReviewPRClient) UpsertReviewPullRequest(_ context.Context, _, branch, _, _, _ string, body, _ string) (hivegithub.RepairPullRequest, error) {
 	f.calls++
 	f.body = body
-	return hivegithub.RepairPullRequest{Number: 29, URL: "https://example.test/pull/29"}, nil
+	head := ""
+	if f.state != nil {
+		for _, attempt := range f.state.Snapshot().Attempts {
+			if attempt != nil && attempt.BaselineReview != nil && attempt.BaselineReview.ProposalBranch == branch {
+				head = attempt.BaselineReview.ProposalCommitSHA
+				break
+			}
+		}
+	}
+	return hivegithub.RepairPullRequest{Number: 29, URL: "https://example.test/pull/29", HeadSHA: head}, nil
 }
 
 func TestDetectBaselineReviewAcceptsExclusiveMissingBaselineBlock(t *testing.T) {
@@ -145,8 +155,8 @@ func TestCreateBaselineProposalUsesSeparateHeldBranchAndPersistsState(t *testing
 	if err := state.Put(attempt); err != nil {
 		t.Fatal(err)
 	}
-	client := &fakeReviewPRClient{}
-	finding := visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryFingerprint: fingerprint, IssueNumber: 48, IssueURL: "https://example.test/issues/48"}
+	client := &fakeReviewPRClient{state: state}
+	finding := visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: fingerprint, IssueNumber: 48, IssueURL: "https://example.test/issues/48"}
 	updated, err := CreateBaselineProposal(context.Background(), BaselineProposalConfig{
 		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "baseline-worktrees"), BaseBranch: "main",
 	}, finding, BaselineProposalSource{WorkflowRunID: 77, ArtifactID: 88, RunURL: "https://example.test/actions/runs/77"},
@@ -161,6 +171,10 @@ func TestCreateBaselineProposalUsesSeparateHeldBranchAndPersistsState(t *testing
 		if output := gitOutput(t, remote, "show", updated.BaselineReview.ProposalBranch+":"+candidate.BaselinePath); len(output) == 0 {
 			t.Fatalf("candidate %s was not pushed", candidate.BaselinePath)
 		}
+	}
+	proposalMessage := gitOutput(t, remote, "show", "-s", "--format=%B", updated.BaselineReview.ProposalBranch)
+	if !hasExactRepairTrailer(proposalMessage, "Hive-Repository-ID", "123") || !hasExactRepairTrailer(proposalMessage, "Hive-Operation", "baseline") {
+		t.Fatalf("baseline proposal lacks repository-scoped ownership: %q", proposalMessage)
 	}
 	if !containsAll(client.body, "Required review", "Exact repair head", local.SHA256, hosted.SHA256) {
 		t.Fatalf("review body lacks exact evidence: %s", client.body)

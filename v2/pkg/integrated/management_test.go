@@ -18,12 +18,20 @@ func TestUpgradeSameImmutableRefIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := "0123456789012345678901234567890123456789"
-	if err := store.Save(Config{Repository: "owner/repo", VisualHiveRef: ref, ACMMLevel: 5, Automation: AutomationRepairPR}); err != nil {
+	config := Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
+		Coverage: CoverageComprehensive, Automation: AutomationRepairPR, Provider: "codex", ACMMLevel: 5,
+		MaxActiveIssues: 5, MaxRepairAttempts: 4, VisualHive: true,
+		VisualHiveRepo: "owner/visual", VisualHiveRef: ref,
+	}
+	if err := store.Save(config); err != nil {
 		t.Fatal(err)
 	}
+	server := installedSetupTestServer(t, config)
+	defer server.Close()
 	result, err := RunManagement(context.Background(), ManagementOptions{
 		Operation: OperationUpgrade, StateDir: stateDir, VisualHiveRef: ref,
-		GitHub: hivegithub.NewClientForTest("http://127.0.0.1:1", "owner", []string{"repo"}, slog.Default()),
+		GitHub: hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default()),
 	})
 	if err != nil || !result.Idempotent || result.PRURL != "" {
 		t.Fatalf("idempotent upgrade = %+v, %v", result, err)

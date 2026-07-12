@@ -9,7 +9,30 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/integrated"
 )
+
+func TestAutoMergeProtectionDoctorDistinguishesSetupActivationAndExistingPolicy(t *testing.T) {
+	config := integrated.Config{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", Automation: integrated.AutomationAutoMerge}
+	pendingSetup := autoMergeProtectionDoctorCheck(false, config, hivegithub.BranchProtectionSummary{}, 0, integrated.ProtectionActivationState{}, false, nil)
+	if pendingSetup.OK || !strings.Contains(pendingSetup.Message, "merge the exact managed setup/upgrade PR") {
+		t.Fatalf("doctor did not report pending setup: %+v", pendingSetup)
+	}
+	pendingActivation := autoMergeProtectionDoctorCheck(true, config, hivegithub.BranchProtectionSummary{}, 42, integrated.ProtectionActivationState{}, false, nil)
+	if pendingActivation.OK || !strings.Contains(pendingActivation.Message, "protection activation is pending") {
+		t.Fatalf("doctor did not report pending protection activation: %+v", pendingActivation)
+	}
+	ownedPolicy := hivegithub.BranchProtectionSummary{
+		Enabled: true, Strict: true, AdminEnforced: true,
+		RequiredChecks: []string{"visual-hive"}, RequiredCheckIdentities: []hivegithub.RequiredCheckIdentity{{Context: "visual-hive", AppID: -1}},
+	}
+	rejected := autoMergeProtectionDoctorCheck(true, config, ownedPolicy, 42, integrated.ProtectionActivationState{}, false, nil)
+	if rejected.OK || !strings.Contains(rejected.Message, "Hive will not replace it") || !strings.Contains(rejected.Message, "App ID 42") {
+		t.Fatalf("doctor did not explain repository-owned policy rejection: %+v", rejected)
+	}
+}
 
 func TestResolveVisualHiveLauncherUsesPackagedRuntime(t *testing.T) {
 	root := t.TempDir()

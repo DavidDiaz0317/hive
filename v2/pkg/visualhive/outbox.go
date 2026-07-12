@@ -100,14 +100,29 @@ func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStor
 		}
 		return lifecycle.MarkIssueOpened(entry.RepositoryFingerprint, number, url)
 	case OutboxCloseIssue:
+		if finding.Status == StatusIssueClosed {
+			// GitHub close and the lifecycle transition are durable before the
+			// outbox completion bit. A crash in that narrow window must make the
+			// pending close an idempotent success rather than a permanent wedge.
+			if finding.IssueNumber <= 0 || entry.IssueNumber <= 0 {
+				return fmt.Errorf("closed finding no longer matches pending close issue")
+			}
+			return nil
+		}
 		if finding.Status != StatusResolved {
 			return fmt.Errorf("refusing to close issue while finding is %s", finding.Status)
 		}
 		if finding.IssueNumber <= 0 {
 			return fmt.Errorf("cannot close finding without a persisted GitHub issue number")
 		}
-		if _, _, err := client.UpdateLifecycleIssue(ctx, entry.Repository, finding.IssueNumber, entry.Title, body, "closed", resolvedLabels(entry.Labels)); err != nil {
+		number, url, err := client.UpdateLifecycleIssue(ctx, entry.Repository, finding.IssueNumber, entry.Title, body, "closed", resolvedLabels(entry.Labels))
+		if err != nil {
 			return err
+		}
+		if number != finding.IssueNumber || url != finding.IssueURL {
+			if err := lifecycle.RebindResolvedIssue(entry.RepositoryFingerprint, number, url); err != nil {
+				return err
+			}
 		}
 		return lifecycle.MarkIssueClosed(entry.RepositoryFingerprint, beadStore)
 	default:

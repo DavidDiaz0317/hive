@@ -2,6 +2,7 @@ package repair
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,37 @@ func TestModelPatchAlreadyAppliedDetectsCrashResume(t *testing.T) {
 	applied, err = modelPatchAlreadyApplied(context.Background(), repository, patch)
 	if err != nil || !applied {
 		t.Fatalf("applied patch was not recognized after resume: applied=%t err=%v", applied, err)
+	}
+}
+
+func TestRejectedModelPatchIsNotInfrastructureFailure(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	patch := "diff --git a/src/value.txt b/src/value.txt\n--- a/src/value.txt\n+++ b/src/value.txt\n@@ -1 +1 @@\n-not-the-current-value\n+fixed\n"
+	err := applyModelPatch(context.Background(), repository, patch)
+	if err == nil {
+		t.Fatal("expected deterministic patch rejection")
+	}
+	if isPatchEngineInfrastructureFailure(err) {
+		t.Fatalf("invalid model output was misclassified as patch-engine infrastructure: %v", err)
+	}
+}
+
+func TestPatchCommandFailureClassifiesFatalRepositoryErrorsAsInfrastructure(t *testing.T) {
+	exitErr := errors.New("exit status 128")
+	failure := errors.New("git apply failed")
+	for _, output := range []string{
+		"fatal: Unable to create '.git/index.lock': Permission denied",
+		"fatal: not a git repository",
+		"error: unable to write new index file: No space left on device",
+	} {
+		classified := classifyPatchCommandFailure(context.Background(), exitErr, output, failure)
+		if !isPatchEngineInfrastructureFailure(classified) {
+			t.Fatalf("fatal repository failure was charged to the model: %q => %v", output, classified)
+		}
+	}
+	classified := classifyPatchCommandFailure(context.Background(), exitErr, "error: patch failed: src/value.txt:1\nerror: src/value.txt: patch does not apply", failure)
+	if isPatchEngineInfrastructureFailure(classified) {
+		t.Fatalf("deterministic patch rejection was classified as infrastructure: %v", classified)
 	}
 }
 

@@ -30,4 +30,5 @@ Set-Content -LiteralPath "$asset.sha256" -Value "$hash  $([IO.Path]::GetFileName
 & (Join-Path $WorkRoot "installed/runtime/node.exe") (Join-Path $WorkRoot "installed/visual-hive/visual-hive.mjs") --version | Out-Null
 $plan = & (Join-Path $WorkRoot "installed/hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $WorkRoot "state") --json | ConvertFrom-Json
 if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Installed Hive did not produce a read-only setup plan." }
+& (Join-Path $HiveRoot "test/integrated-installer-windows-failure-smoke.ps1") -Installer (Join-Path $HiveRoot "install-integrated.ps1") -ReleaseDir $WorkRoot -Version $releaseVersion -WorkRoot (Join-Path $WorkRoot "failure-smoke")
 Write-Host "Windows integrated installer smoke passed: $WorkRoot"

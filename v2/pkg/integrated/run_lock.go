@@ -67,7 +67,10 @@ func acquireProductionRunLease(stateDir string, duration time.Duration) (func(),
 		existingData, readErr := os.ReadFile(path)
 		var existing productionRunLease
 		if readErr == nil && json.Unmarshal(existingData, &existing) == nil && existing.SchemaVersion == "hive.production-run-lease.v1" {
-			if existing.ExpiresAt.After(time.Now().UTC()) {
+			// ExpiresAt bounds stale-file recovery only. It must never authorize
+			// stealing a lease from a live process: a long production run may
+			// legitimately outlive the originally estimated duration.
+			if productionLeaseOwnerAlive(existing.PID) {
 				return nil, fmt.Errorf("%w (pid=%d, started=%s, expires=%s)", ErrRunInProgress, existing.PID, existing.StartedAt.Format(time.RFC3339), existing.ExpiresAt.Format(time.RFC3339))
 			}
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {

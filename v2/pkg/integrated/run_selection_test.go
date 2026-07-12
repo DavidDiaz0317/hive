@@ -127,7 +127,7 @@ func TestDurableRepairAttemptsUsesWorkerCheckpointForCurrentRecurrence(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Put(repair.Attempt{RepositoryFingerprint: "finding", Attempt: 4, Recurrence: 2, Stage: repair.StageNoChange}); err != nil {
+	if err := store.Put(repair.Attempt{RepositoryFingerprint: "finding", Attempt: 4, AttemptCounted: true, Recurrence: 2, Stage: repair.StageNoChange}); err != nil {
 		t.Fatal(err)
 	}
 	spent, err := durableRepairAttempts(stateDir, visualhive.FindingLifecycle{RepositoryFingerprint: "finding", RepairAttempts: 3, Recurrences: 2})
@@ -204,7 +204,7 @@ func TestMarkMergePolicyHoldPersistsReviewRequirement(t *testing.T) {
 	}
 }
 
-func TestReconcileExternallyMergedRepairPersistsExactMerge(t *testing.T) {
+func TestReconcileExternallyMergedRepairRejectsMergeWithoutHiveIntent(t *testing.T) {
 	deleted := 0
 	server := newMergedRepairServer(t, &deleted)
 	defer server.Close()
@@ -236,13 +236,14 @@ func TestReconcileExternallyMergedRepairPersistsExactMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
-	reconciled, err := reconcileExternallyMergedRepair(context.Background(), lifecycle, client)
-	if err != nil {
-		t.Fatal(err)
+	policy := automation.Policy{ACMMLevel: 6, Mode: automation.ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 5}
+	reconciled, err := reconcileExternallyMergedRepair(context.Background(), dir, Config{Repository: "owner/repo", RepositoryID: "123"}, lifecycle, client, policy)
+	if err == nil || !strings.Contains(err.Error(), "without a durable Hive merge intent") {
+		t.Fatalf("external merge was not rejected: reconciled=%t err=%v", reconciled, err)
 	}
 	finding, exists := lifecycle.Finding("finding")
-	if !reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != "merge-sha" || finding.HumanReviewRequired || finding.ManualReviewKind != "" || deleted != 1 {
-		t.Fatalf("external merge was not persisted and cleaned: reconciled=%t deleted=%d finding=%+v", reconciled, deleted, finding)
+	if reconciled || !exists || finding.Status != visualhive.StatusReady || finding.MergeSHA != "" || !finding.HumanReviewRequired || deleted != 0 {
+		t.Fatalf("rejected external merge changed lifecycle: reconciled=%t deleted=%d finding=%+v", reconciled, deleted, finding)
 	}
 }
 
@@ -252,15 +253,23 @@ func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls" && request.URL.Query().Get("state") == "open":
-			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":11,"html_url":"https://example.test/pull/11","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head"},"base":{"ref":"main"}},{"number":12,"html_url":"https://example.test/pull/12","body":%q,"head":{"ref":"hive/repair-current","sha":"current-head"},"base":{"ref":"main"}}]`, marker, marker))
+			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":11,"html_url":"https://example.test/pull/11","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}},{"number":12,"html_url":"https://example.test/pull/12","body":%q,"head":{"ref":"hive/repair-current","sha":"current-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}]`, marker, marker))
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/11":
-			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":11,"state":"open","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head"}}`, marker))
+			state := "open"
+			if closed > 0 {
+				state = "closed"
+			}
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":11,"state":%q,"body":%q,"head":{"ref":"hive/repair-old","sha":"old-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}`, state, marker))
 		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/pulls/11":
 			closed++
 			_, _ = io.WriteString(writer, `{"number":11,"state":"closed"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-old":
 			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-old","object":{"sha":"old-head","type":"commit"}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-current":
+			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-current","object":{"sha":"current-head","type":"commit"}}`)
 		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/repair-old":
 			deleted++
 			writer.WriteHeader(http.StatusNoContent)
@@ -312,6 +321,8 @@ func TestReconcileApprovedBaselineBranchDeletesExactReviewedRef(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/matching-refs/heads/hive/baseline-":
 			_, _ = io.WriteString(writer, `[]`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/baseline-reviewed":
@@ -374,7 +385,7 @@ func TestReconcileApprovedBaselineBranchDeletesExactReviewedRef(t *testing.T) {
 	}
 }
 
-func TestReconcileExternallyMergedRepairRecoversLegacyClosedState(t *testing.T) {
+func TestReconcileExternallyMergedRepairDoesNotImplicitlyMigrateLegacyClosedState(t *testing.T) {
 	deleted := 0
 	server := newMergedRepairServer(t, &deleted)
 	defer server.Close()
@@ -402,13 +413,14 @@ func TestReconcileExternallyMergedRepairRecoversLegacyClosedState(t *testing.T) 
 		t.Fatal(err)
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
-	reconciled, err := reconcileExternallyMergedRepair(context.Background(), lifecycle, client)
+	policy := automation.Policy{ACMMLevel: 6, Mode: automation.ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 5}
+	reconciled, err := reconcileExternallyMergedRepair(context.Background(), dir, Config{Repository: "owner/repo", RepositoryID: "123"}, lifecycle, client, policy)
 	if err != nil {
 		t.Fatal(err)
 	}
 	finding, exists := lifecycle.Finding("finding")
-	if reconciled || !exists || finding.Status != visualhive.StatusIssueClosed || finding.MergeSHA != "merge-sha" || finding.HumanReviewRequired || finding.ManualReviewKind != "" || deleted != 1 {
-		t.Fatalf("legacy closed merge was not recovered and cleaned: reconciled=%t deleted=%d finding=%+v", reconciled, deleted, finding)
+	if reconciled || !exists || finding.Status != visualhive.StatusIssueClosed || finding.MergeSHA != "" || deleted != 0 {
+		t.Fatalf("legacy closed merge bypassed explicit migration: reconciled=%t deleted=%d finding=%+v", reconciled, deleted, finding)
 	}
 }
 
@@ -417,16 +429,20 @@ func newMergedRepairServer(t *testing.T, deleted *int) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
+			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/12":
-			_, _ = io.WriteString(writer, `{"number":12,"state":"closed","merged":true,"merge_commit_sha":"merge-sha","head":{"sha":"repair-sha"},"base":{"ref":"main"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":12,"state":"closed","merged":true,"merge_commit_sha":"merge-sha","head":{"sha":"repair-sha","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-before"},"labels":[]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/12/files":
 			_, _ = io.WriteString(writer, `[{"filename":"index.html"}]`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
-			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]},"required_pull_request_reviews":{"required_approving_review_count":0}}`)
+			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"checks":[{"context":"visual-hive","app_id":42}]},"enforce_admins":{"enabled":true},"required_pull_request_reviews":{"required_approving_review_count":0}}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/commits/repair-sha/check-runs":
-			_, _ = io.WriteString(writer, `{"total_count":1,"check_runs":[{"name":"visual-hive","head_sha":"repair-sha","status":"completed","conclusion":"success"}]}`)
+			_, _ = io.WriteString(writer, `{"total_count":1,"check_runs":[{"id":120,"name":"visual-hive","app":{"id":42},"check_suite":{"id":121},"head_sha":"repair-sha","status":"completed","conclusion":"success"}]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/commits/repair-sha/status":
 			_, _ = io.WriteString(writer, `{"state":"success","statuses":[]}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/visual-hive-pr.yml/runs":
+			_, _ = io.WriteString(writer, `{"total_count":1,"workflow_runs":[{"id":122,"name":"Visual Hive PR","path":".github/workflows/visual-hive-pr.yml","event":"pull_request","head_branch":"hive/repair-proof","head_sha":"repair-sha","status":"completed","conclusion":"success","check_suite_id":121,"repository":{"full_name":"owner/repo"},"head_repository":{"full_name":"owner/repo"},"pull_requests":[{"number":12,"head":{"sha":"repair-sha","ref":"hive/repair-proof"},"base":{"sha":"base-before","ref":"main"}}]}]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-proof":
 			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-proof","object":{"sha":"repair-sha","type":"commit"}}`)
 		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/repair-proof":
