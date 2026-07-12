@@ -3,9 +3,13 @@ package integrated
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestInspectCheckoutBuildsRepositorySpecificSignals(t *testing.T) {
@@ -54,6 +58,110 @@ func TestInspectCheckoutDiscoversNestedDashboardAndPythonTests(t *testing.T) {
 	}
 	if len(inspection.BaselineFiles) != 1 || inspection.BaselineFiles[0] != "tests/__screenshots__/home.png" {
 		t.Fatalf("nested screenshot baseline was not detected: %+v", inspection.BaselineFiles)
+	}
+}
+
+func TestInspectCheckoutUsesEachPackageLockfileRunner(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "apps/pnpm/package.json", `{"scripts":{"test:unit":"vitest run"}}`)
+	writeFixture(t, root, "apps/pnpm/pnpm-lock.yaml", "lockfileVersion: '9.0'")
+	writeFixture(t, root, "apps/yarn/package.json", `{"scripts":{"test:unit":"vitest run"}}`)
+	writeFixture(t, root, "apps/yarn/yarn.lock", "# yarn lockfile")
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCommand(inspection.TestCommands, "pnpm", "--dir", "apps/pnpm", "run", "test:unit") {
+		t.Fatalf("pnpm workspace generated the wrong runner: %+v", inspection.TestCommands)
+	}
+	if !hasCommand(inspection.TestCommands, "yarn", "--cwd", "apps/yarn", "run", "test:unit") {
+		t.Fatalf("yarn workspace generated the wrong runner: %+v", inspection.TestCommands)
+	}
+}
+
+func TestInspectCheckoutInheritsNearestWorkspaceRunner(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "pnpm-lock.yaml", "lockfileVersion: '9.0'")
+	writeFixture(t, root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n")
+	writeFixture(t, root, "package.json", `{"private":true}`)
+	writeFixture(t, root, "packages/app/package.json", `{"scripts":{"test:unit":"vitest run"}}`)
+	writeFixture(t, root, "examples/tool/package.json", `{"scripts":{"test:unit":"vitest run"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCommand(inspection.TestCommands, "pnpm", "--dir", "packages/app", "run", "test:unit") {
+		t.Fatalf("nested package did not inherit the nearest pnpm lock: %+v", inspection.TestCommands)
+	}
+	if !hasCommand(inspection.TestCommands, "npm", "--prefix", "examples/tool", "run", "test:unit") {
+		t.Fatalf("unrelated descendant incorrectly inherited the pnpm workspace lock: %+v", inspection.TestCommands)
+	}
+}
+
+func TestInspectCheckoutRejectsAmbiguousPackageLocks(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test":"vitest run"}}`)
+	writeFixture(t, root, "package-lock.json", `{}`)
+	writeFixture(t, root, "pnpm-lock.yaml", "lockfileVersion: '9.0'")
+	if _, err := InspectCheckout(root, "main"); err == nil || !strings.Contains(err.Error(), "ambiguous lockfiles") {
+		t.Fatalf("ambiguous package manager scope was accepted: %v", err)
+	}
+}
+
+func TestTargetPackageInstallHandlesMixedLockedAndLocklessRoots(t *testing.T) {
+	bash := workflowBash(t)
+	root := t.TempDir()
+	writeFixture(t, root, "locked/package.json", `{}`)
+	writeFixture(t, root, "locked/package-lock.json", `{}`)
+	writeFixture(t, root, "lockless/package.json", `{}`)
+	writeFixture(t, root, "workspace/package.json", `{"workspaces":["packages/*"]}`)
+	writeFixture(t, root, "workspace/package-lock.json", `{}`)
+	writeFixture(t, root, "workspace/packages/member/package.json", `{}`)
+	writeFixture(t, root, "workspace/examples/tool/package.json", `{}`)
+	writeFixture(t, root, "yarn-classic/package.json", `{}`)
+	writeFixture(t, root, "yarn-classic/yarn.lock", "# classic")
+	writeFixture(t, root, "yarn-berry/package.json", `{"packageManager":"yarn@4.9.1"}`)
+	writeFixture(t, root, "yarn-berry/yarn.lock", "# berry")
+	fakeBin := filepath.Join(root, "fake-bin")
+	writeFixture(t, fakeBin, "npm", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$INSTALL_LOG\"\n")
+	writeFixture(t, fakeBin, "corepack", "#!/usr/bin/env bash\nexit 0\n")
+	writeFixture(t, fakeBin, "yarn", "#!/usr/bin/env bash\nif [ \"${1:-}\" = --version ]; then case \"$PWD\" in *yarn-berry) echo 4.9.1 ;; *) echo 1.22.22 ;; esac; exit 0; fi\nprintf 'yarn:%s:%s\\n' \"$(basename \"$PWD\")\" \"$*\" >> \"$INSTALL_LOG\"\n")
+	for _, executable := range []string{"npm", "corepack", "yarn"} {
+		if err := os.Chmod(filepath.Join(fakeBin, executable), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lines := strings.Split(targetPackageInstallShell(), "\n")
+	for index := range lines {
+		lines[index] = strings.TrimPrefix(lines[index], "          ")
+	}
+	script := "export PATH=" + shellQuote(bashFilesystemPath(fakeBin)) + ":\"$PATH\"\n" + strings.Join(lines, "\n")
+	command := exec.Command(bash, "-e", "-o", "pipefail", "-c", script)
+	command.Dir = root
+	command.Env = append(os.Environ(), "INSTALL_LOG="+bashFilesystemPath(filepath.Join(root, "install.log")))
+	shellOutput, runErr := command.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("generated package install failed: %v\n%s", runErr, shellOutput)
+	}
+	log, err := os.ReadFile(filepath.Join(root, "install.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := string(log)
+	for _, expected := range []string{"--prefix ./locked ci", "--prefix ./workspace ci", "--prefix ./lockless install", "--prefix ./workspace/examples/tool install", "yarn:yarn-classic:install --frozen-lockfile", "yarn:yarn-berry:install --immutable"} {
+		if !strings.Contains(value, expected) {
+			t.Fatalf("install plan omitted %q:\n%s", expected, value)
+		}
+	}
+	if strings.Contains(value, "workspace/packages/member") {
+		t.Fatalf("ancestor lock-owned workspace member was installed twice:\n%s\nshell output:\n%s", value, shellOutput)
+	}
+	installShell := targetPackageInstallShell()
+	for _, required := range []string{"yarn --version", "yarn install --immutable", "yarn install --frozen-lockfile"} {
+		if !strings.Contains(installShell, required) {
+			t.Fatalf("Yarn major-version compatibility missing %q:\n%s", required, installShell)
+		}
 	}
 }
 
@@ -115,6 +223,34 @@ func TestInspectCheckoutKeepsOnlyBoundedNonInteractiveAutomation(t *testing.T) {
 		if len(command) != 3 || command[2] != name {
 			t.Fatalf("command %d = %v, want npm run %s", index, command, name)
 		}
+	}
+}
+
+func TestUnsafeLiteDoesNotSuppressSafeUnitAndBuildCommands(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:unit":"vitest run","test:ci:lite":"npm run test:unit || true","test:masked":"vitest run | tee results.txt"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCommandNamed(inspection.TestCommands, "build") || !hasCommandNamed(inspection.TestCommands, "test:unit") {
+		t.Fatalf("unsafe lite wrapper suppressed safe commands: %+v", inspection.TestCommands)
+	}
+	if hasCommandNamed(inspection.TestCommands, "test:ci:lite") || hasCommandNamed(inspection.TestCommands, "test:masked") {
+		t.Fatalf("failure-masking command was selected as evidence: %+v", inspection.TestCommands)
+	}
+}
+
+func TestGranularProducerDoesNotSuppressAnotherPackageSuite(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "apps/a/package.json", `{"scripts":{"test:unit":"vitest run"}}`)
+	writeFixture(t, root, "apps/b/package.json", `{"scripts":{"test:suite":"node suite.js"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCommand(inspection.TestCommands, "npm", "--prefix", "apps/a", "run", "test:unit") || !hasCommand(inspection.TestCommands, "npm", "--prefix", "apps/b", "run", "test:suite") {
+		t.Fatalf("repository-global suite suppression dropped a package: %+v", inspection.TestCommands)
 	}
 }
 
@@ -221,7 +357,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}, {"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "--github-step-summary"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "run_repository_test npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "repository-test-exit-code.txt", "repository-tests.tsv", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "--github-step-summary", "bundle cannot resolve absent findings", "resolution_args+=(--authoritative-for-resolution)"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}
@@ -253,12 +389,20 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	if containsString(value, "schedule:") || containsString(value, "push:") {
 		t.Fatalf("production workflow must be dispatch-only so every run has exactly one Hive consumer:\n%s", value)
 	}
+	var document any
+	if err := yaml.Unmarshal([]byte(value), &document); err != nil || strings.Contains(value, "%!") {
+		t.Fatalf("generated production workflow is invalid: %v\n%s", err, value)
+	}
 }
 
 func TestComprehensiveCoverageKeepsNestedCIUnitSuiteWithoutNodeFallback(t *testing.T) {
 	inspection := RepositoryInspection{
 		Languages:    []string{"TypeScript/JavaScript"},
 		TestCommands: [][]string{{"npm", "--prefix", "dashboard", "run", "test:ci:lite"}},
+		packageScripts: map[string]map[string]string{
+			"dashboard": {"test:ci:lite": "npm run test:unit", "test:unit": "vitest run"},
+		},
+		packageRunners: map[string]string{"dashboard": "npm"},
 	}
 	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
 	if len(commands) != 1 || strings.Join(commands[0], " ") != "npm --prefix dashboard run test:ci:lite" {
@@ -266,9 +410,221 @@ func TestComprehensiveCoverageKeepsNestedCIUnitSuiteWithoutNodeFallback(t *testi
 	}
 }
 
+func TestComprehensiveCoverageAddsUnitFallbackWhenCIScriptHasNoUnitRunner(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:e2e":"playwright test","test:ci:lite":"npm run build && npm run test:e2e"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("generic CI script without a unit runner suppressed fallback: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageDoesNotTreatRunnerNameInProseAsExecution(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:unit":"echo vitest is not configured","test:ci:lite":"npm run test:unit"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("runner name in prose suppressed the unit fallback: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageDoesNotTreatRunnerNameInScriptNameAsExecution(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:vitest-docs":"echo runner is not configured"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("runner name in a package script name suppressed the unit fallback: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageDoesNotTrustForwardedUnitHelpInvocation(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:unit":"vitest run","test:ci:lite":"npm run test:unit -- --help"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("forwarded unit help invocation suppressed the unit fallback: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageDoesNotTrustUnitRunnerHelpMode(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:unit":"vitest --help"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommand(commands, "node", "--test") {
+		t.Fatalf("unit runner help mode suppressed the unit fallback: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageRequiresExactForwardedInvocationWithoutFullSelection(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:unit":"vitest run","test:ci:lite":"npm run test:unit -- --help","test:all":"npm run test:unit && npm run build"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if hasCommandNamed(commands, "test:all") || !hasCommand(commands, "node", "--test") {
+		t.Fatalf("unfiltered aggregate was treated as exact for a forwarded-only selection: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageCandidateCannotSelfMaskForwardedRequirement(t *testing.T) {
+	inspection := RepositoryInspection{
+		Languages: []string{"TypeScript/JavaScript"},
+		TestCommands: [][]string{
+			{"npm", "run", "test:all"},
+			{"npm", "run", "test:e2e:smoke"},
+		},
+		packageScripts: map[string]map[string]string{
+			".": {
+				"build":          "vite build",
+				"test:unit":      "vitest run",
+				"test:e2e:smoke": "npm run test:unit -- --help",
+				"test:all":       "npm run test:unit && npm run build",
+			},
+		},
+		packageRunners: map[string]string{".": "npm"},
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if !hasCommandNamed(commands, "test:e2e:smoke") {
+		t.Fatalf("candidate self-coverage masked a forwarded-only requirement: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoveragePrefersProvenRepositoryAggregateWithoutDuplication(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]")
+	writeFixture(t, root, "tests/test_api.py", "def test_api(): assert True")
+	writeFixture(t, root, "dashboard/package-lock.json", `{}`)
+	writeFixture(t, root, "dashboard/package.json", `{
+		"scripts": {
+			"format:check": "prettier --check .",
+			"lint": "eslint .",
+			"typecheck": "tsc --noEmit",
+			"build": "vite build",
+			"test:unit": "vitest run",
+			"test:coverage": "vitest run --coverage",
+			"test:e2e": "playwright test --project=e2e",
+			"test:a11y": "playwright test --project=a11y",
+			"test:security": "npm audit",
+			"test:perf": "lhci autorun",
+			"test:visual": "playwright test --project=visual",
+			"test:ci:lite": "npm run build && npm run test:unit && npm run test:e2e -- --grep=smoke && npm run test:a11y -- --grep=smoke",
+			"test:ci:heavy": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run test:e2e && npm run test:a11y && npm run test:security && npm run test:perf",
+			"test:all": "npm run test:ci:heavy && npm run test:visual"
+		}
+	}`)
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	want := [][]string{{"npm", "--prefix", "dashboard", "run", "test:all"}, {"python", "-m", "pytest", "-q"}}
+	if len(commands) != len(want) {
+		t.Fatalf("comprehensive plan is duplicative: %+v", commands)
+	}
+	for index := range want {
+		if strings.Join(commands[index], "\x00") != strings.Join(want[index], "\x00") {
+			t.Fatalf("command %d = %v, want %v", index, commands[index], want[index])
+		}
+	}
+}
+
+func TestComprehensiveCoverageRejectsAggregateThatOmitsSelectedLeaf(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package-lock.json", `{}`)
+	writeFixture(t, root, "package.json", `{"scripts":{"build":"vite build","test:unit":"vitest run","test:e2e":"playwright test","test:ci:lite":"npm run build && npm run test:unit","test:all":"npm run build && npm run test:unit"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if hasCommandNamed(commands, "test:all") || !hasCommandNamed(commands, "test:e2e") {
+		t.Fatalf("unproven aggregate replaced selected leaf tests: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageRejectsTextualOrConditionalAggregateEdges(t *testing.T) {
+	for _, aggregate := range []string{
+		"echo npm run test:e2e && npm run test:unit",
+		"npm run test:e2e || npm run test:unit",
+		"npm run test:e2e | npm run test:unit",
+	} {
+		root := t.TempDir()
+		writeFixture(t, root, "package.json", `{"scripts":{"test:unit":"vitest run","test:e2e":"playwright test","test:ci:lite":"npm run test:unit","test:all":`+strconv.Quote(aggregate)+`}}`)
+		inspection, err := InspectCheckout(root, "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+		if hasCommandNamed(commands, "test:all") {
+			t.Fatalf("non-unconditional aggregate %q was trusted: %+v", aggregate, commands)
+		}
+	}
+}
+
+func TestComprehensiveCoverageRejectsFilteredAggregateForFullSelectedLeaf(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:unit":"vitest run","test:e2e":"playwright test","test:ci:lite":"npm run test:unit","test:all":"npm run test:e2e -- --grep=smoke && npm run test:unit"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if hasCommandNamed(commands, "test:all") || !hasCommandNamed(commands, "test:e2e") {
+		t.Fatalf("filtered aggregate invocation replaced a full selected leaf: %+v", commands)
+	}
+}
+
+func TestRepositoryTestShellCapturesFailureAndContinues(t *testing.T) {
+	bash := workflowBash(t)
+	config := Config{TestCommands: [][]string{{"bash", "-c", "exit 7"}, {"bash", "-c", "printf continued > continued.txt"}}}
+	lines := strings.Split(repositoryTestShell(config), "\n")
+	for index := range lines {
+		lines[index] = strings.TrimPrefix(lines[index], "          ")
+	}
+	command := exec.Command(bash, "-e", "-o", "pipefail", "-c", strings.Join(lines, "\n"))
+	command.Dir = t.TempDir()
+	if output, runErr := command.CombinedOutput(); runErr != nil {
+		t.Fatalf("generated shell aborted before evidence capture: %v\n%s", runErr, output)
+	}
+	result, err := os.ReadFile(filepath.Join(command.Dir, ".visual-hive", "repository-test-exit-code.txt"))
+	if err != nil || strings.TrimSpace(string(result)) != "7" {
+		t.Fatalf("repository exit artifact = %q, err %v", result, err)
+	}
+	if _, err := os.Stat(filepath.Join(command.Dir, "continued.txt")); err != nil {
+		t.Fatalf("later repository command did not run: %v", err)
+	}
+	pipelineSentinel, err := os.ReadFile(filepath.Join(command.Dir, ".visual-hive", "pipeline-exit-code.txt"))
+	if err != nil || strings.TrimSpace(string(pipelineSentinel)) != "1" {
+		t.Fatalf("pipeline sentinel = %q, err %v", pipelineSentinel, err)
+	}
+}
+
 func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "node --test", "visual-hive-pr", "pipeline-exit-code.txt", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "run_repository_test node --test", "visual-hive-pr", "pipeline-exit-code.txt", "repository-test-exit-code.txt", "Repository test plan failed", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow missing %q", required)
 		}
@@ -286,6 +642,10 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	}
 	if containsString(value, "HIVE_FRESH_SETUP") {
 		t.Fatal("pull request workflow must not let an inconsistent installation self-certify through a reduced fresh-setup lane")
+	}
+	var document any
+	if err := yaml.Unmarshal([]byte(value), &document); err != nil || strings.Contains(value, "%!") {
+		t.Fatalf("generated pull-request workflow is invalid: %v\n%s", err, value)
 	}
 }
 
@@ -351,4 +711,31 @@ func hasCommand(commands [][]string, want ...string) bool {
 		}
 	}
 	return false
+}
+
+func workflowBash(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{
+		filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe"),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Git", "bin", "bash.exe"),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	if bash, err := exec.LookPath("bash"); err == nil {
+		return bash
+	}
+	t.Skip("bash is required to execute the generated GitHub Actions shell")
+	return ""
+}
+
+func bashFilesystemPath(value string) string {
+	value = filepath.Clean(value)
+	volume := filepath.VolumeName(value)
+	if len(volume) == 2 && volume[1] == ':' {
+		rest := strings.TrimPrefix(filepath.ToSlash(value), filepath.ToSlash(volume))
+		return "/" + strings.ToLower(volume[:1]) + rest
+	}
+	return filepath.ToSlash(value)
 }

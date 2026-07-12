@@ -43,6 +43,8 @@ type RepositoryInspection struct {
 	BranchProtection bool              `json:"branch_protection"`
 	Permissions      map[string]bool   `json:"permissions"`
 	Signals          map[string]string `json:"signals"`
+	packageScripts   map[string]map[string]string
+	packageRunners   map[string]string
 }
 
 type SetupPlan struct {

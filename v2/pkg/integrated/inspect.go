@@ -2,12 +2,16 @@ package integrated
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 type packageJSON struct {
@@ -17,7 +21,13 @@ type packageJSON struct {
 }
 
 func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
-	inspection := RepositoryInspection{DefaultBranch: defaultBranch, Permissions: map[string]bool{}, Signals: map[string]string{}}
+	inspection := RepositoryInspection{
+		DefaultBranch:  defaultBranch,
+		Permissions:    map[string]bool{},
+		Signals:        map[string]string{},
+		packageScripts: map[string]map[string]string{},
+		packageRunners: map[string]string{},
+	}
 	committedFiles, hasCommittedHead := committedFileSet(root)
 	languages, frameworks, managers := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	packageFiles := findPackageJSONFiles(root)
@@ -33,6 +43,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		if packagePath == "" {
 			packagePath = "."
 		}
+		inspection.packageScripts[packagePath] = cloneScriptMap(packageData.Scripts)
 		languages["TypeScript/JavaScript"] = true
 		for name := range mergeMaps(packageData.Dependencies, packageData.DevDependencies) {
 			switch {
@@ -48,23 +59,19 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 				frameworks["Storybook"] = true
 			}
 		}
-		commands := packageScriptCommands(packagePath, packageData.Scripts)
+		runner, err := packageRunnerForRoot(root, packageRoot)
+		if err != nil {
+			return RepositoryInspection{}, err
+		}
+		managers[map[string]string{"npm": "npm", "pnpm": "pnpm", "yarn": "yarn"}[runner]] = true
+		inspection.packageRunners[packagePath] = runner
+		commands := packageScriptCommands(packagePath, runner, packageData.Scripts)
 		inspection.TestCommands = append(inspection.TestCommands, commands...)
 		for name, script := range packageData.Scripts {
 			lowerName := strings.ToLower(name)
 			if name == "test" || name == "build" || name == "vh:plan" || name == "vh:run" || strings.Contains(lowerName, "test") || strings.Contains(lowerName, "lint") || strings.Contains(lowerName, "typecheck") || strings.Contains(lowerName, "suite") || strings.Contains(lowerName, "mutation") || strings.Contains(lowerName, "mutate") || strings.Contains(lowerName, "e2e") || strings.Contains(lowerName, "visual") {
 				inspection.Signals["script:"+packagePath+":"+name] = script
 			}
-		}
-		switch {
-		case exists(filepath.Join(packageRoot, "package-lock.json")):
-			managers["npm"] = true
-		case exists(filepath.Join(packageRoot, "pnpm-lock.yaml")):
-			managers["pnpm"] = true
-		case exists(filepath.Join(packageRoot, "yarn.lock")):
-			managers["yarn"] = true
-		default:
-			managers["npm"] = true
 		}
 	}
 	inspection.TestCommands = preferGranularTestCommands(inspection.TestCommands)
@@ -223,25 +230,26 @@ func findPackageJSONFiles(root string) []string {
 	return result
 }
 
-func packageScriptCommands(packagePath string, scripts map[string]string) [][]string {
+func packageScriptCommands(packagePath, runner string, scripts map[string]string) [][]string {
 	commands := [][]string{}
 	names := make([]string, 0, len(scripts))
 	for name := range scripts {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	_, hasLite := scripts["test:ci:lite"]
-	if hasLite && safeAutomationScript("test:ci:lite", scripts["test:ci:lite"]) {
-		commands = append(commands, npmScriptCommand(packagePath, "test:ci:lite"))
+	liteBody, hasLite := scripts["test:ci:lite"]
+	hasLite = hasLite && safeAutomationScript("test:ci:lite", liteBody)
+	if hasLite {
+		commands = append(commands, packageScriptCommand(packagePath, runner, "test:ci:lite"))
 	}
 	for _, name := range names {
 		if name == "test:ci:lite" || !safeAutomationScript(name, scripts[name]) {
 			continue
 		}
-		if hasLite && commandCoverageRank(npmScriptCommand(packagePath, name)) == 1 {
+		if hasLite && commandCoverageRank(packageScriptCommand(packagePath, runner, name)) == 1 {
 			continue
 		}
-		commands = append(commands, npmScriptCommand(packagePath, name))
+		commands = append(commands, packageScriptCommand(packagePath, runner, name))
 	}
 	return commands
 }
@@ -261,14 +269,163 @@ func safeAutomationScript(name, body string) bool {
 			return false
 		}
 	}
+	// npm scripts run in a shell that does not guarantee pipefail. Reject
+	// failure-masking or multi-statement forms rather than treating a swallowed
+	// test failure as deterministic evidence. A strict && chain is allowed.
+	if strings.ContainsAny(body, ";\r\n|`") || strings.Contains(strings.ReplaceAll(body, "&&", ""), "&") {
+		return false
+	}
 	return commandCoverageRank([]string{"npm", "run", name}) > 0
 }
 
-func npmScriptCommand(packagePath, name string) []string {
-	if packagePath == "." {
-		return []string{"npm", "run", name}
+func packageRunnerForRoot(root, packageRoot string) (string, error) {
+	root = filepath.Clean(root)
+	directory := filepath.Clean(packageRoot)
+	for {
+		locks := []struct {
+			name   string
+			runner string
+		}{
+			{name: "package-lock.json", runner: "npm"},
+			{name: "pnpm-lock.yaml", runner: "pnpm"},
+			{name: "yarn.lock", runner: "yarn"},
+		}
+		matched := []string{}
+		runner := ""
+		for _, lock := range locks {
+			if exists(filepath.Join(directory, lock.name)) {
+				matched = append(matched, lock.name)
+				runner = lock.runner
+			}
+		}
+		if len(matched) > 1 {
+			relative, _ := filepath.Rel(root, directory)
+			if relative == "" {
+				relative = "."
+			}
+			return "", fmt.Errorf("package scope %s has ambiguous lockfiles: %s", filepath.ToSlash(relative), strings.Join(matched, ", "))
+		}
+		if runner != "" && (directory == filepath.Clean(packageRoot) || packageScopeOwnsPath(directory, packageRoot)) {
+			return runner, nil
+		}
+		if directory == root {
+			break
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		relative, err := filepath.Rel(root, parent)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			break
+		}
+		directory = parent
 	}
-	return []string{"npm", "--prefix", packagePath, "run", name}
+	return "npm", nil
+}
+
+func packageScopeOwnsPath(scope, packageRoot string) bool {
+	relative, err := filepath.Rel(scope, packageRoot)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return workspacePatternsMatch(workspacePatterns(scope), filepath.ToSlash(relative))
+}
+
+func workspacePatterns(scope string) []string {
+	patterns := []string{}
+	if data, err := os.ReadFile(filepath.Join(scope, "package.json")); err == nil {
+		var document struct {
+			Workspaces json.RawMessage `json:"workspaces"`
+		}
+		if json.Unmarshal(data, &document) == nil && len(document.Workspaces) > 0 {
+			var direct []string
+			if json.Unmarshal(document.Workspaces, &direct) == nil {
+				patterns = append(patterns, direct...)
+			} else {
+				var nested struct {
+					Packages []string `json:"packages"`
+				}
+				if json.Unmarshal(document.Workspaces, &nested) == nil {
+					patterns = append(patterns, nested.Packages...)
+				}
+			}
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(scope, "pnpm-workspace.yaml")); err == nil {
+		var document struct {
+			Packages []string `yaml:"packages"`
+		}
+		if yaml.Unmarshal(data, &document) == nil {
+			patterns = append(patterns, document.Packages...)
+		}
+	}
+	return patterns
+}
+
+func workspacePatternsMatch(patterns []string, relative string) bool {
+	relative = strings.Trim(filepath.ToSlash(relative), "/")
+	matched := false
+	for _, raw := range patterns {
+		pattern := strings.TrimSpace(filepath.ToSlash(raw))
+		excluded := strings.HasPrefix(pattern, "!")
+		pattern = strings.TrimPrefix(pattern, "!")
+		pattern = strings.TrimPrefix(pattern, "./")
+		pattern = strings.Trim(pattern, "/")
+		if pattern == "" {
+			continue
+		}
+		expression, err := regexp.Compile(workspaceGlobExpression(pattern))
+		if err == nil && expression.MatchString(relative) {
+			matched = !excluded
+		}
+	}
+	return matched
+}
+
+func workspaceGlobExpression(pattern string) string {
+	var result strings.Builder
+	result.WriteString("^")
+	for index := 0; index < len(pattern); index++ {
+		character := pattern[index]
+		switch character {
+		case '*':
+			if index+1 < len(pattern) && pattern[index+1] == '*' {
+				index++
+				if index+1 < len(pattern) && pattern[index+1] == '/' {
+					index++
+					result.WriteString("(?:.*/)?")
+				} else {
+					result.WriteString(".*")
+				}
+			} else {
+				result.WriteString("[^/]*")
+			}
+		case '?':
+			result.WriteString("[^/]")
+		default:
+			if strings.ContainsRune(`.+()|[]{}^$\`, rune(character)) {
+				result.WriteByte('\\')
+			}
+			result.WriteByte(character)
+		}
+	}
+	result.WriteString("$")
+	return result.String()
+}
+
+func packageScriptCommand(packagePath, runner, name string) []string {
+	if packagePath == "." {
+		return []string{runner, "run", name}
+	}
+	switch runner {
+	case "pnpm":
+		return []string{"pnpm", "--dir", packagePath, "run", name}
+	case "yarn":
+		return []string{"yarn", "--cwd", packagePath, "run", name}
+	default:
+		return []string{"npm", "--prefix", packagePath, "run", name}
+	}
 }
 
 func fileContains(path, value string) bool {
@@ -302,6 +459,8 @@ func testCommandPriority(command []string) int {
 		return 40
 	case strings.Contains(value, "mutation") || strings.Contains(value, "mutate"):
 		return 35
+	case strings.Contains(value, "test:ci:lite"):
+		return 25
 	case strings.Contains(value, "suite") || strings.Contains(value, " e2e") || strings.Contains(value, " visual") || strings.Contains(value, " test") || strings.Contains(value, " run"):
 		return 30
 	case strings.Contains(value, "typecheck") || strings.Contains(value, "lint"):
@@ -316,22 +475,27 @@ func testCommandPriority(command []string) int {
 }
 
 func preferGranularTestCommands(commands [][]string) [][]string {
-	hasGranularProducer := false
+	hasGranularProducer := map[string]bool{}
 	for _, command := range commands {
+		packagePath, runner, _, ok := packageScriptCommandParts(command)
+		if !ok {
+			continue
+		}
 		name := commandScriptName(command)
 		if !strings.Contains(name, "suite") && isEvidenceProducerScript(name) {
-			hasGranularProducer = true
-			break
+			hasGranularProducer[runner+"\x00"+packagePath] = true
 		}
 	}
-	if !hasGranularProducer {
+	if len(hasGranularProducer) == 0 {
 		return commands
 	}
 	result := make([][]string, 0, len(commands))
 	for _, command := range commands {
-		if !strings.Contains(commandScriptName(command), "suite") {
-			result = append(result, command)
+		packagePath, runner, _, ok := packageScriptCommandParts(command)
+		if ok && hasGranularProducer[runner+"\x00"+packagePath] && strings.Contains(commandScriptName(command), "suite") {
+			continue
 		}
+		result = append(result, command)
 	}
 	return result
 }
@@ -357,6 +521,14 @@ func mergeMaps(left, right map[string]string) map[string]string {
 	}
 	for key, value := range right {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneScriptMap(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source))
+	for name, body := range source {
+		result[name] = body
 	}
 	return result
 }

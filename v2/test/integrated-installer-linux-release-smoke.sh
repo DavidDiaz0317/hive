@@ -78,7 +78,20 @@ test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
 test -n "$release_dir"
 attestation_bin="$work_root/attestation-bin"
 attestation_marker="$work_root/attestation-verified"
+download_dir_marker="$work_root/release-download-dir"
 release_commit=0123456789abcdef0123456789abcdef01234567
+published_version="$version"
+if ! printf '%s\n' "$published_version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$'; then
+  # A workflow_dispatch rehearsal correctly names its assembled archive with
+  # the commit SHA. Exercise the published-only trust path through a valid
+  # synthetic tag name while retaining the exact assembled archive bytes.
+  published_version=v0.0.0-integrated.0
+fi
+published_release_dir="$work_root/published-release"
+published_asset="hive-integrated-$published_version-linux-amd64.tar.gz"
+mkdir -p "$published_release_dir"
+cp -- "$release_dir/hive-integrated-$version-linux-amd64.tar.gz" "$published_release_dir/$published_asset"
+(cd "$published_release_dir" && sha256sum "$published_asset" > "$published_asset.sha256")
 mkdir -p "$attestation_bin"
 cat > "$attestation_bin/gh" <<'SH'
 #!/usr/bin/env sh
@@ -87,43 +100,48 @@ command_name="${1:-}"
 shift || true
 case "$command_name" in
   auth)
+    [ "$#" -eq 1 ]
     [ "${1:-}" = status ]
     ;;
   api)
-    case "${1:-}" in
-      repos/*/releases/latest) printf '%s\n' "$HIVE_FAKE_VERSION" ;;
-      repos/*/commits/*) printf '%s\n' "$HIVE_FAKE_COMMIT" ;;
-      *) exit 61 ;;
-    esac
+    [ "$#" -eq 3 ]
+    [ "$1" = "repos/$HIVE_FAKE_REPOSITORY/commits/$HIVE_FAKE_VERSION" ]
+    [ "$2" = --jq ]
+    [ "$3" = .sha ]
+    printf '%s\n' "$HIVE_FAKE_COMMIT"
     ;;
   release)
-    [ "${1:-}" = download ]
-    destination=""
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = --dir ]; then destination="$2"; shift 2; else shift; fi
-    done
-    [ -n "$destination" ]
+    [ "$#" -eq 10 ]
+    [ "$1" = download ]
+    [ "$2" = "$HIVE_FAKE_VERSION" ]
+    [ "$3" = --repo ]
+    [ "$4" = "$HIVE_FAKE_REPOSITORY" ]
+    [ "$5" = --pattern ]
+    [ "$6" = "$HIVE_FAKE_ASSET" ]
+    [ "$7" = --pattern ]
+    [ "$8" = "$HIVE_FAKE_ASSET.sha256" ]
+    [ "$9" = --dir ]
+    destination="${10}"
+    [ -d "$destination" ]
+    printf '%s\n' "$destination" > "$HIVE_FAKE_DOWNLOAD_DIR_MARKER"
     cp -- "$HIVE_FAKE_RELEASE_DIR/$HIVE_FAKE_ASSET" "$HIVE_FAKE_RELEASE_DIR/$HIVE_FAKE_ASSET.sha256" "$destination/"
     ;;
   attestation)
-    [ "${1:-}" = verify ]
-    shift
-    source_ref="" source_digest="" signer_digest="" signer_workflow="" denied=0
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --source-ref) source_ref="$2"; shift 2 ;;
-        --source-digest) source_digest="$2"; shift 2 ;;
-        --signer-digest) signer_digest="$2"; shift 2 ;;
-        --signer-workflow) signer_workflow="$2"; shift 2 ;;
-        --deny-self-hosted-runners) denied=1; shift ;;
-        *) shift ;;
-      esac
-    done
-    [ "$source_ref" = "refs/tags/$HIVE_FAKE_VERSION" ]
-    [ "$source_digest" = "$HIVE_FAKE_COMMIT" ]
-    [ "$signer_digest" = "$HIVE_FAKE_COMMIT" ]
-    [ "$signer_workflow" = "$HIVE_FAKE_REPOSITORY/.github/workflows/integrated-release.yml" ]
-    [ "$denied" = 1 ]
+    [ "$#" -eq 13 ]
+    [ "$1" = verify ]
+    download_dir="$(cat "$HIVE_FAKE_DOWNLOAD_DIR_MARKER")"
+    [ "$2" = "$download_dir/$HIVE_FAKE_ASSET" ]
+    [ "$3" = --repo ]
+    [ "$4" = "$HIVE_FAKE_REPOSITORY" ]
+    [ "$5" = --signer-workflow ]
+    [ "$6" = "$HIVE_FAKE_REPOSITORY/.github/workflows/integrated-release.yml" ]
+    [ "$7" = --source-ref ]
+    [ "$8" = "refs/tags/$HIVE_FAKE_VERSION" ]
+    [ "$9" = --source-digest ]
+    [ "${10}" = "$HIVE_FAKE_COMMIT" ]
+    [ "${11}" = --signer-digest ]
+    [ "${12}" = "$HIVE_FAKE_COMMIT" ]
+    [ "${13}" = --deny-self-hosted-runners ]
     : > "$HIVE_FAKE_ATTESTATION_MARKER"
     ;;
   *) exit 62 ;;
@@ -134,13 +152,14 @@ chmod +x "$attestation_bin/gh"
   unset HIVE_RELEASE_DIR HIVE_SKIP_ATTESTATION
   export PATH="$attestation_bin:$PATH"
   export HIVE_INSTALL_DIR="$work_root/attested-install"
-  export HIVE_FAKE_VERSION="$version"
+  export HIVE_FAKE_VERSION="$published_version"
   export HIVE_FAKE_COMMIT="$release_commit"
-  export HIVE_FAKE_RELEASE_DIR="$release_dir"
-  export HIVE_FAKE_ASSET="hive-integrated-$version-linux-amd64.tar.gz"
+  export HIVE_FAKE_RELEASE_DIR="$published_release_dir"
+  export HIVE_FAKE_ASSET="$published_asset"
   export HIVE_FAKE_REPOSITORY="$repository"
   export HIVE_FAKE_ATTESTATION_MARKER="$attestation_marker"
-  sh "$installer" --version "$version" --repo "$repository"
+  export HIVE_FAKE_DOWNLOAD_DIR_MARKER="$download_dir_marker"
+  sh "$installer" --version "$published_version" --repo "$repository"
 )
 test -f "$attestation_marker"
 "$work_root/attested-install/runtime/node" "$work_root/attested-install/visual-hive/visual-hive.mjs" --version

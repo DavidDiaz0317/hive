@@ -31,6 +31,17 @@ const (
 	uploadArtifactActionSHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
 )
 
+var (
+	strictPackageRunPattern = regexp.MustCompile(`^(npm|pnpm|yarn)[[:space:]]+(--silent[[:space:]]+)?run[[:space:]]+([A-Za-z0-9_.:-]+)([[:space:]]+--([[:space:]]+[A-Za-z0-9_./:@%+=,-]+)*)?$`)
+	safeShellTokenPattern   = regexp.MustCompile(`^[A-Za-z0-9_./:@%+=,\\-]+$`)
+	environmentTokenPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+=,\\-]+$`)
+)
+
+type packageScriptInvocation struct {
+	Name      string
+	Forwarded string
+}
+
 type SetupOptions struct {
 	Repository        string
 	Coverage          Coverage
@@ -1084,7 +1095,14 @@ jobs:
           while IFS= read -r contract; do
             if [ -n "$contract" ]; then args+=(--evaluated-contract "$contract"); fi
           done < .visual-hive/evaluated-contracts.txt
-          node "$VISUAL_HIVE_CLI" hive bundle --config visual-hive.config.yaml --issues .visual-hive/issues.json --acmm-request %d --scan-scope full --authoritative-for-resolution "${args[@]}"
+          resolution_args=()
+          repository_exit="$(cat .visual-hive/repository-test-exit-code.txt 2>/dev/null || printf '1')"
+          if [[ "$repository_exit" =~ ^[0-9]+$ ]] && [ "$repository_exit" -eq 0 ]; then
+            resolution_args+=(--authoritative-for-resolution)
+          else
+            echo "Repository test plan was incomplete; bundle cannot resolve absent findings" >&2
+          fi
+          node "$VISUAL_HIVE_CLI" hive bundle --config visual-hive.config.yaml --issues .visual-hive/issues.json --acmm-request %d --scan-scope full "${resolution_args[@]}" "${args[@]}"
       - name: Upload trusted Hive bundle
         id: bundle
         uses: actions/upload-artifact@%s
@@ -1212,7 +1230,18 @@ jobs:
       - name: Enforce deterministic verdict
         if: always()
         shell: bash
-        run: exit "$(cat .visual-hive/pipeline-exit-code.txt)"
+        run: |
+          repository_exit="$(cat .visual-hive/repository-test-exit-code.txt 2>/dev/null || printf '1')"
+          pipeline_exit="$(cat .visual-hive/pipeline-exit-code.txt 2>/dev/null || printf '1')"
+          if ! [[ "$repository_exit" =~ ^[0-9]+$ && "$pipeline_exit" =~ ^[0-9]+$ ]]; then
+            echo "Visual Hive verdict files were missing or invalid" >&2
+            exit 1
+          fi
+          if [ "$repository_exit" -ne 0 ]; then
+            echo "Repository test plan failed with exit $repository_exit" >&2
+            exit "$repository_exit"
+          fi
+          exit "$pipeline_exit"
 `, checkoutActionSHA, checkoutActionSHA, config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, targetDependencies, repositoryTests, uploadArtifactActionSHA)
 }
 
@@ -1230,8 +1259,9 @@ func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage)
 			commands = append(commands, append([]string(nil), command...))
 		}
 	}
-	if maximumRank < 3 || !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(commands) {
-		return commands
+	commands = preferRepositoryComprehensiveSuite(inspection, commands, coverage)
+	if maximumRank < 3 || !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(inspection, commands) {
+		return sortTestCommands(commands)
 	}
 	commands = append(commands, []string{"node", "--test"})
 	return sortTestCommands(commands)
@@ -1267,14 +1297,355 @@ func commandCoverageRank(command []string) int {
 	return 0
 }
 
-func hasRepositoryUnitCommand(commands [][]string) bool {
+func hasRepositoryUnitCommand(inspection RepositoryInspection, commands [][]string) bool {
 	for _, command := range commands {
-		value := strings.ToLower(strings.Join(command, " "))
-		if value == "node --test" || strings.Contains(value, "vitest") || strings.Contains(value, "jest") || strings.HasSuffix(value, " run test") || strings.Contains(value, "test:unit") || strings.Contains(value, "test:ci") {
+		packagePath, _, script, ok := packageScriptCommandParts(command)
+		if !ok {
+			if invokesJavaScriptUnitRunner(command) {
+				return true
+			}
+			continue
+		}
+		scripts := inspection.packageScripts[packagePath]
+		terminals, safe := terminalPackageScripts(scripts, script)
+		if !safe {
+			continue
+		}
+		for invocation := range terminals {
+			if invocation.Forwarded == "" && isJavaScriptUnitRunner(scripts[invocation.Name]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// preferRepositoryComprehensiveSuite preserves the repository author's tested
+// ordering when one safe aggregate provably reaches every selected leaf test.
+// Orchestration wrappers (for example test:ci:lite) are not run beside that
+// aggregate, avoiding repeated browser servers and overlapping smoke tests.
+func preferRepositoryComprehensiveSuite(inspection RepositoryInspection, commands [][]string, coverage Coverage) [][]string {
+	if coverage != CoverageComprehensive && coverage != CoverageCustom {
+		return commands
+	}
+	replacements := map[string][]string{}
+	for packagePath, scripts := range inspection.packageScripts {
+		selected := map[string]bool{}
+		for _, command := range commands {
+			path, _, name, ok := packageScriptCommandParts(command)
+			if ok && path == packagePath {
+				selected[name] = true
+			}
+		}
+		if len(selected) == 0 {
+			continue
+		}
+		aggregate := comprehensiveAggregateScript(scripts, selected)
+		if aggregate == "" {
+			continue
+		}
+		runner := inspection.packageRunners[packagePath]
+		if runner == "" {
+			runner = "npm"
+		}
+		replacements[packagePath] = packageScriptCommand(packagePath, runner, aggregate)
+	}
+	if len(replacements) == 0 {
+		return commands
+	}
+	result := make([][]string, 0, len(commands)+len(replacements))
+	for _, command := range commands {
+		packagePath, _, _, ok := packageScriptCommandParts(command)
+		if ok && replacements[packagePath] != nil {
+			continue
+		}
+		result = append(result, command)
+	}
+	paths := make([]string, 0, len(replacements))
+	for packagePath := range replacements {
+		paths = append(paths, packagePath)
+	}
+	sort.Strings(paths)
+	for _, packagePath := range paths {
+		result = append(result, replacements[packagePath])
+	}
+	return uniqueTestCommands(result)
+}
+
+func comprehensiveAggregateScript(scripts map[string]string, selected map[string]bool) string {
+	for _, candidate := range []string{"test:all", "test:ci:heavy", "test:suite", "vh:suite", "test:ci"} {
+		body, exists := scripts[candidate]
+		if !exists || !safeAutomationScript(candidate, body) {
+			continue
+		}
+		dependencies, strict := strictPackageRunDependencies(body)
+		if !strict || len(dependencies) < 2 {
+			continue
+		}
+		candidateTerminals, safe := terminalPackageScripts(scripts, candidate)
+		if !safe || len(candidateTerminals) == 0 {
+			continue
+		}
+		selectedTerminals := map[packageScriptInvocation]bool{}
+		for name := range selected {
+			if name == candidate {
+				continue
+			}
+			terminals, selectedSafe := terminalPackageScripts(scripts, name)
+			if !selectedSafe {
+				selectedTerminals = nil
+				break
+			}
+			for terminal := range terminals {
+				selectedTerminals[terminal] = true
+			}
+		}
+		for terminal := range selectedTerminals {
+			if terminal.Forwarded != "" && selectedTerminals[packageScriptInvocation{Name: terminal.Name}] {
+				delete(selectedTerminals, terminal)
+			}
+		}
+		if len(selectedTerminals) == 0 {
+			continue
+		}
+		coversSelectedTerminals := true
+		for terminal := range selectedTerminals {
+			if !candidateTerminals[terminal] && !equivalentVitestCoverageLeaf(scripts, terminal, candidateTerminals) {
+				coversSelectedTerminals = false
+				break
+			}
+		}
+		if coversSelectedTerminals {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func terminalPackageScripts(scripts map[string]string, root string) (map[packageScriptInvocation]bool, bool) {
+	terminals := map[packageScriptInvocation]bool{}
+	visiting := map[packageScriptInvocation]bool{}
+	complete := map[packageScriptInvocation]bool{}
+	var visit func(packageScriptInvocation) bool
+	visit = func(invocation packageScriptInvocation) bool {
+		if visiting[invocation] {
+			return false
+		}
+		if complete[invocation] {
+			return true
+		}
+		body, exists := scripts[invocation.Name]
+		if !exists || !safeAutomationScript(invocation.Name, body) {
+			return false
+		}
+		visiting[invocation] = true
+		dependencies, strict := strictPackageRunDependencies(body)
+		if !strict || invocation.Forwarded != "" {
+			terminals[invocation] = true
+		} else {
+			for _, dependency := range dependencies {
+				if !visit(dependency) {
+					return false
+				}
+			}
+		}
+		delete(visiting, invocation)
+		complete[invocation] = true
+		return true
+	}
+	if !visit(packageScriptInvocation{Name: root}) {
+		return nil, false
+	}
+	return terminals, true
+}
+
+func strictPackageRunDependencies(body string) ([]packageScriptInvocation, bool) {
+	parts := strings.Split(strings.TrimSpace(body), "&&")
+	if len(parts) == 0 {
+		return nil, false
+	}
+	dependencies := make([]packageScriptInvocation, 0, len(parts))
+	for _, part := range parts {
+		match := strictPackageRunPattern.FindStringSubmatch(strings.TrimSpace(part))
+		if len(match) < 4 {
+			return nil, false
+		}
+		forwarded := strings.Fields(strings.TrimSpace(match[4]))
+		if len(forwarded) > 0 && forwarded[0] == "--" {
+			forwarded = forwarded[1:]
+		}
+		dependencies = append(dependencies, packageScriptInvocation{Name: match[3], Forwarded: strings.Join(forwarded, "\x00")})
+	}
+	return dependencies, true
+}
+
+func equivalentVitestCoverageLeaf(scripts map[string]string, selected packageScriptInvocation, candidateTerminals map[packageScriptInvocation]bool) bool {
+	if selected.Forwarded != "" || !strings.Contains(strings.ToLower(selected.Name), "unit") {
+		return false
+	}
+	selectedTokens, selectedCoverage, selectedOK := normalizedVitestCommand(scripts[selected.Name])
+	if !selectedOK || selectedCoverage {
+		return false
+	}
+	for candidate := range candidateTerminals {
+		if candidate.Forwarded != "" || !strings.Contains(strings.ToLower(candidate.Name), "coverage") {
+			continue
+		}
+		candidateTokens, candidateCoverage, candidateOK := normalizedVitestCommand(scripts[candidate.Name])
+		if candidateOK && candidateCoverage && strings.Join(selectedTokens, "\x00") == strings.Join(candidateTokens, "\x00") {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizedVitestCommand(body string) ([]string, bool, bool) {
+	parts := strings.Fields(strings.TrimSpace(body))
+	if len(parts) == 0 {
+		return nil, false, false
+	}
+	for _, part := range parts {
+		if !safeShellTokenPattern.MatchString(part) {
+			return nil, false, false
+		}
+	}
+	executable := strings.ToLower(filepath.Base(filepath.ToSlash(parts[0])))
+	if executable != "vitest" && executable != "vitest.cmd" {
+		return nil, false, false
+	}
+	normalized := make([]string, 0, len(parts))
+	hadCoverage := false
+	for _, part := range parts {
+		lower := strings.ToLower(part)
+		if lower == "--coverage" || strings.HasPrefix(lower, "--coverage=") || strings.HasPrefix(lower, "--coverage.") {
+			hadCoverage = true
+			continue
+		}
+		normalized = append(normalized, part)
+	}
+	return normalized, hadCoverage, true
+}
+
+func isJavaScriptUnitRunner(body string) bool {
+	for _, segment := range strings.Split(strings.TrimSpace(body), "&&") {
+		parts := strings.Fields(strings.TrimSpace(segment))
+		if len(parts) == 0 {
+			continue
+		}
+		valid := true
+		for _, part := range parts {
+			if !safeShellTokenPattern.MatchString(part) {
+				valid = false
+				break
+			}
+		}
+		if valid && invokesJavaScriptUnitRunner(parts) {
+			return true
+		}
+	}
+	return false
+}
+
+func invokesJavaScriptUnitRunner(parts []string) bool {
+	for len(parts) > 0 && environmentTokenPattern.MatchString(parts[0]) {
+		parts = parts[1:]
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	executable := strings.ToLower(filepath.Base(filepath.ToSlash(parts[0])))
+	parts = parts[1:]
+	switch executable {
+	case "vitest", "vitest.cmd", "jest", "jest.cmd", "mocha", "mocha.cmd", "ava", "ava.cmd", "tap", "tap.cmd", "uvu", "uvu.cmd":
+		return !hasNoExecutionMode(parts)
+	case "node", "node.exe":
+		if hasNoExecutionMode(parts) {
+			return false
+		}
+		for _, argument := range parts {
+			if argument == "--test" {
+				return true
+			}
+		}
+	case "react-scripts", "react-scripts.cmd":
+		return len(parts) > 0 && parts[0] == "test" && !hasNoExecutionMode(parts[1:])
+	case "npx", "npx.cmd":
+		if len(parts) > 0 && parts[0] == "--no-install" {
+			parts = parts[1:]
+		}
+		return isKnownJavaScriptUnitInvocation(parts)
+	case "npm", "npm.cmd":
+		if len(parts) == 0 || parts[0] != "exec" {
+			return false
+		}
+		parts = parts[1:]
+		if len(parts) > 0 && parts[0] == "--" {
+			parts = parts[1:]
+		}
+		return isKnownJavaScriptUnitInvocation(parts)
+	case "pnpm", "pnpm.cmd", "yarn", "yarn.cmd":
+		if len(parts) > 0 && parts[0] == "exec" {
+			parts = parts[1:]
+		}
+		return isKnownJavaScriptUnitInvocation(parts)
+	case "cross-env", "cross-env.cmd":
+		for len(parts) > 0 && environmentTokenPattern.MatchString(parts[0]) {
+			parts = parts[1:]
+		}
+		return len(parts) > 0 && invokesJavaScriptUnitRunner(parts)
+	}
+	return false
+}
+
+func isKnownJavaScriptUnitInvocation(parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(filepath.ToSlash(parts[0])))
+	switch name {
+	case "vitest", "vitest.cmd", "jest", "jest.cmd", "mocha", "mocha.cmd", "ava", "ava.cmd", "tap", "tap.cmd", "uvu", "uvu.cmd":
+		return !hasNoExecutionMode(parts[1:])
+	default:
+		return false
+	}
+}
+
+func hasNoExecutionMode(arguments []string) bool {
+	for index, argument := range arguments {
+		value := strings.ToLower(argument)
+		for _, denied := range []string{
+			"--help", "-h", "help", "--version", "-v", "version", "init", "--init",
+			"list", "--list", "--listtests", "--list-tests", "--showconfig", "--show-config",
+			"--clearcache", "--clear-cache", "--collect-only", "--collectonly", "--dry-run", "--dryrun",
+		} {
+			if value == denied || strings.HasPrefix(value, denied+"=") {
+				return true
+			}
+		}
+		if (value == "config" || value == "--config") && index == len(arguments)-1 {
+			return true
+		}
+	}
+	return false
+}
+
+func packageScriptCommandParts(command []string) (packagePath, runner, name string, ok bool) {
+	if len(command) == 3 && command[1] == "run" && (command[0] == "npm" || command[0] == "pnpm" || command[0] == "yarn") {
+		return ".", command[0], command[2], true
+	}
+	if len(command) != 5 || command[3] != "run" {
+		return "", "", "", false
+	}
+	switch {
+	case command[0] == "npm" && command[1] == "--prefix":
+		return filepath.ToSlash(command[2]), "npm", command[4], true
+	case command[0] == "pnpm" && command[1] == "--dir":
+		return filepath.ToSlash(command[2]), "pnpm", command[4], true
+	case command[0] == "yarn" && command[1] == "--cwd":
+		return filepath.ToSlash(command[2]), "yarn", command[4], true
+	default:
+		return "", "", "", false
+	}
 }
 
 func sortTestCommands(commands [][]string) [][]string {
@@ -1290,25 +1661,7 @@ func sortTestCommands(commands [][]string) [][]string {
 }
 
 func targetDependencyInstallShell() string {
-	return `          npm_lock_count=0
-          while IFS= read -r lockfile; do
-            package_dir="$(dirname "$lockfile")"
-            npm --prefix "$package_dir" ci
-            npm_lock_count=$((npm_lock_count + 1))
-          done < <(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
-          if [ "$npm_lock_count" -eq 0 ]; then
-            while IFS= read -r manifest; do
-              npm --prefix "$(dirname "$manifest")" install
-            done < <(find . -name package.json -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
-          fi
-          while IFS= read -r lockfile; do
-            corepack enable
-            pnpm --dir "$(dirname "$lockfile")" install --frozen-lockfile
-          done < <(find . -name pnpm-lock.yaml -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
-          while IFS= read -r lockfile; do
-            corepack enable
-            yarn --cwd "$(dirname "$lockfile")" install --immutable
-          done < <(find . -name yarn.lock -not -path '*/node_modules/*' -not -path './.git/*' -print | sort)
+	return targetPackageInstallShell() + `
           if [ -f pyproject.toml ]; then
             python -m pip install -e .
           elif [ -f requirements.txt ]; then
@@ -1316,23 +1669,192 @@ func targetDependencyInstallShell() string {
           fi
           tooling_playwright="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
           node "$tooling_playwright" install --with-deps chromium
-          while IFS= read -r playwright_cli; do
+          while IFS= read -r -d '' playwright_cli; do
             node "$playwright_cli" install chromium
-          done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.git/*' -print | sort)`
+          done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.git/*' -print0 | sort -z)`
+}
+
+func targetPackageInstallShell() string {
+	return `          corepack_enabled=0
+          enable_corepack() {
+            if [ "$corepack_enabled" -eq 0 ]; then
+              corepack enable
+              corepack_enabled=1
+            fi
+          }
+          while IFS= read -r -d '' lockfile; do
+            package_dir="$(dirname "$lockfile")"
+            lock_count=0
+            [ -f "$package_dir/package-lock.json" ] && lock_count=$((lock_count + 1))
+            [ -f "$package_dir/pnpm-lock.yaml" ] && lock_count=$((lock_count + 1))
+            [ -f "$package_dir/yarn.lock" ] && lock_count=$((lock_count + 1))
+            if [ "$lock_count" -ne 1 ]; then
+              echo "Package scope $package_dir must contain exactly one supported lockfile" >&2
+              exit 1
+            fi
+          done < <(find . \( -name package-lock.json -o -name pnpm-lock.yaml -o -name yarn.lock \) -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
+          while IFS= read -r -d '' lockfile; do
+            npm --prefix "$(dirname "$lockfile")" ci
+          done < <(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
+          while IFS= read -r -d '' lockfile; do
+            enable_corepack
+            package_dir="$(dirname "$lockfile")"
+            (cd "$package_dir" && pnpm install --frozen-lockfile)
+          done < <(find . -name pnpm-lock.yaml -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
+          while IFS= read -r -d '' lockfile; do
+            enable_corepack
+            package_dir="$(dirname "$lockfile")"
+            yarn_version="$(cd "$package_dir" && yarn --version)"
+            yarn_major="${yarn_version%%.*}"
+            if ! [[ "$yarn_major" =~ ^[0-9]+$ ]]; then
+              echo "Could not determine Yarn major version for $package_dir" >&2
+              exit 1
+            fi
+            if [ "$yarn_major" -ge 2 ]; then
+              (cd "$package_dir" && yarn install --immutable)
+            else
+              (cd "$package_dir" && yarn install --frozen-lockfile)
+            fi
+          done < <(find . -name yarn.lock -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
+          has_ancestor_package_lock() {
+            local candidate="$1"
+            node - "$candidate" <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const root = fs.realpathSync(process.cwd());
+          const target = fs.realpathSync(process.argv[2]);
+          const locks = ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"];
+
+          function patternsFor(scope) {
+            const patterns = [];
+            try {
+              const manifest = JSON.parse(fs.readFileSync(path.join(scope, "package.json"), "utf8"));
+              if (Array.isArray(manifest.workspaces)) patterns.push(...manifest.workspaces);
+              if (manifest.workspaces && Array.isArray(manifest.workspaces.packages)) patterns.push(...manifest.workspaces.packages);
+            } catch (_) {}
+            try {
+              const lines = fs.readFileSync(path.join(scope, "pnpm-workspace.yaml"), "utf8").split(/\r?\n/);
+              let inPackages = false;
+              for (const line of lines) {
+                const inline = line.match(/^\s*packages\s*:\s*\[(.*)\]\s*$/);
+                if (inline) {
+                  for (const value of inline[1].split(",")) patterns.push(value.trim().replace(/^['"]|['"]$/g, ""));
+                  inPackages = false;
+                  continue;
+                }
+                if (/^\s*packages\s*:\s*$/.test(line)) {
+                  inPackages = true;
+                  continue;
+                }
+                if (inPackages && /^\S/.test(line)) inPackages = false;
+                if (inPackages) {
+                  const item = line.match(/^\s*-\s*(['"]?)(.*?)\1\s*(?:#.*)?$/);
+                  if (item && item[2]) patterns.push(item[2]);
+                }
+              }
+            } catch (_) {}
+            return patterns;
+          }
+
+          function globExpression(pattern) {
+            pattern = pattern.split(String.fromCharCode(92)).join("/").replace(/^\.\//, "").replace(/^\/+|\/+$/g, "");
+            let source = "^";
+            for (let index = 0; index < pattern.length; index += 1) {
+              const character = pattern[index];
+              if (character === "*") {
+                if (pattern[index + 1] === "*") {
+                  index += 1;
+                  if (pattern[index + 1] === "/") {
+                    index += 1;
+                    source += "(?:.*/)?";
+                  } else {
+                    source += ".*";
+                  }
+                } else {
+                  source += "[^/]*";
+                }
+              } else if (character === "?") {
+                source += "[^/]";
+              } else {
+                if (".+()|[]{}^$".includes(character)) source += "\\";
+                source += character;
+              }
+            }
+            return new RegExp(source + "$");
+          }
+
+          function owns(scope) {
+            const relative = path.relative(scope, target).split(path.sep).join("/");
+            let matched = false;
+            for (let pattern of patternsFor(scope)) {
+              pattern = String(pattern).trim().split(String.fromCharCode(92)).join("/");
+              const excluded = pattern.startsWith("!");
+              if (excluded) pattern = pattern.slice(1);
+              if (pattern && globExpression(pattern).test(relative)) matched = !excluded;
+            }
+            return matched;
+          }
+
+          function insideRoot(value) {
+            const relative = path.relative(root, value);
+            return relative === "" || (relative !== ".." && !relative.startsWith(".." + path.sep));
+          }
+
+          let scope = target;
+          while (insideRoot(scope)) {
+            const hasLock = locks.some((name) => fs.existsSync(path.join(scope, name)));
+            if (hasLock && (scope === target || owns(scope))) process.exit(0);
+            if (scope === root) break;
+            const parent = path.dirname(scope);
+            if (parent === scope) break;
+            scope = parent;
+          }
+          process.exit(1);
+          NODE
+          }
+          lockless_package_dirs=()
+          while IFS= read -r -d '' manifest; do
+            package_dir="$(dirname "$manifest")"
+            if has_ancestor_package_lock "$package_dir"; then
+              continue
+            fi
+            lockless_package_dirs+=("$package_dir")
+          done < <(find . -name package.json -not -path '*/node_modules/*' -not -path './.git/*' -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/coverage/*' -not -path '*/vendor/*' -not -path './.visual-hive/*' -print0 | sort -z)
+          for package_dir in "${lockless_package_dirs[@]}"; do
+            npm --prefix "$package_dir" install
+          done`
 }
 
 func repositoryTestShell(config Config) string {
-	if len(config.TestCommands) == 0 {
-		return "          : # No additional repository unit-test bootstrap was required."
+	lines := []string{
+		"          mkdir -p .visual-hive",
+		"          repository_exit=0",
+		"          printf '1\\n' > .visual-hive/pipeline-exit-code.txt",
+		"          printf '1\\n' > .visual-hive/repository-test-exit-code.txt",
+		"          : > .visual-hive/repository-tests.tsv",
+		"          run_repository_test() {",
+		"            set +e",
+		"            \"$@\"",
+		"            command_exit=$?",
+		"            set -e",
+		"            printf '%s\\t%s\\n' \"$command_exit\" \"$*\" >> .visual-hive/repository-tests.tsv",
+		"            if [ \"$command_exit\" -ne 0 ] && [ \"$repository_exit\" -eq 0 ]; then",
+		"              repository_exit=$command_exit",
+		"            fi",
+		"            return 0",
+		"          }",
 	}
-	lines := make([]string, 0, len(config.TestCommands))
+	if len(config.TestCommands) == 0 {
+		lines = append(lines, "          : # No additional repository unit-test bootstrap was required.")
+	}
 	for _, command := range config.TestCommands {
 		quoted := make([]string, 0, len(command))
 		for _, argument := range command {
 			quoted = append(quoted, shellQuote(argument))
 		}
-		lines = append(lines, "          "+strings.Join(quoted, " "))
+		lines = append(lines, "          run_repository_test "+strings.Join(quoted, " "))
 	}
+	lines = append(lines, "          printf '%s\\n' \"$repository_exit\" > .visual-hive/repository-test-exit-code.txt")
 	return strings.Join(lines, "\n")
 }
 

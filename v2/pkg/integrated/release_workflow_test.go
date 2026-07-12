@@ -44,6 +44,31 @@ func TestIntegratedReleaseInstallsBrowserBeforeVisualDemo(t *testing.T) {
 	}
 }
 
+func TestLinuxReleaseSmokeSupportsCommitSHARehearsals(t *testing.T) {
+	data, err := os.ReadFile("../../test/integrated-installer-linux-release-smoke.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	smoke := string(data)
+	for _, invariant := range []string{
+		`published_version="$version"`,
+		`published_version=v0.0.0-integrated.0`,
+		`published_asset="hive-integrated-$published_version-linux-amd64.tar.gz"`,
+		`sha256sum "$published_asset"`,
+		`--version "$published_version"`,
+		`[ "$1" = "repos/$HIVE_FAKE_REPOSITORY/commits/$HIVE_FAKE_VERSION" ]`,
+		`[ "$2" = "$HIVE_FAKE_VERSION" ]`,
+		`[ "$6" = "$HIVE_FAKE_ASSET" ]`,
+		`[ "$8" = "$HIVE_FAKE_ASSET.sha256" ]`,
+		`[ "$2" = "$download_dir/$HIVE_FAKE_ASSET" ]`,
+		`[ "${13}" = --deny-self-hosted-runners ]`,
+	} {
+		if !strings.Contains(smoke, invariant) {
+			t.Fatalf("Linux release smoke lost branch-rehearsal published-trust fixture %q", invariant)
+		}
+	}
+}
+
 func TestIntegratedReleaseVerifiesPublishedReleaseIsImmutable(t *testing.T) {
 	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
 	if err != nil {
