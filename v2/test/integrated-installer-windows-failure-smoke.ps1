@@ -358,3 +358,7 @@ try {
 }
 
 Write-Host "Windows installer failure smoke passed: $resolvedWorkRoot"
+# Expected child-process failures are the substance of this smoke. PowerShell
+# otherwise propagates the final child's nonzero LASTEXITCODE even after every
+# assertion passes, which makes a successful hosted runner step fail.
+$global:LASTEXITCODE = 0

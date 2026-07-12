@@ -117,3 +117,14 @@ func TestIntegratedReleaseImmutabilityFailurePaths(t *testing.T) {
 		t.Fatalf("integrated release immutability failure smoke: %v\n%s", err, output)
 	}
 }
+
+func TestWindowsInstallerFailureSmokeClearsExpectedChildExit(t *testing.T) {
+	data, err := os.ReadFile("../../test/integrated-installer-windows-failure-smoke.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	smoke := strings.TrimSpace(string(data))
+	if !strings.HasSuffix(smoke, `$global:LASTEXITCODE = 0`) {
+		t.Fatal("successful Windows failure smoke must clear the final expected child-process exit code")
+	}
+}
