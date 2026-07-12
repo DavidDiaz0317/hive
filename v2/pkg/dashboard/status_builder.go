@@ -1105,6 +1105,7 @@ func collectSystemResources() *SystemResources {
 	}
 
 	// --- CPU (cgroup v2, with v1 fallback, sampled) ---
+	cpuSampleStarted := time.Now()
 	usec1 := readCgroupCPUUsageUsec(cgroupCPUStat)
 	if usec1 < 0 {
 		usec1 = readCgroupV1CPUUsageUsec(cgroupV1CPUUsage)
@@ -1116,20 +1117,26 @@ func collectSystemResources() *SystemResources {
 			usec2 = readCgroupV1CPUUsageUsec(cgroupV1CPUUsage)
 		}
 		if usec2 > usec1 {
-			deltaUsec := float64(usec2 - usec1)
-			deltaSec := float64(cpuSampleDelayMs) / 1000.0
-			numCPUs := float64(runtime.NumCPU())
-			if numCPUs < 1 {
-				numCPUs = 1
-			}
-			cpuFraction := deltaUsec / (deltaSec * microsecondsPerSec * numCPUs)
-			res.CpuPct = roundTo(cpuFraction*pctMultiplierSysRes, 1)
+			res.CpuPct = cpuUsagePercent(usec2-usec1, time.Since(cpuSampleStarted), runtime.NumCPU())
 		}
 	}
 
 	res.CpuCores = runtime.NumCPU()
 
 	return res
+}
+
+// cpuUsagePercent converts accumulated cgroup CPU time into a host-capacity
+// percentage. Sampling uses the measured monotonic interval because Sleep only
+// guarantees a minimum delay. Cgroup accounting and timer precision can still
+// introduce small boundary overshoots, so keep the public percentage bounded.
+func cpuUsagePercent(deltaUsec int64, elapsed time.Duration, numCPUs int) float64 {
+	if deltaUsec <= 0 || elapsed <= 0 || numCPUs <= 0 {
+		return 0
+	}
+	capacityUsec := elapsed.Seconds() * microsecondsPerSec * float64(numCPUs)
+	percent := float64(deltaUsec) / capacityUsec * pctMultiplierSysRes
+	return roundTo(math.Min(percent, pctMultiplierSysRes), 1)
 }
 
 // readCgroupInt64 reads a single int64 from a cgroup file. Returns -1 on error

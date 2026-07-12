@@ -3,8 +3,10 @@
 package agent
 
 import (
+	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -91,8 +93,11 @@ func TestReapAgentCLI_KillsMarkedProcess(t *testing.T) {
 	}
 	defer func() { _ = decoy.Process.Kill() }()
 
-	// Give /proc time to expose the new PIDs' cmdline/environ.
-	time.Sleep(200 * time.Millisecond)
+	// Start returns before the child necessarily completes execve. Wait for the
+	// exact post-exec /proc identity instead of assuming a fixed delay is enough
+	// on a loaded runner.
+	waitForProcCLIMarker(t, target.Process.Pid, "HIVE_AGENT=scanner")
+	waitForProcCLIMarker(t, decoy.Process.Pid, "HIVE_AGENT=scanner-2")
 
 	agent := m.agents["scanner"]
 	reaped := m.reapAgentCLI(agent)
@@ -115,6 +120,26 @@ func TestReapAgentCLI_KillsMarkedProcess(t *testing.T) {
 	// the exact agent, never another agent sharing the dev UID.
 	if !processAlive(decoy.Process.Pid) {
 		t.Errorf("decoy pid %d (scanner-2) was killed; reaper matched wrong agent", decoy.Process.Pid)
+	}
+}
+
+func waitForProcCLIMarker(t *testing.T, pid int, marker string) {
+	t.Helper()
+	procDir := "/proc/" + strconv.Itoa(pid)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cmdline, cmdlineErr := os.ReadFile(procDir + "/cmdline")
+		environ, environErr := os.ReadFile(procDir + "/environ")
+		if cmdlineErr == nil && environErr == nil && containsCLIMarker(string(cmdline)) && environHasMarker(string(environ), marker) {
+			return
+		}
+		if !processAlive(pid) {
+			t.Fatalf("process %d exited before /proc exposed %s", pid, marker)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d did not expose CLI marker %s in /proc: cmdline_err=%v environ_err=%v", pid, marker, cmdlineErr, environErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
