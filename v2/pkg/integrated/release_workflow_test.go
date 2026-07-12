@@ -2,6 +2,8 @@ package integrated
 
 import (
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -39,5 +41,54 @@ func TestIntegratedReleaseInstallsBrowserBeforeVisualDemo(t *testing.T) {
 	}
 	if demo == -1 || install > demo {
 		t.Fatal("integrated release must install Playwright Chromium before running demo:all")
+	}
+}
+
+func TestIntegratedReleaseVerifiesPublishedReleaseIsImmutable(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, invariant := range []string{
+		`source v2/integrated-release-immutability.sh`,
+		`if ! verify_published_release_immutable`,
+		`trap cleanup_on_exit EXIT`,
+		`release_verified=true`,
+		`trap - EXIT`,
+	} {
+		if !strings.Contains(workflow, invariant) {
+			t.Fatalf("integrated release lost immutable-publication verification %q", invariant)
+		}
+	}
+	query := strings.Index(workflow, `if ! verify_published_release_immutable`)
+	trap := strings.Index(workflow, `trap cleanup_on_exit EXIT`)
+	if query < 0 || trap < 0 || trap > query {
+		t.Fatal("release immutability polling must execute under the cleanup trap")
+	}
+	helper, err := os.ReadFile("../../integrated-release-immutability.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invariant := range []string{
+		`releases/tags/$RELEASE_TAG`,
+		`release(tagName:$tag)`,
+		`isDraft`,
+		`[[ -z "$release_node" ]]`,
+	} {
+		if !strings.Contains(string(helper), invariant) {
+			t.Fatalf("release cleanup lost exact published/draft absence proof %q", invariant)
+		}
+	}
+}
+
+func TestIntegratedReleaseImmutabilityFailurePaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the production helper executes on the Ubuntu publish runner")
+	}
+	command := exec.Command("bash", "../../test/integrated-release-immutability-failure-smoke.sh")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("integrated release immutability failure smoke: %v\n%s", err, output)
 	}
 }

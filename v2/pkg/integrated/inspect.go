@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ type packageJSON struct {
 
 func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	inspection := RepositoryInspection{DefaultBranch: defaultBranch, Permissions: map[string]bool{}, Signals: map[string]string{}}
+	committedFiles, hasCommittedHead := committedFileSet(root)
 	languages, frameworks, managers := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	packageFiles := findPackageJSONFiles(root)
 	for _, packageFile := range packageFiles {
@@ -116,7 +118,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		if strings.Contains(lower, "dockerfile") || strings.HasPrefix(lower, "deploy/") || strings.HasPrefix(lower, "k8s/") || strings.HasSuffix(lower, "vercel.json") || strings.Contains(lower, "terraform") {
 			inspection.DeploymentFiles = append(inspection.DeploymentFiles, relative)
 		}
-		if (strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__")) && (strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".json")) {
+		if isReviewableBaselinePath(lower) && (!hasCommittedHead || committedFiles[relative]) {
 			inspection.BaselineFiles = append(inspection.BaselineFiles, relative)
 		}
 		if strings.Contains(lower, "auth") || strings.Contains(lower, "security") || strings.Contains(lower, "secret") || strings.HasPrefix(lower, ".github/workflows/") {
@@ -129,6 +131,15 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 	inspection.PackageManagers = sortedKeys(managers)
 	inspection.CIFiles = sortedUnique(inspection.CIFiles)
 	inspection.DeploymentFiles = sortedUnique(inspection.DeploymentFiles)
+	// The broad repository walk deliberately skips generated .visual-hive
+	// artifacts. Reviewed snapshots are the exception: setup must distinguish
+	// committed baselines from transient actual/diff images so its plan does not
+	// claim baseline review is missing when a repository already has it.
+	for _, baseline := range existingVisualBaselines(root) {
+		if isReviewableBaselinePath(baseline) && (!hasCommittedHead || committedFiles[baseline]) {
+			inspection.BaselineFiles = append(inspection.BaselineFiles, baseline)
+		}
+	}
 	inspection.BaselineFiles = sortedUnique(inspection.BaselineFiles)
 	inspection.HighRiskPaths = sortedUnique(inspection.HighRiskPaths)
 	inspection.TestCommands = uniqueTestCommands(inspection.TestCommands)
@@ -140,6 +151,42 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		return strings.Join(inspection.TestCommands[i], "\x00") < strings.Join(inspection.TestCommands[j], "\x00")
 	})
 	return inspection, nil
+}
+
+func committedFileSet(root string) (map[string]bool, bool) {
+	topOutput, err := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return nil, false
+	}
+	rootInfo, rootErr := os.Stat(root)
+	topInfo, topErr := os.Stat(strings.TrimSpace(string(topOutput)))
+	if rootErr != nil || topErr != nil || !os.SameFile(rootInfo, topInfo) {
+		return nil, false
+	}
+	output, err := exec.Command("git", "-C", root, "ls-tree", "-r", "--name-only", "-z", "HEAD").Output()
+	if err != nil {
+		return nil, false
+	}
+	files := map[string]bool{}
+	for _, value := range strings.Split(string(output), "\x00") {
+		if value = filepath.ToSlash(strings.TrimSpace(value)); value != "" {
+			files[value] = true
+		}
+	}
+	return files, true
+}
+
+func isReviewableBaselinePath(value string) bool {
+	lower := strings.ToLower(filepath.ToSlash(value))
+	if !(strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".json")) {
+		return false
+	}
+	for _, suffix := range []string{"-actual.png", "-diff.png", ".actual.png", ".diff.png", "-actual.json", "-diff.json", ".actual.json", ".diff.json"} {
+		if strings.HasSuffix(lower, suffix) {
+			return false
+		}
+	}
+	return strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__") || strings.Contains(lower, "-snapshots/") || strings.HasPrefix(lower, ".visual-hive/snapshots/")
 }
 
 func commandsContain(commands [][]string, fragment string) bool {

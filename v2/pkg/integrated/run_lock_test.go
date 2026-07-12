@@ -32,9 +32,10 @@ func TestProductionRunLeaseRecoversExpiredOwner(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now().UTC()
 	expired := productionRunLease{
-		SchemaVersion: "hive.production-run-lease.v1", ID: "expired", PID: 42,
-		StartedAt: time.Now().Add(-time.Hour), ExpiresAt: time.Now().Add(-time.Minute),
+		SchemaVersion: "hive.production-run-lease.v1", ID: "expired", PID: 1 << 30,
+		StartedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Hour),
 	}
 	data, _ := json.Marshal(expired)
 	if err := os.WriteFile(filepath.Join(dir, "production-run.lock"), data, 0o600); err != nil {

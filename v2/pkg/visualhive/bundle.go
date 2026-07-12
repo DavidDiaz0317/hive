@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,15 +23,17 @@ import (
 )
 
 const (
-	ManifestSchema  = "visual-hive.bundle.v2"
-	maxManifestSize = 2 << 20
-	maxFileSize     = 25 << 20
-	maxBundleSize   = 100 << 20
-	maxBundleFiles  = 512
+	ManifestSchema             = "visual-hive.bundle.v2"
+	PublicationDigestAlgorithm = "visual-hive.bundle.publication-digest.v1"
+	maxManifestSize            = 2 << 20
+	maxFileSize                = 25 << 20
+	maxBundleSize              = 100 << 20
+	maxBundleFiles             = 512
 )
 
 type Manifest struct {
 	SchemaVersion     string           `json:"schemaVersion"`
+	DigestAlgorithm   string           `json:"digestAlgorithm,omitempty"`
 	BundleID          string           `json:"bundleId"`
 	GeneratedAt       time.Time        `json:"generatedAt"`
 	ExpiresAt         time.Time        `json:"expiresAt"`
@@ -78,6 +82,9 @@ type Scan struct {
 type Observation struct {
 	Fingerprint           string   `json:"fingerprint"`
 	RepositoryFingerprint string   `json:"repositoryFingerprint"`
+	PublicationRole       string   `json:"publicationRole,omitempty"`
+	RootCauseKey          string   `json:"rootCauseKey,omitempty"`
+	BlockedByRootKeys     []string `json:"blockedByRootKeys"`
 	State                 string   `json:"state"`
 	IssueKind             string   `json:"issueKind"`
 	Severity              string   `json:"severity"`
@@ -170,6 +177,7 @@ var (
 	absolutePath = regexp.MustCompile(`(?i)(/home/|/Users/|[A-Z]:[/\\]+Users[/\\]+)`)
 	secretValue  = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
 	windowsDrive = regexp.MustCompile(`^[A-Za-z]:/`)
+	rootCauseKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~:/,%+-]{0,511}$`)
 )
 
 func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedBundle, error) {
@@ -276,6 +284,9 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 	if m.SchemaVersion != ManifestSchema || !safeID.MatchString(m.BundleID) {
 		return fmt.Errorf("unsupported or invalid bundle identity")
 	}
+	if m.DigestAlgorithm != "" && m.DigestAlgorithm != PublicationDigestAlgorithm {
+		return fmt.Errorf("unsupported bundle digest algorithm %q", m.DigestAlgorithm)
+	}
 	if m.Producer.Name != "visual-hive" || strings.TrimSpace(m.Producer.Version) == "" || strings.TrimSpace(m.Producer.GitCommit) == "" {
 		return fmt.Errorf("invalid Visual Hive producer")
 	}
@@ -355,12 +366,16 @@ func validateScanAndObservations(m Manifest) error {
 		}
 	}
 	seen := make(map[string]bool, len(m.Observations))
+	canonicalRoots := make(map[string]bool)
+	legacyPublicationMetadata := false
+	explicitPublicationMetadata := false
 	evaluatedContracts := make(map[string]bool, len(m.Scan.EvaluatedContracts))
 	for _, contract := range m.Scan.EvaluatedContracts {
 		evaluatedContracts[contract] = true
 	}
 	for _, observation := range m.Observations {
-		digestFields := []string{observation.Fingerprint, observation.IssueKind, observation.OwningAgentHint, observation.Title, observation.Body, observation.ValidationCommand, observation.SourceArtifact}
+		digestFields := []string{observation.Fingerprint, observation.PublicationRole, observation.RootCauseKey, observation.IssueKind, observation.OwningAgentHint, observation.Title, observation.Body, observation.ValidationCommand, observation.SourceArtifact}
+		digestFields = append(digestFields, observation.BlockedByRootKeys...)
 		digestFields = append(digestFields, observation.Labels...)
 		digestFields = append(digestFields, observation.SourceArtifacts...)
 		digestFields = append(digestFields, observation.AffectedContracts...)
@@ -369,11 +384,23 @@ func validateScanAndObservations(m Manifest) error {
 				return fmt.Errorf("bundle lifecycle observations cannot contain NUL delimiters")
 			}
 		}
+		if err := validatePublicationMetadata(observation, canonicalRoots); err != nil {
+			return err
+		}
+		if observation.PublicationRole == "" && observation.RootCauseKey == "" && observation.BlockedByRootKeys == nil {
+			legacyPublicationMetadata = true
+		} else {
+			explicitPublicationMetadata = true
+		}
 		if strings.TrimSpace(observation.Fingerprint) == "" || !hexDigest.MatchString(observation.RepositoryFingerprint) || seen[observation.RepositoryFingerprint] {
 			return fmt.Errorf("bundle lifecycle observation identity is invalid")
 		}
 		seen[observation.RepositoryFingerprint] = true
-		expectedFingerprint := digest([]byte(strings.ToLower(strings.TrimSpace(m.Source.Repository)) + "\x00" + observation.Fingerprint))
+		fingerprintSource := observation.Fingerprint
+		if observation.PublicationRole == "canonical" {
+			fingerprintSource = observation.RootCauseKey
+		}
+		expectedFingerprint := digest([]byte(strings.ToLower(strings.TrimSpace(m.Source.Repository)) + "\x00" + fingerprintSource))
 		if observation.RepositoryFingerprint != expectedFingerprint {
 			return fmt.Errorf("bundle lifecycle observation repository fingerprint mismatch")
 		}
@@ -416,7 +443,94 @@ func validateScanAndObservations(m Manifest) error {
 			}
 		}
 	}
+	if legacyPublicationMetadata && explicitPublicationMetadata {
+		return fmt.Errorf("bundle cannot mix legacy and explicit publication metadata")
+	}
+	if m.DigestAlgorithm == "" && explicitPublicationMetadata {
+		return fmt.Errorf("explicit publication metadata requires digest algorithm %q", PublicationDigestAlgorithm)
+	}
+	if m.DigestAlgorithm == PublicationDigestAlgorithm && legacyPublicationMetadata {
+		return fmt.Errorf("publication digest algorithm requires complete explicit publication metadata")
+	}
 	return nil
+}
+
+func validatePublicationMetadata(observation Observation, canonicalRoots map[string]bool) error {
+	hasRole := observation.PublicationRole != ""
+	hasRoot := observation.RootCauseKey != ""
+	hasBlockedField := observation.BlockedByRootKeys != nil
+	hasBlockedRoots := len(observation.BlockedByRootKeys) > 0
+	if !hasRole && !hasRoot && !hasBlockedField {
+		return nil // Legacy bundle: publication remains one issue per observation.
+	}
+	if !hasRole || !hasRoot || !hasBlockedField || !validRootCauseKey(observation.RootCauseKey) {
+		return fmt.Errorf("bundle lifecycle observation publication metadata is incomplete or invalid")
+	}
+	if !sortedUnique(observation.BlockedByRootKeys) {
+		return fmt.Errorf("bundle lifecycle blocked root keys must be sorted and unique")
+	}
+	for _, root := range observation.BlockedByRootKeys {
+		if !validRootCauseKey(root) {
+			return fmt.Errorf("bundle lifecycle blocked root key %q is invalid", root)
+		}
+	}
+	knownKind := map[string]bool{
+		"setup_needed": true, "map_drift": true, "missing_visual_coverage": true,
+		"test_adequacy_gap": true, "weak_visual_test": true, "stale_baseline": true,
+		"baseline_churn": true, "visual_regression": true, "selector_contract_failure": true,
+		"screenshot_diff": true, "mutation_survivor": true, "workflow_safety": true,
+		"provider_governance": true, "protected_target_blocked": true, "external_repo_onboarding": true,
+	}
+	if !knownKind[observation.IssueKind] {
+		return fmt.Errorf("bundle lifecycle observation publication kind %q is unsupported", observation.IssueKind)
+	}
+	switch observation.PublicationRole {
+	case "canonical":
+		if hasBlockedRoots {
+			return fmt.Errorf("canonical publication observation cannot block on other roots")
+		}
+		if canonicalRoots[observation.RootCauseKey] {
+			return fmt.Errorf("bundle contains more than one canonical observation for root %q", observation.RootCauseKey)
+		}
+		canonicalRoots[observation.RootCauseKey] = true
+	case "derivative":
+		if hasBlockedRoots {
+			return fmt.Errorf("derivative publication observation cannot block on other roots")
+		}
+		if observation.IssueKind != "missing_visual_coverage" && observation.IssueKind != "weak_visual_test" && observation.IssueKind != "external_repo_onboarding" {
+			return fmt.Errorf("issue kind %q cannot be a derivative publication", observation.IssueKind)
+		}
+	case "aggregate":
+		if !hasBlockedRoots {
+			return fmt.Errorf("aggregate publication observation requires blocked root keys")
+		}
+		if observation.IssueKind != "external_repo_onboarding" {
+			return fmt.Errorf("issue kind %q cannot be an aggregate publication", observation.IssueKind)
+		}
+	default:
+		return fmt.Errorf("bundle lifecycle observation publication role %q is unsupported", observation.PublicationRole)
+	}
+	return nil
+}
+
+func validRootCauseKey(value string) bool {
+	if !rootCauseKey.MatchString(value) {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] != '%' {
+			continue
+		}
+		if index+2 >= len(value) || !isHexByte(value[index+1]) || !isHexByte(value[index+2]) {
+			return false
+		}
+		index += 2
+	}
+	return true
+}
+
+func isHexByte(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F')
 }
 
 func validateFileRecord(file File, seen map[string]bool) error {
@@ -483,14 +597,26 @@ func decodeStrict(reader io.Reader, target interface{}) error {
 }
 
 func digestBundleContent(manifest Manifest, fileLines []string) string {
+	if manifest.DigestAlgorithm == PublicationDigestAlgorithm {
+		return digestPublicationBundleContent(manifest)
+	}
+	return digestLegacyBundleContent(manifest, fileLines)
+}
+
+func digestLegacyBundleContent(manifest Manifest, fileLines []string) string {
 	lines := append([]string(nil), fileLines...)
 	sort.Strings(lines)
 	observationLines := make([]string, 0, len(manifest.Observations))
 	for _, observation := range manifest.Observations {
-		observationLines = append(observationLines, strings.Join([]string{
+		fields := []string{
 			"observation",
 			observation.RepositoryFingerprint,
 			observation.Fingerprint,
+		}
+		if observation.PublicationRole != "" || observation.RootCauseKey != "" || len(observation.BlockedByRootKeys) > 0 {
+			fields = append(fields, observation.PublicationRole, observation.RootCauseKey, strings.Join(observation.BlockedByRootKeys, ","))
+		}
+		fields = append(fields,
 			observation.State,
 			observation.IssueKind,
 			observation.Severity,
@@ -504,7 +630,8 @@ func digestBundleContent(manifest Manifest, fileLines []string) string {
 			observation.ObservedAt,
 			observation.FirstSeenAt,
 			observation.SourceArtifact,
-		}, "\x00"))
+		)
+		observationLines = append(observationLines, strings.Join(fields, "\x00"))
 	}
 	sort.Strings(observationLines)
 	lines = append(lines, observationLines...)
@@ -540,6 +667,132 @@ func digestBundleContent(manifest Manifest, fileLines []string) string {
 	}, "\x00"))
 	lines = append(lines, "replay\x00"+manifest.ReplayProtection.Key)
 	return digest([]byte(strings.Join(lines, "\n")))
+}
+
+type publicationDigestRecord struct {
+	bytes.Buffer
+}
+
+func newPublicationDigestRecord(domain string) *publicationDigestRecord {
+	record := &publicationDigestRecord{}
+	record.WriteByte('R')
+	writePublicationDigestLP(&record.Buffer, []byte(domain))
+	return record
+}
+
+func (record *publicationDigestRecord) scalar(field, value string) {
+	record.WriteByte('S')
+	writePublicationDigestLP(&record.Buffer, []byte(field))
+	writePublicationDigestLP(&record.Buffer, []byte(value))
+}
+
+func (record *publicationDigestRecord) array(field string, values []string) {
+	record.WriteByte('A')
+	writePublicationDigestLP(&record.Buffer, []byte(field))
+	writePublicationDigestLP(&record.Buffer, []byte(strconv.Itoa(len(values))))
+	for _, value := range values {
+		record.WriteByte('E')
+		writePublicationDigestLP(&record.Buffer, []byte(value))
+	}
+}
+
+func (record *publicationDigestRecord) finish() []byte {
+	record.WriteByte('Z')
+	return append([]byte(nil), record.Bytes()...)
+}
+
+func writePublicationDigestLP(target *bytes.Buffer, value []byte) {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+	target.Write(length[:])
+	target.Write(value)
+}
+
+func writePublicationDigestCollection(target *bytes.Buffer, domain string, records [][]byte) {
+	sort.Slice(records, func(left, right int) bool { return bytes.Compare(records[left], records[right]) < 0 })
+	target.WriteByte('C')
+	writePublicationDigestLP(target, []byte(domain))
+	writePublicationDigestLP(target, []byte(strconv.Itoa(len(records))))
+	for _, record := range records {
+		target.WriteByte('I')
+		writePublicationDigestLP(target, record)
+	}
+}
+
+func digestPublicationBundleContent(manifest Manifest) string {
+	stream := &bytes.Buffer{}
+	stream.WriteString(PublicationDigestAlgorithm)
+
+	fileRecords := make([][]byte, 0, len(manifest.Files))
+	for _, file := range manifest.Files {
+		record := newPublicationDigestRecord("file")
+		record.scalar("path", file.Path)
+		record.scalar("sha256", file.SHA256)
+		record.scalar("size", strconv.FormatInt(file.Size, 10))
+		fileRecords = append(fileRecords, record.finish())
+	}
+	writePublicationDigestCollection(stream, "files", fileRecords)
+
+	observationRecords := make([][]byte, 0, len(manifest.Observations))
+	for _, observation := range manifest.Observations {
+		record := newPublicationDigestRecord("observation")
+		record.scalar("repositoryFingerprint", observation.RepositoryFingerprint)
+		record.scalar("fingerprint", observation.Fingerprint)
+		record.scalar("publicationRole", observation.PublicationRole)
+		record.scalar("rootCauseKey", observation.RootCauseKey)
+		record.array("blockedByRootKeys", observation.BlockedByRootKeys)
+		record.scalar("state", observation.State)
+		record.scalar("issueKind", observation.IssueKind)
+		record.scalar("severity", observation.Severity)
+		record.scalar("owningAgentHint", observation.OwningAgentHint)
+		record.scalar("title", observation.Title)
+		record.scalar("body", observation.Body)
+		record.array("labels", observation.Labels)
+		record.array("sourceArtifacts", observation.SourceArtifacts)
+		record.array("affectedContracts", observation.AffectedContracts)
+		record.scalar("validationCommand", observation.ValidationCommand)
+		record.scalar("observedAt", observation.ObservedAt)
+		record.scalar("firstSeenAt", observation.FirstSeenAt)
+		record.scalar("sourceArtifact", observation.SourceArtifact)
+		observationRecords = append(observationRecords, record.finish())
+	}
+	writePublicationDigestCollection(stream, "observations", observationRecords)
+
+	scan := newPublicationDigestRecord("scan")
+	scan.scalar("scope", manifest.Scan.Scope)
+	scan.scalar("authoritativeForResolution", strconv.FormatBool(manifest.Scan.AuthoritativeForResolution))
+	scan.array("evaluatedContracts", manifest.Scan.EvaluatedContracts)
+	scan.array("evaluatedFiles", manifest.Scan.EvaluatedFiles)
+	scan.scalar("testPlanVersion", manifest.Scan.TestPlanVersion)
+	scan.scalar("toolRegistryVersion", manifest.Scan.ToolRegistryVersion)
+	stream.Write(scan.finish())
+
+	source := newPublicationDigestRecord("source")
+	source.scalar("repository", manifest.Source.Repository)
+	source.scalar("repositoryId", manifest.Source.RepositoryID)
+	source.scalar("ref", manifest.Source.Ref)
+	source.scalar("commitSha", manifest.Source.CommitSHA)
+	source.scalar("workflowRunId", manifest.Source.WorkflowRunID)
+	source.scalar("workflowArtifactId", manifest.Source.WorkflowArtifactID)
+	source.scalar("conclusion", manifest.Source.Conclusion)
+	stream.Write(source.finish())
+
+	metadata := newPublicationDigestRecord("metadata")
+	metadata.scalar("project", manifest.Project)
+	metadata.scalar("mode", manifest.Mode)
+	metadata.scalar("verdict", manifest.Verdict)
+	metadata.scalar("acmmRequest", strconv.Itoa(manifest.ACMMRequest))
+	metadata.scalar("externalCallsMade", strconv.Itoa(manifest.ExternalCallsMade))
+	metadata.scalar("producerName", manifest.Producer.Name)
+	metadata.scalar("producerVersion", manifest.Producer.Version)
+	metadata.scalar("producerGitCommit", manifest.Producer.GitCommit)
+	stream.Write(metadata.finish())
+
+	replay := newPublicationDigestRecord("replay")
+	replay.scalar("key", manifest.ReplayProtection.Key)
+	stream.Write(replay.finish())
+
+	return digest(stream.Bytes())
 }
 
 func sortedUnique(values []string) bool {

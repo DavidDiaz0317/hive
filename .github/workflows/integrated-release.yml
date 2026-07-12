@@ -24,7 +24,7 @@ jobs:
       release_tag: ${{ steps.metadata.outputs.release_tag }}
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '13410bd566a54bdc71b5b39efd773b02533a8e8b' }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '0a21e851bd481021607f5379416f005fa0e75b66' }}
       RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || '' }}
       RELEASE_VERSION: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:
@@ -213,6 +213,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hive-integrated-${{ github.sha }}
@@ -249,6 +252,10 @@ jobs:
             [[ "$object_type" == "commit" ]] || { echo "Release tag resolves to unsupported object type: $object_type" >&2; return 1; }
             printf '%s\n' "$object_sha"
           }
+          # This exact helper is failure-smoked under transient query, deletion,
+          # and still-present release conditions before publication.
+          source v2/integrated-release-immutability.sh
+          release_verified=false
 
           # The tag push is the release authorization and the attestation's
           # immutable source ref. Never create a release tag from a branch-run
@@ -259,6 +266,7 @@ jobs:
             echo "Refusing to publish: $RELEASE_TAG no longer targets $GITHUB_SHA." >&2
             exit 1
           }
+          trap cleanup_on_exit EXIT
           gh release create "$RELEASE_TAG" \
             .release/dist/hive-integrated-*.tar.gz \
             .release/dist/hive-integrated-*.tar.gz.sha256 \
@@ -269,3 +277,10 @@ jobs:
             .release/dist/install-integrated.ps1 \
             .release/dist/install-integrated.ps1.sha256 \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Hive integrated $RELEASE_TAG" --generate-notes
+
+          if ! verify_published_release_immutable; then
+            echo "Refusing to retain a release that GitHub did not mark immutable." >&2
+            exit 1
+          fi
+          release_verified=true
+          trap - EXIT

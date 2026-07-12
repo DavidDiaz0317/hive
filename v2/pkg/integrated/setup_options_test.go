@@ -47,3 +47,19 @@ func TestAutoMergeSetupPlanExplainsPostMergeActivation(t *testing.T) {
 		t.Fatalf("started setup result does not explain automatic activation: %q", message)
 	}
 }
+
+func TestSetupPlanDoesNotWarnWhenReviewedBaselinesExist(t *testing.T) {
+	options := SetupOptions{
+		Repository: "owner/repo", Coverage: CoverageComprehensive, Automation: AutomationAdvisory,
+		Provider: "codex", StateDir: t.TempDir(), MaxActiveIssues: 5, MaxRepairAttempts: 4, VisualHive: true,
+	}
+	plan := buildSetupPlan(options, RepositoryInspection{
+		DefaultBranch: "main",
+		BaselineFiles: []string{".visual-hive/snapshots/dashboard.png"},
+	})
+	for _, warning := range plan.Warnings {
+		if strings.Contains(warning, "No reviewed visual baselines") {
+			t.Fatalf("setup plan reported a missing baseline despite reviewed snapshots: %v", plan.Warnings)
+		}
+	}
+}

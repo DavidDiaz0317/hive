@@ -50,6 +50,11 @@ type FindingLifecycle struct {
 	RepositoryID                   string          `json:"repository_id,omitempty"`
 	Fingerprint                    string          `json:"fingerprint"`
 	RepositoryFingerprint          string          `json:"repository_fingerprint"`
+	PublicationRole                string          `json:"publication_role,omitempty"`
+	RootCauseKey                   string          `json:"root_cause_key,omitempty"`
+	BlockedByRootKeys              []string        `json:"blocked_by_root_keys,omitempty"`
+	PublicationFingerprint         string          `json:"publication_fingerprint,omitempty"`
+	PendingMarkerMigrationFrom     string          `json:"pending_marker_migration_from,omitempty"`
 	Status                         LifecycleStatus `json:"status"`
 	IssueKind                      string          `json:"issue_kind"`
 	Severity                       string          `json:"severity"`
@@ -104,6 +109,7 @@ type OutboxEntry struct {
 	Body                  string            `json:"body,omitempty"`
 	Labels                []string          `json:"labels,omitempty"`
 	Evidence              map[string]string `json:"evidence,omitempty"`
+	PreviousMarker        string            `json:"previous_marker,omitempty"`
 	Attempts              int               `json:"attempts"`
 	LastError             string            `json:"last_error,omitempty"`
 	CreatedAt             time.Time         `json:"created_at"`
@@ -215,9 +221,36 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	if targetRef == "" {
 		targetRef = "refs/heads/main"
 	}
+	canonicalOwners := make(map[string]*FindingLifecycle)
+	newLegacyMigrations := make(map[string]*FindingLifecycle)
+	ambiguousLegacyCanonicals := make(map[string][]legacyCanonicalMatch)
+	for _, observation := range manifest.Observations {
+		if observation.State != "present" || observation.PublicationRole != "canonical" || s.state.Findings[observation.RepositoryFingerprint] != nil {
+			continue
+		}
+		if owner := exactMigratedCanonicalOwner(manifest.Source.Repository, s.state.Findings, observation); owner != nil {
+			canonicalOwners[observation.RepositoryFingerprint] = owner
+			continue
+		}
+		legacyMatches := exactLegacyCanonicalMigrationMatches(manifest.Source.Repository, s.state.Findings, observation)
+		if len(legacyMatches) != 1 || legacyMatches[0].key != legacyMatches[0].finding.RepositoryFingerprint {
+			if len(legacyMatches) == 0 {
+				continue
+			}
+			ambiguousLegacyCanonicals[observation.RepositoryFingerprint] = legacyMatches
+			s.auditLocked(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "ambiguous exact legacy canonical ownership; no existing issue was adopted"})
+			continue
+		}
+		legacy := legacyMatches[0].finding
+		canonicalOwners[observation.RepositoryFingerprint] = legacy
+		newLegacyMigrations[observation.RepositoryFingerprint] = legacy
+	}
 	beadInputs := make([]beads.BatchInput, 0, len(manifest.Observations))
 	for _, observation := range manifest.Observations {
 		if observation.State != "present" {
+			continue
+		}
+		if canonicalOwners[observation.RepositoryFingerprint] != nil {
 			continue
 		}
 		if existing := s.state.Findings[observation.RepositoryFingerprint]; existing == nil || existing.BeadID == "" {
@@ -231,18 +264,42 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		}
 		result.BeadsCreated, result.BeadsSkipped = beadResult.Created, beadResult.Skipped
 	}
+	for _, observation := range manifest.Observations {
+		legacy := newLegacyMigrations[observation.RepositoryFingerprint]
+		if legacy == nil {
+			continue
+		}
+		legacy.PendingMarkerMigrationFrom = lifecycleMarker(legacy.RepositoryFingerprint)
+		attachCanonicalPublicationIdentity(legacy, manifest.Source.Repository, observation)
+		s.auditLocked(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: true, Repository: legacy.Repository, RepositoryFingerprint: legacy.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: fmt.Sprintf("preserved issue #%d and existing repair identity for exact source fingerprint and issue kind", legacy.IssueNumber)})
+	}
 
 	observedFingerprints := make(map[string]bool, len(manifest.Observations))
-	publicationSet := selectIssuePublications(manifest.Observations, s.state.Findings, options.MaxActiveIssues, options.PreferRepairable)
+	presentRoots := make(map[string]bool)
+	for _, observation := range manifest.Observations {
+		if observation.State == "present" && observation.RootCauseKey != "" {
+			presentRoots[observation.RootCauseKey] = true
+		}
+	}
+	coveredRoots := coveredPublicationRoots(manifest.Source.Repository, manifest.Observations, s.state.Findings)
+	publicationSet := selectIssuePublications(manifest.Source.Repository, manifest.Observations, s.state.Findings, options.MaxActiveIssues, options.PreferRepairable)
 	for _, observation := range manifest.Observations {
 		observedFingerprints[observation.RepositoryFingerprint] = true
+		for _, legacy := range ambiguousLegacyCanonicals[observation.RepositoryFingerprint] {
+			observedFingerprints[legacy.key] = true
+		}
 		finding := s.state.Findings[observation.RepositoryFingerprint]
+		canonicalOwner := canonicalOwners[observation.RepositoryFingerprint]
+		if finding == nil && canonicalOwner != nil {
+			finding = canonicalOwner
+			observedFingerprints[finding.RepositoryFingerprint] = true
+		}
 		if observation.State == "absent" {
 			if finding == nil {
 				result.IgnoredAbsent++
 				continue
 			}
-			if allowed, reason := resolutionAllowed(finding, manifest, targetRef, options); !allowed {
+			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
 				result.IgnoredAbsent++
 				s.auditLocked(LifecycleAuditEntry{Action: "resolve_finding", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: reason})
 				continue
@@ -269,6 +326,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			continue
 		}
 
+		deferredReason := publicationDeferralReason(observation, coveredRoots)
+		preserveActiveOwner := deferredReason != "" && finding != nil && finding.IssueNumber > 0 && finding.RootCauseKey == observation.RootCauseKey &&
+			finding.PublicationFingerprint == publicationFingerprint(finding.Repository, finding.RootCauseKey, finding.RepositoryFingerprint)
 		wasReopened := false
 		if finding == nil {
 			firstSeenAt, _ := time.Parse(time.RFC3339Nano, observation.FirstSeenAt)
@@ -291,8 +351,27 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				wasReopened = true
 			}
 		}
-		updateFindingFromObservation(finding, manifest, observation)
-		if bead := beadStore.FindByExternalRef(beadExternalRef(manifest.Source.Repository, observation.RepositoryFingerprint)); bead != nil {
+		if !preserveActiveOwner {
+			if canonicalOwner != nil {
+				updateFindingPublicationFromObservation(finding, manifest, observation)
+			} else {
+				legacyIssueIdentity := finding.IssueNumber > 0 && finding.RootCauseKey == "" && observation.RootCauseKey != ""
+				legacyPublicationFingerprint := finding.PublicationFingerprint
+				updateFindingFromObservation(finding, manifest, observation)
+				if legacyIssueIdentity {
+					// Publication metadata must never silently rebind a legacy observation
+					// issue to a new root marker. It remains independently managed until a
+					// user explicitly reconciles it.
+					finding.PublicationRole, finding.RootCauseKey, finding.BlockedByRootKeys = "", "", nil
+					finding.PublicationFingerprint = legacyPublicationFingerprint
+				}
+			}
+		}
+		beadFingerprint := observation.RepositoryFingerprint
+		if canonicalOwner != nil {
+			beadFingerprint = finding.RepositoryFingerprint
+		}
+		if bead := beadStore.FindByExternalRef(beadExternalRef(manifest.Source.Repository, beadFingerprint)); bead != nil {
 			if finding.BeadID == "" {
 				finding.BeadID = bead.ID
 			}
@@ -302,6 +381,12 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 					value.ClosedAt = nil
 				})
 			}
+		}
+		if deferredReason != "" {
+			result.Deferred++
+			s.auditLocked(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: deferredReason})
+			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
+			continue
 		}
 		action := OutboxOpenIssue
 		if finding.IssueNumber > 0 {
@@ -315,6 +400,37 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			s.auditLocked(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "active issue work-in-progress limit reached"})
 			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 			continue
+		}
+		if publicationSet[observation.RepositoryFingerprint] && observation.RootCauseKey != "" {
+			if owner := publicationOwner(manifest.Source.Repository, s.state.Findings, observation); owner != nil && owner.RepositoryFingerprint != finding.RepositoryFingerprint {
+				ownerReopened := owner.Status == StatusIssueClosed || owner.Status == StatusResolved
+				if ownerReopened {
+					owner.Status = StatusDetected
+					owner.ResolvedAt, owner.ClosedAt = nil, nil
+					owner.Recurrences++
+					resetRepairCycle(owner)
+					if owner.BeadID != "" {
+						_ = beadStore.Update(owner.BeadID, func(value *beads.Bead) {
+							value.Status = beads.StatusOpen
+							value.ClosedAt = nil
+						})
+					}
+					result.Reopened++
+				}
+				updateFindingPublicationFromObservation(owner, manifest, observation)
+				ownerAction := OutboxUpdateIssue
+				if ownerReopened {
+					ownerAction = OutboxReopenIssue
+				}
+				if s.enqueueLocked(outboxForFinding(ownerAction, owner, manifest, now)) {
+					result.OutboxCreated++
+				}
+				result.Updated++
+				result.FindingIDs = append(result.FindingIDs, owner.RepositoryFingerprint)
+				s.auditLocked(LifecycleAuditEntry{Action: string(ownerAction), Allowed: true, Repository: owner.Repository, RepositoryFingerprint: owner.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "updated the existing exact-root publication owner"})
+				result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
+				continue
+			}
 		}
 		if s.enqueueLocked(outboxForFinding(action, finding, manifest, now)) {
 			result.OutboxCreated++
@@ -339,7 +455,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			if finding == nil || !strings.EqualFold(finding.Repository, manifest.Source.Repository) || observedFingerprints[key] || finding.Status == StatusIssueClosed {
 				continue
 			}
-			if allowed, reason := resolutionAllowed(finding, manifest, targetRef, options); !allowed {
+			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
 				s.auditLocked(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: reason})
 				continue
 			}
@@ -371,32 +487,32 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	return result, nil
 }
 
-func selectIssuePublications(observations []Observation, findings map[string]*FindingLifecycle, maxActive int, preferRepairable bool) map[string]bool {
+func selectIssuePublications(repository string, observations []Observation, findings map[string]*FindingLifecycle, maxActive int, preferRepairable bool) map[string]bool {
 	selected := map[string]bool{}
-	if maxActive <= 0 {
-		for _, observation := range observations {
-			if observation.State == "present" {
-				selected[observation.RepositoryFingerprint] = true
-			}
+	coveredRoots := coveredPublicationRoots(repository, observations, findings)
+	explicitPublication := false
+	for _, observation := range observations {
+		if observation.PublicationRole != "" {
+			explicitPublication = true
+			break
 		}
-		return selected
 	}
-	active := 0
+	activeIssues := map[string]bool{}
 	for _, finding := range findings {
-		if finding != nil && finding.IssueNumber > 0 && finding.Status != StatusResolved && finding.Status != StatusIssueClosed {
-			active++
+		if finding != nil && finding.IssueNumber > 0 && finding.Status != StatusResolved && finding.Status != StatusIssueClosed && (!explicitPublication || finding.RootCauseKey != "") {
+			activeIssues[fmt.Sprintf("%s#%d", strings.ToLower(strings.TrimSpace(finding.Repository)), finding.IssueNumber)] = true
 		}
-	}
-	slots := maxActive - active
-	if slots <= 0 {
-		return selected
 	}
 	candidates := make([]Observation, 0, len(observations))
 	for _, observation := range observations {
 		if observation.State != "present" {
 			continue
 		}
-		if finding := findings[observation.RepositoryFingerprint]; finding != nil && finding.IssueNumber > 0 {
+		if publicationDeferralReason(observation, coveredRoots) != "" {
+			continue
+		}
+		if publicationOwner(repository, findings, observation) != nil {
+			selected[observation.RepositoryFingerprint] = true
 			continue
 		}
 		candidates = append(candidates, observation)
@@ -420,13 +536,157 @@ func selectIssuePublications(observations []Observation, findings map[string]*Fi
 		}
 		return left.RepositoryFingerprint < right.RepositoryFingerprint
 	})
+	slots := len(candidates)
+	if maxActive > 0 {
+		slots = maxActive - len(activeIssues)
+		if slots < 0 {
+			slots = 0
+		}
+	}
+	created := 0
 	for _, observation := range candidates {
-		if len(selected) >= slots {
+		if created >= slots {
 			break
 		}
 		selected[observation.RepositoryFingerprint] = true
+		created++
 	}
 	return selected
+}
+
+func coveredPublicationRoots(repository string, observations []Observation, findings map[string]*FindingLifecycle) map[string]bool {
+	covered := map[string]bool{}
+	present := map[string]bool{}
+	absent := map[string]bool{}
+	for _, observation := range observations {
+		if observation.RootCauseKey == "" {
+			continue
+		}
+		if observation.State == "present" {
+			present[observation.RootCauseKey] = true
+			if observation.PublicationRole == "canonical" {
+				covered[observation.RootCauseKey] = true
+			}
+		} else if observation.State == "absent" {
+			absent[observation.RootCauseKey] = true
+		}
+	}
+	for _, finding := range findings {
+		if finding != nil && finding.RootCauseKey != "" && finding.IssueNumber > 0 && finding.Status != StatusResolved && finding.Status != StatusIssueClosed &&
+			(repository == "" || strings.EqualFold(strings.TrimSpace(finding.Repository), strings.TrimSpace(repository))) &&
+			finding.PublicationFingerprint == publicationFingerprint(finding.Repository, finding.RootCauseKey, finding.RepositoryFingerprint) &&
+			(!absent[finding.RootCauseKey] || present[finding.RootCauseKey]) {
+			covered[finding.RootCauseKey] = true
+		}
+	}
+	return covered
+}
+
+func publicationDeferralReason(observation Observation, coveredRoots map[string]bool) string {
+	if observation.State != "present" || observation.RootCauseKey == "" {
+		return ""
+	}
+	switch observation.PublicationRole {
+	case "derivative":
+		if coveredRoots[observation.RootCauseKey] {
+			return fmt.Sprintf("deferred derivative observation: exact root %q has a canonical observation or active owner", observation.RootCauseKey)
+		}
+	case "aggregate":
+		if len(observation.BlockedByRootKeys) == 0 {
+			return "" // Invalid/unrecognized linkage fails open at publication.
+		}
+		for _, root := range observation.BlockedByRootKeys {
+			if !coveredRoots[root] {
+				return "" // Any uncovered dependency makes the aggregate independently actionable.
+			}
+		}
+		return "deferred aggregate observation: every exact blocked root has a canonical observation or active owner"
+	}
+	return ""
+}
+
+func publicationOwner(repository string, findings map[string]*FindingLifecycle, observation Observation) *FindingLifecycle {
+	if observation.RootCauseKey == "" {
+		return findings[observation.RepositoryFingerprint]
+	}
+	var owner *FindingLifecycle
+	for _, finding := range findings {
+		if finding == nil || finding.IssueNumber <= 0 || finding.RootCauseKey != observation.RootCauseKey ||
+			(repository != "" && !strings.EqualFold(strings.TrimSpace(finding.Repository), strings.TrimSpace(repository))) ||
+			finding.PublicationFingerprint != publicationFingerprint(finding.Repository, finding.RootCauseKey, finding.RepositoryFingerprint) {
+			continue
+		}
+		if owner == nil || finding.IssueNumber < owner.IssueNumber || (finding.IssueNumber == owner.IssueNumber && finding.RepositoryFingerprint < owner.RepositoryFingerprint) {
+			owner = finding
+		}
+	}
+	return owner
+}
+
+type legacyCanonicalMatch struct {
+	key     string
+	finding *FindingLifecycle
+}
+
+func exactLegacyCanonicalMigrationMatches(repository string, findings map[string]*FindingLifecycle, observation Observation) []legacyCanonicalMatch {
+	if observation.State != "present" || observation.PublicationRole != "canonical" || observation.RootCauseKey == "" || !legacyCanonicalIssueKind(observation.IssueKind) {
+		return nil
+	}
+	expectedLegacyFingerprint := digest([]byte(strings.ToLower(strings.TrimSpace(repository)) + "\x00" + observation.Fingerprint))
+	matches := make([]legacyCanonicalMatch, 0, 1)
+	for key, finding := range findings {
+		if finding == nil || finding.IssueNumber <= 0 || strings.TrimSpace(finding.IssueURL) == "" || finding.Status == StatusResolved || finding.Status == StatusIssueClosed ||
+			!strings.EqualFold(strings.TrimSpace(finding.Repository), strings.TrimSpace(repository)) ||
+			finding.PublicationRole != "" || finding.RootCauseKey != "" || len(finding.BlockedByRootKeys) != 0 ||
+			(finding.PublicationFingerprint != "" && finding.PublicationFingerprint != finding.RepositoryFingerprint) ||
+			finding.RepositoryFingerprint != expectedLegacyFingerprint || finding.Fingerprint != observation.Fingerprint || finding.IssueKind != observation.IssueKind {
+			continue
+		}
+		matches = append(matches, legacyCanonicalMatch{key: key, finding: finding})
+	}
+	sort.Slice(matches, func(left, right int) bool { return matches[left].key < matches[right].key })
+	return matches
+}
+
+func legacyCanonicalIssueKind(issueKind string) bool {
+	switch issueKind {
+	case "missing_visual_coverage", "weak_visual_test", "external_repo_onboarding":
+		return false
+	default:
+		return true
+	}
+}
+
+func exactMigratedCanonicalOwner(repository string, findings map[string]*FindingLifecycle, observation Observation) *FindingLifecycle {
+	expectedLegacyFingerprint := digest([]byte(strings.ToLower(strings.TrimSpace(repository)) + "\x00" + observation.Fingerprint))
+	var owner *FindingLifecycle
+	for key, finding := range findings {
+		if finding == nil || key != expectedLegacyFingerprint || finding.RepositoryFingerprint != expectedLegacyFingerprint || finding.IssueNumber <= 0 ||
+			!strings.EqualFold(strings.TrimSpace(finding.Repository), strings.TrimSpace(repository)) ||
+			finding.PublicationRole != "canonical" || finding.RootCauseKey != observation.RootCauseKey || finding.Fingerprint != observation.Fingerprint || finding.IssueKind != observation.IssueKind ||
+			finding.PublicationFingerprint != publicationFingerprint(repository, observation.RootCauseKey, observation.RepositoryFingerprint) {
+			continue
+		}
+		if owner != nil {
+			return nil
+		}
+		owner = finding
+	}
+	return owner
+}
+
+func attachCanonicalPublicationIdentity(finding *FindingLifecycle, repository string, observation Observation) {
+	finding.PublicationRole = observation.PublicationRole
+	finding.RootCauseKey = observation.RootCauseKey
+	finding.BlockedByRootKeys = append([]string(nil), observation.BlockedByRootKeys...)
+	finding.PublicationFingerprint = publicationFingerprint(repository, observation.RootCauseKey, observation.RepositoryFingerprint)
+}
+
+func publicationFingerprint(repository, rootCauseKey, legacyFingerprint string) string {
+	if rootCauseKey == "" {
+		return legacyFingerprint
+	}
+	return digest([]byte(strings.ToLower(strings.TrimSpace(repository)) + "\x00" + rootCauseKey))
 }
 
 func observationNeedsHumanReview(observation Observation) bool {
@@ -554,6 +814,31 @@ func (s *LifecycleStore) MarkIssueOpened(repositoryFingerprint string, number in
 		if finding.Status == StatusDetected || finding.Status == StatusResolved || finding.Status == StatusIssueClosed {
 			finding.Status = StatusIssueOpen
 		}
+		return nil
+	})
+}
+
+func (s *LifecycleStore) MarkIssueMarkerMigrated(repositoryFingerprint, previousMarker, marker string, number int, issueURL string) error {
+	return s.updateFinding(repositoryFingerprint, "issue_marker_migrated", func(finding *FindingLifecycle) error {
+		if number <= 0 || number != finding.IssueNumber || strings.TrimSpace(issueURL) == "" {
+			return fmt.Errorf("migrated GitHub issue identity does not match the persisted lifecycle issue")
+		}
+		expectedMarker := lifecycleMarker(finding.PublicationFingerprint)
+		if marker != expectedMarker {
+			return fmt.Errorf("migrated GitHub issue marker does not match the stable publication identity")
+		}
+		if finding.PendingMarkerMigrationFrom == "" {
+			if previousMarker != lifecycleMarker(finding.RepositoryFingerprint) {
+				return fmt.Errorf("completed marker migration does not match the preserved legacy identity")
+			}
+			finding.IssueURL = issueURL
+			return nil
+		}
+		if previousMarker != finding.PendingMarkerMigrationFrom || previousMarker == marker {
+			return fmt.Errorf("marker migration does not match the pending exact legacy marker")
+		}
+		finding.PendingMarkerMigrationFrom = ""
+		finding.IssueURL = issueURL
 		return nil
 	})
 }
@@ -980,6 +1265,10 @@ func updateFindingFromObservation(finding *FindingLifecycle, manifest Manifest, 
 	finding.RepositoryID = manifest.Source.RepositoryID
 	finding.Fingerprint = observation.Fingerprint
 	finding.RepositoryFingerprint = observation.RepositoryFingerprint
+	finding.PublicationRole = observation.PublicationRole
+	finding.RootCauseKey = observation.RootCauseKey
+	finding.BlockedByRootKeys = append([]string(nil), observation.BlockedByRootKeys...)
+	finding.PublicationFingerprint = publicationFingerprint(manifest.Source.Repository, observation.RootCauseKey, observation.RepositoryFingerprint)
 	finding.IssueKind = observation.IssueKind
 	finding.Severity = observation.Severity
 	finding.OwningAgentHint = observation.OwningAgentHint
@@ -994,6 +1283,21 @@ func updateFindingFromObservation(finding *FindingLifecycle, manifest Manifest, 
 	finding.LastBundleID = manifest.BundleID
 	finding.LastBundleDigest = manifest.OverallDigest
 	finding.LastWorkflowRunID = manifest.Source.WorkflowRunID
+}
+
+func updateFindingPublicationFromObservation(finding *FindingLifecycle, manifest Manifest, observation Observation) {
+	identity := finding.RepositoryFingerprint
+	beadID := finding.BeadID
+	issueNumber, issueURL := finding.IssueNumber, finding.IssueURL
+	firstSeenAt := finding.FirstSeenAt
+	updateFindingFromObservation(finding, manifest, observation)
+	// A root owner is a durable lifecycle identity. New canonical wording or a
+	// changed producer fingerprint updates that exact issue; it never creates a
+	// second marker or rewires the owner's repair history.
+	finding.RepositoryFingerprint = identity
+	finding.BeadID = beadID
+	finding.IssueNumber, finding.IssueURL = issueNumber, issueURL
+	finding.FirstSeenAt = firstSeenAt
 }
 
 func resetRepairCycle(finding *FindingLifecycle) {
@@ -1040,6 +1344,7 @@ func outboxForFinding(action OutboxAction, finding *FindingLifecycle, manifest M
 		ID: id, Action: action, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint,
 		BundleID: manifest.BundleID, BundleDigest: manifest.OverallDigest, IssueNumber: finding.IssueNumber,
 		Title: finding.Title, Body: finding.Body, Labels: append([]string(nil), finding.Labels...),
+		PreviousMarker: finding.PendingMarkerMigrationFrom,
 		Evidence: map[string]string{
 			"bundle_id": manifest.BundleID, "bundle_digest": manifest.OverallDigest,
 			"commit_sha": manifest.Source.CommitSHA, "workflow_run_id": manifest.Source.WorkflowRunID,
@@ -1093,6 +1398,25 @@ func refsEquivalent(left, right string) bool {
 		return strings.TrimPrefix(strings.TrimSpace(value), "refs/heads/")
 	}
 	return normalize(left) != "" && normalize(left) == normalize(right)
+}
+
+func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions, presentRoots map[string]bool) (bool, string) {
+	allowed, reason := resolutionAllowed(finding, manifest, targetRef, options)
+	if !allowed || finding == nil || finding.RootCauseKey == "" || finding.IssueNumber <= 0 {
+		return allowed, reason
+	}
+	if presentRoots[finding.RootCauseKey] {
+		return false, fmt.Sprintf("root %q still has present evidence", finding.RootCauseKey)
+	}
+	for _, related := range s.state.Findings {
+		if related == nil || related == finding || related.RootCauseKey != finding.RootCauseKey || !strings.EqualFold(related.Repository, finding.Repository) || related.Status == StatusResolved || related.Status == StatusIssueClosed {
+			continue
+		}
+		if relatedAllowed, relatedReason := resolutionAllowed(related, manifest, targetRef, options); !relatedAllowed {
+			return false, fmt.Sprintf("root %q is not authoritatively absent: %s", finding.RootCauseKey, relatedReason)
+		}
+	}
+	return true, ""
 }
 
 func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions) (bool, string) {

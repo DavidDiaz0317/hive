@@ -300,10 +300,19 @@ func writeRefreshFixture(t *testing.T, root, relative, value string) {
 
 func commitRefreshFixture(t *testing.T, root, message string) {
 	t.Helper()
+	// Persist a repository-local identity so later Git operations that create
+	// commits (for example, the merge used to model GitHub's update-branch
+	// behavior) do not depend on developer or hosted-runner global config.
+	if _, err := runGit(context.Background(), root, "config", "--local", "user.name", "Hive Repair Test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(context.Background(), root, "config", "--local", "user.email", "hive-repair-test@example.test"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := runGit(context.Background(), root, "add", "--all"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runGit(context.Background(), root, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", message); err != nil {
+	if _, err := runGit(context.Background(), root, "commit", "-m", message); err != nil {
 		t.Fatal(err)
 	}
 }

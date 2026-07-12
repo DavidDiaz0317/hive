@@ -121,6 +121,114 @@ func TestUpdateLifecycleIssueClosesExplicitly(t *testing.T) {
 	}
 }
 
+func TestMigrateLifecycleIssueMarkerVerifiesOldOwnershipAndIsIdempotent(t *testing.T) {
+	previousMarker := "<!-- hive-visual-fingerprint: " + strings.Repeat("a", 64) + " -->"
+	marker := "<!-- hive-visual-fingerprint: " + strings.Repeat("b", 64) + " -->"
+	body := previousMarker + "\n<!-- visual-hive-issue dedupe:must-not-be-used -->\nlegacy evidence"
+	patches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if serveLifecycleWriter(writer, request) {
+			return
+		}
+		issue := map[string]interface{}{
+			"number": 15, "title": "Mutation survived", "html_url": "https://github.test/owner/repo/issues/15",
+			"body": body, "state": "open", "user": map[string]interface{}{"login": "hive-writer", "id": int64(4242)},
+		}
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/15":
+			_ = json.NewEncoder(writer).Encode(issue)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues":
+			_ = json.NewEncoder(writer).Encode([]interface{}{issue})
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/issues/15":
+			var update struct {
+				Body  string `json:"body"`
+				State string `json:"state"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&update); err != nil {
+				t.Error(err)
+				return
+			}
+			if update.State != "open" || strings.Count(update.Body, marker) != 1 || strings.Contains(update.Body, previousMarker) || strings.Contains(update.Body, "visual-hive-issue dedupe:") {
+				t.Errorf("unsafe marker migration request: %+v", update)
+			}
+			patches++
+			body = update.Body
+			issue["body"] = body
+			_ = json.NewEncoder(writer).Encode(issue)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	desiredBody := marker + "\nEvidence after exact migration"
+	for attempt := 0; attempt < 2; attempt++ {
+		number, url, err := client.MigrateLifecycleIssueMarker(context.Background(), "owner/repo", 15, previousMarker, marker, "Mutation survived", desiredBody, "open", []string{"hive/managed", "hive/active"})
+		if err != nil || number != 15 || url != "https://github.test/owner/repo/issues/15" {
+			t.Fatalf("attempt %d marker migration failed: number=%d url=%q err=%v", attempt+1, number, url, err)
+		}
+	}
+	if patches != 2 {
+		t.Fatalf("idempotent marker migration did not safely refresh the exact target: patches=%d, want 2", patches)
+	}
+}
+
+func TestMigrateLifecycleIssueMarkerRejectsForeignOrInexactOldOwnership(t *testing.T) {
+	previousMarker := "<!-- hive-visual-fingerprint: " + strings.Repeat("a", 64) + " -->"
+	marker := "<!-- hive-visual-fingerprint: " + strings.Repeat("b", 64) + " -->"
+	visualMarker := "<!-- visual-hive-issue dedupe:legacy-visual-only -->"
+	tests := []struct {
+		name   string
+		author string
+		id     int64
+		body   string
+	}{
+		{name: "foreign author", author: "attacker", body: previousMarker},
+		{name: "different immutable author id", author: "hive-writer", id: 31337, body: previousMarker},
+		{name: "Visual marker only", author: "hive-writer", body: visualMarker},
+		{name: "missing marker", author: "hive-writer", body: "legacy evidence"},
+		{name: "multiple old markers", author: "hive-writer", body: previousMarker + "\n" + previousMarker},
+		{name: "different Hive marker", author: "hive-writer", body: "<!-- hive-visual-fingerprint: other -->"},
+		{name: "new marker without migration receipt", author: "hive-writer", body: marker},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			patched := false
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if serveLifecycleWriter(writer, request) {
+					return
+				}
+				switch {
+				case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/15":
+					id := test.id
+					if id == 0 && test.author == "hive-writer" {
+						id = 4242
+					} else if id == 0 {
+						id = 31337
+					}
+					_ = json.NewEncoder(writer).Encode(map[string]interface{}{
+						"number": 15, "html_url": "https://github.test/owner/repo/issues/15", "body": test.body,
+						"user": map[string]interface{}{"login": test.author, "id": id},
+					})
+				case request.Method == http.MethodPatch:
+					patched = true
+					http.Error(writer, "unsafe patch", http.StatusInternalServerError)
+				default:
+					http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			_, _, err := client.MigrateLifecycleIssueMarker(context.Background(), "owner/repo", 15, previousMarker, marker, "Mutation survived", marker+"\nevidence", "open", []string{"hive/managed"})
+			if err == nil || patched {
+				t.Fatalf("unsafe marker ownership was not rejected before mutation: patched=%t err=%v", patched, err)
+			}
+		})
+	}
+}
+
 func TestLifecycleIssueUpsertReconcilesConcurrentDuplicateCreate(t *testing.T) {
 	marker := "<!-- hive-visual-fingerprint: concurrent-proof -->"
 	states := map[int]string{7: "open", 8: "open"}
@@ -346,7 +454,7 @@ func serveLifecycleWriter(writer http.ResponseWriter, request *http.Request) boo
 	if request.Method != http.MethodGet || request.URL.Path != "/user" {
 		return false
 	}
-	_, _ = io.WriteString(writer, `{"login":"hive-writer"}`)
+	_, _ = io.WriteString(writer, `{"login":"hive-writer","id":4242}`)
 	return true
 }
 

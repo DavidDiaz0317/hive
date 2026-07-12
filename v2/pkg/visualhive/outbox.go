@@ -13,6 +13,7 @@ import (
 type LifecycleIssueClient interface {
 	UpsertLifecycleIssue(ctx context.Context, repository, marker, title, body string, labels []string) (number int, url string, created bool, err error)
 	UpdateLifecycleIssue(ctx context.Context, repository string, number int, title, body, state string, labels []string) (updatedNumber int, url string, err error)
+	MigrateLifecycleIssueMarker(ctx context.Context, repository string, number int, previousMarker, marker, title, body, state string, labels []string) (updatedNumber int, url string, err error)
 }
 
 type OutboxProcessorResult struct {
@@ -77,8 +78,56 @@ func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *be
 }
 
 func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStore *beads.Store, client LifecycleIssueClient, finding FindingLifecycle, entry OutboxEntry) error {
-	marker := lifecycleMarker(finding.RepositoryFingerprint)
+	markerFingerprint := finding.PublicationFingerprint
+	if finding.RootCauseKey != "" {
+		expected := publicationFingerprint(finding.Repository, finding.RootCauseKey, finding.RepositoryFingerprint)
+		if markerFingerprint != expected {
+			return fmt.Errorf("root publication fingerprint does not match repository and root cause key")
+		}
+		markerFingerprint = expected
+	} else {
+		markerFingerprint = finding.RepositoryFingerprint
+	}
+	marker := lifecycleMarker(markerFingerprint)
 	body := lifecycleIssueBody(marker, entry, finding)
+	if entry.PreviousMarker != "" {
+		if finding.IssueNumber <= 0 || entry.IssueNumber != finding.IssueNumber || entry.PreviousMarker == marker {
+			return fmt.Errorf("pending lifecycle marker migration does not match the persisted issue identity")
+		}
+		if finding.PendingMarkerMigrationFrom != "" && finding.PendingMarkerMigrationFrom != entry.PreviousMarker {
+			return fmt.Errorf("outbox marker migration does not match the currently pending exact old marker")
+		}
+		state := "open"
+		labels := activeLabels(entry.Labels)
+		switch entry.Action {
+		case OutboxUpdateIssue, OutboxReopenIssue:
+		case OutboxCloseIssue:
+			if finding.Status == StatusIssueClosed {
+				if finding.PendingMarkerMigrationFrom != "" {
+					return fmt.Errorf("closed finding still has a pending marker migration")
+				}
+				return nil
+			}
+			if finding.Status != StatusResolved {
+				return fmt.Errorf("refusing to migrate and close issue while finding is %s", finding.Status)
+			}
+			state = "closed"
+			labels = resolvedLabels(entry.Labels)
+		default:
+			return fmt.Errorf("unsupported lifecycle action %q for an exact marker migration", entry.Action)
+		}
+		number, url, err := client.MigrateLifecycleIssueMarker(ctx, entry.Repository, finding.IssueNumber, entry.PreviousMarker, marker, entry.Title, body, state, labels)
+		if err != nil {
+			return err
+		}
+		if err := lifecycle.MarkIssueMarkerMigrated(entry.RepositoryFingerprint, entry.PreviousMarker, marker, number, url); err != nil {
+			return err
+		}
+		if entry.Action == OutboxCloseIssue {
+			return lifecycle.MarkIssueClosed(entry.RepositoryFingerprint, beadStore)
+		}
+		return lifecycle.MarkIssueOpened(entry.RepositoryFingerprint, number, url)
+	}
 	switch entry.Action {
 	case OutboxOpenIssue:
 		number, url, _, err := client.UpsertLifecycleIssue(ctx, entry.Repository, marker, entry.Title, body, activeLabels(entry.Labels))
@@ -139,9 +188,13 @@ func lifecycleIssueBody(marker string, entry OutboxEntry, finding FindingLifecyc
 	if entry.Action == OutboxCloseIssue {
 		status = "resolved after authoritative target-branch verification"
 	}
+	observationBody := strings.TrimSpace(entry.Body)
+	if finding.RootCauseKey != "" {
+		observationBody = stripLegacyVisualHiveDedupeMarkers(observationBody)
+	}
 	lines := []string{
 		marker,
-		strings.TrimSpace(entry.Body),
+		observationBody,
 		"",
 		"## Hive lifecycle",
 		"",
@@ -164,6 +217,24 @@ func lifecycleIssueBody(marker string, entry OutboxEntry, finding FindingLifecyc
 	}
 	lines = append(lines, "", "Hive owns this issue lifecycle. Absence from partial, stale, failed, or non-target-branch evidence cannot close it.")
 	return strings.Join(lines, "\n")
+}
+
+func stripLegacyVisualHiveDedupeMarkers(body string) string {
+	const prefix = "<!-- visual-hive-issue dedupe:"
+	for {
+		start := strings.Index(body, prefix)
+		if start < 0 {
+			break
+		}
+		end := strings.Index(body[start:], "-->")
+		if end < 0 {
+			// A malformed marker cannot be used by the GitHub compatibility
+			// lookup, so leave evidence text unchanged.
+			break
+		}
+		body = body[:start] + body[start+end+3:]
+	}
+	return strings.TrimSpace(body)
 }
 
 func activeLabels(labels []string) []string {

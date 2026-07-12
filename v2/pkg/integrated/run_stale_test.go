@@ -177,6 +177,11 @@ func (c *staleRaceIssueClient) UpdateLifecycleIssue(_ context.Context, _ string,
 	return number, "https://github.test/owner/repo/issues/17", nil
 }
 
+func (c *staleRaceIssueClient) MigrateLifecycleIssueMarker(_ context.Context, _ string, number int, _, _, _, _ string, state string, _ []string) (int, string, error) {
+	c.states = append(c.states, state)
+	return number, "https://github.test/owner/repo/issues/17", nil
+}
+
 func staleRaceBundle(id, head, state string) *visualhive.ValidatedBundle {
 	now := time.Now().UTC()
 	observation := visualhive.Observation{

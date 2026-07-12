@@ -2,7 +2,9 @@ package visualhive
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kubestellar/hive/v2/pkg/automation"
@@ -11,27 +13,54 @@ import (
 type fakeLifecycleIssueClient struct {
 	upserts        int
 	updates        int
+	migrations     int
 	state          string
 	labels         []string
 	canonicalIssue int
 	canonicalURL   string
+	marker         string
+	previousMarker string
+	migrationErr   error
 }
 
-func (client *fakeLifecycleIssueClient) UpsertLifecycleIssue(_ context.Context, _, _, _, _ string, labels []string) (int, string, bool, error) {
+func (client *fakeLifecycleIssueClient) MigrateLifecycleIssueMarker(_ context.Context, _ string, number int, previousMarker, marker, _, _ string, state string, labels []string) (int, string, error) {
+	client.migrations++
+	client.previousMarker = previousMarker
+	client.marker = marker
+	client.state = state
+	client.labels = append([]string(nil), labels...)
+	if client.migrationErr != nil {
+		return 0, "", client.migrationErr
+	}
+	return number, fmt.Sprintf("https://github.test/owner/repo/issues/%d", number), nil
+}
+
+func (client *fakeLifecycleIssueClient) UpsertLifecycleIssue(_ context.Context, _, marker, _, _ string, labels []string) (int, string, bool, error) {
 	client.upserts++
+	client.marker = marker
 	client.state = "open"
 	client.labels = append([]string(nil), labels...)
 	return 17, "https://github.test/owner/repo/issues/17", client.upserts == 1, nil
 }
 
-func (client *fakeLifecycleIssueClient) UpdateLifecycleIssue(_ context.Context, _ string, number int, _, _ string, state string, labels []string) (int, string, error) {
+func (client *fakeLifecycleIssueClient) UpdateLifecycleIssue(_ context.Context, _ string, number int, _, body string, state string, labels []string) (int, string, error) {
 	client.updates++
+	client.marker = lifecycleMarkerFromIssueBody(body)
 	client.state = state
 	client.labels = append([]string(nil), labels...)
 	if client.canonicalIssue > 0 {
 		return client.canonicalIssue, client.canonicalURL, nil
 	}
 	return number, "https://github.test/owner/repo/issues/17", nil
+}
+
+func lifecycleMarkerFromIssueBody(body string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "<!-- hive-visual-fingerprint:") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
 }
 
 func TestProcessOutboxUsesACMMAndClosesOnlyResolvedFinding(t *testing.T) {
@@ -90,6 +119,19 @@ func TestProcessOutboxUsesACMMAndClosesOnlyResolvedFinding(t *testing.T) {
 	finding, _ := lifecycle.Finding(fingerprint)
 	if finding.Status != StatusIssueClosed {
 		t.Fatalf("finding state was not closed: %+v", finding)
+	}
+}
+
+func TestExplicitRootIssueBodyCannotTriggerLegacyDerivativeRebind(t *testing.T) {
+	entry := OutboxEntry{Body: "<!-- visual-hive-issue dedupe:legacy-derivative -->\nEvidence remains", BundleID: "bundle", BundleDigest: "digest", Evidence: map[string]string{}}
+	rootFinding := FindingLifecycle{Fingerprint: "source", RootCauseKey: "mutation/api-500/localPreview/dashboard-shell"}
+	body := lifecycleIssueBody(lifecycleMarker("root"), entry, rootFinding)
+	if strings.Contains(body, "<!-- visual-hive-issue dedupe:") || !strings.Contains(body, "Evidence remains") {
+		t.Fatalf("explicit root issue body retained a legacy ownership marker or lost evidence: %q", body)
+	}
+	legacyBody := lifecycleIssueBody(lifecycleMarker("legacy"), entry, FindingLifecycle{Fingerprint: "source"})
+	if !strings.Contains(legacyBody, "<!-- visual-hive-issue dedupe:legacy-derivative -->") {
+		t.Fatalf("legacy lifecycle compatibility marker was unexpectedly removed: %q", legacyBody)
 	}
 }
 

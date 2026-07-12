@@ -319,6 +319,12 @@ func setupIntegratedRefreshRepository(t *testing.T) (remote, worktree, oldHead, 
 	if _, err := git(ctx, worktree, "init", "-b", "main"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := git(ctx, worktree, "config", "--local", "user.name", "Hive Integrated Test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git(ctx, worktree, "config", "--local", "user.email", "hive-integrated-test@example.test"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := git(ctx, worktree, "remote", "add", "origin", remote); err != nil {
 		t.Fatal(err)
 	}

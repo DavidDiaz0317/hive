@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -105,6 +106,87 @@ func (c *Client) UpdateLifecycleIssue(ctx context.Context, repository string, nu
 		return 0, "", err
 	}
 	return canonical.GetNumber(), canonical.GetHTMLURL(), nil
+}
+
+// MigrateLifecycleIssueMarker performs the one narrowly scoped ownership
+// transition from an exact legacy Hive marker to a stable root marker. Unlike
+// UpsertLifecycleIssue it never searches for or adopts a Visual Hive dedupe
+// marker: the persisted repository, issue number, immutable author, and old
+// Hive marker must all match before GitHub receives a mutation.
+func (c *Client) MigrateLifecycleIssueMarker(ctx context.Context, repository string, number int, previousMarker, marker, title, body, state string, labels []string) (int, string, error) {
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return 0, "", err
+	}
+	if number <= 0 || strings.TrimSpace(title) == "" || strings.TrimSpace(body) == "" || (state != "open" && state != "closed") {
+		return 0, "", fmt.Errorf("valid lifecycle marker migration issue, title, body, and state are required")
+	}
+	if previousMarker == marker || !isExactHiveLifecycleMarker(previousMarker) || !isExactHiveLifecycleMarker(marker) {
+		return 0, "", fmt.Errorf("marker migration requires distinct exact old and new Hive markers")
+	}
+	desiredMarkers := hiveLifecycleMarkers(body)
+	if len(desiredMarkers) != 1 || desiredMarkers[0] != marker || len(markerMigrationReceipts(body)) != 0 {
+		return 0, "", fmt.Errorf("marker migration body must contain exactly the new Hive marker")
+	}
+	writer, writerID, err := c.authenticatedLifecycleWriter(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	existing, _, err := c.client.Issues.Get(ctx, owner, repo, number)
+	if err != nil {
+		return 0, "", fmt.Errorf("read lifecycle issue #%d before marker migration: %w", number, err)
+	}
+	if existing.GetNumber() != number || existing.IsPullRequest() || existing.GetUser().GetID() != writerID || !strings.EqualFold(strings.TrimSpace(existing.GetUser().GetLogin()), strings.TrimSpace(writer)) {
+		return 0, "", fmt.Errorf("lifecycle issue #%d is not the exact issue authored by the authenticated Hive writer", number)
+	}
+	existingMarkers := hiveLifecycleMarkers(existing.GetBody())
+	receipt := markerMigrationReceipt(previousMarker, marker)
+	if len(existingMarkers) == 1 && existingMarkers[0] == marker {
+		receipts := markerMigrationReceipts(existing.GetBody())
+		if len(receipts) != 1 || receipts[0] != receipt {
+			return 0, "", fmt.Errorf("lifecycle issue #%d has the new marker without the exact migration receipt", number)
+		}
+	} else if len(existingMarkers) != 1 || existingMarkers[0] != previousMarker || len(markerMigrationReceipts(existing.GetBody())) != 0 {
+		return 0, "", fmt.Errorf("lifecycle issue #%d does not contain exactly the expected old Hive marker", number)
+	}
+	newOwners, err := c.findLifecycleIssues(ctx, owner, repo, marker, writer)
+	if err != nil {
+		return 0, "", err
+	}
+	for _, candidate := range newOwners {
+		if candidate.GetNumber() != number {
+			return 0, "", fmt.Errorf("stable lifecycle marker is already owned by issue #%d", candidate.GetNumber())
+		}
+	}
+	migrationBody := strings.TrimSpace(body) + "\n" + receipt
+	request := &gh.IssueRequest{Title: gh.Ptr(title), Body: gh.Ptr(migrationBody), Labels: &labels, State: gh.Ptr(state)}
+	if _, _, err := c.client.Issues.Edit(ctx, owner, repo, number, request); err != nil {
+		return 0, "", fmt.Errorf("migrate lifecycle issue #%d marker: %w", number, err)
+	}
+	confirmed, _, err := c.client.Issues.Get(ctx, owner, repo, number)
+	if err != nil {
+		return 0, "", fmt.Errorf("confirm lifecycle issue #%d marker migration: %w", number, err)
+	}
+	confirmedReceipts := markerMigrationReceipts(confirmed.GetBody())
+	if confirmed.GetNumber() != number || confirmed.GetUser().GetID() != writerID || !isOwnedLifecycleIssue(confirmed, marker, writer) || len(hiveLifecycleMarkers(confirmed.GetBody())) != 1 || len(confirmedReceipts) != 1 || confirmedReceipts[0] != receipt {
+		return 0, "", fmt.Errorf("lifecycle issue #%d marker migration could not be confirmed", number)
+	}
+	return number, confirmed.GetHTMLURL(), nil
+}
+
+func (c *Client) authenticatedLifecycleWriter(ctx context.Context) (string, int64, error) {
+	if c == nil || c.client == nil {
+		return "", 0, fmt.Errorf("GitHub client is required")
+	}
+	user, _, err := c.client.Users.Get(ctx, "")
+	if err != nil {
+		return "", 0, fmt.Errorf("read authenticated GitHub identity: %w", err)
+	}
+	login, id := strings.TrimSpace(user.GetLogin()), user.GetID()
+	if login == "" || id <= 0 {
+		return "", 0, fmt.Errorf("authenticated GitHub identity has no immutable user identity")
+	}
+	return login, id, nil
 }
 
 func (c *Client) findLifecycleIssue(ctx context.Context, owner, repo, marker, writer string) (int, error) {
@@ -213,6 +295,57 @@ func lifecycleMarkerFromBody(body string) string {
 		return ""
 	}
 	return marker
+}
+
+func hiveLifecycleMarkers(body string) []string {
+	const prefix = "<!-- hive-visual-fingerprint:"
+	markers := make([]string, 0, 1)
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			markers = append(markers, line)
+		}
+	}
+	return markers
+}
+
+func isExactHiveLifecycleMarker(marker string) bool {
+	markers := hiveLifecycleMarkers(marker)
+	if len(markers) != 1 || markers[0] != strings.TrimSpace(marker) || lifecycleMarkerFromBody(marker) != markers[0] {
+		return false
+	}
+	const prefix = "<!-- hive-visual-fingerprint: "
+	const suffix = " -->"
+	if !strings.HasPrefix(markers[0], prefix) || !strings.HasSuffix(markers[0], suffix) {
+		return false
+	}
+	fingerprint := strings.TrimSuffix(strings.TrimPrefix(markers[0], prefix), suffix)
+	if len(fingerprint) != 64 {
+		return false
+	}
+	for _, value := range fingerprint {
+		if (value < '0' || value > '9') && (value < 'a' || value > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func markerMigrationReceipt(previousMarker, marker string) string {
+	sum := sha256.Sum256([]byte(previousMarker + "\x00" + marker))
+	return fmt.Sprintf("<!-- hive-marker-migration: %x -->", sum[:])
+}
+
+func markerMigrationReceipts(body string) []string {
+	const prefix = "<!-- hive-marker-migration:"
+	receipts := make([]string, 0, 1)
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			receipts = append(receipts, line)
+		}
+	}
+	return receipts
 }
 
 func duplicateLifecycleLabels(desired []string) []string {

@@ -1,6 +1,7 @@
 package integrated
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,46 @@ func TestInspectCheckoutDiscoversNestedDashboardAndPythonTests(t *testing.T) {
 	}
 	if len(inspection.BaselineFiles) != 1 || inspection.BaselineFiles[0] != "tests/__screenshots__/home.png" {
 		t.Fatalf("nested screenshot baseline was not detected: %+v", inspection.BaselineFiles)
+	}
+}
+
+func TestInspectCheckoutDetectsPlaywrightAndVisualHiveReviewedBaselines(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{}`)
+	writeFixture(t, root, "e2e/dashboard.spec.ts-snapshots/dashboard.png", "playwright baseline")
+	writeFixture(t, root, ".visual-hive/snapshots/dashboard.png", "visual hive baseline")
+	writeFixture(t, root, ".visual-hive/snapshots/unreviewed.png", "uncommitted bootstrap output")
+	writeFixture(t, root, "e2e/dashboard.spec.ts-snapshots/dashboard-actual.png", "tracked actual artifact")
+	writeFixture(t, root, "e2e/dashboard.spec.ts-snapshots/dashboard-diff.png", "tracked diff artifact")
+	writeFixture(t, root, ".visual-hive/artifacts/dashboard-actual.png", "transient evidence")
+	if _, err := git(context.Background(), root, "init", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"package.json",
+		"e2e/dashboard.spec.ts-snapshots/dashboard.png",
+		".visual-hive/snapshots/dashboard.png",
+		"e2e/dashboard.spec.ts-snapshots/dashboard-actual.png",
+		"e2e/dashboard.spec.ts-snapshots/dashboard-diff.png",
+	} {
+		if _, err := git(context.Background(), root, "add", "-f", "--", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := git(context.Background(), root, "-c", "user.name=Hive Inspect Test", "-c", "user.email=hive-inspect@example.test", "commit", "-m", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		".visual-hive/snapshots/dashboard.png",
+		"e2e/dashboard.spec.ts-snapshots/dashboard.png",
+	}
+	if strings.Join(inspection.BaselineFiles, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("reviewed baselines = %v, want %v", inspection.BaselineFiles, want)
 	}
 }
 

@@ -521,7 +521,7 @@ func TestIssuePublicationSelectionEnforcesActiveWIPAndRanksDirectFailuresFirst(t
 		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen},
 	}
 
-	selected := selectIssuePublications(observations, findings, 2, false)
+	selected := selectIssuePublications("", observations, findings, 2, false)
 
 	if len(selected) != 1 || !selected["regression"] {
 		t.Fatalf("expected one remaining slot to select the direct high-severity failure, got %v", selected)
@@ -538,7 +538,7 @@ func TestIssuePublicationSelectionPrefersRepairableConsoleFailure(t *testing.T) 
 		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen, HumanReviewRequired: true},
 	}
 
-	selected := selectIssuePublications(observations, findings, 2, true)
+	selected := selectIssuePublications("", observations, findings, 2, true)
 
 	if len(selected) != 1 || !selected["console"] {
 		t.Fatalf("expected repair mode to select the actionable console failure, got %v", selected)
@@ -553,13 +553,452 @@ func TestIssuePublicationSelectionPrefersTestOnlyRepairOverUnrepairableBacklog(t
 		{RepositoryFingerprint: "onboarding", State: "present", Severity: "critical", IssueKind: "external_repo_onboarding", Title: "Review readiness gate"},
 		{RepositoryFingerprint: "tests", State: "present", Severity: "high", IssueKind: "test_adequacy_gap", Title: "Add repository unit test coverage"},
 	}
-	selected := selectIssuePublications(observations, nil, 1, true)
+	selected := selectIssuePublications("", observations, nil, 1, true)
 	if len(selected) != 1 || !selected["tests"] {
 		t.Fatalf("repair mode should select the bounded test-only repair before advisory backlog: %v", selected)
 	}
-	selected = selectIssuePublications(observations, nil, 1, false)
+	selected = selectIssuePublications("", observations, nil, 1, false)
 	if len(selected) != 1 || !selected["onboarding"] {
 		t.Fatalf("issues-only mode should preserve severity ordering: %v", selected)
+	}
+}
+
+func TestExplicitRootPublicationCollapsesNineObservationsToTwoIssues(t *testing.T) {
+	mutationRoot := "mutation/api-500/localPreview/dashboard-shell"
+	testRoot := "test-adequacy/repository/testing-layer:2"
+	observations := []Observation{
+		{RepositoryFingerprint: "mutation", State: "present", Severity: "high", IssueKind: "mutation_survivor", PublicationRole: "canonical", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "tests", State: "present", Severity: "high", IssueKind: "test_adequacy_gap", PublicationRole: "canonical", RootCauseKey: testRoot},
+		{RepositoryFingerprint: "mutation-maintenance", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", PublicationRole: "derivative", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "mutation-strengthen", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", PublicationRole: "derivative", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "mutation-adequacy", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", PublicationRole: "derivative", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "mutation-handoff", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", PublicationRole: "derivative", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "weak", State: "present", Severity: "high", IssueKind: "weak_visual_test", PublicationRole: "derivative", RootCauseKey: mutationRoot},
+		{RepositoryFingerprint: "unit-map", State: "present", Severity: "low", IssueKind: "missing_visual_coverage", PublicationRole: "derivative", RootCauseKey: testRoot},
+		{RepositoryFingerprint: "readiness", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", PublicationRole: "aggregate", RootCauseKey: "aggregate/readiness/readiness_gate", BlockedByRootKeys: []string{mutationRoot}},
+	}
+
+	for _, maxActive := range []int{0, 10} {
+		selected := selectIssuePublications("", observations, nil, maxActive, true)
+		if len(selected) != 2 || !selected["mutation"] || !selected["tests"] {
+			t.Fatalf("maxActive=%d publication set = %v, want exact two canonical roots", maxActive, selected)
+		}
+	}
+}
+
+func TestExplicitRootPublicationFailsOpenForUncoveredValidLinkage(t *testing.T) {
+	root := "mutation/api-500/localPreview/dashboard-shell"
+	observations := []Observation{
+		{RepositoryFingerprint: "uncovered", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", PublicationRole: "derivative", RootCauseKey: root},
+		{RepositoryFingerprint: "aggregate", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", PublicationRole: "aggregate", RootCauseKey: "aggregate/readiness", BlockedByRootKeys: []string{root, "workflow/unknown"}},
+		{RepositoryFingerprint: "legacy-text", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", Title: "Maintain visual test: mutation_survivor"},
+	}
+	selected := selectIssuePublications("", observations, nil, 0, true)
+	if len(selected) != len(observations) {
+		t.Fatalf("uncovered or legacy valid metadata was suppressed: %v", selected)
+	}
+
+	active := map[string]*FindingLifecycle{
+		"owner": {Repository: "owner/repo", RepositoryFingerprint: "owner", PublicationFingerprint: "corrupt", RootCauseKey: root, IssueNumber: 7, Status: StatusIssueOpen},
+	}
+	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, true)
+	if len(selected) != 1 || !selected["uncovered"] {
+		t.Fatalf("invalid root ownership suppressed an independently actionable derivative: %v", selected)
+	}
+	active["owner"].PublicationFingerprint = digest([]byte("owner/repo\x00" + root))
+	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, true)
+	if len(selected) != 0 {
+		t.Fatalf("derivative was not deferred by exact active root owner: %v", selected)
+	}
+}
+
+func TestExplicitRootLifecyclePreservesNineBeadsAndPublishesTwoIssues(t *testing.T) {
+	root := t.TempDir()
+	mutationRoot := "mutation/api-500/localPreview/dashboard-shell"
+	testRoot := "test-adequacy/repository/testing-layer:2"
+	observations := []Observation{
+		publicationTestObservation("mutation", "canonical", mutationRoot, "mutation_survivor", "Mutation survived: api-500"),
+		publicationTestObservation("tests", "canonical", testRoot, "test_adequacy_gap", "Add repository unit tests"),
+		publicationTestObservation("mutation-maintenance", "derivative", mutationRoot, "missing_visual_coverage", "Maintain mutation test"),
+		publicationTestObservation("mutation-strengthen", "derivative", mutationRoot, "missing_visual_coverage", "Strengthen mutation test"),
+		publicationTestObservation("mutation-adequacy", "derivative", mutationRoot, "external_repo_onboarding", "Mutation adequacy handoff"),
+		publicationTestObservation("mutation-handoff", "derivative", mutationRoot, "external_repo_onboarding", "Mutation survivor handoff"),
+		publicationTestObservation("weak", "derivative", mutationRoot, "weak_visual_test", "Weak mutation test"),
+		publicationTestObservation("unit-map", "derivative", testRoot, "missing_visual_coverage", "Repository map unit gap"),
+		publicationTestObservation("readiness", "aggregate", "aggregate/readiness/readiness_gate", "external_repo_onboarding", "Readiness handoff"),
+	}
+	observations[1].AffectedContracts = []string{"testing-layer:2"}
+	observations[8].BlockedByRootKeys = []string{mutationRoot}
+	bundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-nine-to-two", observations, true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	result, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 10, PreferRepairable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 9 || result.BeadsCreated != 9 || result.OutboxCreated != 2 || result.Deferred != 7 || beadStore.Count() != 9 || len(lifecycle.PendingOutbox()) != 2 {
+		t.Fatalf("explicit publication did not preserve 9 observations/beads and collapse only issues to 2: result=%+v beads=%d outbox=%+v", result, beadStore.Count(), lifecycle.PendingOutbox())
+	}
+}
+
+func TestCanonicalObservationUpdatesUncoveredDerivativeRootOwnerWithoutDuplicate(t *testing.T) {
+	root := t.TempDir()
+	rootKey := "mutation/api-500/localPreview/dashboard-shell"
+	derivative := publicationTestObservation("derivative-source", "derivative", rootKey, "missing_visual_coverage", "Uncovered mutation test gap")
+	first := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "first"), "bundle-root-owner-first", []Observation{derivative}, false))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if result, err := lifecycle.ApplyBundle(first, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil || result.OutboxCreated != 1 {
+		t.Fatalf("uncovered derivative did not fail open: result=%+v err=%v", result, err)
+	}
+	client := &fakeLifecycleIssueClient{}
+	policy := automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}
+	if result := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); result.Succeeded != 1 {
+		t.Fatalf("root owner issue open failed: %+v", result)
+	}
+	expectedMarker := lifecycleMarker(digest([]byte("owner/repo\x00" + rootKey)))
+	if client.marker != expectedMarker {
+		t.Fatalf("root marker = %q, want %q", client.marker, expectedMarker)
+	}
+	ownerBeforePartial, _ := lifecycle.Finding(first.Manifest.Observations[0].RepositoryFingerprint)
+	derivative.Title, derivative.Body = "Derivative-only partial wording churn", "Derivative-only partial wording churn"
+	partial := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "partial"), "bundle-root-owner-partial", []Observation{derivative}, false))
+	if result, err := lifecycle.ApplyBundle(partial, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil || result.OutboxCreated != 0 || result.Deferred != 1 {
+		t.Fatalf("active derivative owner was churned by partial evidence: result=%+v err=%v", result, err)
+	}
+	ownerAfterPartial, _ := lifecycle.Finding(first.Manifest.Observations[0].RepositoryFingerprint)
+	if ownerAfterPartial.Title != ownerBeforePartial.Title || ownerAfterPartial.LastBundleDigest != ownerBeforePartial.LastBundleDigest || ownerAfterPartial.Status != StatusIssueOpen {
+		t.Fatalf("derivative-only partial evidence changed active owner: before=%+v after=%+v", ownerBeforePartial, ownerAfterPartial)
+	}
+
+	canonical := publicationTestObservation("canonical-source-wording-v2", "canonical", rootKey, "mutation_survivor", "Canonical mutation api-500")
+	second := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "second"), "bundle-root-owner-second", []Observation{canonical}, true))
+	result, err := lifecycle.ApplyBundle(second, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil || result.OutboxCreated != 1 || result.Created != 1 {
+		t.Fatalf("canonical root update failed: result=%+v err=%v", result, err)
+	}
+	pending := lifecycle.PendingOutbox()
+	if len(pending) != 1 || pending[0].Action != OutboxUpdateIssue || pending[0].RepositoryFingerprint != first.Manifest.Observations[0].RepositoryFingerprint || pending[0].IssueNumber != 17 {
+		t.Fatalf("canonical observation did not target the existing derivative root owner: %+v", pending)
+	}
+	if processed := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); processed.Succeeded != 1 || client.upserts != 1 || client.updates != 1 || client.marker != expectedMarker {
+		t.Fatalf("canonical update created or rebound the root issue: processed=%+v client=%+v", processed, client)
+	}
+	owner, _ := lifecycle.Finding(first.Manifest.Observations[0].RepositoryFingerprint)
+	if owner.IssueNumber != 17 || owner.Title != canonical.Title || owner.Fingerprint != canonical.Fingerprint || owner.PublicationFingerprint != digest([]byte("owner/repo\x00"+rootKey)) {
+		t.Fatalf("stable root owner did not adopt canonical content: %+v", owner)
+	}
+
+	canonicalV3 := publicationTestObservation("canonical-source-wording-v3", "canonical", rootKey, "mutation_survivor", "Canonical mutation api-500 with clearer wording")
+	third := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "third"), "bundle-root-owner-third", []Observation{canonicalV3}, true))
+	result, err = lifecycle.ApplyBundle(third, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil || result.Created != 0 || result.OutboxCreated != 1 {
+		t.Fatalf("canonical wording/fingerprint update changed root identity: result=%+v err=%v", result, err)
+	}
+	if processed := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); processed.Succeeded != 1 || client.upserts != 1 || client.updates != 2 || client.marker != expectedMarker {
+		t.Fatalf("canonical wording/fingerprint update duplicated the issue: processed=%+v client=%+v", processed, client)
+	}
+	owner, _ = lifecycle.Finding(first.Manifest.Observations[0].RepositoryFingerprint)
+	if owner.Title != canonicalV3.Title || owner.Fingerprint != canonicalV3.Fingerprint || owner.IssueNumber != 17 {
+		t.Fatalf("canonical wording/fingerprint update did not refresh exact root owner: %+v", owner)
+	}
+}
+
+func TestExplicitMetadataNeverSilentlyRebindsOrClosesLegacyDerivativeIssue(t *testing.T) {
+	root := t.TempDir()
+	legacy := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "legacy"), "bundle-legacy-derivative", "present", "main", true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(legacy, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := legacy.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(legacyID, 16, "https://github.test/owner/repo/issues/16"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+
+	}
+	rootKey := "mutation/api-500/localPreview/dashboard-shell"
+	canonical := publicationTestObservation("canonical-new", "canonical", rootKey, "mutation_survivor", "Canonical mutation")
+	derivative := publicationTestObservation(legacy.Manifest.Observations[0].Fingerprint, "derivative", rootKey, "missing_visual_coverage", "Legacy derivative now has explicit metadata")
+	current := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "current"), "bundle-legacy-derivative-current", []Observation{canonical, derivative}, true))
+	result, err := lifecycle.ApplyBundle(current, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFinding, _ := lifecycle.Finding(legacyID)
+	if legacyFinding.IssueNumber != 16 || legacyFinding.Status != StatusIssueOpen || legacyFinding.RootCauseKey != "" || legacyFinding.PublicationRole != "" || legacyFinding.PendingMarkerMigrationFrom != "" {
+		t.Fatalf("legacy derivative issue was silently rebound or closed: %+v", legacyFinding)
+	}
+	pending := lifecycle.PendingOutbox()
+	if result.OutboxCreated != 1 || len(pending) != 1 || pending[0].Action != OutboxOpenIssue || pending[0].RepositoryFingerprint == legacyID {
+		t.Fatalf("explicit canonical publication did not remain separate from legacy identity: result=%+v pending=%+v", result, pending)
+	}
+}
+
+func TestExactLegacyCanonicalMigrationPreservesIssueBeadAndRepairIdentity(t *testing.T) {
+	root := t.TempDir()
+	const sourceFingerprint = "visual-hive:mutation:api-500"
+	const rootKey = "mutation/api-500/localPreview/dashboard-shell"
+	legacy := validateLocalBundle(t, writeLegacyLifecycleObservationBundle(t, filepath.Join(root, "legacy"), "bundle-legacy-canonical", sourceFingerprint, "mutation_survivor"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if result, err := lifecycle.ApplyBundle(legacy, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1}); err != nil || result.BeadsCreated != 1 {
+		t.Fatalf("legacy canonical setup failed: result=%+v err=%v", result, err)
+	}
+	legacyID := legacy.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(legacyID, 15, "https://github.test/owner/repo/issues/15"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lifecycle.MarkRepairStarted(legacyID, "hive/repair-legacy-canonical"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(legacyID, strings.Repeat("a", 40), 19, "https://github.test/owner/repo/pull/19"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := lifecycle.Finding(legacyID)
+
+	canonical := publicationTestObservation(sourceFingerprint, "canonical", rootKey, "mutation_survivor", "Mutation survived: api-500")
+	current := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "current"), "bundle-explicit-canonical", []Observation{canonical}, false))
+	result, err := lifecycle.ApplyBundle(current, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCanonicalID := current.Manifest.Observations[0].RepositoryFingerprint
+	if result.Created != 0 || result.BeadsCreated != 0 || result.OutboxCreated != 1 || beadStore.Count() != 1 {
+		t.Fatalf("exact legacy migration duplicated lifecycle state: result=%+v beads=%d", result, beadStore.Count())
+	}
+	if _, exists := lifecycle.Finding(newCanonicalID); exists {
+		t.Fatalf("exact legacy migration created a second root finding %s", newCanonicalID)
+	}
+	pending := lifecycle.PendingOutbox()
+	expectedPreviousMarker := lifecycleMarker(legacyID)
+	if len(pending) != 1 || pending[0].Action != OutboxUpdateIssue || pending[0].RepositoryFingerprint != legacyID || pending[0].IssueNumber != 15 || pending[0].PreviousMarker != expectedPreviousMarker {
+		t.Fatalf("migration did not directly update the exact existing issue: %+v", pending)
+	}
+	after, _ := lifecycle.Finding(legacyID)
+	if after.IssueNumber != before.IssueNumber || after.BeadID != before.BeadID || after.Branch != before.Branch || after.PRNumber != before.PRNumber || after.PRURL != before.PRURL || after.RepairCommitSHA != before.RepairCommitSHA ||
+		after.RootCauseKey != rootKey || after.PublicationRole != "canonical" || after.PublicationFingerprint != digest([]byte("owner/repo\x00"+rootKey)) || after.RepositoryFingerprint != legacyID || after.PendingMarkerMigrationFrom != expectedPreviousMarker {
+		t.Fatalf("migration did not preserve legacy issue/bead/repair identity: before=%+v after=%+v", before, after)
+	}
+	// New evidence may supersede this outbox record before GitHub is reached.
+	// The exact old marker must remain durable on the replacement record.
+	canonical.Title, canonical.Body = "Mutation survived: api-500 (new evidence)", "Mutation survived: api-500 (new evidence)"
+	newerPending := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "newer-pending"), "bundle-explicit-canonical-newer-pending", []Observation{canonical}, false))
+	if result, err = lifecycle.ApplyBundle(newerPending, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1}); err != nil || result.OutboxCreated != 1 {
+		t.Fatalf("newer evidence did not preserve the pending marker migration: result=%+v err=%v", result, err)
+	}
+	pending = lifecycle.PendingOutbox()
+	if len(pending) != 2 || pending[1].PreviousMarker != expectedPreviousMarker {
+		t.Fatalf("replacement outbox lost the durable old marker: %+v", pending)
+	}
+	client := &fakeLifecycleIssueClient{migrationErr: fmt.Errorf("authenticated old-marker verification failed")}
+	policy := automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}
+	if denied := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); denied.StaleSkipped != 1 || denied.Failed != 1 || denied.Succeeded != 0 {
+		t.Fatalf("failed remote ownership verification was not retained for retry: result=%+v client=%+v", denied, client)
+	}
+	if retained, _ := lifecycle.Finding(legacyID); retained.PendingMarkerMigrationFrom != expectedPreviousMarker || len(lifecycle.PendingOutbox()) != 1 {
+		t.Fatalf("failed marker migration was not durable: finding=%+v pending=%+v", retained, lifecycle.PendingOutbox())
+	}
+	client.migrationErr = nil
+	if processed := ProcessOutbox(context.Background(), lifecycle, beadStore, policy, client); processed.Succeeded != 1 || client.upserts != 0 || client.updates != 0 || client.migrations != 2 || client.previousMarker != expectedPreviousMarker || client.marker != lifecycleMarker(digest([]byte("owner/repo\x00"+rootKey))) {
+		t.Fatalf("migration did not use a direct issue update with the stable root marker: result=%+v client=%+v", processed, client)
+	}
+	if migrated, _ := lifecycle.Finding(legacyID); migrated.PendingMarkerMigrationFrom != "" {
+		t.Fatalf("completed marker migration remained pending: %+v", migrated)
+	}
+
+	// A later canonical scan must continue using the migrated identity without
+	// creating the new root-key bead or finding on a second run.
+	canonical.Title, canonical.Body = "Mutation survived: api-500 (confirmed)", "Mutation survived: api-500 (confirmed)"
+	later := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "later"), "bundle-explicit-canonical-later", []Observation{canonical}, false))
+	if result, err = lifecycle.ApplyBundle(later, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1}); err != nil || result.Created != 0 || result.BeadsCreated != 0 || result.OutboxCreated != 1 || beadStore.Count() != 1 {
+		t.Fatalf("migrated owner was not stable on a later canonical scan: result=%+v err=%v beads=%d", result, err, beadStore.Count())
+	}
+}
+
+func TestLegacyDerivativeAndAggregateKindsAreNeverMigrationCandidates(t *testing.T) {
+	for _, issueKind := range []string{"missing_visual_coverage", "weak_visual_test", "external_repo_onboarding"} {
+		t.Run(issueKind, func(t *testing.T) {
+			const fingerprint = "visual-hive:legacy-publication"
+			repositoryFingerprint := digest([]byte("owner/repo\x00" + fingerprint))
+			findings := map[string]*FindingLifecycle{
+				repositoryFingerprint: {
+					Repository: "owner/repo", Fingerprint: fingerprint, RepositoryFingerprint: repositoryFingerprint,
+					IssueKind: issueKind, IssueNumber: 17, IssueURL: "https://github.test/owner/repo/issues/17", Status: StatusIssueOpen,
+				},
+			}
+			observation := Observation{Fingerprint: fingerprint, PublicationRole: "canonical", RootCauseKey: "root/future", State: "present", IssueKind: issueKind}
+			if matches := exactLegacyCanonicalMigrationMatches("owner/repo", findings, observation); len(matches) != 0 {
+				t.Fatalf("legacy derivative/aggregate-compatible kind was eligible for migration: %+v", matches)
+			}
+		})
+	}
+}
+
+func TestAmbiguousLegacyCanonicalMigrationAdoptsNeitherAndDoesNotStarveRoot(t *testing.T) {
+	root := t.TempDir()
+	const sourceFingerprint = "visual-hive:mutation:api-500"
+	legacy := validateLocalBundle(t, writeLegacyLifecycleObservationBundle(t, filepath.Join(root, "legacy"), "bundle-legacy-ambiguous", sourceFingerprint, "mutation_survivor"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(legacy, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1}); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := legacy.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(legacyID, 15, "https://github.test/owner/repo/issues/15"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	duplicate := *lifecycle.state.Findings[legacyID]
+	duplicate.IssueNumber = 16
+	duplicate.IssueURL = "https://github.test/owner/repo/issues/16"
+	lifecycle.state.Findings["ambiguous-state-key"] = &duplicate
+
+	const rootKey = "mutation/api-500/localPreview/dashboard-shell"
+	canonical := publicationTestObservation(sourceFingerprint, "canonical", rootKey, "mutation_survivor", "Mutation survived: api-500")
+	current := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "current"), "bundle-explicit-ambiguous", []Observation{canonical}, true))
+	result, err := lifecycle.ApplyBundle(current, beadStore, ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{legacyID, "ambiguous-state-key"} {
+		finding := lifecycle.state.Findings[key]
+		if finding.RootCauseKey != "" || finding.PublicationRole != "" || finding.Status == StatusResolved || finding.Status == StatusIssueClosed {
+			t.Fatalf("ambiguous legacy issue %s was adopted or closed: %+v", key, finding)
+		}
+	}
+	canonicalID := current.Manifest.Observations[0].RepositoryFingerprint
+	canonicalFinding, exists := lifecycle.Finding(canonicalID)
+	if !exists || canonicalFinding.RootCauseKey != rootKey || result.Created != 1 || result.OutboxCreated != 1 {
+		t.Fatalf("legacy WIP starved the independently owned canonical root: result=%+v finding=%+v", result, canonicalFinding)
+	}
+	pending := lifecycle.PendingOutbox()
+	if len(pending) != 1 || pending[0].Action != OutboxOpenIssue || pending[0].RepositoryFingerprint != canonicalID {
+		t.Fatalf("ambiguous migration did not fail closed to a new exact-marker issue: %+v", pending)
+	}
+}
+
+func TestAuthoritativelyAbsentRootUnblocksAggregateInSameCycle(t *testing.T) {
+	root := t.TempDir()
+	const rootKey = "mutation/api-500/localPreview/dashboard-shell"
+	canonical := publicationTestObservation("canonical", "canonical", rootKey, "mutation_survivor", "Mutation survived: api-500")
+	present := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "present"), "bundle-root-before-absence", []Observation{canonical}, true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ownerID := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	absentCanonical := canonical
+	absentCanonical.State = "absent"
+	aggregate := publicationTestObservation("readiness", "aggregate", "aggregate/readiness", "external_repo_onboarding", "Repository readiness handoff")
+	aggregate.BlockedByRootKeys = []string{rootKey}
+	current := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "current"), "bundle-root-absent-aggregate-present", []Observation{absentCanonical, aggregate}, true))
+	result, err := lifecycle.ApplyBundle(current, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Resolved != 1 || result.Created != 1 || result.OutboxCreated != 2 || result.Deferred != 0 {
+		t.Fatalf("authoritatively absent root deferred the now-actionable aggregate for another cycle: %+v", result)
+	}
+	pending := lifecycle.PendingOutbox()
+	if len(pending) != 2 || pending[0].Action != OutboxCloseIssue || pending[1].Action != OutboxOpenIssue {
+		t.Fatalf("same-cycle root close and aggregate open were not both scheduled: %+v", pending)
+	}
+}
+
+func TestRootOwnerClosesOnlyAfterRootWideAuthoritativeAbsence(t *testing.T) {
+	root := t.TempDir()
+	rootKey := "mutation/api-500/localPreview/dashboard-shell"
+	canonical := publicationTestObservation("canonical", "canonical", rootKey, "mutation_survivor", "Canonical mutation")
+	derivative := publicationTestObservation("derivative", "derivative", rootKey, "missing_visual_coverage", "Derivative mutation guidance")
+	present := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "present"), "bundle-root-present", []Observation{canonical, derivative}, true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ownerID := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := lifecycle.Finding(ownerID)
+
+	partial := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "partial"), "bundle-root-partial", []Observation{derivative}, false))
+	if result, err := lifecycle.ApplyBundle(partial, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil || result.Resolved != 0 || result.OutboxCreated != 0 {
+		t.Fatalf("derivative-only partial evidence churned the owner: result=%+v err=%v", result, err)
+	}
+	afterPartial, _ := lifecycle.Finding(ownerID)
+	if afterPartial.Status != StatusIssueOpen || afterPartial.LastBundleDigest != before.LastBundleDigest || afterPartial.Title != before.Title {
+		t.Fatalf("derivative-only partial evidence changed the root owner: before=%+v after=%+v", before, afterPartial)
+	}
+
+	fullDerivative := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "full-derivative"), "bundle-root-full-derivative", []Observation{derivative}, true))
+	if result, err := lifecycle.ApplyBundle(fullDerivative, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil || result.Resolved != 0 || result.OutboxCreated != 0 {
+		t.Fatalf("present derivative allowed root owner closure: result=%+v err=%v", result, err)
+	}
+	if owner, _ := lifecycle.Finding(ownerID); owner.Status != StatusIssueOpen {
+		t.Fatalf("root owner closed while exact-root evidence remained: %+v", owner)
+	}
+
+	absent := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-root-absent", nil, true))
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil || result.Resolved != 2 || result.OutboxCreated != 1 {
+		t.Fatalf("root-wide authoritative absence did not resolve root evidence: result=%+v err=%v", result, err)
+	}
+	owner, _ := lifecycle.Finding(ownerID)
+	pending := lifecycle.PendingOutbox()
+	if owner.Status != StatusResolved || len(pending) != 1 || pending[0].Action != OutboxCloseIssue || pending[0].RepositoryFingerprint != ownerID {
+		t.Fatalf("root owner close was not exact and singular: owner=%+v pending=%+v", owner, pending)
 	}
 }
 
@@ -738,6 +1177,77 @@ func writeLifecycleBundle(t *testing.T, root, bundleID, state, ref string, autho
 	manifest.OverallDigest = digestBundleContent(manifest, []string{fmt.Sprintf("file\x00%s\x00%s\x00%d", file.Path, file.SHA256, file.Size)})
 	manifest.Provenance.SubjectDigest = manifest.OverallDigest
 	writeManifest(t, manifestPath, manifest)
+	return manifestPath
+}
+
+func publicationTestObservation(fingerprint, role, rootCauseKey, issueKind, title string) Observation {
+	return Observation{
+		Fingerprint: fingerprint, State: "present", PublicationRole: role, RootCauseKey: rootCauseKey,
+		IssueKind: issueKind, Severity: "high", Title: title, Body: title,
+		AffectedContracts: []string{"app-shell"}, BlockedByRootKeys: []string{},
+	}
+}
+
+func writeLegacyLifecycleObservationBundle(t *testing.T, root, bundleID, fingerprint, issueKind string) string {
+	t.Helper()
+	manifestPath := writeTestBundle(t, root, false)
+	manifest := readManifest(t, manifestPath)
+	manifest.BundleID = bundleID
+	manifest.Source.Ref = "refs/heads/main"
+	manifest.Scan.Scope = "full"
+	manifest.Scan.AuthoritativeForResolution = true
+	manifest.Observations[0].Fingerprint = fingerprint
+	manifest.Observations[0].RepositoryFingerprint = digest([]byte("owner/repo\x00" + fingerprint))
+	manifest.Observations[0].IssueKind = issueKind
+	manifest.Observations[0].PublicationRole = ""
+	manifest.Observations[0].RootCauseKey = ""
+	manifest.Observations[0].BlockedByRootKeys = nil
+	manifest.ReplayProtection.Nonce = bundleID
+	manifest.ReplayProtection.Key = replayKey(manifest)
+	sealTestManifest(t, manifestPath, &manifest)
+	return manifestPath
+}
+
+func writePublicationLifecycleBundle(t *testing.T, root, bundleID string, observations []Observation, authoritative bool) string {
+	t.Helper()
+	manifestPath := writeTestBundle(t, root, false)
+	manifest := readManifest(t, manifestPath)
+	template := manifest.Observations[0]
+	manifest.BundleID = bundleID
+	manifest.DigestAlgorithm = PublicationDigestAlgorithm
+	manifest.Source.Ref = "refs/heads/main"
+	manifest.Scan.AuthoritativeForResolution = authoritative
+	manifest.Scan.Scope = "partial"
+	if authoritative {
+		manifest.Scan.Scope = "full"
+	}
+	manifest.Scan.EvaluatedContracts = []string{"app-shell", "testing-layer:2"}
+	manifest.Observations = make([]Observation, 0, len(observations))
+	for _, input := range observations {
+		observation := template
+		observation.Fingerprint = input.Fingerprint
+		observation.PublicationRole = input.PublicationRole
+		observation.RootCauseKey = input.RootCauseKey
+		observation.BlockedByRootKeys = nil
+		if input.BlockedByRootKeys != nil {
+			observation.BlockedByRootKeys = append([]string{}, input.BlockedByRootKeys...)
+		}
+		observation.State = input.State
+		observation.IssueKind = input.IssueKind
+		observation.Severity = input.Severity
+		observation.Title = input.Title
+		observation.Body = input.Body
+		observation.AffectedContracts = append([]string(nil), input.AffectedContracts...)
+		fingerprintSource := observation.Fingerprint
+		if observation.PublicationRole == "canonical" {
+			fingerprintSource = observation.RootCauseKey
+		}
+		observation.RepositoryFingerprint = digest([]byte("owner/repo\x00" + fingerprintSource))
+		manifest.Observations = append(manifest.Observations, observation)
+	}
+	manifest.ReplayProtection.Nonce = bundleID
+	manifest.ReplayProtection.Key = replayKey(manifest)
+	sealTestManifest(t, manifestPath, &manifest)
 	return manifestPath
 }
 
