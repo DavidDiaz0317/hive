@@ -84,6 +84,7 @@ jobs:
           npm run typecheck
           npm test
           npm run lint
+          npx --no-install playwright install --with-deps chromium
           npm run demo:all
           node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
 
