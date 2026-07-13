@@ -45,6 +45,7 @@ func (p *healthFailureProvider) Run(_ context.Context, worktree, _ string) (Prov
 }
 
 func TestInfrastructureFailureDoesNotCountModelAttempt(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	stateDir := filepath.Join(t.TempDir(), "state")
 	state, err := NewStore(stateDir)
@@ -158,6 +159,7 @@ func TestProviderLaunchFailureResumesSameUncountedAttempt(t *testing.T) {
 }
 
 func TestValidationLaunchFailureResumesCountedPatchCheckpoint(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -208,6 +210,7 @@ func TestRepairCommandFailureClassificationSeparatesInfrastructureFromTestFailur
 }
 
 func TestWorktreeInfrastructureFailureResumesProvisioning(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -302,6 +305,7 @@ func TestModelAttemptCountReconcilesExactlyOnceAcrossReload(t *testing.T) {
 }
 
 func TestStaleModelCheckpointCannotSpendNewRecurrenceBudget(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "stale")
 	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-stale-a1", "main", ""); err != nil {

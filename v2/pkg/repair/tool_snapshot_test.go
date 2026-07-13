@@ -46,6 +46,15 @@ func TestRepairToolMutationHelperProcess(t *testing.T) {
 		if err := child.Start(); err != nil {
 			os.Exit(5)
 		}
+		ready := os.Getenv("HIVE_REPAIR_TEST_READY")
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(ready); err == nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		os.Exit(6)
 	case "spawn-setsid-writer":
 		child := exec.Command(os.Args[0], "-test.run=^TestRepairToolMutationHelperProcess$", "--", "setsid-wait-write")
 		child.Env = os.Environ()
@@ -134,8 +143,17 @@ func TestRepairToolMutationHelperProcess(t *testing.T) {
 		time.Sleep(750 * time.Millisecond)
 		write(filepath.Join("src", "value.txt"), "background-validator-authored\n")
 	case "delayed-write-long":
-		time.Sleep(30 * time.Second)
-		write(filepath.Join("src", "value.txt"), "background-validator-authored\n")
+		write(os.Getenv("HIVE_REPAIR_TEST_READY"), "ready\n")
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(os.Getenv("HIVE_REPAIR_TEST_SIGNAL")); err == nil {
+				write(filepath.Join("src", "value.txt"), "background-validator-authored\n")
+				write(os.Getenv("HIVE_REPAIR_TEST_ACK"), "written\n")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		os.Exit(17)
 	default:
 		os.Exit(4)
 	}
@@ -143,6 +161,14 @@ func TestRepairToolMutationHelperProcess(t *testing.T) {
 
 func TestValidationProcessTreeCannotRaceCommittedCandidate(t *testing.T) {
 	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
+	coordination := t.TempDir()
+	ready := filepath.Join(coordination, "ready")
+	signal := filepath.Join(coordination, "signal")
+	ack := filepath.Join(coordination, "ack")
+	t.Setenv("HIVE_REPAIR_TEST_READY", ready)
+	t.Setenv("HIVE_REPAIR_TEST_SIGNAL", signal)
+	t.Setenv("HIVE_REPAIR_TEST_ACK", ack)
+	t.Cleanup(func() { _ = os.WriteFile(signal, []byte("stop\n"), 0o600) })
 	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	worker := &Worker{
@@ -153,18 +179,20 @@ func TestValidationProcessTreeCannotRaceCommittedCandidate(t *testing.T) {
 		},
 		Provider: &patchProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
 	}
-	started := time.Now()
 	result, err := worker.Run(context.Background(), standardRepairFinding("owner/repo:background-validator"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Windows process creation and antivirus hooks can add several seconds on
-	// loaded runners. This remains well below the helper's 30-second delayed
-	// write, so it still proves that Hive did not wait for or leak the child.
-	if elapsed := time.Since(started); elapsed >= 15*time.Second {
-		t.Fatalf("contained background validator delayed worker return for %s", elapsed)
+	if _, err := os.Stat(ready); err != nil {
+		t.Fatalf("background validator was not running before containment: %v", err)
+	}
+	if err := os.WriteFile(signal, []byte("write now\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	time.Sleep(time.Second)
+	if _, err := os.Stat(ack); !os.IsNotExist(err) {
+		t.Fatalf("background validator survived process-tree containment: %v", err)
+	}
 	if content := strings.TrimSpace(gitOutput(t, remote, "show", result.Branch+":src/value.txt")); content != "fixed by model patch" {
 		t.Fatalf("background validator raced committed candidate: %q", content)
 	}

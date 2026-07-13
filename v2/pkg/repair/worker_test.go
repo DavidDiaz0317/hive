@@ -200,6 +200,7 @@ func (f *fakePRClient) UpsertRepairPullRequest(_ context.Context, _, branch, _, 
 }
 
 func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
+	t.Parallel()
 	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -245,6 +246,7 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 }
 
 func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -319,6 +321,7 @@ func TestWorkerDeniesModelAtLowerACMMBeforeRun(t *testing.T) {
 }
 
 func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
@@ -357,6 +360,7 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 }
 
 func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
@@ -397,6 +401,7 @@ func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
 }
 
 func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
@@ -435,6 +440,7 @@ func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
 }
 
 func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &noChangeThenFixProvider{}
@@ -474,6 +480,7 @@ func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 }
 
 func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
+	t.Parallel()
 	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	lifecycle := &fakeLifecycle{}
@@ -504,6 +511,7 @@ func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
 }
 
 func TestWorkerAppliesCorrectivePatchOverDirtyFailedAttempt(t *testing.T) {
+	t.Parallel()
 	repository, remote := seedGitRepository(t)
 	configPath := filepath.Join(repository, "visual-hive.config.yaml")
 	if err := os.WriteFile(configPath, []byte("serve: npm run preview\ntextMustNotExist: []\n"), 0o600); err != nil {

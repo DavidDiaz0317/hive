@@ -184,6 +184,57 @@ func TestCreateSetupBaselineProposalRejectsArtifactMutationAfterDurableSave(t *t
 	}
 }
 
+func TestVerifySetupBaselineArtifactAcceptsOnlyExactExtractionCompletionMarker(t *testing.T) {
+	root := t.TempDir()
+	content := append([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}, []byte("hosted-linux-baseline")...)
+	path := ".visual-hive/snapshots/linux/home.png"
+	absolute := filepath.Join(root, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(absolute, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fileHash := sha256.Sum256(content)
+	candidates := []SetupBaselineCandidate{{Path: path, SHA256: hex.EncodeToString(fileHash[:]), Bytes: int64(len(content))}}
+	candidateDigest, err := setupBaselineCandidateDigest(candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, correlation := strings.Repeat("a", 40), strings.Repeat("b", 64)
+	manifest := setupBaselineArtifactManifest{
+		SchemaVersion: setupBaselineArtifactSchema, Repository: "owner/repo", RepositoryID: "123", CaptureCorrelation: correlation,
+		CaptureHead: head, WorkflowRunID: "77", WorkflowName: visualHiveProductionWorkflowName, WorkflowPath: visualHiveProductionWorkflowPath,
+		Event: "workflow_dispatch", Platform: "linux", Runner: "ubuntu-latest", CandidateDigest: candidateDigest,
+		FileCount: 1, TotalBytes: int64(len(content)), Files: candidates,
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "setup-baseline-manifest.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, ".hive-extraction-complete")
+	if err := os.WriteFile(marker, []byte("88\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	intent := SetupBaselineIntent{
+		Repository: "owner/repo", RepositoryID: "123", CaptureCorrelation: correlation, CaptureHeadSHA: head,
+		CaptureRunID: 77, ArtifactID: 88,
+	}
+	verified, digest, err := verifySetupBaselineArtifact(root, intent)
+	if err != nil || len(verified) != 1 || digest != candidateDigest {
+		t.Fatalf("exact extracted setup baseline artifact was rejected: verified=%+v digest=%s err=%v", verified, digest, err)
+	}
+	if err := os.WriteFile(marker, []byte("89\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := verifySetupBaselineArtifact(root, intent); err == nil || !strings.Contains(err.Error(), "extraction completion marker") {
+		t.Fatalf("artifact with a mismatched extraction marker was accepted: %v", err)
+	}
+}
+
 func TestEnsureSetupBaselineDestinationRejectsSymlinkParentEscape(t *testing.T) {
 	checkout, outside := t.TempDir(), t.TempDir()
 	link := filepath.Join(checkout, ".visual-hive")

@@ -314,7 +314,13 @@ func verifySetupBaselineArtifact(root string, intent SetupBaselineIntent) ([]Set
 		manifest.FileCount != len(manifest.Files) || manifest.FileCount < 1 || manifest.FileCount > 200 {
 		return nil, "", fmt.Errorf("setup baseline manifest identity or bounded file count is invalid")
 	}
-	expectedPaths := map[string]bool{"setup-baseline-manifest.json": true}
+	markerPath := filepath.Join(root, ".hive-extraction-complete")
+	markerInfo, markerErr := os.Lstat(markerPath)
+	marker, readMarkerErr := os.ReadFile(markerPath)
+	if intent.ArtifactID <= 0 || markerErr != nil || readMarkerErr != nil || !markerInfo.Mode().IsRegular() || string(marker) != strconv.FormatInt(intent.ArtifactID, 10)+"\n" {
+		return nil, "", fmt.Errorf("setup baseline artifact extraction completion marker is invalid")
+	}
+	expectedPaths := map[string]bool{"setup-baseline-manifest.json": true, ".hive-extraction-complete": true}
 	var total int64
 	for index, candidate := range manifest.Files {
 		clean := filepath.ToSlash(filepath.Clean(candidate.Path))

@@ -132,6 +132,7 @@ func TestTestAdequacyContextCanReadApplicationSourceWithoutAuthorizingSourceEdit
 }
 
 func TestRepairSourceContextEnforcesFileAndRenderedByteCaps(t *testing.T) {
+	t.Parallel()
 	repository, _ := seedGitRepository(t)
 	for index := 0; index < repairSourceContextMaxFiles+20; index++ {
 		writeRepairSourceFixture(t, repository, fmt.Sprintf("src/generated-%03d.txt", index), strings.Repeat("quoted \\\" text\n", 256))
