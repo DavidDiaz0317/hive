@@ -3,6 +3,7 @@ package integrated
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -132,6 +133,8 @@ func TestDispatchRecoveryReusesCorrelationWithoutRedispatch(t *testing.T) {
 	correlation := ""
 	dispatches := 0
 	exposeRun := false
+	listObserved := make(chan struct{})
+	var listOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		mu.Lock()
@@ -150,6 +153,7 @@ func TestDispatchRecoveryReusesCorrelationWithoutRedispatch(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/runs":
 			if !exposeRun {
 				_, _ = io.WriteString(writer, `{"total_count":0,"workflow_runs":[]}`)
+				listOnce.Do(func() { close(listObserved) })
 				return
 			}
 			_, _ = fmt.Fprintf(writer, `{"total_count":1,"workflow_runs":[{"id":31,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://example.test/runs/31","head_sha":"head"}]}`, workflowDispatchDisplayTitle(correlation))
@@ -166,13 +170,35 @@ func TestDispatchRecoveryReusesCorrelationWithoutRedispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
-	firstCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	firstCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, _, err := dispatchAndWaitAttempt(firstCtx, client, store, config, "owner", "repo", "hive-visual-hive.yml", "main"); err == nil || !strings.Contains(err.Error(), "exactly correlated") {
-		t.Fatalf("unobserved dispatch should retain a recoverable error, got %v", err)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, dispatchErr := dispatchAndWaitAttempt(firstCtx, client, store, config, "owner", "repo", "hive-visual-hive.yml", "main")
+		firstDone <- dispatchErr
+	}()
+	select {
+	case <-listObserved:
+	case firstErr := <-firstDone:
+		t.Fatalf("dispatch returned before its acknowledged run search: %v", firstErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("acknowledged dispatch did not begin its exact run search")
+	}
+	cancel()
+	var firstErr error
+	select {
+	case firstErr = <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled dispatch did not stop its exact run search")
+	}
+	if firstErr == nil || !errors.Is(firstErr, context.Canceled) || !strings.Contains(firstErr.Error(), "exactly correlated") {
+		t.Fatalf("unobserved acknowledged dispatch should retain a recoverable exact-correlation error, got %v", firstErr)
 	}
 	intent, exists, err := store.LoadWorkflowDispatchIntent()
-	if err != nil || !exists || intent.CorrelationID != correlation || intent.RunID != 0 || intent.DispatchAcknowledgedAt.IsZero() {
+	mu.Lock()
+	dispatchedCorrelation := correlation
+	mu.Unlock()
+	if err != nil || !exists || intent.CorrelationID != dispatchedCorrelation || intent.RunID != 0 || intent.DispatchAcknowledgedAt.IsZero() {
 		t.Fatalf("unobserved dispatch was not durably recoverable: exists=%t intent=%+v err=%v", exists, intent, err)
 	}
 
@@ -183,8 +209,11 @@ func TestDispatchRecoveryReusesCorrelationWithoutRedispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dispatches != 1 || selected.GetID() != 31 || recovered.CorrelationID != correlation || recovered.RunID != 31 {
-		t.Fatalf("recovery redispatched or selected the wrong run: dispatches=%d selected=%+v intent=%+v", dispatches, selected, recovered)
+	mu.Lock()
+	dispatchCount, recoveredCorrelation := dispatches, correlation
+	mu.Unlock()
+	if dispatchCount != 1 || selected.GetID() != 31 || recovered.CorrelationID != recoveredCorrelation || recovered.RunID != 31 {
+		t.Fatalf("recovery redispatched or selected the wrong run: dispatches=%d selected=%+v intent=%+v", dispatchCount, selected, recovered)
 	}
 }
 
