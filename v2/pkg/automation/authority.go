@@ -42,6 +42,7 @@ const (
 	ActionSetupCommit          Action = "setup_commit"
 	ActionSetupPush            Action = "setup_push"
 	ActionSetupPR              Action = "setup_pr"
+	ActionSetupStatus          Action = "setup_status"
 )
 
 type RiskTier int
@@ -223,7 +224,7 @@ func modeForAction(action Action) Mode {
 		return ModeRepairPR
 	case ActionMergePR:
 		return ModeAutoMerge
-	case ActionSetupBranch, ActionSetupCommit, ActionSetupPush, ActionSetupPR:
+	case ActionSetupBranch, ActionSetupCommit, ActionSetupPush, ActionSetupPR, ActionSetupStatus:
 		return ModeAdvisory
 	default:
 		return ModeAutoMerge
@@ -231,7 +232,7 @@ func modeForAction(action Action) Mode {
 }
 
 func isSetupAction(action Action) bool {
-	return action == ActionSetupBranch || action == ActionSetupCommit || action == ActionSetupPush || action == ActionSetupPR
+	return action == ActionSetupBranch || action == ActionSetupCommit || action == ActionSetupPush || action == ActionSetupPR || action == ActionSetupStatus
 }
 
 func acmmCapability(agent string, level int) Mode {

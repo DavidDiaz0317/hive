@@ -168,16 +168,20 @@ type staleRaceIssueClient struct {
 	states []string
 }
 
-func (c *staleRaceIssueClient) UpsertLifecycleIssue(_ context.Context, _, _, _, _ string, _ []string) (int, string, bool, error) {
+func (c *staleRaceIssueClient) ResolveLifecycleIssueWriter(_ context.Context, _, _ string, _ int) (string, int64, error) {
+	return "hive-writer", 42, nil
+}
+
+func (c *staleRaceIssueClient) UpsertLifecycleIssueOwned(_ context.Context, _, _, _ string, _ int64, _, _ string, _ []string) (int, string, bool, error) {
 	return 17, "https://github.test/owner/repo/issues/17", false, nil
 }
 
-func (c *staleRaceIssueClient) UpdateLifecycleIssue(_ context.Context, _ string, number int, _, _, state string, _ []string) (int, string, error) {
+func (c *staleRaceIssueClient) UpdateLifecycleIssueOwned(_ context.Context, _ string, number int, _, _ string, _ int64, _, _ string, state string, _ []string) (int, string, error) {
 	c.states = append(c.states, state)
 	return number, "https://github.test/owner/repo/issues/17", nil
 }
 
-func (c *staleRaceIssueClient) MigrateLifecycleIssueMarker(_ context.Context, _ string, number int, _, _, _, _ string, state string, _ []string) (int, string, error) {
+func (c *staleRaceIssueClient) MigrateLifecycleIssueMarkerOwned(_ context.Context, _ string, number int, _, _, _ string, _ int64, _, _ string, state string, _ []string) (int, string, error) {
 	c.states = append(c.states, state)
 	return number, "https://github.test/owner/repo/issues/17", nil
 }

@@ -16,6 +16,7 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
 const (
@@ -248,9 +249,14 @@ type activationWorkflowChecks struct {
 func verifyActivationWorkflowCheck(ctx context.Context, client *hivegithub.Client, config Config, workflow WorkflowRunEvidence, intent WorkflowDispatchIntent, expectedAppID int64) (activationWorkflowChecks, error) {
 	result := activationWorkflowChecks{}
 	owner, repo, ok := strings.Cut(strings.TrimSpace(config.Repository), "/")
-	if !ok || owner == "" || repo == "" || workflow.RunID <= 0 || workflow.Conclusion != "success" ||
+	if !ok || owner == "" || repo == "" || workflow.RunID <= 0 || (workflow.Conclusion != "success" && workflow.Conclusion != "failure") ||
 		!immutableCommit.MatchString(strings.ToLower(strings.TrimSpace(workflow.HeadSHA))) || expectedAppID <= 0 {
-		return result, fmt.Errorf("protection activation requires exact successful workflow evidence")
+		return result, fmt.Errorf("protection activation requires exact completed managed workflow evidence")
+	}
+	_, _, repositoryTestDigest, repositoryTestErr := visualhive.EncodeRepositoryTestEvidence(workflow.RepositoryTests, workflow.RepositoryTestOverall)
+	if repositoryTestErr != nil || !workflowDispatchCorrelationPattern.MatchString(workflow.RepositoryTestDigest) || repositoryTestDigest != workflow.RepositoryTestDigest ||
+		((workflow.RepositoryTestOverall == 0) != (workflow.Conclusion == "success")) {
+		return result, fmt.Errorf("protection activation requires runner-controlled repository-test evidence consistent with the workflow conclusion")
 	}
 	branch, _, err := client.GoGitHub().Repositories.GetBranch(ctx, owner, repo, config.DefaultBranch, 0)
 	if err != nil {
@@ -263,11 +269,23 @@ func verifyActivationWorkflowCheck(ctx context.Context, client *hivegithub.Clien
 	if err != nil {
 		return result, fmt.Errorf("read exact activation workflow run: %w", err)
 	}
+	expectedDisplayTitle := workflowDispatchDisplayTitle(intent.CorrelationID)
 	if run.GetID() != workflow.RunID || run.GetName() != visualHiveProductionWorkflowName || exactActivationWorkflowPath(run.GetPath()) != visualHiveProductionWorkflowPath ||
 		run.GetEvent() != visualHiveProductionWorkflowEvent || run.GetHeadBranch() != config.DefaultBranch || !strings.EqualFold(run.GetHeadSHA(), workflow.HeadSHA) ||
-		run.GetStatus() != "completed" || run.GetConclusion() != "success" || run.GetDisplayTitle() != workflowDispatchDisplayTitle(intent.CorrelationID) ||
+		run.GetStatus() != "completed" || (run.GetConclusion() != "success" && run.GetConclusion() != "failure") || run.GetDisplayTitle() != expectedDisplayTitle ||
 		(run.GetRepository().GetFullName() != "" && !strings.EqualFold(run.GetRepository().GetFullName(), config.Repository)) {
-		return result, fmt.Errorf("exact activation run is not the successful managed production workflow path/name/event/ref/head")
+		return result, fmt.Errorf("exact activation run is not the completed managed production workflow path/name/event/ref/head")
+	}
+	if run.GetWorkflowID() <= 0 {
+		return result, fmt.Errorf("exact activation run did not identify its managed workflow definition")
+	}
+	definition, _, err := client.GoGitHub().Actions.GetWorkflowByID(ctx, owner, repo, run.GetWorkflowID())
+	if err != nil {
+		return result, fmt.Errorf("read exact activation workflow definition: %w", err)
+	}
+	if definition.GetID() != run.GetWorkflowID() || definition.GetName() != visualHiveProductionWorkflowName ||
+		exactActivationWorkflowPath(definition.GetPath()) != visualHiveProductionWorkflowPath || definition.GetState() != "active" {
+		return result, fmt.Errorf("exact activation workflow definition is not the active managed production workflow path/name")
 	}
 	var productionJob, seedJob *gh.WorkflowJob
 	options := &gh.ListWorkflowJobsOptions{Filter: "latest", ListOptions: gh.ListOptions{PerPage: 100}}
@@ -328,7 +346,8 @@ func verifyActivationWorkflowCheck(ctx context.Context, client *hivegithub.Clien
 
 func validActivationWorkflowJob(job *gh.WorkflowJob, workflow WorkflowRunEvidence, branch, context string) bool {
 	return job != nil && job.GetName() == context && job.GetRunID() == workflow.RunID && strings.EqualFold(job.GetHeadSHA(), workflow.HeadSHA) &&
-		job.GetHeadBranch() == branch && job.GetStatus() == "completed" && job.GetConclusion() == "success" && job.GetWorkflowName() == visualHiveProductionWorkflowName
+		job.GetHeadBranch() == branch && job.GetStatus() == "completed" && job.GetConclusion() == "success" &&
+		job.GetWorkflowName() == visualHiveProductionWorkflowName
 }
 
 func validActivationCheckRun(check *gh.CheckRun, id int64, context, headSHA string, expectedAppID int64) bool {

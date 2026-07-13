@@ -21,9 +21,23 @@ type fakeLifecycleIssueClient struct {
 	marker         string
 	previousMarker string
 	migrationErr   error
+	resolveCalls   int
+	writerLogin    string
+	writerID       int64
 }
 
-func (client *fakeLifecycleIssueClient) MigrateLifecycleIssueMarker(_ context.Context, _ string, number int, previousMarker, marker, _, _ string, state string, labels []string) (int, string, error) {
+func (client *fakeLifecycleIssueClient) ResolveLifecycleIssueWriter(_ context.Context, _, _ string, _ int) (string, int64, error) {
+	client.resolveCalls++
+	if client.writerLogin == "" {
+		client.writerLogin = "hive-writer"
+	}
+	if client.writerID == 0 {
+		client.writerID = 42
+	}
+	return client.writerLogin, client.writerID, nil
+}
+
+func (client *fakeLifecycleIssueClient) MigrateLifecycleIssueMarkerOwned(_ context.Context, _ string, number int, previousMarker, marker, _ string, _ int64, _, _ string, state string, labels []string) (int, string, error) {
 	client.migrations++
 	client.previousMarker = previousMarker
 	client.marker = marker
@@ -35,7 +49,7 @@ func (client *fakeLifecycleIssueClient) MigrateLifecycleIssueMarker(_ context.Co
 	return number, fmt.Sprintf("https://github.test/owner/repo/issues/%d", number), nil
 }
 
-func (client *fakeLifecycleIssueClient) UpsertLifecycleIssue(_ context.Context, _, marker, _, _ string, labels []string) (int, string, bool, error) {
+func (client *fakeLifecycleIssueClient) UpsertLifecycleIssueOwned(_ context.Context, _, marker, _ string, _ int64, _, _ string, labels []string) (int, string, bool, error) {
 	client.upserts++
 	client.marker = marker
 	client.state = "open"
@@ -43,7 +57,7 @@ func (client *fakeLifecycleIssueClient) UpsertLifecycleIssue(_ context.Context, 
 	return 17, "https://github.test/owner/repo/issues/17", client.upserts == 1, nil
 }
 
-func (client *fakeLifecycleIssueClient) UpdateLifecycleIssue(_ context.Context, _ string, number int, _, body string, state string, labels []string) (int, string, error) {
+func (client *fakeLifecycleIssueClient) UpdateLifecycleIssueOwned(_ context.Context, _ string, number int, _ string, _ string, _ int64, _, body string, state string, labels []string) (int, string, error) {
 	client.updates++
 	client.marker = lifecycleMarkerFromIssueBody(body)
 	client.state = state
@@ -90,6 +104,11 @@ func TestProcessOutboxUsesACMMAndClosesOnlyResolvedFinding(t *testing.T) {
 	}
 
 	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	finding, _ := lifecycle.Finding(fingerprint)
+	if client.resolveCalls != 1 || finding.IssueWriterID != 42 || finding.IssueWriterLogin != "hive-writer" {
+		t.Fatalf("immutable issue writer was not durably bound before publication: finding=%+v client=%+v", finding, client)
+	}
+	client.writerID, client.writerLogin = 99, "rotated-operator"
 	if err := lifecycle.MarkRepairStarted(fingerprint, "hive/repair"); err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +135,12 @@ func TestProcessOutboxUsesACMMAndClosesOnlyResolvedFinding(t *testing.T) {
 	if closed.Succeeded != 1 || client.state != "closed" || !containsLabel(client.labels, "hive/resolved") || containsLabel(client.labels, "hive/active") {
 		t.Fatalf("resolved issue close failed: result=%+v client=%+v", closed, client)
 	}
-	finding, _ := lifecycle.Finding(fingerprint)
+	finding, _ = lifecycle.Finding(fingerprint)
 	if finding.Status != StatusIssueClosed {
 		t.Fatalf("finding state was not closed: %+v", finding)
+	}
+	if client.resolveCalls != 1 || finding.IssueWriterID != 42 || finding.IssueWriterLogin != "hive-writer" {
+		t.Fatalf("authentication rotation changed immutable issue ownership: finding=%+v client=%+v", finding, client)
 	}
 }
 

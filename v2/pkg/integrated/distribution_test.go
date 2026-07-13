@@ -20,6 +20,26 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeDir := filepath.Join(root, "node-runtime")
+	nodeName := "node"
+	if runtime.GOOS == "windows" {
+		nodeName = "node.exe"
+	}
+	if err := copyRegularFile(testBinary, filepath.Join(runtimeDir, nodeName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range requiredNodeRuntimeFiles(runtime.GOOS) {
+		if relative == nodeName {
+			continue
+		}
+		target := filepath.Join(runtimeDir, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("test runtime "+relative+"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	nodeLicense := filepath.Join(root, "NODE-LICENSE")
 	if err := os.WriteFile(nodeLicense, []byte("Node.js license\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -31,10 +51,16 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: hive\ndescription: test\n---\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(skillDir, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "agents", "openai.yaml"), []byte("name: Hive\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	output := filepath.Join(root, "distribution")
 	manifest, err := BuildDistribution(context.Background(), DistributionOptions{
 		HiveBinary: testBinary, HiveCommit: strings.Repeat("b", 40), VisualHiveDir: visualDir, VisualCommit: visualCommit,
-		NodeBinary: testBinary, NodeLicense: nodeLicense, NodeVersion: "v22.23.1", SkillDir: skillDir, OutputDir: output,
+		NodeBinary: testBinary, NodeRuntimeDir: runtimeDir, NodeLicense: nodeLicense, NodeVersion: "v22.23.1", SkillDir: skillDir, OutputDir: output,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -42,11 +68,11 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	if manifest.SchemaVersion != DistributionSchema || manifest.VisualHiveVersion != "0.2.0" || len(manifest.Files) < 5 {
 		t.Fatalf("unexpected distribution manifest: %+v", manifest)
 	}
-	hiveName, nodeName := "hive", "node"
+	hiveName := "hive"
 	if runtime.GOOS == "windows" {
-		hiveName, nodeName = "hive.exe", "node.exe"
+		hiveName = "hive.exe"
 	}
-	for _, required := range []string{hiveName, filepath.Join("runtime", nodeName), filepath.Join("runtime", "LICENSE.node.txt"), filepath.Join("visual-hive", "visual-hive.mjs"), filepath.Join("skills", "hive", "SKILL.md"), "distribution-manifest.json"} {
+	for _, required := range []string{hiveName, filepath.Join("runtime", nodeName), filepath.Join("runtime", "LICENSE.node.txt"), filepath.Join("visual-hive", "visual-hive.mjs"), filepath.Join("skills", "hive", "SKILL.md"), filepath.Join("skills", "hive", "agents", "openai.yaml"), "distribution-manifest.json"} {
 		if _, err := os.Stat(filepath.Join(output, required)); err != nil {
 			t.Fatalf("missing distribution file %s: %v", required, err)
 		}

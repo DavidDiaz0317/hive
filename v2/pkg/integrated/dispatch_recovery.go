@@ -48,6 +48,7 @@ type RecoverWorkflowDispatchResult struct {
 	CorrelationID string                            `json:"correlation_id"`
 	WorkflowFile  string                            `json:"workflow_file"`
 	Ref           string                            `json:"ref"`
+	Operation     string                            `json:"operation"`
 	DisplayTitle  string                            `json:"display_title"`
 	RequestDigest string                            `json:"request_digest"`
 	RequestState  string                            `json:"request_state"`
@@ -98,6 +99,9 @@ func RecoverWorkflowDispatch(ctx context.Context, options RecoverWorkflowDispatc
 	if err != nil {
 		return result, err
 	}
+	if err := rejectPendingAuthorizerTransfer(store, options.StateDir, "workflow dispatch recovery"); err != nil {
+		return result, err
+	}
 	result.Repository, result.RepositoryID, result.Action = config.Repository, config.RepositoryID, options.Action
 	fail := func(cause error) (RecoverWorkflowDispatchResult, error) {
 		if options.PlanOnly {
@@ -127,7 +131,7 @@ func RecoverWorkflowDispatch(ctx context.Context, options RecoverWorkflowDispatc
 	if intent.RequestDigest == "" {
 		return fail(fmt.Errorf("ambiguous workflow dispatch has no exact recorded request digest"))
 	}
-	result.CorrelationID, result.WorkflowFile, result.Ref = intent.CorrelationID, intent.WorkflowFile, intent.Ref
+	result.CorrelationID, result.WorkflowFile, result.Ref, result.Operation = intent.CorrelationID, intent.WorkflowFile, intent.Ref, intent.Operation
 	result.DisplayTitle, result.RequestDigest, result.RequestState = intent.ExpectedDisplayTitle, intent.RequestDigest, "ambiguous_transport_failure"
 	actor, err := options.GitHub.AuthenticatedLogin(ctx)
 	if err != nil {
@@ -177,6 +181,11 @@ func RecoverWorkflowDispatch(ctx context.Context, options RecoverWorkflowDispatc
 	result.PlannedAt, result.ExpiresAt, result.PlanDigest = options.PlannedAt, options.PlannedAt.Add(dispatchRecoveryPlanLifetime), expectedPlanDigest
 	result.Applied = true
 	if options.Action == WorkflowDispatchRecoveryRevoke {
+		if intent.Operation == setupBaselineWorkflowOperation {
+			if err := revokeSetupBaselineDispatch(store, config, intent); err != nil {
+				return result, fmt.Errorf("retire exact setup baseline dispatch before revoke: %w", err)
+			}
+		}
 		if err := store.DeleteWorkflowDispatchIntent(); err != nil {
 			return result, fmt.Errorf("revoke exact ambiguous workflow dispatch: %w", err)
 		}
@@ -212,13 +221,14 @@ func workflowDispatchRecoveryPlanDigest(intent WorkflowDispatchIntent, action Wo
 		CorrelationID string                         `json:"correlation_id"`
 		WorkflowFile  string                         `json:"workflow_file"`
 		Ref           string                         `json:"ref"`
+		Operation     string                         `json:"operation"`
 		DisplayTitle  string                         `json:"display_title"`
 		RequestDigest string                         `json:"request_digest"`
 		Actor         string                         `json:"actor"`
 		PlannedAt     time.Time                      `json:"planned_at"`
 	}{
 		SchemaVersion: "hive.recover-workflow-dispatch-plan.v1", Repository: intent.Repository, RepositoryID: intent.RepositoryID,
-		Action: action, CorrelationID: intent.CorrelationID, WorkflowFile: intent.WorkflowFile, Ref: intent.Ref,
+		Action: action, CorrelationID: intent.CorrelationID, WorkflowFile: intent.WorkflowFile, Ref: intent.Ref, Operation: intent.Operation,
 		DisplayTitle: intent.ExpectedDisplayTitle, RequestDigest: intent.RequestDigest, Actor: actor, PlannedAt: plannedAt.UTC(),
 	}
 	data, err := json.Marshal(record)

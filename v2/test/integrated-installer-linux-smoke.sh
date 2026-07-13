@@ -20,13 +20,25 @@ curl --fail --silent --show-error --location "$base/$archive" -o "$work_root/nod
 (cd "$work_root/node" && grep "  $archive$" SHASUMS256.txt | sha256sum --check --strict -)
 tar -xzf "$work_root/node/$archive" -C "$work_root/node"
 node_root="$work_root/node/node-v${node_version}-linux-x64"
+node_runtime="$work_root/node-runtime"
+mkdir -p "$node_runtime/node_modules"
+cp "$node_root/bin/node" "$node_runtime/node"
+cp "$node_root/LICENSE" "$node_runtime/LICENSE.node.txt"
+cp -RL "$node_root/lib/node_modules/npm" "$node_runtime/node_modules/npm"
+cp -RL "$node_root/lib/node_modules/corepack" "$node_runtime/node_modules/corepack"
+cp "$hive_root/runtime-launchers/linux/npm" "$hive_root/runtime-launchers/linux/npx" \
+  "$hive_root/runtime-launchers/linux/corepack" "$hive_root/runtime-launchers/linux/pnpm" \
+  "$hive_root/runtime-launchers/linux/pnpx" "$hive_root/runtime-launchers/linux/yarn" \
+  "$hive_root/runtime-launchers/linux/yarnpkg" "$node_runtime/"
+chmod 0755 "$node_runtime/node" "$node_runtime/npm" "$node_runtime/npx" "$node_runtime/corepack" \
+  "$node_runtime/pnpm" "$node_runtime/pnpx" "$node_runtime/yarn" "$node_runtime/yarnpkg"
 
 (cd "$hive_root" && go build -trimpath -ldflags "-s -w -X main.gitHash=$hive_commit -X main.gitShort=${hive_commit:0:12}" -o "$work_root/hive" ./cmd/hive)
 distribution="$work_root/release/hive-integrated-${release_version}-linux-amd64"
 (cd "$hive_root" && go run ./cmd/hive-dist \
   --hive "$work_root/hive" --hive-commit "$hive_commit" \
   --visual-hive "$visual_bundle" --visual-hive-commit "$visual_commit" \
-  --node "$node_root/bin/node" --node-license "$node_root/LICENSE" --node-version "v${node_version}" \
+  --node "$node_root/bin/node" --node-runtime "$node_runtime" --node-license "$node_root/LICENSE" --node-version "v${node_version}" \
   --skill "$hive_root/skills/hive" --target-os linux --target-arch amd64 --output "$distribution" >/dev/null)
 
 (cd "$work_root/release" && tar -czf "hive-integrated-${release_version}-linux-amd64.tar.gz" "hive-integrated-${release_version}-linux-amd64")

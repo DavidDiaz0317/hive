@@ -31,7 +31,9 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case "/repos/owner/repo/actions/runs/42":
-			_, _ = io.WriteString(writer, `{"id":42,"name":"Visual Hive Scheduled","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
+			_, _ = io.WriteString(writer, `{"id":42,"workflow_id":12,"name":"Visual Hive Scheduled","display_title":"Visual Hive Scheduled [correlation]","path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
+		case "/repos/owner/repo/actions/workflows/12":
+			_, _ = io.WriteString(writer, `{"id":12,"name":"Visual Hive Scheduled","path":".github/workflows/visual-hive.yml","state":"active"}`)
 		case "/repos/owner/repo/actions/runs/42/artifacts":
 			_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":2,"artifacts":[{"id":98,"name":"visual-hive-evidence","size_in_bytes":100,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"abc123"}},{"id":99,"name":"visual-hive-bundle","size_in_bytes":%d,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"abc123"}}]}`, len(zipData)))
 		case "/repos/owner/repo/actions/artifacts/99/zip":
@@ -60,11 +62,13 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	bundle, verified, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
 		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, SourceArtifactID: 98, FetchSourceArtifact: true, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
+		ExpectedWorkflowName: "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedRunName: "Visual Hive Scheduled [correlation]",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bundle.Validation.Trusted || verified.RepositoryID != "123" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" {
+	if !bundle.Validation.Trusted || verified.RepositoryID != "123" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" ||
+		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" {
 		t.Fatalf("unexpected verified artifact: bundle=%+v verified=%+v", bundle.Validation, verified)
 	}
 	if data, err := os.ReadFile(filepath.Join(verified.SourceArtifactPath, "verdict.json")); err != nil || !strings.Contains(string(data), "allContributions") {
@@ -92,6 +96,44 @@ func TestFetchAndVerifyVisualHiveBundleRejectsWrongTargetBranch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match target branch") {
 		t.Fatalf("expected target branch rejection, got %v", err)
+	}
+}
+
+func TestFetchAndVerifyVisualHiveBundleSeparatesStaticNameFromCorrelatedTitle(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		runName      string
+		displayTitle string
+		want         string
+	}{
+		{name: "spoofed static run name", runName: "Visual Hive Scheduled [correlation]", displayTitle: "Visual Hive Scheduled [correlation]", want: "definition or run name mismatch"},
+		{name: "spoofed correlated title", runName: "Visual Hive Scheduled", displayTitle: "Visual Hive Scheduled", want: "correlated workflow run name mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/repos/owner/repo":
+					_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
+				case "/repos/owner/repo/actions/runs/42":
+					_, _ = fmt.Fprintf(writer, `{"id":42,"workflow_id":12,"name":%q,"display_title":%q,"path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success"}`, test.runName, test.displayTitle)
+				case "/repos/owner/repo/actions/workflows/12":
+					_, _ = io.WriteString(writer, `{"id":12,"name":"Visual Hive Scheduled","path":".github/workflows/visual-hive.yml","state":"active"}`)
+				default:
+					http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			_, _, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
+				Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
+				ExpectedWorkflowName: "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedRunName: "Visual Hive Scheduled [correlation]",
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("spoofed workflow identity was accepted: %v", err)
+			}
+		})
 	}
 }
 

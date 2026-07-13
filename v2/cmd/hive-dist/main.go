@@ -17,6 +17,7 @@ func main() {
 	visualHiveDir := flag.String("visual-hive", "", "path to an unpacked Visual Hive release bundle")
 	visualCommit := flag.String("visual-hive-commit", "", "immutable Visual Hive commit SHA")
 	nodeBinary := flag.String("node", "", "path to the pinned Node 22 binary")
+	nodeRuntime := flag.String("node-runtime", "", "path to the complete pinned Node 22 runtime with npm and corepack")
 	nodeLicense := flag.String("node-license", "", "path to the Node license")
 	skillDir := flag.String("skill", "", "path to the Hive Codex skill")
 	targetOS := flag.String("target-os", "", "distribution operating system (linux or windows)")
@@ -28,7 +29,7 @@ func main() {
 	defer cancel()
 	manifest, err := integrated.BuildDistribution(ctx, integrated.DistributionOptions{
 		HiveBinary: *hiveBinary, HiveCommit: *hiveCommit, VisualHiveDir: *visualHiveDir, VisualCommit: *visualCommit,
-		NodeBinary: *nodeBinary, NodeLicense: *nodeLicense, NodeVersion: *nodeVersion, SkillDir: *skillDir,
+		NodeBinary: *nodeBinary, NodeRuntimeDir: *nodeRuntime, NodeLicense: *nodeLicense, NodeVersion: *nodeVersion, SkillDir: *skillDir,
 		TargetOS: *targetOS, TargetArch: *targetArch, OutputDir: *output,
 	})
 	if err != nil {

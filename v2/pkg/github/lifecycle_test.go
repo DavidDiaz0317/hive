@@ -450,6 +450,38 @@ func TestUpdateLifecycleIssueRejectsForeignAuthoredStateTarget(t *testing.T) {
 	}
 }
 
+func TestLifecycleIssueOwnedSurvivesAuthenticatedWriterRotationWithoutDuplicate(t *testing.T) {
+	marker := "<!-- hive-visual-fingerprint: " + strings.Repeat("d", 64) + " -->"
+	posts, patches := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/user":
+			_, _ = io.WriteString(writer, `{"login":"new-operator","id":9002}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues":
+			_, _ = io.WriteString(writer, `[{"number":19,"state":"open","html_url":"https://github.test/owner/repo/issues/19","body":"`+marker+`","labels":[{"name":"hive/managed"}],"user":{"login":"original-writer","id":9001}}]`)
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/issues/19":
+			patches++
+			_, _ = io.WriteString(writer, `{"number":19,"state":"open","html_url":"https://github.test/owner/repo/issues/19","body":"`+marker+`","user":{"login":"original-writer","id":9001}}`)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/issues":
+			posts++
+			http.Error(writer, "must not create a duplicate", http.StatusInternalServerError)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	login, id, err := client.ResolveLifecycleIssueWriter(context.Background(), "owner/repo", marker, 0)
+	if err != nil || login != "original-writer" || id != 9001 {
+		t.Fatalf("resolved writer = %s/%d err=%v", login, id, err)
+	}
+	number, _, created, err := client.UpsertLifecycleIssueOwned(context.Background(), "owner/repo", marker, login, id, "Finding", marker+"\nupdated", []string{"hive/managed", "hive/active"})
+	if err != nil || number != 19 || created || posts != 0 || patches != 2 {
+		t.Fatalf("owned rotation upsert issue=%d created=%t posts=%d patches=%d err=%v", number, created, posts, patches, err)
+	}
+}
+
 func serveLifecycleWriter(writer http.ResponseWriter, request *http.Request) bool {
 	if request.Method != http.MethodGet || request.URL.Path != "/user" {
 		return false

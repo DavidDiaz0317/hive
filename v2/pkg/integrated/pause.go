@@ -40,6 +40,11 @@ func SetPaused(ctx context.Context, stateDir string, paused bool) (Config, error
 	if err != nil {
 		return Config{}, err
 	}
+	if !paused {
+		if err := rejectPendingAuthorizerTransfer(store, stateDir, "automation resume"); err != nil {
+			return Config{}, err
+		}
+	}
 	action := "resume"
 	if paused {
 		action = "pause"

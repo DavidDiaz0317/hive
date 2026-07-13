@@ -15,7 +15,8 @@ const (
 	StateSchemaV2 = "hive.repair-worker-state.v2"
 	StateSchemaV3 = "hive.repair-worker-state.v3"
 	StateSchemaV4 = "hive.repair-worker-state.v4"
-	StateSchema   = "hive.repair-worker-state.v5"
+	StateSchemaV5 = "hive.repair-worker-state.v5"
+	StateSchema   = "hive.repair-worker-state.v6"
 )
 
 type Stage string
@@ -42,42 +43,76 @@ const (
 )
 
 type Attempt struct {
-	Repository            string       `json:"repository"`
-	RepositoryFingerprint string       `json:"repository_fingerprint"`
-	Recurrence            int          `json:"recurrence,omitempty"`
-	Attempt               int          `json:"attempt"`
-	Branch                string       `json:"branch"`
-	Worktree              string       `json:"worktree"`
-	DiscardDirtyBranch    string       `json:"discard_dirty_branch,omitempty"`
-	Stage                 Stage        `json:"stage"`
-	Provider              string       `json:"provider"`
-	LifecycleStarted      bool         `json:"lifecycle_started,omitempty"`
-	AttemptCounted        bool         `json:"attempt_counted"`
-	ModelInvocationID     string       `json:"model_invocation_id,omitempty"`
-	ModelSummary          string       `json:"model_summary,omitempty"`
-	PriorModelSummary     string       `json:"prior_model_summary,omitempty"`
-	ModelPatch            string       `json:"model_patch,omitempty"`
-	LastFailureClass      FailureClass `json:"last_failure_class,omitempty"`
-	LastFailureID         string       `json:"last_failure_id,omitempty"`
-	LastFailure           string       `json:"last_failure,omitempty"`
-	ResumeStage           Stage        `json:"resume_stage,omitempty"`
-	RetryAuthorizedAt     time.Time    `json:"retry_authorized_at,omitempty"`
-	RetryActor            string       `json:"retry_actor,omitempty"`
-	RetryReason           string       `json:"retry_reason,omitempty"`
-	RetryTransactionID    string       `json:"retry_transaction_id,omitempty"`
-	RetryResumeStage      Stage        `json:"retry_resume_stage,omitempty"`
-	CommitSHA             string       `json:"commit_sha,omitempty"`
-	PRNumber              int          `json:"pr_number,omitempty"`
-	PRURL                 string       `json:"pr_url,omitempty"`
-	LifecyclePROpen       bool         `json:"lifecycle_pr_open,omitempty"`
+	Repository            string `json:"repository"`
+	RepositoryFingerprint string `json:"repository_fingerprint"`
+	Recurrence            int    `json:"recurrence,omitempty"`
+	Attempt               int    `json:"attempt"`
+	Branch                string `json:"branch"`
+	Worktree              string `json:"worktree"`
+	DiscardDirtyBranch    string `json:"discard_dirty_branch,omitempty"`
+	Stage                 Stage  `json:"stage"`
+	Provider              string `json:"provider"`
+	LifecycleStarted      bool   `json:"lifecycle_started,omitempty"`
+	AttemptCounted        bool   `json:"attempt_counted"`
+	ModelInvocationID     string `json:"model_invocation_id,omitempty"`
+	ModelSummary          string `json:"model_summary,omitempty"`
+	PriorModelSummary     string `json:"prior_model_summary,omitempty"`
+	ModelPatch            string `json:"model_patch,omitempty"`
+	// ModelBaseTree is the exact cumulative tree presented to a read-only
+	// provider. CandidateTree is the immutable tree authorized after applying
+	// that provider's bounded patch; commits are created from it, never by
+	// staging a mutable post-validation worktree.
+	ModelBaseTree             string       `json:"model_base_tree,omitempty"`
+	ModelBaseParent           string       `json:"model_base_parent,omitempty"`
+	ModelBaseGuardRef         string       `json:"model_base_guard_ref,omitempty"`
+	ModelBaseGuardCommit      string       `json:"model_base_guard_commit,omitempty"`
+	ModelBaseGuardBinding     string       `json:"model_base_guard_binding,omitempty"`
+	ModelBaseGuardKind        string       `json:"model_base_guard_kind,omitempty"`
+	CandidateTree             string       `json:"candidate_tree,omitempty"`
+	CandidateParent           string       `json:"candidate_parent,omitempty"`
+	CandidateGuardRef         string       `json:"candidate_guard_ref,omitempty"`
+	CandidateGuardCommit      string       `json:"candidate_guard_commit,omitempty"`
+	CandidateGuardBinding     string       `json:"candidate_guard_binding,omitempty"`
+	CandidateGuardKind        string       `json:"candidate_guard_kind,omitempty"`
+	ToolSnapshotRef           string       `json:"tool_snapshot_ref,omitempty"`
+	ToolSnapshotCommit        string       `json:"tool_snapshot_commit,omitempty"`
+	ToolSnapshotHead          string       `json:"tool_snapshot_head,omitempty"`
+	ToolSnapshotBranch        string       `json:"tool_snapshot_branch,omitempty"`
+	ToolSnapshotPhase         string       `json:"tool_snapshot_phase,omitempty"`
+	ToolSnapshotStartedAt     time.Time    `json:"tool_snapshot_started_at,omitempty"`
+	ToolSnapshotDeadline      time.Time    `json:"tool_snapshot_deadline,omitempty"`
+	RecoveredPatchAttempt     int          `json:"recovered_patch_attempt,omitempty"`
+	RecoveredPatchSHA256      string       `json:"recovered_patch_sha256,omitempty"`
+	RecoveredPatchAuthorized  bool         `json:"recovered_patch_authorized,omitempty"`
+	RecoveredProviderSHA256   string       `json:"recovered_provider_sha256,omitempty"`
+	PreparationRecoveryHead   string       `json:"preparation_recovery_head,omitempty"`
+	PreparationReplayTree     string       `json:"preparation_replay_tree,omitempty"`
+	PreparationReplayProof    string       `json:"preparation_replay_proof,omitempty"`
+	PreparationCleanupPending bool         `json:"preparation_cleanup_pending,omitempty"`
+	PreparationCleanupRef     string       `json:"preparation_cleanup_ref,omitempty"`
+	PreparationCleanupCommit  string       `json:"preparation_cleanup_commit,omitempty"`
+	LastFailureClass          FailureClass `json:"last_failure_class,omitempty"`
+	LastFailureID             string       `json:"last_failure_id,omitempty"`
+	LastFailure               string       `json:"last_failure,omitempty"`
+	ResumeStage               Stage        `json:"resume_stage,omitempty"`
+	RetryAuthorizedAt         time.Time    `json:"retry_authorized_at,omitempty"`
+	RetryActor                string       `json:"retry_actor,omitempty"`
+	RetryReason               string       `json:"retry_reason,omitempty"`
+	RetryTransactionID        string       `json:"retry_transaction_id,omitempty"`
+	RetryResumeStage          Stage        `json:"retry_resume_stage,omitempty"`
+	CommitSHA                 string       `json:"commit_sha,omitempty"`
+	PRNumber                  int          `json:"pr_number,omitempty"`
+	PRURL                     string       `json:"pr_url,omitempty"`
+	LifecyclePROpen           bool         `json:"lifecycle_pr_open,omitempty"`
 	// LegacyOwnershipAdoption is set only while migrating a fully bound
 	// pre-v5 PR-open checkpoint. It is consumed after one exact local refresh
 	// creates an ownership-trailed head and is never enabled for new attempts.
-	LegacyOwnershipAdoption bool            `json:"legacy_ownership_adoption,omitempty"`
-	ChangedFiles            []string        `json:"changed_files,omitempty"`
-	BaselineReview          *BaselineReview `json:"baseline_review,omitempty"`
-	StartedAt               time.Time       `json:"started_at"`
-	UpdatedAt               time.Time       `json:"updated_at"`
+	LegacyOwnershipAdoption  bool            `json:"legacy_ownership_adoption,omitempty"`
+	LegacyUnsealedCheckpoint bool            `json:"legacy_unsealed_checkpoint,omitempty"`
+	ChangedFiles             []string        `json:"changed_files,omitempty"`
+	BaselineReview           *BaselineReview `json:"baseline_review,omitempty"`
+	StartedAt                time.Time       `json:"started_at"`
+	UpdatedAt                time.Time       `json:"updated_at"`
 }
 
 // CountedModelAttempts returns the bounded model budget represented by this
@@ -138,12 +173,13 @@ type State struct {
 }
 
 type Store struct {
-	mu         sync.Mutex
-	path       string
-	auditPath  string
-	data       State
-	renameFile func(string, string) error
-	poisoned   error
+	mu             sync.Mutex
+	path           string
+	auditPath      string
+	refJournalPath string
+	data           State
+	renameFile     func(string, string) error
+	poisoned       error
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -154,10 +190,11 @@ func NewStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	store := &Store{
-		path:       filepath.Join(dir, "repair-worker-state.json"),
-		auditPath:  filepath.Join(dir, "repair-retry-audit.jsonl"),
-		data:       State{SchemaVersion: StateSchema, Attempts: map[string]*Attempt{}},
-		renameFile: durableRename,
+		path:           filepath.Join(dir, "repair-worker-state.json"),
+		auditPath:      filepath.Join(dir, "repair-retry-audit.jsonl"),
+		refJournalPath: filepath.Join(dir, "repair-ref-journal.jsonl"),
+		data:           State{SchemaVersion: StateSchema, Attempts: map[string]*Attempt{}},
+		renameFile:     durableRename,
 	}
 	data, err := os.ReadFile(store.path)
 	if err == nil {
@@ -178,6 +215,20 @@ func NewStore(dir string) (*Store, error) {
 					attempt.PRNumber > 0 && strings.TrimSpace(attempt.PRURL) != "" && strings.HasPrefix(strings.TrimSpace(attempt.Branch), "hive/repair-") {
 					attempt.LifecyclePROpen = true
 					attempt.LegacyOwnershipAdoption = true
+				}
+				if attempt != nil && (attempt.Stage == StageModelComplete || attempt.Stage == StageValidated) {
+					attempt.LegacyUnsealedCheckpoint = true
+				}
+			}
+			store.data.SchemaVersion = StateSchema
+			migrated = true
+		} else if store.data.SchemaVersion == StateSchemaV5 {
+			// v5 already persisted exact attempt-counting semantics. In particular,
+			// a model_running checkpoint can be intentionally uncounted until its
+			// ambiguous invocation is reconciled; never apply the v1-v4 inference.
+			for _, attempt := range store.data.Attempts {
+				if attempt != nil && (attempt.Stage == StageModelComplete || attempt.Stage == StageValidated) {
+					attempt.LegacyUnsealedCheckpoint = true
 				}
 			}
 			store.data.SchemaVersion = StateSchema
@@ -241,6 +292,10 @@ func (s *Store) Put(attempt Attempt) error {
 	copy := cloneAttempt(attempt)
 	s.data.Attempts[attempt.RepositoryFingerprint] = &copy
 	desired := cloneState(s.data)
+	if err := validatePersistedRepairState(desired); err != nil {
+		s.data = previous
+		return fmt.Errorf("validate repair worker state update: %w", err)
+	}
 	if err := s.persistLocked(); err != nil {
 		if reconcileErr := s.reconcilePersistFailureLocked(err, previous, desired); reconcileErr != nil {
 			return reconcileErr
@@ -364,6 +419,18 @@ func validatePersistedRepairState(state State) error {
 	for fingerprint, attempt := range state.Attempts {
 		if strings.TrimSpace(fingerprint) == "" || attempt == nil || attempt.RepositoryFingerprint != fingerprint {
 			return fmt.Errorf("repair worker state contains an invalid attempt key %q", fingerprint)
+		}
+		if !validToolSnapshot(*attempt) {
+			return fmt.Errorf("repair worker state contains an invalid tool snapshot for %q", fingerprint)
+		}
+		if !validRecoveredPatchProvenance(*attempt) {
+			return fmt.Errorf("repair worker state contains invalid recovered-patch provenance for %q", fingerprint)
+		}
+		if err := sealedTreeGuardStateError(*attempt); err != nil {
+			return fmt.Errorf("repair worker state contains invalid sealed-tree guards for %q: %w", fingerprint, err)
+		}
+		if hasToolSnapshot(*attempt) && attempt.PreparationCleanupPending {
+			return fmt.Errorf("repair worker state mixes tool and preparation-cleanup snapshots for %q", fingerprint)
 		}
 	}
 	return nil
