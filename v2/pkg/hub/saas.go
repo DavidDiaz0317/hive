@@ -143,6 +143,10 @@ func (s *HubServer) registerSaaSRoutes() {
 	s.mux.HandleFunc("DELETE /api/saas/admin/hub-banner", s.requireAdmin(s.handleClearHubBanner))
 	s.mux.HandleFunc("GET /api/saas/admin/hub-banner", s.requireAdmin(s.handleGetHubBanner))
 
+	startHubBackgroundWorkers(s)
+}
+
+var startHubBackgroundWorkers = func(s *HubServer) {
 	go s.startProvisionWatcher()
 	go s.StartLatestSHAPoller()
 }
@@ -1580,7 +1584,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 	user.Hives[hiveID] = "owner"
 	saveSaaSUser(user)
 
-	go func() {
+	dispatchHiveProvision(func() {
 		cluster := s.clusterForHive(h)
 		if cluster == nil {
 			h.Status = "error"
@@ -1598,7 +1602,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 		}
 		h.Status = "provisioning"
 		saveSaaSHive(h)
-	}()
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -1606,6 +1610,10 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 		"status":    "provisioning",
 		"subdomain": h.Subdomain,
 	})
+}
+
+var dispatchHiveProvision = func(work func()) {
+	go work()
 }
 
 func (s *HubServer) handleHiveStatus(w http.ResponseWriter, r *http.Request) {
