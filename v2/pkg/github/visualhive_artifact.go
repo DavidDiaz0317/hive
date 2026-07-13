@@ -323,7 +323,7 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 	if err := os.MkdirAll(destinationDir, 0o700); err != nil {
 		return "", fmt.Errorf("create Visual Hive artifact directory: %w", err)
 	}
-	if prefix != "artifact" && prefix != "source-artifact" && prefix != "pr-artifact" {
+	if !validArtifactExtractionPrefix(prefix) {
 		return "", fmt.Errorf("invalid Visual Hive artifact extraction prefix")
 	}
 	finalDir := filepath.Join(destinationDir, fmt.Sprintf("%s-%d", prefix, artifactID))
@@ -388,6 +388,15 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 		return "", fmt.Errorf("publish Visual Hive artifact: %w", err)
 	}
 	return finalDir, nil
+}
+
+func validArtifactExtractionPrefix(prefix string) bool {
+	switch prefix {
+	case "artifact", "source-artifact", "pr-artifact", "setup-baseline-artifact":
+		return true
+	default:
+		return false
+	}
 }
 
 func isLoopbackDownload(host string) bool {

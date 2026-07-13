@@ -60,6 +60,19 @@ func TestValidateSetupBaselineWorkflowRunUsesCorrelationBoundTitleAndImmutableWo
 	}
 }
 
+func TestValidArtifactExtractionPrefixIncludesSetupBaselineWithoutAcceptingPaths(t *testing.T) {
+	for _, prefix := range []string{"artifact", "source-artifact", "pr-artifact", "setup-baseline-artifact"} {
+		if !validArtifactExtractionPrefix(prefix) {
+			t.Fatalf("required extraction prefix %q was rejected", prefix)
+		}
+	}
+	for _, prefix := range []string{"", ".", "..", "setup-baseline", "setup-baseline-artifact/child", `setup-baseline-artifact\\child`} {
+		if validArtifactExtractionPrefix(prefix) {
+			t.Fatalf("unsafe or unknown extraction prefix %q was accepted", prefix)
+		}
+	}
+}
+
 func TestValidateSetupBaselineJobInventoryRejectsTruncatedPage(t *testing.T) {
 	head := strings.Repeat("a", 40)
 	job := func(name, conclusion string) *gh.WorkflowJob {
