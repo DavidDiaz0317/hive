@@ -193,13 +193,25 @@ func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, 
 		if markerCount != 1 {
 			return RepairPullRequest{}, fmt.Errorf("open repair pull request #%d contains marker %q more than once", pull.GetNumber(), marker)
 		}
-		if err := validateManagedPullRequest(pull, identity, repository, pull.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); err != nil {
-			return RepairPullRequest{}, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not the exact managed PR: %w", pull.GetNumber(), marker, err)
+		candidate := pull
+		if err := validateManagedPullRequest(candidate, identity, repository, candidate.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); err != nil {
+			// GitHub's open-PR list can briefly retain the previous head after
+			// Hive has atomically updated the same managed branch. Re-read only
+			// this repository-owned marker claimant before rejecting it; the
+			// exact repository, branch, head, base, and marker checks still apply.
+			live, _, readErr := c.client.PullRequests.Get(ctx, owner, repo, candidate.GetNumber())
+			if readErr != nil {
+				return RepairPullRequest{}, fmt.Errorf("re-read inexact managed pull request #%d: %w", candidate.GetNumber(), readErr)
+			}
+			if liveErr := validateManagedPullRequest(live, identity, repository, live.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); liveErr != nil {
+				return RepairPullRequest{}, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not the exact managed PR: %w", pull.GetNumber(), marker, liveErr)
+			}
+			candidate = live
 		}
 		if matched != nil {
 			return RepairPullRequest{}, fmt.Errorf("multiple exact open repair pull requests contain marker %q", marker)
 		}
-		matched = pull
+		matched = candidate
 	}
 	if matched != nil {
 		live, _, err := c.client.PullRequests.Get(ctx, owner, repo, matched.GetNumber())

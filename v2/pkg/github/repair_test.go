@@ -70,6 +70,48 @@ func TestUpsertRepairPullRequestCreatesThenUpdates(t *testing.T) {
 	}
 }
 
+func TestUpsertRepairPullRequestRefreshesStaleListHeadAfterManagedPush(t *testing.T) {
+	marker := "<!-- hive-setup: owner/repo -->"
+	previousHead := strings.Repeat("9", 40)
+	expectedHead := strings.Repeat("a", 40)
+	title, body := "Previous setup", marker+"\nprevious"
+	getCalls, editCalls, createCalls := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			writeManagedRepository(writer)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/setup-proof":
+			writeManagedRef(writer, "hive/setup-proof", expectedHead)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
+			writeManagedPullList(writer, managedPull(7, title, body, "hive/setup-proof", previousHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
+			getCalls++
+			writeManagedPull(writer, managedPull(7, title, body, "hive/setup-proof", expectedHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/pulls/7":
+			editCalls++
+			var input struct {
+				Title string `json:"title"`
+				Body  string `json:"body"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&input)
+			title, body = input.Title, input.Body
+			writeManagedPull(writer, managedPull(7, title, body, "hive/setup-proof", expectedHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/pulls":
+			createCalls++
+			http.Error(writer, "must not create a duplicate", http.StatusInternalServerError)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	pull, err := client.UpsertRepairPullRequest(context.Background(), "owner/repo", "hive/setup-proof", expectedHead, "main", "Current setup", marker+"\ncurrent", marker)
+	if err != nil || pull.Created || pull.Number != 7 || pull.HeadSHA != expectedHead || getCalls != 3 || editCalls != 1 || createCalls != 0 {
+		t.Fatalf("stale list head was not refreshed safely: pull=%+v gets=%d edits=%d creates=%d err=%v", pull, getCalls, editCalls, createCalls, err)
+	}
+}
+
 func TestUpsertReviewPullRequestIsDraftAndHoldLabeled(t *testing.T) {
 	head := strings.Repeat("b", 40)
 	marker := "<!-- hive-baseline-review: proof -->"
@@ -158,6 +200,8 @@ func TestUpsertRepairPullRequestRejectsMarkerOnAnotherBranch(t *testing.T) {
 			writeManagedRef(writer, "hive/repair-retry", head)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
 			writeManagedPullList(writer, managedPull(7, "title", marker, "hive/repair-original", head, "main", 123, "owner/repo"))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
+			writeManagedPull(writer, managedPull(7, "title", marker, "hive/repair-original", head, "main", 123, "owner/repo"))
 		default:
 			createCalls++
 			http.Error(writer, "must not create", http.StatusInternalServerError)
@@ -193,6 +237,8 @@ func TestUpsertRepairPullRequestRejectsTargetRepositoryClaimWithWrongHeadOrBase(
 					writeManagedRef(writer, "hive/repair-exact", expectedHead)
 				case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
 					writeManagedPullList(writer, managedPull(7, "title", marker, "hive/repair-exact", test.head, test.base, 123, "owner/repo"))
+				case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
+					writeManagedPull(writer, managedPull(7, "title", marker, "hive/repair-exact", test.head, test.base, 123, "owner/repo"))
 				default:
 					mutations++
 					http.Error(writer, "must not mutate", http.StatusInternalServerError)
