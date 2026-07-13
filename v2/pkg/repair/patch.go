@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -57,8 +59,11 @@ func extractModelPatch(output string) (string, error) {
 	if patch == "" || len(patch) > maxModelPatch {
 		return "", fmt.Errorf("model patch is empty or exceeds %d bytes", maxModelPatch)
 	}
-	if providerSecret.MatchString(patch) || strings.ContainsRune(patch, '\x00') {
+	if strings.ContainsRune(patch, '\x00') {
 		return "", fmt.Errorf("model patch contains an unsafe value")
+	}
+	if err := validateRepairTextSecrets(patch, "model patch"); err != nil {
+		return "", err
 	}
 	return patch + "\n", nil
 }
@@ -67,8 +72,11 @@ func patchChangedFiles(patchText string) ([]string, error) {
 	if len(patchText) == 0 || len(patchText) > maxModelPatch {
 		return nil, fmt.Errorf("model patch is empty or exceeds %d bytes", maxModelPatch)
 	}
-	if providerSecret.MatchString(patchText) || strings.ContainsRune(patchText, '\x00') {
+	if strings.ContainsRune(patchText, '\x00') {
 		return nil, fmt.Errorf("model patch contains an unsafe value")
+	}
+	if err := validateRepairTextSecrets(patchText, "model patch"); err != nil {
+		return nil, err
 	}
 	lower := strings.ToLower(patchText)
 	for _, forbidden := range []string{"git binary patch", "binary files ", "rename from ", "rename to ", "copy from ", "copy to ", "old mode ", "new mode ", "submodule "} {
@@ -131,22 +139,32 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 	if err != nil {
 		return err
 	}
-	addArgs := append([]string{"add", "--"}, files...)
-	if _, err := runGit(ctx, worktree, addArgs...); err != nil {
-		return patchEngineInfrastructureFailure(fmt.Errorf("stage cumulative repair state for incremental patch: %w", err))
+	indexDirectory, err := os.MkdirTemp("", "hive-repair-index-")
+	if err != nil {
+		return patchEngineInfrastructureFailure(fmt.Errorf("create isolated incremental patch index: %w", err))
 	}
-	resetIndex := func() error {
-		resetArgs := append([]string{"reset", "--"}, files...)
-		_, resetErr := runGit(ctx, worktree, resetArgs...)
-		return resetErr
+	defer func() { _ = os.RemoveAll(indexDirectory) }()
+	indexFile := filepath.Join(indexDirectory, "index")
+	if _, err := runGitWithIndex(ctx, worktree, indexFile, "read-tree", "HEAD"); err != nil {
+		return patchEngineInfrastructureFailure(fmt.Errorf("initialize isolated incremental patch index: %w", err))
 	}
-	applyErr := func() error {
-		canApply, _, err := checkModelPatch(ctx, worktree, patchText, false, true)
+	stageFiles, err := incrementalPatchBaseFiles(ctx, worktree, indexFile, files)
+	if err != nil {
+		return patchEngineInfrastructureFailure(fmt.Errorf("inspect cumulative repair state for incremental patch: %w", err))
+	}
+	if len(stageFiles) > 0 {
+		addArgs := append([]string{"add", "--"}, stageFiles...)
+		if _, err := runGitWithIndex(ctx, worktree, indexFile, addArgs...); err != nil {
+			return patchEngineInfrastructureFailure(fmt.Errorf("stage cumulative repair state in isolated incremental patch index: %w", err))
+		}
+	}
+	return func() error {
+		canApply, _, err := checkModelPatchWithIndex(ctx, worktree, patchText, false, true, indexFile)
 		if err != nil {
 			return patchEngineInfrastructureFailure(err)
 		}
 		if canApply {
-			return applyIndexedModelPatch(ctx, worktree, patchText)
+			return applyIndexedModelPatch(ctx, worktree, patchText, indexFile)
 		}
 		hunks, err := splitModelPatchHunks(patchText)
 		if err != nil {
@@ -154,14 +172,14 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 		}
 		pending := make([]string, 0, len(hunks))
 		for index, hunk := range hunks {
-			alreadyApplied, _, checkErr := checkModelPatch(ctx, worktree, hunk, true, true)
+			alreadyApplied, _, checkErr := checkModelPatchWithIndex(ctx, worktree, hunk, true, true, indexFile)
 			if checkErr != nil {
 				return patchEngineInfrastructureFailure(checkErr)
 			}
 			if alreadyApplied {
 				continue
 			}
-			applicable, detail, checkErr := checkModelPatch(ctx, worktree, hunk, false, true)
+			applicable, detail, checkErr := checkModelPatchWithIndex(ctx, worktree, hunk, false, true, indexFile)
 			if checkErr != nil {
 				return patchEngineInfrastructureFailure(checkErr)
 			}
@@ -173,22 +191,39 @@ func applyIncrementalModelPatch(ctx context.Context, worktree, patchText string)
 		if len(pending) == 0 {
 			return nil
 		}
-		return applyIndexedModelPatch(ctx, worktree, strings.Join(pending, ""))
+		return applyIndexedModelPatch(ctx, worktree, strings.Join(pending, ""), indexFile)
 	}()
-	resetErr := resetIndex()
-	if applyErr != nil {
-		if resetErr != nil {
-			return patchEngineInfrastructureFailure(fmt.Errorf("%v; restore repair index after rejected incremental patch: %w", applyErr, resetErr))
-		}
-		return applyErr
-	}
-	if resetErr != nil {
-		return patchEngineInfrastructureFailure(fmt.Errorf("restore repair index after incremental patch: %w", resetErr))
-	}
-	return nil
 }
 
-func applyIndexedModelPatch(ctx context.Context, worktree, patchText string) error {
+// incrementalPatchBaseFiles returns the patch targets whose current worktree
+// state must be copied into the isolated index before git apply --index. An
+// absent path that is also absent from HEAD is deliberately omitted: it is the
+// valid preimage of a new-file patch, and git add rejects that pathspec.
+func incrementalPatchBaseFiles(ctx context.Context, worktree, indexFile string, files []string) ([]string, error) {
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		_, statErr := os.Lstat(filepath.Join(worktree, filepath.FromSlash(file)))
+		if statErr == nil {
+			result = append(result, file)
+			continue
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect incremental patch path %s: %w", file, statErr)
+		}
+		tracked, err := runGitWithIndex(ctx, worktree, indexFile, "ls-files", "--cached", "-z", "--", file)
+		if err != nil {
+			return nil, err
+		}
+		if tracked != "" {
+			// Stage a cumulative deletion so the temporary index continues to
+			// describe the exact worktree presented to the model.
+			result = append(result, file)
+		}
+	}
+	return result, nil
+}
+
+func applyIndexedModelPatch(ctx context.Context, worktree, patchText, indexFile string) error {
 	for _, check := range []bool{true, false} {
 		args := []string{"apply", "--index"}
 		if check {
@@ -197,7 +232,7 @@ func applyIndexedModelPatch(ctx context.Context, worktree, patchText string) err
 		args = append(args, "--whitespace=error-all", "--recount", "-")
 		command := exec.CommandContext(ctx, "git", args...)
 		command.Dir = worktree
-		command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+		command.Env = patchGitEnvironment(indexFile)
 		command.Stdin = strings.NewReader(patchText)
 		var output limitedBuffer
 		command.Stdout, command.Stderr = &output, &output
@@ -228,6 +263,10 @@ func classifyPatchCommandFailure(ctx context.Context, commandErr error, output s
 }
 
 func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, indexed bool) (bool, string, error) {
+	return checkModelPatchWithIndex(ctx, worktree, patchText, reverse, indexed, "")
+}
+
+func checkModelPatchWithIndex(ctx context.Context, worktree, patchText string, reverse, indexed bool, indexFile string) (bool, string, error) {
 	args := []string{"apply"}
 	if indexed {
 		args = append(args, "--index")
@@ -238,7 +277,7 @@ func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, i
 	args = append(args, "--check", "--whitespace=error-all", "--recount", "-")
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = worktree
-	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	command.Env = patchGitEnvironment(indexFile)
 	command.Stdin = strings.NewReader(patchText)
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
@@ -251,6 +290,36 @@ func checkModelPatch(ctx context.Context, worktree, patchText string, reverse, i
 		return false, output.String(), nil
 	}
 	return true, output.String(), nil
+}
+
+func runGitWithIndex(ctx context.Context, worktree, indexFile string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = worktree
+	command.Env = patchGitEnvironment(indexFile)
+	var output limitedBuffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Run(); err != nil {
+		return output.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, safeExcerpt(output.String()))
+	}
+	return output.String(), nil
+}
+
+func patchGitEnvironment(indexFile string) []string {
+	environment := providerEnvironment()
+	filtered := environment[:0]
+	for _, pair := range environment {
+		name, _, _ := strings.Cut(pair, "=")
+		if strings.EqualFold(name, "GIT_INDEX_FILE") || strings.EqualFold(name, "GIT_CONFIG_COUNT") ||
+			strings.EqualFold(name, "GIT_CONFIG_KEY_0") || strings.EqualFold(name, "GIT_CONFIG_VALUE_0") {
+			continue
+		}
+		filtered = append(filtered, pair)
+	}
+	filtered = append(filtered, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	if indexFile != "" {
+		filtered = append(filtered, "GIT_INDEX_FILE="+indexFile)
+	}
+	return filtered
 }
 
 func splitModelPatchHunks(patchText string) ([]string, error) {

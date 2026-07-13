@@ -81,7 +81,7 @@ func TestMergeIntentDurablyBindsExactRepositoryPullRequestAndDiff(t *testing.T) 
 
 func TestPrepareMergeIntentInvalidatesStaleDurableIntent(t *testing.T) {
 	rawDiff := "diff --git a/tests/fix.test.ts b/tests/fix.test.ts\n-old\n+new\n"
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.URL.Path == "/repos/owner/repo":
@@ -179,7 +179,7 @@ func TestFinalGateDriftAfterDurableAuthorizationInvalidatesIntentWithoutMerge(t 
 
 	normalPullReads, mergeRequests := 0, 0
 	rawDiff := "diff --git a/tests/fix.test.ts b/tests/fix.test.ts\n-old\n+new\n"
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		head, base := strings.Repeat("a", 40), strings.Repeat("b", 40)
 		switch {
@@ -198,7 +198,7 @@ func TestFinalGateDriftAfterDurableAuthorizationInvalidatesIntentWithoutMerge(t 
 			if normalPullReads >= 2 {
 				labels = `[{"name":"hold"}]`
 			}
-			_, _ = fmt.Fprintf(writer, `{"number":12,"state":"open","draft":false,"mergeable":true,"mergeable_state":"clean","head":{"sha":%q,"ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q},"labels":%s}`, head, base, labels)
+			_, _ = fmt.Fprintf(writer, `{"number":12,"changed_files":1,"state":"open","draft":false,"mergeable":true,"mergeable_state":"clean","head":{"sha":%q,"ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q},"labels":%s}`, head, base, labels)
 		case request.URL.Path == "/repos/owner/repo/pulls/12/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/fix.test.ts"}]`)
 		case request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -237,6 +237,57 @@ func TestFinalGateDriftAfterDurableAuthorizationInvalidatesIntentWithoutMerge(t 
 	}
 }
 
+func TestFinalLiveBoundaryRejectsObservationHoldAddedAfterApproval(t *testing.T) {
+	stateDir := t.TempDir()
+	config := exactTestMergeConfig()
+	config.StateDir = stateDir
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config); err != nil {
+		t.Fatal(err)
+	}
+	approval := exactTestMergeApproval(strings.Repeat("c", 64))
+	if err := store.SaveMergeApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	expectedFinding := visualhive.FindingLifecycle{
+		Repository: config.Repository, RepositoryID: config.RepositoryID, RepositoryFingerprint: "finding", Status: visualhive.StatusReady,
+		IssueNumber: 11, PRNumber: approval.PRNumber, Branch: "hive/repair-proof", RepairCommitSHA: approval.HeadSHA,
+		HumanReviewRequired: true, ManualReviewKind: "merge_policy", RepairAttempts: 1,
+	}
+	liveFinding := expectedFinding
+	liveFinding.ObservationHumanReviewRequired = true
+	lifecycleDir := filepath.Join(stateDir, "visual-hive")
+	if err := os.MkdirAll(lifecycleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(visualhive.LifecycleState{
+		SchemaVersion: visualhive.LifecycleSchema, Findings: map[string]*visualhive.FindingLifecycle{"finding": &liveFinding},
+		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lifecycleDir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(lifecycleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := exactTestMergeGate()
+	gate.ChangedFiles = []string{"visual-hive.config.yaml"}
+	_, _, _, err = authorizeLiveMergeIntent(context.Background(), stateDir, config, expectedFinding, lifecycle, gate, approval.DiffDigest, &approval, nil)
+	if err == nil || !strings.Contains(err.Error(), "observation-level human review") {
+		t.Fatalf("preexisting merge approval overrode newly observed review authority: %v", err)
+	}
+	if _, exists, loadErr := store.LoadMergeIntent(); loadErr != nil || exists {
+		t.Fatalf("observation-held finding persisted merge authority: exists=%t err=%v", exists, loadErr)
+	}
+}
+
 func TestReconcileApprovedMergeIntentRecoversCrashAndConsumesAuthority(t *testing.T) {
 	stateDir := t.TempDir()
 	deleted := 0
@@ -256,7 +307,7 @@ func TestReconcileApprovedMergeIntentRecoversCrashAndConsumesAuthority(t *testin
 		t.Fatal(err)
 	}
 	finding, exists := lifecycle.Finding("finding")
-	if !reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != "merge-sha" || finding.HumanReviewRequired || finding.ManualReviewKind != "" {
+	if !reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != exactTestMergeSHA() || finding.HumanReviewRequired || finding.ManualReviewKind != "" {
 		t.Fatalf("exact approved intent was not recovered into merged lifecycle: reconciled=%t finding=%+v", reconciled, finding)
 	}
 	assertMergeAuthorityConsumed(t, store)
@@ -275,7 +326,7 @@ func TestReconcileMergeIntentConsumesOrphansAfterLifecycleWasMarkedMerged(t *tes
 	approval := exactTestMergeApproval(digestTestDiff(rawDiff))
 	intent := exactTestMergeIntent(&approval)
 	intent.DiffDigest, intent.Approval.DiffDigest = approval.DiffDigest, approval.DiffDigest
-	store, lifecycle := saveExactMergeRecoveryState(t, stateDir, visualhive.StatusMerged, "merge-sha", false, intent, approval)
+	store, lifecycle := saveExactMergeRecoveryState(t, stateDir, visualhive.StatusMerged, exactTestMergeSHA(), false, intent, approval)
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	config := exactTestMergeConfig()
 
@@ -284,7 +335,7 @@ func TestReconcileMergeIntentConsumesOrphansAfterLifecycleWasMarkedMerged(t *tes
 		t.Fatal(err)
 	}
 	finding, exists := lifecycle.Finding("finding")
-	if reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != "merge-sha" {
+	if reconciled || !exists || finding.Status != visualhive.StatusMerged || finding.MergeSHA != exactTestMergeSHA() {
 		t.Fatalf("already-merged lifecycle was not preserved: reconciled=%t finding=%+v", reconciled, finding)
 	}
 	assertMergeAuthorityConsumed(t, store)
@@ -334,7 +385,7 @@ func TestMergeIntentRecoveryUsesPersistedAuthorizationNotMutableCurrentPolicy(t 
 }
 
 func TestApproveMergeRejectsLiveRepositoryIdentityMismatch(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.URL.Path == "/repos/owner/repo" {
 			_, _ = io.WriteString(writer, `{"id":456,"full_name":"owner/repo"}`)
@@ -496,7 +547,8 @@ func newExactMergedIntentServer(t *testing.T, rawDiff string, deleted *int) *htt
 func newMergedIntentServer(t *testing.T, rawDiff string, deleted *int, mergedBy, liveBase string, strict bool, checkState string) *httptest.Server {
 	t.Helper()
 	head := strings.Repeat("a", 40)
-	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	mergeSHA := exactTestMergeSHA()
+	return newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.URL.Path == "/apps/github-actions":
@@ -505,7 +557,7 @@ func newMergedIntentServer(t *testing.T, rawDiff string, deleted *int, mergedBy,
 			writer.Header().Set("Content-Type", "application/vnd.github.v3.diff")
 			_, _ = io.WriteString(writer, rawDiff)
 		case request.URL.Path == "/repos/owner/repo/pulls/12":
-			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":12,"state":"closed","merged":true,"merged_by":{"login":%q},"merge_commit_sha":"merge-sha","draft":false,"mergeable":true,"head":{"sha":%q,"ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q},"labels":[]}`, mergedBy, head, liveBase))
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":12,"changed_files":1,"state":"closed","merged":true,"merged_by":{"login":%q},"merge_commit_sha":%q,"draft":false,"mergeable":true,"head":{"sha":%q,"ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q},"labels":[]}`, mergedBy, mergeSHA, head, liveBase))
 		case request.URL.Path == "/repos/owner/repo/pulls/12/files":
 			_, _ = io.WriteString(writer, `[{"filename":"visual-hive.config.yaml"}]`)
 		case request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -526,6 +578,8 @@ func newMergedIntentServer(t *testing.T, rawDiff string, deleted *int, mergedBy,
 		}
 	}))
 }
+
+func exactTestMergeSHA() string { return strings.Repeat("c", 40) }
 
 func assertMergeAuthorityConsumed(t *testing.T, store *Store) {
 	t.Helper()

@@ -81,6 +81,82 @@ func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch
 	return pull, nil
 }
 
+// UpsertHeldPullRequest creates a non-draft but explicitly hold-labeled review
+// PR. This allows exact-head checks to run while Hive remains the sole process
+// that may remove the hold after its durable human approval binding.
+func (c *Client) UpsertHeldPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
+	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false)
+	if err != nil {
+		return RepairPullRequest{}, err
+	}
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return RepairPullRequest{}, err
+	}
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return RepairPullRequest{}, err
+	}
+	live, _, err := c.client.PullRequests.Get(ctx, owner, repo, pull.Number)
+	if err != nil {
+		return RepairPullRequest{}, fmt.Errorf("verify held pull request before labeling: %w", err)
+	}
+	if err := validateManagedPullRequest(live, identity, repository, pull.Number, branch, expectedHeadSHA, base, marker, title, body); err != nil || live.GetDraft() {
+		if err == nil {
+			err = fmt.Errorf("pull request is unexpectedly draft")
+		}
+		return RepairPullRequest{}, fmt.Errorf("refusing to label inexact held pull request #%d: %w", pull.Number, err)
+	}
+	for name, color := range map[string]string{"hold": "B60205", "hive/setup-baseline-review": "D4C5F9"} {
+		if err := c.ensureLabel(ctx, owner, repo, name, color); err != nil {
+			return RepairPullRequest{}, err
+		}
+	}
+	if _, _, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, pull.Number, []string{"hold", "hive/setup-baseline-review"}); err != nil {
+		return RepairPullRequest{}, fmt.Errorf("label held setup baseline pull request: %w", err)
+	}
+	return pull, nil
+}
+
+// ReleaseHeldSetupBaselinePullRequestExact removes only Hive's two exact hold
+// labels after re-reading the same-repository marker/ref/head/base identity.
+func (c *Client) ReleaseHeldSetupBaselinePullRequestExact(ctx context.Context, repository string, number int, marker, branch, headSHA, base string) error {
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return err
+	}
+	identity, err := c.resolveManagedRepositoryIdentity(ctx, owner, repo, repository)
+	if err != nil {
+		return err
+	}
+	pull, _, err := c.client.PullRequests.Get(ctx, owner, repo, number)
+	if err != nil {
+		return fmt.Errorf("read held setup baseline PR #%d: %w", number, err)
+	}
+	if err := validateManagedPullRequest(pull, identity, repository, number, branch, headSHA, base, marker, "", ""); err != nil || pull.GetState() != "open" || pull.GetMerged() || pull.GetDraft() {
+		if err == nil {
+			err = fmt.Errorf("pull request is not an open non-draft unmerged review")
+		}
+		return fmt.Errorf("refusing to release held setup baseline PR #%d: %w", number, err)
+	}
+	labels, _, err := c.client.Issues.ListLabelsByIssue(ctx, owner, repo, number, &gh.ListOptions{PerPage: 100})
+	if err != nil {
+		return fmt.Errorf("read held setup baseline PR labels: %w", err)
+	}
+	present := map[string]bool{}
+	for _, label := range labels {
+		present[label.GetName()] = true
+	}
+	for _, label := range []string{"hold", "hive/setup-baseline-review"} {
+		if present[label] {
+			if _, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, number, label); err != nil {
+				return fmt.Errorf("remove exact setup baseline label %q: %w", label, err)
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string, draft bool) (RepairPullRequest, error) {
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
@@ -240,11 +316,11 @@ func (c *Client) CloseRepairPullRequestExact(ctx context.Context, repository str
 	if err := validateManagedPullRequest(pull, identity, repository, number, expectedBranch, expectedHeadSHA, pull.GetBase().GetRef(), marker, "", ""); err != nil {
 		return fmt.Errorf("refusing to close repair pull request #%d: %w", number, err)
 	}
-	if err := c.verifyManagedBranchHead(ctx, owner, repo, expectedBranch, expectedHeadSHA); err != nil {
-		return fmt.Errorf("refusing to close repair pull request #%d: %w", number, err)
-	}
 	if pull.GetState() != "open" {
 		return nil
+	}
+	if err := c.verifyManagedBranchHead(ctx, owner, repo, expectedBranch, expectedHeadSHA); err != nil {
+		return fmt.Errorf("refusing to close repair pull request #%d: %w", number, err)
 	}
 	if _, _, err := c.client.PullRequests.Edit(ctx, owner, repo, number, &gh.PullRequest{State: gh.Ptr("closed")}); err != nil {
 		return fmt.Errorf("close repair pull request #%d: %w", number, err)

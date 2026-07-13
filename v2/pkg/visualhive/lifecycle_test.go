@@ -3,6 +3,7 @@ package visualhive
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,6 +48,77 @@ func TestLifecyclePersistsAndDeduplicatesBundle(t *testing.T) {
 	finding, ok := reloaded.Finding(fingerprint)
 	if !ok || finding.Status != StatusDetected || finding.BeadID == "" {
 		t.Fatalf("lifecycle state did not survive restart: %+v", finding)
+	}
+}
+
+func TestAdvisoryLifecyclePersistsFindingAndBeadWithoutIssueOutbox(t *testing.T) {
+	root := t.TempDir()
+	bundle := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-advisory-present", "present", "refs/heads/main", true))
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main", DisableIssuePublication: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding, exists := lifecycle.Finding(bundle.Manifest.Observations[0].RepositoryFingerprint)
+	if result.Created != 1 || result.BeadsCreated != 1 || result.OutboxCreated != 0 || len(lifecycle.PendingOutbox()) != 0 || beadStore.Count() != 1 || !exists || finding.Status != StatusDetected {
+		t.Fatalf("advisory evidence was not durable and publication-free: result=%+v finding=%+v beads=%d pending=%+v", result, finding, beadStore.Count(), lifecycle.PendingOutbox())
+	}
+}
+
+func TestAdvisoryLifecycleResolvesLocallyWithoutCloseOutbox(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-before-advisory", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+	open := lifecycle.PendingOutbox()[0]
+	if err := lifecycle.MarkIssueOpened(fingerprint, 77, "https://github.test/owner/repo/issues/77"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkOutboxAttempt(open.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	absent := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-advisory-absent", "absent", "refs/heads/main", true))
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main", DisableIssuePublication: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding, _ := lifecycle.Finding(fingerprint)
+	if result.Resolved != 1 || result.OutboxCreated != 0 || len(lifecycle.PendingOutbox()) != 0 || finding.Status != StatusResolved || finding.IssueNumber != 77 {
+		t.Fatalf("advisory absence did not resolve locally without GitHub publication: result=%+v finding=%+v pending=%+v", result, finding, lifecycle.PendingOutbox())
+	}
+}
+
+func TestAdvisoryAuthorityCancelsPreexistingPublicationIntent(t *testing.T) {
+	root := t.TempDir()
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-pending-before-advisory", "present", "refs/heads/main", true))
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.PendingOutbox()) != 1 {
+		t.Fatal("fixture did not create one pending publication")
+	}
+	cancelled, err := lifecycle.CancelPendingIssuePublication("automation authority is advisory")
+	if err != nil || cancelled != 1 || len(lifecycle.PendingOutbox()) != 0 || beadStore.Count() != 1 {
+		t.Fatalf("advisory downgrade did not durably consume publication intent: cancelled=%d err=%v pending=%+v beads=%d", cancelled, err, lifecycle.PendingOutbox(), beadStore.Count())
+	}
+	if finding, exists := lifecycle.Finding(bundle.Manifest.Observations[0].RepositoryFingerprint); !exists || finding.Status != StatusDetected {
+		t.Fatalf("advisory cancellation mutated the finding: %+v", finding)
 	}
 }
 
@@ -548,6 +620,17 @@ func TestIssuePublicationSelectionPrefersRepairableConsoleFailure(t *testing.T) 
 	}
 }
 
+func TestIssuePublicationSelectionPrioritizesBlockingRepositoryPlan(t *testing.T) {
+	observations := []Observation{
+		{RepositoryFingerprint: "visual", State: "present", Severity: "critical", IssueKind: "visual_regression", Title: "Critical visual regression"},
+		{RepositoryFingerprint: "repository-plan", State: "present", Severity: "high", IssueKind: RepositoryTestFailureKind, Title: "Repository test failed"},
+	}
+	selected := selectIssuePublications("", observations, nil, 1, true)
+	if len(selected) != 1 || !selected["repository-plan"] {
+		t.Fatalf("blocking repository plan did not reserve the bounded repair slot: %v", selected)
+	}
+}
+
 func TestIssuePublicationSelectionPrefersTestOnlyRepairOverUnrepairableBacklog(t *testing.T) {
 	observations := []Observation{
 		{RepositoryFingerprint: "onboarding", State: "present", Severity: "critical", IssueKind: "external_repo_onboarding", Title: "Review readiness gate"},
@@ -1002,6 +1085,87 @@ func TestRootOwnerClosesOnlyAfterRootWideAuthoritativeAbsence(t *testing.T) {
 	}
 }
 
+func TestCanonicalRootClosureResolvesContractlessDeferredDerivative(t *testing.T) {
+	root := t.TempDir()
+	rootKey := "test-adequacy/repository/testing-layer:2"
+	canonical := publicationTestObservation("canonical", "canonical", rootKey, "test_adequacy_gap", "Add unit coverage")
+	canonical.AffectedContracts = []string{"testing-layer:2"}
+	derivative := publicationTestObservation("derivative", "derivative", rootKey, "missing_visual_coverage", "Repository map unit gap")
+	derivative.AffectedContracts = nil
+	present := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "present"), "bundle-contractless-derivative-present", []Observation{canonical, derivative}, true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ownerID := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	absent := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-contractless-derivative-absent", nil, true))
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Resolved != 2 || result.OutboxCreated != 1 {
+		t.Fatalf("canonical proof did not resolve its contractless deferred derivative and owner: %+v", result)
+	}
+	owner, _ := lifecycle.Finding(ownerID)
+	pending := lifecycle.PendingOutbox()
+	if owner.Status != StatusResolved || len(pending) != 1 || pending[0].Action != OutboxCloseIssue || pending[0].RepositoryFingerprint != ownerID {
+		t.Fatalf("canonical issue closure was not exact and singular: owner=%+v pending=%+v", owner, pending)
+	}
+}
+
+func TestCanonicalRootClosureCannotSubstituteForDerivativeDistinctContract(t *testing.T) {
+	root := t.TempDir()
+	rootKey := "test-adequacy/repository/testing-layer:2"
+	canonical := publicationTestObservation("canonical", "canonical", rootKey, "test_adequacy_gap", "Add unit coverage")
+	canonical.AffectedContracts = []string{"testing-layer:2"}
+	derivative := publicationTestObservation("derivative", "derivative", rootKey, "missing_visual_coverage", "Distinct integration gap")
+	derivative.AffectedContracts = []string{"integration-contract-not-evaluated"}
+	present := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "present"), "bundle-distinct-derivative-present", []Observation{canonical, derivative}, true))
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	ownerID := present.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	absent := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "absent"), "bundle-distinct-derivative-absent", nil, true))
+	result, err := lifecycle.ApplyBundle(absent, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Resolved != 0 || result.OutboxCreated != 0 {
+		t.Fatalf("canonical contract incorrectly substituted for a derivative's distinct unevaluated contract: %+v", result)
+	}
+	owner, _ := lifecycle.Finding(ownerID)
+	if owner.Status != StatusIssueOpen {
+		t.Fatalf("canonical issue closed despite an unresolved distinct-contract facet: %+v", owner)
+	}
+}
+
 func TestLifecycleRefusesResolutionFromStaleDefaultHead(t *testing.T) {
 	root := t.TempDir()
 	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
@@ -1267,4 +1431,121 @@ func newTestBeadStore(t *testing.T, dir string) *beads.Store {
 		t.Fatal(err)
 	}
 	return store
+}
+
+func TestLifecycleAuditFailureBlocksRemoteTransitionAndRetryRecovers(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	bundle := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-audit-recovery", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := bundle.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.BindIssueWriter(fingerprint, 42, "hive-writer"); err != nil {
+		t.Fatal(err)
+	}
+	entry := lifecycle.PendingOutbox()[0]
+	finding, _ := lifecycle.Finding(fingerprint)
+	auditBackup := lifecycle.auditPath + ".backup"
+	if err := os.Rename(lifecycle.auditPath, auditBackup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(lifecycle.auditPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeLifecycleIssueClient{}
+	if err := processOutboxEntry(context.Background(), lifecycle, beadStore, client, finding, entry); err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Fatalf("audit write failure did not block lifecycle publication state: %v", err)
+	}
+	blocked, _ := lifecycle.Finding(fingerprint)
+	if client.upserts != 1 || blocked.IssueNumber != 0 || blocked.Status != StatusDetected || len(lifecycle.PendingOutbox()) != 1 {
+		t.Fatalf("remote-success/audit-failure window was not recoverable: finding=%+v pending=%d client=%+v", blocked, len(lifecycle.PendingOutbox()), client)
+	}
+	if err := os.Remove(lifecycle.auditPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(auditBackup, lifecycle.auditPath); err != nil {
+		t.Fatal(err)
+	}
+	result := ProcessOutbox(context.Background(), lifecycle, beadStore, automation.Policy{ACMMLevel: 4, Mode: automation.ModeIssues, AllowedRepositories: []string{"owner/repo"}}, client)
+	recovered, _ := lifecycle.Finding(fingerprint)
+	if result.Succeeded != 1 || result.Failed != 0 || client.upserts != 2 || recovered.Status != StatusIssueOpen || recovered.IssueNumber != 17 || len(lifecycle.PendingOutbox()) != 0 {
+		t.Fatalf("idempotent outbox retry did not recover audit transition: result=%+v finding=%+v client=%+v", result, recovered, client)
+	}
+}
+
+func TestLifecycleAuditReceiptRecoversAuditBeforeStateCrashWindow(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "lifecycle")
+	lifecycle, err := NewLifecycleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	bundle := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-audit-receipt", "present", "main", true))
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := bundle.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.BindIssueWriter(fingerprint, 42, "hive-writer"); err != nil {
+		t.Fatal(err)
+	}
+	stateBackup := lifecycle.statePath + ".backup"
+	if err := os.Rename(lifecycle.statePath, stateBackup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(lifecycle.statePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkIssueOpened(fingerprint, 17, "https://github.test/owner/repo/issues/17"); err == nil {
+		t.Fatal("state publication failure was not returned after durable audit receipt")
+	}
+	rolledBack, _ := lifecycle.Finding(fingerprint)
+	if rolledBack.IssueNumber != 0 || rolledBack.Status != StatusDetected {
+		t.Fatalf("failed state publication was not rolled back: %+v", rolledBack)
+	}
+	if err := os.Remove(lifecycle.statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stateBackup, lifecycle.statePath); err != nil {
+		t.Fatal(err)
+	}
+	recoveredStore, err := NewLifecycleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recoveredStore.MarkIssueOpened(fingerprint, 17, "https://github.test/owner/repo/issues/17"); err != nil {
+		t.Fatalf("receipt-bound state retry failed: %v", err)
+	}
+	if count := countLifecycleAuditAction(t, recoveredStore.auditPath, "issue_opened"); count != 1 {
+		t.Fatalf("audit-before-state retry appended %d issue-opened receipts; want exactly one", count)
+	}
+}
+
+func countLifecycleAuditAction(t *testing.T, path, action string) int {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	count := 0
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var entry LifecycleAuditEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry.Action == action {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }

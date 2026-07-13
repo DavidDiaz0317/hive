@@ -19,6 +19,7 @@ import (
 
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
 type activationRepositoryServer struct {
@@ -30,9 +31,14 @@ type activationRepositoryServer struct {
 	config         Config
 	head           string
 	runName        string
+	runTitle       string
 	runPath        string
 	runEvent       string
 	runBranch      string
+	runConclusion  string
+	workflowName   string
+	workflowPath   string
+	workflowState  string
 	seedConclusion string
 }
 
@@ -48,8 +54,9 @@ func newActivationRepositoryServer(t *testing.T, installed bool, protectionMode 
 	}
 	fixture := &activationRepositoryServer{
 		installed: installed, protectionMode: protectionMode, config: config, head: strings.Repeat("b", 40),
-		runName: visualHiveProductionWorkflowName, runPath: visualHiveProductionWorkflowPath,
-		runEvent: visualHiveProductionWorkflowEvent, runBranch: "main", seedConclusion: "success",
+		runName: visualHiveProductionWorkflowName, runTitle: workflowDispatchDisplayTitle(strings.Repeat("c", 64)), runPath: visualHiveProductionWorkflowPath,
+		runEvent: visualHiveProductionWorkflowEvent, runBranch: "main", runConclusion: "success", seedConclusion: "success",
+		workflowName: visualHiveProductionWorkflowName, workflowPath: visualHiveProductionWorkflowPath, workflowState: "active",
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		fixture.serve(t, writer, request)
@@ -67,9 +74,11 @@ func (s *activationRepositoryServer) serve(t *testing.T, writer http.ResponseWri
 	case "/repos/owner/repo/branches/main":
 		_, _ = io.WriteString(writer, fmt.Sprintf(`{"name":"main","commit":{"sha":%q}}`, s.head))
 	case "/repos/owner/repo/actions/runs/77":
-		_, _ = io.WriteString(writer, fmt.Sprintf(`{"id":77,"name":%q,"path":%q,"event":%q,"head_branch":%q,"head_sha":%q,"display_title":%q,"status":"completed","conclusion":"success","repository":{"id":123,"full_name":"owner/repo"}}`, s.runName, s.runPath, s.runEvent, s.runBranch, s.head, workflowDispatchDisplayTitle(strings.Repeat("c", 64))))
+		_, _ = io.WriteString(writer, fmt.Sprintf(`{"id":77,"workflow_id":12,"name":%q,"path":%q,"event":%q,"head_branch":%q,"head_sha":%q,"display_title":%q,"status":"completed","conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, s.runName, s.runPath, s.runEvent, s.runBranch, s.head, s.runTitle, s.runConclusion))
+	case "/repos/owner/repo/actions/workflows/12":
+		_, _ = io.WriteString(writer, fmt.Sprintf(`{"id":12,"name":%q,"path":%q,"state":%q}`, s.workflowName, s.workflowPath, s.workflowState))
 	case "/repos/owner/repo/actions/runs/77/jobs":
-		_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":2,"jobs":[{"id":800,"run_id":77,"head_branch":%q,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-production","workflow_name":"Hive Visual Hive Production","check_run_url":%q},{"id":801,"run_id":77,"head_branch":%q,"head_sha":%q,"status":"completed","conclusion":%q,"name":"visual-hive","workflow_name":"Hive Visual Hive Production","check_run_url":%q}]}`, s.runBranch, s.head, s.url+"/repos/owner/repo/check-runs/900", s.runBranch, s.head, s.seedConclusion, s.url+"/repos/owner/repo/check-runs/901"))
+		_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":2,"jobs":[{"id":800,"run_id":77,"head_branch":%q,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-production","workflow_name":%q,"check_run_url":%q},{"id":801,"run_id":77,"head_branch":%q,"head_sha":%q,"status":"completed","conclusion":%q,"name":"visual-hive","workflow_name":%q,"check_run_url":%q}]}`, s.runBranch, s.head, visualHiveProductionWorkflowName, s.url+"/repos/owner/repo/check-runs/900", s.runBranch, s.head, s.seedConclusion, visualHiveProductionWorkflowName, s.url+"/repos/owner/repo/check-runs/901"))
 	case "/repos/owner/repo/check-runs/900":
 		_, _ = io.WriteString(writer, fmt.Sprintf(`{"id":900,"name":"visual-hive-production","head_sha":%q,"status":"completed","conclusion":"success","app":{"id":42}}`, s.head))
 	case "/repos/owner/repo/check-runs/901":
@@ -138,7 +147,8 @@ func writeActivationContent(writer http.ResponseWriter, data []byte) {
 }
 
 func activationWorkflow(fixture *activationRepositoryServer) WorkflowRunEvidence {
-	return WorkflowRunEvidence{CorrelationID: strings.Repeat("c", 64), RunID: 77, RunURL: fixture.url + "/actions/runs/77", HeadSHA: fixture.head, Conclusion: "success", EvidenceArtifact: 88, BundleArtifact: 89}
+	_, _, digest, _ := visualhive.EncodeRepositoryTestEvidence(nil, 0)
+	return WorkflowRunEvidence{CorrelationID: strings.Repeat("c", 64), RunID: 77, RunURL: fixture.url + "/actions/runs/77", HeadSHA: fixture.head, Conclusion: "success", EvidenceArtifact: 88, BundleArtifact: 89, RepositoryTestDigest: digest}
 }
 
 func saveActivationDispatch(t *testing.T, store *Store, config Config, workflow WorkflowRunEvidence) {
@@ -207,13 +217,45 @@ func TestProtectionActivationSeedsPRContextWithoutPriorPRCheckAndRerunsAsNoop(t 
 	}
 }
 
+func TestProtectionActivationAcceptsOnlyRepositoryTestCausedWorkflowFailure(t *testing.T) {
+	fixture, server := newActivationRepositoryServer(t, true, "none")
+	defer server.Close()
+	fixture.runConclusion = "failure"
+	store, err := NewStore(filepath.Join(fixture.config.StateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	workflow := activationWorkflow(fixture)
+	workflow.Conclusion = "failure"
+	workflow.RepositoryTestOverall = 1
+	failed, err := visualhive.NewRepositoryTestResult("npm test", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow.RepositoryTests = []visualhive.RepositoryTestResult{failed}
+	_, _, workflow.RepositoryTestDigest, _ = visualhive.EncodeRepositoryTestEvidence(workflow.RepositoryTests, workflow.RepositoryTestOverall)
+	saveActivationDispatch(t, store, fixture.config, workflow)
+	result, err := ActivateAutoMergeProtection(context.Background(), store, client, fixture.config, workflow)
+	if err != nil || !result.Activated || !result.ProtectionCreated {
+		t.Fatalf("repository-test-caused run failure did not preserve independent protection activation: result=%+v err=%v", result, err)
+	}
+
+	bad := workflow
+	bad.RepositoryTestDigest = strings.Repeat("d", 64)
+	if _, err := verifyActivationWorkflowCheck(context.Background(), client, fixture.config, bad, WorkflowDispatchIntent{CorrelationID: bad.CorrelationID}, 42); err == nil || !strings.Contains(err.Error(), "repository-test evidence") {
+		t.Fatalf("inconsistent failed workflow was accepted: %v", err)
+	}
+}
+
 func TestProtectionActivationRejectsWrongProductionWorkflowProvenance(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*activationRepositoryServer)
 	}{
 		{name: "PR workflow path", mutate: func(f *activationRepositoryServer) { f.runPath = ".github/workflows/visual-hive-pr.yml" }},
-		{name: "PR workflow name", mutate: func(f *activationRepositoryServer) { f.runName = "Visual Hive PR" }},
+		{name: "wrong static workflow run name", mutate: func(f *activationRepositoryServer) { f.runName = "Visual Hive PR" }},
+		{name: "wrong correlated display title", mutate: func(f *activationRepositoryServer) { f.runTitle = visualHiveProductionWorkflowName }},
 		{name: "pull request event", mutate: func(f *activationRepositoryServer) { f.runEvent = "pull_request" }},
 		{name: "off-default dispatch with spoofed green seed", mutate: func(f *activationRepositoryServer) { f.runBranch = "hive/repair-one" }},
 	} {
@@ -233,6 +275,36 @@ func TestProtectionActivationRejectsWrongProductionWorkflowProvenance(t *testing
 			}
 			if fixture.protectionPuts != 0 {
 				t.Fatalf("spoofed activation mutated protection %d time(s)", fixture.protectionPuts)
+			}
+		})
+	}
+}
+
+func TestProtectionActivationRejectsWrongWorkflowDefinition(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*activationRepositoryServer)
+	}{
+		{name: "workflow name", mutate: func(f *activationRepositoryServer) { f.workflowName = "Visual Hive PR" }},
+		{name: "workflow path", mutate: func(f *activationRepositoryServer) { f.workflowPath = ".github/workflows/visual-hive-pr.yml" }},
+		{name: "disabled workflow", mutate: func(f *activationRepositoryServer) { f.workflowState = "disabled_manually" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, server := newActivationRepositoryServer(t, true, "none")
+			defer server.Close()
+			test.mutate(fixture)
+			store, err := NewStore(filepath.Join(fixture.config.StateDir, "integrated"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			workflow := activationWorkflow(fixture)
+			saveActivationDispatch(t, store, fixture.config, workflow)
+			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			if _, err := ActivateAutoMergeProtection(context.Background(), store, client, fixture.config, workflow); err == nil || !strings.Contains(err.Error(), "workflow definition") {
+				t.Fatalf("spoofed workflow definition was accepted: %v", err)
+			}
+			if fixture.protectionPuts != 0 {
+				t.Fatalf("spoofed workflow definition mutated protection %d time(s)", fixture.protectionPuts)
 			}
 		})
 	}

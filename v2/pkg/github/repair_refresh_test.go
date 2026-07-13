@@ -23,7 +23,7 @@ func TestInspectRepairPullRequestRefreshExactIsReadOnly(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"checks":[{"context":"visual-hive","app_id":42}]},"enforce_admins":{"enabled":true}}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
-			_, _ = fmt.Fprintf(writer, `{"number":7,"state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable":false,"mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, baseSHA)
+			_, _ = fmt.Fprintf(writer, `{"number":7,"changed_files":1,"state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable":false,"mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, baseSHA)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/proof.test.ts"}]`)
 		case request.Method == http.MethodPut && request.URL.Path == "/repos/owner/repo/pulls/7/update-branch":
@@ -61,7 +61,7 @@ func TestRefreshRepairPullRequestBranchRejectsForkBeforeMutation(t *testing.T) {
 		case "/repos/owner/repo/branches/main/protection":
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]},"enforce_admins":{"enabled":true}}`)
 		case "/repos/owner/repo/pulls/7":
-			_, _ = fmt.Fprintf(writer, `{"number":7,"state":"open","body":"<!-- hive-repair: finding -->","mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":999,"full_name":"fork/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, baseSHA)
+			_, _ = fmt.Fprintf(writer, `{"number":7,"changed_files":1,"state":"open","body":"<!-- hive-repair: finding -->","mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":999,"full_name":"fork/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, baseSHA)
 		case "/repos/owner/repo/pulls/7/update-branch":
 			updates++
 			writer.WriteHeader(http.StatusAccepted)
@@ -93,7 +93,7 @@ func TestInspectRepairPullRequestRefreshReportsBaseMovementWithoutMutation(t *te
 		case "/repos/owner/repo/branches/main/protection":
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]},"enforce_admins":{"enabled":true}}`)
 		case "/repos/owner/repo/pulls/7":
-			_, _ = fmt.Fprintf(writer, `{"number":7,"state":"open","body":"<!-- hive-repair: finding -->","mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, liveBaseSHA)
+			_, _ = fmt.Fprintf(writer, `{"number":7,"changed_files":1,"state":"open","body":"<!-- hive-repair: finding -->","mergeable_state":"behind","head":{"ref":"hive/repair-proof-a1","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, oldHead, liveBaseSHA)
 		case "/repos/owner/repo/pulls/7/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/proof.test.ts"}]`)
 		case "/repos/owner/repo/pulls/7/update-branch":

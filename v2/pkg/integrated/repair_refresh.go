@@ -355,13 +355,7 @@ func syncIntermediateRepairRefreshHead(repairStore *repair.Store, lifecycle *vis
 }
 
 func repairRefreshCommands(config Config) []repair.Command {
-	commands := make([]repair.Command, 0, len(config.TestCommands))
-	for _, command := range config.TestCommands {
-		if len(command) > 0 {
-			commands = append(commands, repair.Command{Name: command[0], Args: append([]string(nil), command[1:]...)})
-		}
-	}
-	return commands
+	return []repair.Command{{Name: "git", Args: []string{"diff", "--check"}}}
 }
 
 func refreshCheckpointRequest(config Config, attempt repair.Attempt, intent RepairRefreshIntent, commands []repair.Command) repair.RefreshedBranchCheckpointRequest {
@@ -370,7 +364,7 @@ func refreshCheckpointRequest(config Config, attempt repair.Attempt, intent Repa
 		RemoteHeadSHA: intent.CurrentHeadSHA, BaseBranch: intent.BaseBranch, BaseSHA: intent.BaseSHA,
 		ExpectedChangedFiles: append([]string(nil), intent.ChangedFiles...), ExpectedContributionPatchID: intent.ContributionPatchID,
 		AllowLegacyHeadAdoption: intent.LegacyOwnershipAdoption && strings.EqualFold(intent.CurrentHeadSHA, intent.OldHeadSHA),
-		ValidationCommands:      commands, Environment: repairValidationEnvironment(config), CommandTimeout: 15 * time.Minute,
+		ValidationCommands:      commands, CommandTimeout: 15 * time.Minute,
 	}
 }
 

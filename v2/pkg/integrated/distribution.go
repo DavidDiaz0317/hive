@@ -21,17 +21,18 @@ const DistributionSchema = "hive.integrated-distribution.v1"
 var immutableCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
 
 type DistributionOptions struct {
-	HiveBinary    string
-	HiveCommit    string
-	VisualHiveDir string
-	VisualCommit  string
-	NodeBinary    string
-	NodeLicense   string
-	NodeVersion   string
-	SkillDir      string
-	TargetOS      string
-	TargetArch    string
-	OutputDir     string
+	HiveBinary     string
+	HiveCommit     string
+	VisualHiveDir  string
+	VisualCommit   string
+	NodeBinary     string
+	NodeRuntimeDir string
+	NodeLicense    string
+	NodeVersion    string
+	SkillDir       string
+	TargetOS       string
+	TargetArch     string
+	OutputDir      string
 }
 
 type DistributionFile struct {
@@ -57,7 +58,7 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	if !immutableCommit.MatchString(options.HiveCommit) || !immutableCommit.MatchString(options.VisualCommit) {
 		return DistributionManifest{}, fmt.Errorf("Hive and Visual Hive commits must be immutable 40-character SHA-1 values")
 	}
-	for label, source := range map[string]string{"Hive binary": options.HiveBinary, "Visual Hive bundle": options.VisualHiveDir, "Node binary": options.NodeBinary, "Hive Codex skill": options.SkillDir} {
+	for label, source := range map[string]string{"Hive binary": options.HiveBinary, "Visual Hive bundle": options.VisualHiveDir, "Node binary": options.NodeBinary, "complete Node runtime": options.NodeRuntimeDir, "Hive Codex skill": options.SkillDir} {
 		if strings.TrimSpace(source) == "" {
 			return DistributionManifest{}, fmt.Errorf("%s is required", label)
 		}
@@ -121,12 +122,33 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	if err := copyRegularFile(options.HiveBinary, filepath.Join(staging, hiveName), 0o755); err != nil {
 		return DistributionManifest{}, err
 	}
-	if err := copyRegularFile(options.NodeBinary, filepath.Join(staging, "runtime", nodeName), 0o755); err != nil {
+	if err := copyRegularTree(options.NodeRuntimeDir, filepath.Join(staging, "runtime")); err != nil {
 		return DistributionManifest{}, err
 	}
-	if options.NodeLicense != "" {
+	packagedNode := filepath.Join(staging, "runtime", nodeName)
+	launchers := []string{nodeName}
+	if targetOS == "linux" {
+		launchers = append(launchers, "npm", "npx", "corepack", "pnpm", "pnpx", "yarn", "yarnpkg")
+	}
+	for _, launcher := range launchers {
+		if err := os.Chmod(filepath.Join(staging, "runtime", launcher), 0o755); err != nil {
+			return DistributionManifest{}, fmt.Errorf("mark bundled runtime launcher %s executable: %w", launcher, err)
+		}
+	}
+	if same, compareErr := regularFilesEqual(options.NodeBinary, packagedNode); compareErr != nil || !same {
+		if compareErr != nil {
+			return DistributionManifest{}, compareErr
+		}
+		return DistributionManifest{}, fmt.Errorf("complete Node runtime does not contain the exact verified %s binary", nodeName)
+	}
+	if options.NodeLicense != "" && !exists(filepath.Join(staging, "runtime", "LICENSE.node.txt")) {
 		if err := copyRegularFile(options.NodeLicense, filepath.Join(staging, "runtime", "LICENSE.node.txt"), 0o644); err != nil {
 			return DistributionManifest{}, err
+		}
+	}
+	for _, required := range requiredNodeRuntimeFiles(targetOS) {
+		if info, err := os.Lstat(filepath.Join(staging, "runtime", filepath.FromSlash(required))); err != nil || !info.Mode().IsRegular() {
+			return DistributionManifest{}, fmt.Errorf("complete Node runtime is missing regular file %s", required)
 		}
 	}
 	if err := copyRegularTree(options.VisualHiveDir, filepath.Join(staging, "visual-hive")); err != nil {
@@ -134,6 +156,11 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	}
 	if err := copyRegularTree(options.SkillDir, filepath.Join(staging, "skills", "hive")); err != nil {
 		return DistributionManifest{}, err
+	}
+	for _, relative := range []string{"skills/hive/SKILL.md", "skills/hive/agents/openai.yaml"} {
+		if info, err := os.Lstat(filepath.Join(staging, filepath.FromSlash(relative))); err != nil || !info.Mode().IsRegular() {
+			return DistributionManifest{}, fmt.Errorf("Hive Codex skill is missing required regular file %s", relative)
+		}
 	}
 	files, err := inventoryFiles(staging)
 	if err != nil {
@@ -155,6 +182,25 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	}
 	committed = true
 	return manifest, nil
+}
+
+func requiredNodeRuntimeFiles(targetOS string) []string {
+	if targetOS == "windows" {
+		return []string{"node.exe", "npm.cmd", "npx.cmd", "corepack.cmd", "pnpm.cmd", "pnpx.cmd", "yarn.cmd", "yarnpkg.cmd", "node_modules/npm/bin/npm-cli.js", "node_modules/corepack/dist/corepack.js", "node_modules/corepack/dist/pnpm.js", "node_modules/corepack/dist/yarn.js"}
+	}
+	return []string{"node", "npm", "npx", "corepack", "pnpm", "pnpx", "yarn", "yarnpkg", "node_modules/npm/bin/npm-cli.js", "node_modules/corepack/dist/corepack.js", "node_modules/corepack/dist/pnpm.js", "node_modules/corepack/dist/yarn.js"}
+}
+
+func regularFilesEqual(left, right string) (bool, error) {
+	leftData, err := os.ReadFile(left)
+	if err != nil {
+		return false, err
+	}
+	rightData, err := os.ReadFile(right)
+	if err != nil {
+		return false, err
+	}
+	return sha256.Sum256(leftData) == sha256.Sum256(rightData), nil
 }
 
 func renameDistribution(staging, output string) error {

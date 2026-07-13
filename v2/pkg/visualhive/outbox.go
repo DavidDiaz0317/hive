@@ -11,9 +11,10 @@ import (
 )
 
 type LifecycleIssueClient interface {
-	UpsertLifecycleIssue(ctx context.Context, repository, marker, title, body string, labels []string) (number int, url string, created bool, err error)
-	UpdateLifecycleIssue(ctx context.Context, repository string, number int, title, body, state string, labels []string) (updatedNumber int, url string, err error)
-	MigrateLifecycleIssueMarker(ctx context.Context, repository string, number int, previousMarker, marker, title, body, state string, labels []string) (updatedNumber int, url string, err error)
+	ResolveLifecycleIssueWriter(ctx context.Context, repository, marker string, issueNumber int) (login string, id int64, err error)
+	UpsertLifecycleIssueOwned(ctx context.Context, repository, marker, writerLogin string, writerID int64, title, body string, labels []string) (number int, url string, created bool, err error)
+	UpdateLifecycleIssueOwned(ctx context.Context, repository string, number int, marker, writerLogin string, writerID int64, title, body, state string, labels []string) (updatedNumber int, url string, err error)
+	MigrateLifecycleIssueMarkerOwned(ctx context.Context, repository string, number int, previousMarker, marker, writerLogin string, writerID int64, title, body, state string, labels []string) (updatedNumber int, url string, err error)
 }
 
 type OutboxProcessorResult struct {
@@ -45,8 +46,16 @@ func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *be
 			continue
 		}
 		if entry.BundleDigest != finding.LastBundleDigest {
-			_ = lifecycle.MarkOutboxAttempt(entry.ID, nil)
-			lifecycle.RecordAuthorization(entry.RepositoryFingerprint, string(entry.Action), false, "stale outbox entry superseded by newer evidence")
+			if err := lifecycle.RecordAuthorizationStrict(entry.RepositoryFingerprint, string(entry.Action), false, "stale outbox entry superseded by newer evidence"); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, fmt.Sprintf("persist stale outbox authorization: %v", err))
+				continue
+			}
+			if err := lifecycle.MarkOutboxAttempt(entry.ID, nil); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, fmt.Sprintf("persist stale outbox completion: %v", err))
+				continue
+			}
 			result.StaleSkipped++
 			continue
 		}
@@ -55,13 +64,19 @@ func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *be
 			Repository: entry.Repository, RepairAttempts: finding.RepairAttempts,
 		}
 		decision := policy.Authorize(request)
-		lifecycle.RecordAuthorization(entry.RepositoryFingerprint, string(entry.Action), decision.Allowed, strings.Join(decision.Reasons, "; "))
+		if err := lifecycle.RecordAuthorizationStrict(entry.RepositoryFingerprint, string(entry.Action), decision.Allowed, strings.Join(decision.Reasons, "; ")); err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, fmt.Sprintf("persist %s authorization: %v", entry.Action, err))
+			continue
+		}
 		if !decision.Allowed {
 			result.Denied++
 			continue
 		}
 		if err := processOutboxEntry(ctx, lifecycle, beadStore, client, finding, entry); err != nil {
-			_ = lifecycle.MarkOutboxAttempt(entry.ID, err)
+			if persistErr := lifecycle.MarkOutboxAttempt(entry.ID, err); persistErr != nil {
+				err = fmt.Errorf("%v; persist failed outbox attempt: %w", err, persistErr)
+			}
 			result.Failed++
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", entry.Action, err))
 			continue
@@ -89,6 +104,17 @@ func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStor
 		markerFingerprint = finding.RepositoryFingerprint
 	}
 	marker := lifecycleMarker(markerFingerprint)
+	writerLogin, writerID := strings.TrimSpace(finding.IssueWriterLogin), finding.IssueWriterID
+	if writerID <= 0 || writerLogin == "" {
+		resolvedLogin, resolvedID, err := client.ResolveLifecycleIssueWriter(ctx, entry.Repository, marker, finding.IssueNumber)
+		if err != nil {
+			return fmt.Errorf("resolve immutable lifecycle issue writer: %w", err)
+		}
+		if err := lifecycle.BindIssueWriter(entry.RepositoryFingerprint, resolvedID, resolvedLogin); err != nil {
+			return fmt.Errorf("persist immutable lifecycle issue writer: %w", err)
+		}
+		writerLogin, writerID = resolvedLogin, resolvedID
+	}
 	body := lifecycleIssueBody(marker, entry, finding)
 	if entry.PreviousMarker != "" {
 		if finding.IssueNumber <= 0 || entry.IssueNumber != finding.IssueNumber || entry.PreviousMarker == marker {
@@ -116,7 +142,7 @@ func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStor
 		default:
 			return fmt.Errorf("unsupported lifecycle action %q for an exact marker migration", entry.Action)
 		}
-		number, url, err := client.MigrateLifecycleIssueMarker(ctx, entry.Repository, finding.IssueNumber, entry.PreviousMarker, marker, entry.Title, body, state, labels)
+		number, url, err := client.MigrateLifecycleIssueMarkerOwned(ctx, entry.Repository, finding.IssueNumber, entry.PreviousMarker, marker, writerLogin, writerID, entry.Title, body, state, labels)
 		if err != nil {
 			return err
 		}
@@ -130,20 +156,20 @@ func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStor
 	}
 	switch entry.Action {
 	case OutboxOpenIssue:
-		number, url, _, err := client.UpsertLifecycleIssue(ctx, entry.Repository, marker, entry.Title, body, activeLabels(entry.Labels))
+		number, url, _, err := client.UpsertLifecycleIssueOwned(ctx, entry.Repository, marker, writerLogin, writerID, entry.Title, body, activeLabels(entry.Labels))
 		if err != nil {
 			return err
 		}
 		return lifecycle.MarkIssueOpened(entry.RepositoryFingerprint, number, url)
 	case OutboxUpdateIssue, OutboxReopenIssue:
 		if finding.IssueNumber <= 0 {
-			number, url, _, err := client.UpsertLifecycleIssue(ctx, entry.Repository, marker, entry.Title, body, activeLabels(entry.Labels))
+			number, url, _, err := client.UpsertLifecycleIssueOwned(ctx, entry.Repository, marker, writerLogin, writerID, entry.Title, body, activeLabels(entry.Labels))
 			if err != nil {
 				return err
 			}
 			return lifecycle.MarkIssueOpened(entry.RepositoryFingerprint, number, url)
 		}
-		number, url, err := client.UpdateLifecycleIssue(ctx, entry.Repository, finding.IssueNumber, entry.Title, body, "open", activeLabels(entry.Labels))
+		number, url, err := client.UpdateLifecycleIssueOwned(ctx, entry.Repository, finding.IssueNumber, marker, writerLogin, writerID, entry.Title, body, "open", activeLabels(entry.Labels))
 		if err != nil {
 			return err
 		}
@@ -164,7 +190,7 @@ func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStor
 		if finding.IssueNumber <= 0 {
 			return fmt.Errorf("cannot close finding without a persisted GitHub issue number")
 		}
-		number, url, err := client.UpdateLifecycleIssue(ctx, entry.Repository, finding.IssueNumber, entry.Title, body, "closed", resolvedLabels(entry.Labels))
+		number, url, err := client.UpdateLifecycleIssueOwned(ctx, entry.Repository, finding.IssueNumber, marker, writerLogin, writerID, entry.Title, body, "closed", resolvedLabels(entry.Labels))
 		if err != nil {
 			return err
 		}

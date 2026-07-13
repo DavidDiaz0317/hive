@@ -13,12 +13,14 @@ import (
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v72/github"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
 
 func TestDispatchConsumesOnlyExactCorrelationAndArtifacts(t *testing.T) {
 	var correlation string
 	dispatches := 0
+	exactHead := strings.Repeat("e", 40)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
@@ -38,8 +40,14 @@ func TestDispatchConsumesOnlyExactCorrelationAndArtifacts(t *testing.T) {
 			writer.WriteHeader(http.StatusNoContent)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/runs":
 			manual := `{"id":22,"display_title":"manual production run","event":"workflow_dispatch","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://example.test/runs/22","head_sha":"manual"}`
-			exact := fmt.Sprintf(`{"id":21,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://example.test/runs/21","head_sha":"exact-head"}`, workflowDispatchDisplayTitle(correlation))
+			exact := fmt.Sprintf(`{"id":21,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://example.test/runs/21","head_sha":%q}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), exactHead)
 			_, _ = fmt.Fprintf(writer, `{"total_count":2,"workflow_runs":[%s,%s]}`, manual, exact)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/21":
+			_, _ = fmt.Fprintf(writer, `{"id":21,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"success","repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), exactHead)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/12":
+			_, _ = fmt.Fprintf(writer, `{"id":12,"name":%q,"path":%q,"state":"active"}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/21/jobs":
+			_, _ = fmt.Fprintf(writer, `{"total_count":3,"jobs":[{"id":700,"run_id":21,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-production","workflow_name":%q},{"id":701,"run_id":21,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive","workflow_name":%q},{"id":702,"run_id":21,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-execution","workflow_name":%q}]}`, exactHead, visualHiveProductionWorkflowName, exactHead, visualHiveProductionWorkflowName, exactHead, visualHiveProductionWorkflowName)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/21/artifacts":
 			_, _ = io.WriteString(writer, `{"total_count":4,"artifacts":[{"id":901,"name":"visual-hive-evidence-decoy"},{"id":902,"name":"visual-hive-bundle-decoy"},{"id":101,"name":"visual-hive-evidence-21"},{"id":102,"name":"visual-hive-bundle-21"}]}`)
 		default:
@@ -55,7 +63,7 @@ func TestDispatchConsumesOnlyExactCorrelationAndArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dispatches != 1 || workflow.RunID != 21 || workflow.HeadSHA != "exact-head" || workflow.CorrelationID != correlation {
+	if dispatches != 1 || workflow.RunID != 21 || workflow.HeadSHA != exactHead || workflow.CorrelationID != correlation || workflow.RepositoryTestOverall != 0 || len(workflow.RepositoryTestDigest) != 64 {
 		t.Fatalf("wrong workflow consumed: dispatches=%d workflow=%+v", dispatches, workflow)
 	}
 	if workflow.EvidenceArtifact != 101 || workflow.BundleArtifact != 102 {
@@ -74,6 +82,48 @@ func TestDispatchConsumesOnlyExactCorrelationAndArtifacts(t *testing.T) {
 	}
 	if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
 		t.Fatalf("consumed dispatch intent remains: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestDispatchAcceptsOnlyRepositoryTestCausedWorkflowFailure(t *testing.T) {
+	var correlation string
+	head := strings.Repeat("f", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/dispatches":
+			var body struct {
+				Inputs map[string]any `json:"inputs"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			correlation, _ = body.Inputs[workflowDispatchInput].(string)
+			writer.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/runs":
+			_, _ = fmt.Fprintf(writer, `{"total_count":1,"workflow_runs":[{"id":41,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"failure","html_url":"https://example.test/runs/41"}]}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), head)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/41":
+			_, _ = fmt.Fprintf(writer, `{"id":41,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"failure","repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), head)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/12":
+			_, _ = fmt.Fprintf(writer, `{"id":12,"name":%q,"path":%q,"state":"active"}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/41/jobs":
+			_, _ = fmt.Fprintf(writer, `{"total_count":4,"jobs":[{"id":700,"run_id":41,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-production","workflow_name":%q},{"id":701,"run_id":41,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive","workflow_name":%q},{"id":702,"run_id":41,"head_sha":%q,"status":"completed","conclusion":"failure","name":"Hive repository test 001","workflow_name":%q,"steps":[{"name":"Set up job","status":"completed","conclusion":"success","number":1},{"name":"Execute exact repository test command","status":"completed","conclusion":"failure","number":2}]},{"id":703,"run_id":41,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-execution","workflow_name":%q}]}`, head, visualHiveProductionWorkflowName, head, visualHiveProductionWorkflowName, head, visualHiveProductionWorkflowName, head, visualHiveProductionWorkflowName)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/41/artifacts":
+			_, _ = io.WriteString(writer, `{"total_count":2,"artifacts":[{"id":101,"name":"visual-hive-evidence-41"},{"id":102,"name":"visual-hive-bundle-41"}]}`)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	config := dispatchTestConfig(t.TempDir())
+	config.TestCommands = [][]string{{"npm", "test"}}
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	workflow, err := dispatchAndWait(context.Background(), client, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.Conclusion != "failure" || workflow.RepositoryTestOverall != 1 || len(workflow.RepositoryTests) != 1 || workflow.RepositoryTests[0].ExitCode != 1 || len(workflow.RepositoryTestDigest) != 64 {
+		t.Fatalf("repository-test-caused workflow failure was not preserved as trusted lifecycle evidence: %+v", workflow)
 	}
 }
 
@@ -183,6 +233,138 @@ func TestDispatchUsesReturnedRunIDWithoutRecencySearch(t *testing.T) {
 	}
 }
 
+func TestExactWorkflowRunBindingStabilizesTransientDisplayTitle(t *testing.T) {
+	intent := WorkflowDispatchIntent{
+		RunID:                51,
+		Ref:                  "main",
+		ExpectedDisplayTitle: workflowDispatchDisplayTitle(strings.Repeat("a", 64)),
+	}
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.Method != http.MethodGet || request.URL.Path != "/repos/owner/repo/actions/runs/51" {
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+			return
+		}
+		reads++
+		displayTitle := visualHiveProductionWorkflowName
+		status := "queued"
+		conclusion := ""
+		if reads >= 3 {
+			displayTitle = intent.ExpectedDisplayTitle
+			status = "completed"
+			conclusion = "success"
+		}
+		_, _ = fmt.Fprintf(writer, `{"id":51,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","status":%q,"conclusion":%q}`, displayTitle, status, conclusion)
+	}))
+	defer server.Close()
+
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	selected, err := waitForExactWorkflowRunWithTiming(context.Background(), client, "owner", "repo", intent, nil, 10*time.Millisecond, time.Millisecond, 100*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads != 3 || selected.GetID() != intent.RunID || selected.GetDisplayTitle() != intent.ExpectedDisplayTitle {
+		t.Fatalf("transient binding did not stabilize on the exact run: reads=%d selected=%+v", reads, selected)
+	}
+}
+
+func TestExactWorkflowRunBindingStaticWorkflowTitleTimesOutFailClosed(t *testing.T) {
+	intent := WorkflowDispatchIntent{
+		RunID:                62,
+		Ref:                  "main",
+		ExpectedDisplayTitle: workflowDispatchDisplayTitle(strings.Repeat("d", 64)),
+	}
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		reads++
+		_, _ = fmt.Fprintf(writer, `{"id":62,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","status":"completed","conclusion":"success"}`, visualHiveProductionWorkflowName)
+	}))
+	defer server.Close()
+
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	_, err := waitForExactWorkflowRunWithTiming(context.Background(), client, "owner", "repo", intent, nil, 10*time.Millisecond, 2*time.Millisecond, 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not stabilize") || !strings.Contains(err.Error(), "display_title") || !strings.Contains(err.Error(), "remains bound to run 62") {
+		t.Fatalf("persistent static workflow title did not fail closed after bounded stabilization: %v", err)
+	}
+	if reads < 2 {
+		t.Fatalf("static workflow title was not retried before timeout: reads=%d", reads)
+	}
+}
+
+func TestExactWorkflowRunBindingRejectsPermanentMismatch(t *testing.T) {
+	intent := WorkflowDispatchIntent{
+		RunID:                51,
+		Ref:                  "main",
+		ExpectedDisplayTitle: workflowDispatchDisplayTitle(strings.Repeat("b", 64)),
+	}
+	exact := func() *gh.WorkflowRun {
+		return &gh.WorkflowRun{
+			ID:           gh.Ptr(intent.RunID),
+			DisplayTitle: gh.Ptr(intent.ExpectedDisplayTitle),
+			Event:        gh.Ptr("workflow_dispatch"),
+			HeadBranch:   gh.Ptr(intent.Ref),
+			Status:       gh.Ptr("completed"),
+			Conclusion:   gh.Ptr("success"),
+		}
+	}
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		reads++
+		http.Error(writer, "permanent mismatch must not be retried", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	for _, test := range []struct {
+		name   string
+		mutate func(*gh.WorkflowRun)
+		want   string
+	}{
+		{name: "id", mutate: func(run *gh.WorkflowRun) { run.ID = gh.Ptr(int64(52)) }, want: "persisted run id"},
+		{name: "display title", mutate: func(run *gh.WorkflowRun) { run.DisplayTitle = gh.Ptr("different correlation") }, want: "display_title"},
+		{name: "event", mutate: func(run *gh.WorkflowRun) { run.Event = gh.Ptr("push") }, want: "event"},
+		{name: "ref", mutate: func(run *gh.WorkflowRun) { run.HeadBranch = gh.Ptr("other") }, want: "head branch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reads = 0
+			run := exact()
+			test.mutate(run)
+			_, err := waitForExactWorkflowRunWithTiming(context.Background(), client, "owner", "repo", intent, run, 10*time.Millisecond, time.Millisecond, 100*time.Millisecond)
+			if err == nil || !strings.Contains(err.Error(), "violates its exact durable dispatch binding") || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("permanent mismatch was not rejected: %v", err)
+			}
+			if reads != 0 {
+				t.Fatalf("permanent mismatch triggered %d retry reads", reads)
+			}
+		})
+	}
+}
+
+func TestExactWorkflowRunBindingStabilizationTimeoutIsActionable(t *testing.T) {
+	intent := WorkflowDispatchIntent{
+		RunID:                61,
+		Ref:                  "main",
+		ExpectedDisplayTitle: workflowDispatchDisplayTitle(strings.Repeat("c", 64)),
+	}
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		reads++
+		_, _ = io.WriteString(writer, `{"id":61,"display_title":"","event":"workflow_dispatch","head_branch":"main","status":"queued"}`)
+	}))
+	defer server.Close()
+
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	_, err := waitForExactWorkflowRunWithTiming(context.Background(), client, "owner", "repo", intent, nil, 10*time.Millisecond, 2*time.Millisecond, 20*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not stabilize") || !strings.Contains(err.Error(), "display_title") || !strings.Contains(err.Error(), "remains bound to run 61") || !strings.Contains(err.Error(), "will not select a different run") {
+		t.Fatalf("persistent incomplete binding did not return an actionable fail-closed timeout: %v", err)
+	}
+	if reads < 2 {
+		t.Fatalf("incomplete binding was not retried before timeout: reads=%d", reads)
+	}
+}
+
 func TestWorkflowDispatchAPIVersionSelection(t *testing.T) {
 	for _, test := range []struct {
 		host string
@@ -221,6 +403,8 @@ func TestProductionWorkflowRequiresExactDispatchCorrelation(t *testing.T) {
 	value := workflow(Config{VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("a", 40), ACMMLevel: 4})
 	for _, required := range []string{
 		"hive_dispatch_id:",
+		"hive_operation:",
+		"setup-baseline-capture",
 		"required: true",
 		"type: string",
 		`run-name: "Hive Visual Hive Production [${{ inputs.hive_dispatch_id }}]"`,
@@ -239,17 +423,20 @@ func TestProductionWorkflowRequiresExactDispatchCorrelation(t *testing.T) {
 		t.Fatalf("production workflow must contain exactly one guarded PR-context seed:\n%s", value)
 	}
 	seed := value[strings.Index(value, "  # GitHub allows an App-bound context"):]
-	if strings.Contains(seed, "\n    if:") || strings.Contains(seed, "\n      if:") {
-		t.Fatalf("activation seed must fail actively instead of being skipped:\n%s", seed)
+	if !strings.Contains(seed, "\n    if: ${{ inputs.hive_operation == 'production' }}") || strings.Contains(seed, "\n      if:") {
+		t.Fatalf("activation seed must run actively in production and be excluded only from the dedicated capture lane:\n%s", seed)
 	}
 }
 
 func TestPullRequestWorkflowHasNoManualDispatchAndOwnsProtectedContext(t *testing.T) {
 	value := pullRequestWorkflow(Config{VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("a", 40)})
-	if strings.Contains(value, "workflow_dispatch") || !strings.Contains(value, "on:\n  pull_request:") || !strings.Contains(value, "  visual-hive:\n") {
+	if strings.Contains(value, "workflow_dispatch") || !strings.Contains(value, "on:\n  pull_request:") || !strings.Contains(value, "  pull_request_target:\n") || !strings.Contains(value, "  visual-hive:\n") {
 		t.Fatalf("PR workflow triggers or check context are unsafe:\n%s", value)
 	}
-	for _, forbidden := range []string{"github.event_name", "github.ref }}", "origin/$HIVE_DEFAULT_BRANCH", "visual-hive-production:"} {
+	if !strings.Contains(value, "github.event_name == 'pull_request'") || !strings.Contains(value, "operation == 'uninstall'") {
+		t.Fatalf("PR target jobs and protected aggregator are not explicitly event-gated:\n%s", value)
+	}
+	for _, forbidden := range []string{"github.ref }}", "origin/$HIVE_DEFAULT_BRANCH", "visual-hive-production:"} {
 		if strings.Contains(value, forbidden) {
 			t.Fatalf("PR workflow retains manual/production fallback %q:\n%s", forbidden, value)
 		}

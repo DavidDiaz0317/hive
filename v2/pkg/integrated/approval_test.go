@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +129,32 @@ func TestPathApprovalCannotOverrideAnyOtherMergeGate(t *testing.T) {
 	}
 }
 
+func TestRepositoryTestRepairAlwaysRequiresExactPathApproval(t *testing.T) {
+	config := exactTestMergeConfig()
+	config.AllowedAutoMergePaths = []string{"**/*.test.*", "**/*_test.go"}
+	policy := integratedPolicy(config)
+	finding := visualhive.FindingLifecycle{
+		IssueKind: visualhive.RepositoryTestFailureKind, RepairAttempts: 1,
+		RepairCommitSHA: strings.Repeat("a", 40), OwningAgentHint: "quality",
+	}
+	gate := exactTestMergeGate()
+	gate.HeadSHA = finding.RepairCommitSHA
+	gate.ChangedFiles = []string{"src/security-audit.test.ts"}
+	request := mergeActionRequest(config, finding, gate)
+	if ordinary := policy.Authorize(request); !ordinary.Allowed {
+		t.Fatalf("fixture must prove the global test-only auto-merge policy would allow this change: %+v", ordinary)
+	}
+	perFinding := mergePolicyForFinding(policy, finding)
+	denied := perFinding.Authorize(request)
+	if denied.Allowed || len(denied.Reasons) != 1 || !strings.Contains(denied.Reasons[0], "outside the auto-merge allowlist") {
+		t.Fatalf("repository-test repair did not receive an exact path-policy hold: %+v", denied)
+	}
+	approved, eligible := authorizePathApprovedMerge(perFinding, request, denied)
+	if !eligible || !approved.Allowed {
+		t.Fatalf("exact-head approval could not override only the forced path hold: eligible=%t decision=%+v", eligible, approved)
+	}
+}
+
 func TestHeldApprovedFindingIsReachableAndAmbiguityFailsClosed(t *testing.T) {
 	stateDir := t.TempDir()
 	store, _ := NewStore(filepath.Join(stateDir, "integrated"))
@@ -156,10 +181,62 @@ func TestHeldApprovedFindingIsReachableAndAmbiguityFailsClosed(t *testing.T) {
 	}
 }
 
+func TestObservationReviewInvalidatesPreexistingApprovalBeforeSelection(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := MergeApproval{
+		SchemaVersion: MergeApprovalSchema, Repository: "owner/repo", RepositoryID: "123", PRNumber: 7,
+		HeadSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), BaseBranch: "main", DiffDigest: strings.Repeat("c", 64),
+		Actor: "accountable-user", Reason: "reviewed before new evidence", ApprovedAt: time.Now().UTC(),
+	}
+	if err := store.SaveMergeApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	state := visualhive.LifecycleState{SchemaVersion: visualhive.LifecycleSchema, Findings: map[string]*visualhive.FindingLifecycle{
+		"held": {
+			Repository: "owner/repo", RepositoryFingerprint: "held", Status: visualhive.StatusReady, IssueNumber: 6,
+			PRNumber: 7, RepairCommitSHA: approval.HeadSHA, HumanReviewRequired: true, ManualReviewKind: "merge_policy",
+			ObservationHumanReviewRequired: true,
+		},
+		"next": {Repository: "owner/repo", RepositoryFingerprint: "next", Status: visualhive.StatusIssueOpen, IssueNumber: 8},
+	}, ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{}}
+	lifecycleDir := filepath.Join(stateDir, "visual-hive")
+	if err := os.MkdirAll(lifecycleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lifecycleDir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(lifecycleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repairFindingForOrchestration(stateDir, lifecycle.Snapshot()); err == nil || !strings.Contains(err.Error(), "matched 0") {
+		t.Fatalf("preexisting approval selected a newly observation-held finding: %v", err)
+	}
+	if err := reconcileStaleMergeApproval(context.Background(), stateDir, Config{Repository: "owner/repo", RepositoryID: "123"}, lifecycle, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := store.LoadMergeApproval(); err != nil || exists {
+		t.Fatalf("observation-invalidated approval remained active: exists=%t err=%v", exists, err)
+	}
+	selected, exists, err := repairFindingForOrchestration(stateDir, lifecycle.Snapshot())
+	if err != nil || exists {
+		t.Fatalf("invalidated approval released the repository-wide one-active-PR slot while the held PR still exists: selected=%+v exists=%t err=%v", selected, exists, err)
+	}
+}
+
 func TestApproveMergeBindsAuthenticatedActorAndRawDiff(t *testing.T) {
 	head, base := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	rawDiff := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n-old\n+new\n"
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.URL.Path == "/apps/github-actions":
@@ -172,7 +249,7 @@ func TestApproveMergeBindsAuthenticatedActorAndRawDiff(t *testing.T) {
 			writer.Header().Set("Content-Type", "application/vnd.github.v3.diff")
 			_, _ = io.WriteString(writer, rawDiff)
 		case request.URL.Path == "/repos/owner/repo/pulls/7":
-			_, _ = io.WriteString(writer, `{"number":7,"state":"open","draft":false,"mergeable":true,"head":{"sha":"`+head+`","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"`+base+`"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":7,"changed_files":1,"state":"open","draft":false,"mergeable":true,"head":{"sha":"`+head+`","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"`+base+`"},"labels":[]}`)
 		case request.URL.Path == "/repos/owner/repo/pulls/7/files":
 			_, _ = io.WriteString(writer, `[{"filename":"visual-hive.config.yaml"}]`)
 		case request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -213,6 +290,21 @@ func TestApproveMergeBindsAuthenticatedActorAndRawDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	lifecycleState.Findings["finding"].ObservationHumanReviewRequired = true
+	data, _ = json.Marshal(lifecycleState)
+	if err := os.WriteFile(filepath.Join(lifecycleDir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApproveMerge(context.Background(), ApproveMergeOptions{
+		StateDir: stateDir, PRNumber: 7, ExpectedHeadSHA: head, PlanOnly: true, GitHub: client,
+	}); err == nil || !strings.Contains(err.Error(), "not a ready Hive repair") {
+		t.Fatalf("observation-level authority was offered a merge-policy approval plan: %v", err)
+	}
+	lifecycleState.Findings["finding"].ObservationHumanReviewRequired = false
+	data, _ = json.Marshal(lifecycleState)
+	if err := os.WriteFile(filepath.Join(lifecycleDir, "visual-hive-lifecycle.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	plan, err := ApproveMerge(context.Background(), ApproveMergeOptions{
 		StateDir: stateDir, PRNumber: 7, ExpectedHeadSHA: head, PlanOnly: true, GitHub: client,
 	})
@@ -260,7 +352,7 @@ func TestApproveMergeBindsAuthenticatedActorAndRawDiff(t *testing.T) {
 
 func TestStaleApprovalIsInvalidatedBeforeFindingSelection(t *testing.T) {
 	oldHead, newHead, base := strings.Repeat("a", 40), strings.Repeat("d", 40), strings.Repeat("b", 40)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.URL.Path == "/apps/github-actions":
@@ -269,7 +361,7 @@ func TestStaleApprovalIsInvalidatedBeforeFindingSelection(t *testing.T) {
 			writer.Header().Set("Content-Type", "application/vnd.github.v3.diff")
 			_, _ = io.WriteString(writer, "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n-old\n+changed\n")
 		case request.URL.Path == "/repos/owner/repo/pulls/7":
-			_, _ = io.WriteString(writer, `{"number":7,"state":"open","draft":false,"mergeable":true,"head":{"sha":"`+newHead+`"},"base":{"ref":"main","sha":"`+base+`"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":7,"changed_files":1,"state":"open","draft":false,"mergeable":true,"head":{"sha":"`+newHead+`"},"base":{"ref":"main","sha":"`+base+`"},"labels":[]}`)
 		case request.URL.Path == "/repos/owner/repo/pulls/7/files":
 			_, _ = io.WriteString(writer, `[{"filename":"visual-hive.config.yaml"}]`)
 		case request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -313,7 +405,7 @@ func TestStaleApprovalIsInvalidatedBeforeFindingSelection(t *testing.T) {
 		t.Fatalf("stale approval remained active: exists=%t err=%v", exists, err)
 	}
 	selected, exists, err := repairFindingForOrchestration(stateDir, lifecycle.Snapshot())
-	if err != nil || !exists || selected.RepositoryFingerprint != "next" {
-		t.Fatalf("stale approval still blocked unrelated work: selected=%+v exists=%t err=%v", selected, exists, err)
+	if err != nil || exists {
+		t.Fatalf("stale approval invalidation released the one-active-PR slot while its held repair PR still exists: selected=%+v exists=%t err=%v", selected, exists, err)
 	}
 }

@@ -115,7 +115,7 @@ func runVisualLifecycleCommand(args []string) int {
 	var providerArgs stringListFlag
 	var allowedRepairPaths stringListFlag
 	var checkJSON stringListFlag
-	flags.Var(&providerArgs, "provider-arg", "model provider launcher argument; repeat for wrappers such as npx")
+	flags.Var(&providerArgs, "provider-arg", "native Codex option; repeat as needed (script/package-runner wrappers are rejected)")
 	flags.Var(&allowedRepairPaths, "repair-path", "allowed repair path glob; repeatable")
 	flags.Var(&checkJSON, "check-json", `required validation command as a JSON string array, for example ["npm","test"]; repeatable`)
 	if err := flags.Parse(args[1:]); err != nil {
