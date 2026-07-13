@@ -29,8 +29,71 @@ sh "$installer"
 grep -q '"schema_version": "hive.setup-plan.v1"' "$work_root/setup-plan.json"
 grep -q '"read_only": true' "$work_root/setup-plan.json"
 
+# Installation paths are ownership boundaries. Reject unsafe/common parents and
+# unrecognized targets/backups without changing even one sentinel byte.
+test -n "$release_dir"
+if HIVE_INSTALL_DIR=/ sh "$installer" >"$work_root/root-install.log" 2>&1; then
+  echo "filesystem-root install unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'Refusing unsafe Hive install directory /' "$work_root/root-install.log"
+
+printf '%s\n' preserve-home > "$HOME/home-sentinel"
+home_hash="$(sha256sum "$HOME/home-sentinel" | awk '{print $1}')"
+if HIVE_INSTALL_DIR="$HOME" sh "$installer" >"$work_root/home-install.log" 2>&1; then
+  echo "home-directory install unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'home or common parent directory' "$work_root/home-install.log"
+test "$(sha256sum "$HOME/home-sentinel" | awk '{print $1}')" = "$home_hash"
+
+unsafe_install="$work_root/workspace"
+mkdir -p "$unsafe_install"
+printf '\000\001\002\376\377' > "$unsafe_install/do-not-delete.bin"
+unsafe_hash="$(sha256sum "$unsafe_install/do-not-delete.bin" | awk '{print $1}')"
+if HIVE_INSTALL_DIR="$unsafe_install" sh "$installer" >"$work_root/unsafe-install.log" 2>&1; then
+  echo "unsafe install path unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'Refusing non-dedicated Hive install leaf' "$work_root/unsafe-install.log"
+test "$(sha256sum "$unsafe_install/do-not-delete.bin" | awk '{print $1}')" = "$unsafe_hash"
+
+unrecognized_target="$work_root/install-unrecognized-target"
+mkdir -p "$unrecognized_target"
+printf '\377\010\007\006\005' > "$unrecognized_target/unrelated-project.bin"
+target_hash="$(sha256sum "$unrecognized_target/unrelated-project.bin" | awk '{print $1}')"
+if HIVE_INSTALL_DIR="$unrecognized_target" sh "$installer" >"$work_root/unrecognized-target.log" 2>&1; then
+  echo "unrecognized install target unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'not an exact recognized Hive distribution' "$work_root/unrecognized-target.log"
+test "$(sha256sum "$unrecognized_target/unrelated-project.bin" | awk '{print $1}')" = "$target_hash"
+test ! -e "$unrecognized_target.previous"
+
+backup_target="$work_root/install-unrecognized-backup"
+unrecognized_backup="$backup_target.previous"
+mkdir -p "$unrecognized_backup"
+printf '\011\010\007\006' > "$unrecognized_backup/unrelated-backup.bin"
+backup_hash="$(sha256sum "$unrecognized_backup/unrelated-backup.bin" | awk '{print $1}')"
+if HIVE_INSTALL_DIR="$backup_target" sh "$installer" >"$work_root/unrecognized-backup.log" 2>&1; then
+  echo "unrecognized install backup unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'existing .previous backup' "$work_root/unrecognized-backup.log"
+test ! -e "$backup_target"
+test "$(sha256sum "$unrecognized_backup/unrelated-backup.bin" | awk '{print $1}')" = "$backup_hash"
+
+# A valid exact prior Hive tree upgrades idempotently and cleans only its
+# recognized backup.
+sh "$installer"
+"$HIVE_INSTALL_DIR/runtime/node" "$HIVE_INSTALL_DIR/visual-hive/visual-hive.mjs" --version
+test ! -e "$HIVE_INSTALL_DIR.previous"
+
 # A failure after activation must restore the previous install and launcher.
-printf '%s\n' previous-install > "$HIVE_INSTALL_DIR/transaction-marker"
+printf '%s\n' previous-install > "$work_root/transaction-sentinel"
+transaction_sentinel_hash="$(sha256sum "$work_root/transaction-sentinel" | awk '{print $1}')"
+prior_manifest_hash="$(sha256sum "$HIVE_INSTALL_DIR/distribution-manifest.json" | awk '{print $1}')"
+prior_hive_hash="$(sha256sum "$HIVE_INSTALL_DIR/hive" | awk '{print $1}')"
 blocked_codex="$work_root/blocked-codex"
 mkdir -p "$blocked_codex"
 printf '%s\n' blocks-directory > "$blocked_codex/skills"
@@ -39,7 +102,36 @@ if CODEX_HOME="$blocked_codex" sh "$installer" >"$work_root/post-activation-fail
   exit 1
 fi
 grep -q 'previous installation, launcher, and Codex skill were restored' "$work_root/post-activation-failure.log"
-test -f "$HIVE_INSTALL_DIR/transaction-marker"
+test "$(sha256sum "$work_root/transaction-sentinel" | awk '{print $1}')" = "$transaction_sentinel_hash"
+test "$(sha256sum "$HIVE_INSTALL_DIR/distribution-manifest.json" | awk '{print $1}')" = "$prior_manifest_hash"
+test "$(sha256sum "$HIVE_INSTALL_DIR/hive" | awk '{print $1}')" = "$prior_hive_hash"
+test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
+
+# Secondary install targets are ownership boundaries too. An unrelated
+# executable or skill named hive must fail before activation and remain exact.
+owned_link_target="$(readlink "$HOME/.local/bin/hive")"
+rm -- "$HOME/.local/bin/hive"
+printf '%s\n' unrelated-launcher > "$HOME/.local/bin/hive"
+unrelated_launcher_hash="$(sha256sum "$HOME/.local/bin/hive" | awk '{print $1}')"
+if sh "$installer" >"$work_root/unrelated-launcher.log" 2>&1; then
+  echo "unrelated launcher collision unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'not the launcher owned by the recognized Hive installation' "$work_root/unrelated-launcher.log"
+test "$(sha256sum "$HOME/.local/bin/hive" | awk '{print $1}')" = "$unrelated_launcher_hash"
+rm -- "$HOME/.local/bin/hive"
+ln -s "$owned_link_target" "$HOME/.local/bin/hive"
+
+collision_codex="$work_root/unrelated-codex"
+mkdir -p "$collision_codex/skills/hive"
+printf '%s\n' unrelated-skill > "$collision_codex/skills/hive/do-not-delete.txt"
+unrelated_skill_hash="$(sha256sum "$collision_codex/skills/hive/do-not-delete.txt" | awk '{print $1}')"
+if CODEX_HOME="$collision_codex" sh "$installer" >"$work_root/unrelated-skill.log" 2>&1; then
+  echo "unrelated Codex skill collision unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'not an exact packaged Hive skill' "$work_root/unrelated-skill.log"
+test "$(sha256sum "$collision_codex/skills/hive/do-not-delete.txt" | awk '{print $1}')" = "$unrelated_skill_hash"
 test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
 
 # If moving a pre-existing skill to its backup fails, rollback must not delete
@@ -47,8 +139,7 @@ test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
 # all other install operations real.
 real_mv="$(command -v mv)"
 fake_bin="$work_root/fake-bin"
-mkdir -p "$fake_bin" "$HOME/.codex/skills/hive"
-printf '%s\n' original-skill > "$HOME/.codex/skills/hive/original-skill.txt"
+mkdir -p "$fake_bin"
 cat > "$fake_bin/mv" <<'SH'
 #!/usr/bin/env sh
 set -eu
@@ -68,8 +159,10 @@ if PATH="$fake_bin:$PATH" \
   exit 1
 fi
 grep -q 'synthetic skill backup move failure' "$work_root/skill-backup-move-failure.log"
-test -f "$HOME/.codex/skills/hive/original-skill.txt"
-test -f "$HIVE_INSTALL_DIR/transaction-marker"
+test -f "$HOME/.codex/skills/hive/SKILL.md"
+test "$(sha256sum "$work_root/transaction-sentinel" | awk '{print $1}')" = "$transaction_sentinel_hash"
+test "$(sha256sum "$HIVE_INSTALL_DIR/distribution-manifest.json" | awk '{print $1}')" = "$prior_manifest_hash"
+test "$(sha256sum "$HIVE_INSTALL_DIR/hive" | awk '{print $1}')" = "$prior_hive_hash"
 test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
 
 # Exercise the published-release trust policy with a fake gh transport. The
@@ -151,7 +244,7 @@ chmod +x "$attestation_bin/gh"
 (
   unset HIVE_RELEASE_DIR HIVE_SKIP_ATTESTATION
   export PATH="$attestation_bin:$PATH"
-  export HIVE_INSTALL_DIR="$work_root/attested-install"
+  export HIVE_INSTALL_DIR="$work_root/install-attested"
   export HIVE_FAKE_VERSION="$published_version"
   export HIVE_FAKE_COMMIT="$release_commit"
   export HIVE_FAKE_RELEASE_DIR="$published_release_dir"
@@ -162,5 +255,5 @@ chmod +x "$attestation_bin/gh"
   sh "$installer" --version "$published_version" --repo "$repository"
 )
 test -f "$attestation_marker"
-"$work_root/attested-install/runtime/node" "$work_root/attested-install/visual-hive/visual-hive.mjs" --version
+"$work_root/install-attested/runtime/node" "$work_root/install-attested/visual-hive/visual-hive.mjs" --version
 echo "Signed Linux integrated installer smoke passed: $work_root"

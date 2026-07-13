@@ -56,7 +56,7 @@ type patchProvider struct{}
 func (p *patchProvider) Name() string                 { return "patch-model" }
 func (p *patchProvider) Health(context.Context) error { return nil }
 func (p *patchProvider) Run(_ context.Context, _ string, prompt string) (ProviderResult, error) {
-	if !strings.Contains(prompt, modelPatchBegin) || !strings.Contains(prompt, "intentionally read-only") {
+	if !strings.Contains(prompt, modelPatchBegin) || !strings.Contains(prompt, "filesystem-denied") {
 		return ProviderResult{}, fmt.Errorf("repair prompt did not require the read-only patch contract")
 	}
 	output := `HIVE_PATCH_BEGIN
@@ -68,6 +68,43 @@ diff --git a/src/value.txt b/src/value.txt
 +fixed by model patch
 HIVE_PATCH_END`
 	return ProviderResult{Summary: "proposed bounded patch", Output: output}, nil
+}
+
+type unsafeOutputProvider struct{ value string }
+
+func (p *unsafeOutputProvider) Name() string                 { return "unsafe-test-model" }
+func (p *unsafeOutputProvider) Health(context.Context) error { return nil }
+func (p *unsafeOutputProvider) Run(context.Context, string, string) (ProviderResult, error) {
+	return ProviderResult{Summary: p.value, Output: p.value}, nil
+}
+
+func TestWorkerRejectsUnsafeProviderOutputBeforeStatePersistence(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := strings.Join([]string{"AKIA", "ABCD", "EFGH", "IJKL", "MNOP"}, "")
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "owner/repo:unsafe-provider-output", Status: visualhive.StatusIssueOpen,
+		Title: "Repair value", Body: "Value is broken.", IssueKind: "functional", Severity: "high", OwningAgentHint: "quality", IssueNumber: 44, IssueURL: "https://example.test/issues/44",
+	}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
+		},
+		Provider: &unsafeOutputProvider{value: `const id = "` + secret + `"`}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
+	}
+	_, runErr := worker.Run(context.Background(), finding)
+	if !IsRetryableAttemptError(runErr) || !strings.Contains(runErr.Error(), "aws-access-key-id-v1") || strings.Contains(runErr.Error(), secret) {
+		t.Fatalf("unsafe output did not produce a non-disclosing charged rejection: %v", runErr)
+	}
+	attempt, ok := state.Get(finding.RepositoryFingerprint)
+	if !ok || !attempt.AttemptCounted || attempt.ModelPatch != "" || strings.Contains(attempt.ModelSummary, secret) || strings.Contains(attempt.LastFailure, secret) {
+		t.Fatalf("unsafe provider bytes reached durable state: %+v", attempt)
+	}
 }
 
 func TestRepairPreparationHelperProcess(t *testing.T) {
@@ -554,15 +591,37 @@ func TestTestAdequacyScopeIsCentrallyTestOnly(t *testing.T) {
 			t.Fatalf("test adequacy scope allowed non-test files: %v", files)
 		}
 	}
-	prompt := repairPrompt(finding, "verified evidence", "", "")
+	prompt := repairPrompt(finding, "verified evidence", "", "", "")
 	if !strings.Contains(prompt, "test-adequacy repair") || !strings.Contains(prompt, "Change only focused files") || !strings.Contains(prompt, "fileURLToPath") {
 		t.Fatalf("test-only constraint missing from repair prompt: %s", prompt)
 	}
 }
 
+func TestRepositoryTestRepairPromptAllowsOnlyReviewedDependencyMetadata(t *testing.T) {
+	finding := visualhive.FindingLifecycle{
+		IssueKind:         visualhive.RepositoryTestFailureKind,
+		Title:             "[Hive] Repository test failed: npm --prefix dashboard run test:all",
+		ValidationCommand: "npm --prefix dashboard run test:all",
+	}
+	prompt := repairPrompt(finding, "- source=repository_test_plan status=failed", "", "", "")
+	for _, required := range []string{
+		"Dependency manifest and lockfile changes are permitted only when they are the smallest fix",
+		"Never delete, rename, skip, or weaken the failing script",
+		"held for exact-head human approval",
+		"do not add install hooks, registries, credentials, or ignore rules",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("repository-test repair prompt lost guardrail %q: %s", required, prompt)
+		}
+	}
+	if strings.Contains(prompt, "infrastructure, dependencies, or visual baselines") {
+		t.Fatal("repository-test prompt retained the unconditional dependency-edit prohibition")
+	}
+}
+
 func TestAPI500RepairPromptUsesFirstPartyMutationMarker(t *testing.T) {
 	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500", IssueKind: "missing_visual_coverage"}
-	prompt := repairPrompt(finding, "verified evidence", "", "")
+	prompt := repairPrompt(finding, "verified evidence", "", "", "")
 	for _, expected := range []string{"visual-hive api-500 mutation", "textMustNotExist", "Do not change the nominal server/data harness", "remove any added `[data-testid='api-data-area']`", "matching `mustExist`"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("api-500 repair guidance missing %q: %s", expected, prompt)
@@ -573,7 +632,7 @@ func TestAPI500RepairPromptUsesFirstPartyMutationMarker(t *testing.T) {
 func TestRepairPromptIncludesCumulativeRevisionDiff(t *testing.T) {
 	finding := visualhive.FindingLifecycle{Title: "Strengthen tests for surviving mutation api-500", IssueKind: "missing_visual_coverage"}
 	diff := "diff --git a/visual-hive.config.yaml b/visual-hive.config.yaml\n--- a/visual-hive.config.yaml\n+++ b/visual-hive.config.yaml\n@@ -1 +1 @@\n-serve: npm run preview\n+serve: node scripts/testing/start-lhci-server.mjs\n"
-	prompt := repairPrompt(finding, "verified evidence", "prior response", diff)
+	prompt := repairPrompt(finding, "verified evidence", "prior response", diff, "")
 	for _, expected := range []string{"Current cumulative uncommitted repair diff", "start-lhci-server.mjs", "applied on top of this exact state", "do not repeat changes already present", "removal of an unsafe prior change"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("cumulative revision guidance missing %q: %s", expected, prompt)

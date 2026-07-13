@@ -37,12 +37,15 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 		"hive_setup_plan": false, "hive_setup_apply": false, "hive_doctor": false,
 		"hive_status": false, "hive_run": false, "hive_start": false,
 		"hive_stop": false, "hive_plan_merge_approval": false, "hive_approve_merge": false,
+		"hive_plan_baseline_approval": false, "hive_approve_baseline": false,
 		"hive_revoke_merge_approval": false, "hive_retry_repair": false, "hive_pause": false,
 		"hive_plan_dispatch_recovery": false, "hive_recover_dispatch": false,
-		"hive_resume": false, "hive_upgrade": false, "hive_rollback": false,
-		"hive_uninstall": false,
+		"hive_transfer_setup_authorizer": false,
+		"hive_resume":                    false, "hive_upgrade": false, "hive_rollback": false,
+		"hive_set_coverage": false, "hive_set_automation": false,
+		"hive_set_issue_limit": false, "hive_set_retry_limit": false, "hive_uninstall": false,
 	}
-	var issueLimit, uninstall, upgrade map[string]any
+	var setup, issueLimit, retryLimit, uninstall, upgrade, authorizerTransfer map[string]any
 	for _, candidate := range tools {
 		value := candidate.(map[string]any)
 		if name, ok := value["name"].(string); ok {
@@ -53,15 +56,24 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 		if value["name"] == "hive_set_issue_limit" {
 			issueLimit = value
 		}
+		if value["name"] == "hive_setup_apply" {
+			setup = value
+		}
+		if value["name"] == "hive_set_retry_limit" {
+			retryLimit = value
+		}
 		if value["name"] == "hive_uninstall" {
 			uninstall = value
 		}
 		if value["name"] == "hive_upgrade" {
 			upgrade = value
 		}
+		if value["name"] == "hive_transfer_setup_authorizer" {
+			authorizerTransfer = value
+		}
 	}
-	if issueLimit == nil {
-		t.Fatal("hive_set_issue_limit is missing")
+	if issueLimit == nil || retryLimit == nil {
+		t.Fatal("hive_set_issue_limit or hive_set_retry_limit is missing")
 	}
 	for name, found := range requiredTools {
 		if !found {
@@ -73,15 +85,33 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 	if value["minimum"] != float64(1) && value["minimum"] != 1 {
 		t.Fatalf("unexpected issue-limit schema: %+v", value)
 	}
-	if !knownTool("hive_set_retry_limit") {
-		t.Fatal("hive_set_retry_limit is missing")
+	retryProperties := retryLimit["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	retryValue := retryProperties["value"].(map[string]any)
+	if retryValue["minimum"] != float64(1) && retryValue["minimum"] != 1 || retryValue["maximum"] != float64(10) && retryValue["maximum"] != 10 {
+		t.Fatalf("unexpected retry-limit schema: %+v", retryValue)
 	}
 	if uninstall == nil || upgrade == nil {
 		t.Fatal("upgrade or uninstall schema is missing")
 	}
+	if authorizerTransfer == nil || len(authorizerTransfer["inputSchema"].(map[string]any)["oneOf"].([]any)) != 2 {
+		t.Fatal("authorizer transfer schema does not expose transfer and cancel alternatives")
+	}
+	if setup == nil {
+		t.Fatal("setup schema is missing")
+	}
+	setupProperties := setup["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := setupProperties["auto_merge_paths"]; !ok {
+		t.Fatal("MCP setup cannot configure the auto-merge path allowlist")
+	}
+	if _, ok := setupProperties["auto_merge_risks"]; !ok {
+		t.Fatal("MCP setup cannot configure auto-merge risk tiers")
+	}
 	uninstallProperties := uninstall["inputSchema"].(map[string]any)["properties"].(map[string]any)
 	if _, ok := uninstallProperties["delete_state"]; !ok {
 		t.Fatal("hive_uninstall cannot express --delete-state")
+	}
+	if _, ok := uninstallProperties["cancel"]; !ok {
+		t.Fatal("hive_uninstall cannot express exact pending cleanup cancellation")
 	}
 	upgradeProperties := upgrade["inputSchema"].(map[string]any)["properties"].(map[string]any)
 	if upgradeProperties["value"].(map[string]any)["pattern"] != `^[a-fA-F0-9]{40}$` {
@@ -101,5 +131,35 @@ func TestServerReportsToolExecutionErrorsInsideResult(t *testing.T) {
 	})
 	if !strings.Contains(output.String(), `"isError":true`) || !strings.Contains(output.String(), "deadline exceeded") {
 		t.Fatalf("expected tool execution error result: %s", output.String())
+	}
+}
+
+func TestServerRejectsArgumentsOutsideAdvertisedSchema(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments string
+		message   string
+	}{
+		{"unknown", `{"state_dir":"state","startt":false}`, `unknown argument \"startt\"`},
+		{"missing", `{"state_dir":"state"}`, `missing required argument \"value\"`},
+		{"range", `{"state_dir":"state","value":0}`, `must be at least 1`},
+		{"array-enum", `{"auto_merge_paths":["tests/**"],"auto_merge_risks":["unknown"]}`, `must be one of automatic, low, medium, restricted`},
+	}
+	tools := []string{"hive_setup_apply", "hive_set_issue_limit", "hive_set_retry_limit", "hive_setup_apply"}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tools[index] + `","arguments":` + test.arguments + `}}` + "\n"
+			var output bytes.Buffer
+			called := false
+			if err := Serve(context.Background(), strings.NewReader(input), &output, func(context.Context, string, map[string]any) (any, error) {
+				called = true
+				return map[string]any{}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if called || !strings.Contains(output.String(), `"code":-32602`) || !strings.Contains(output.String(), test.message) {
+				t.Fatalf("invalid MCP arguments were not rejected before execution: %s", output.String())
+			}
+		})
 	}
 }

@@ -56,6 +56,9 @@ func RetryRepair(ctx context.Context, options RetryRepairOptions) (RetryRepairRe
 	if err != nil {
 		return result, err
 	}
+	if err := rejectPendingAuthorizerTransfer(store, options.StateDir, "repair retry"); err != nil {
+		return result, err
+	}
 	if _, err := verifyLiveRepositoryIdentity(ctx, options.GitHub, config); err != nil {
 		return result, err
 	}

@@ -160,6 +160,9 @@ func ApproveMerge(ctx context.Context, options ApproveMergeOptions) (ApproveMerg
 	if err != nil {
 		return result, err
 	}
+	if err := rejectPendingAuthorizerTransfer(store, options.StateDir, "merge approval"); err != nil {
+		return result, err
+	}
 	fail := func(cause error) (ApproveMergeResult, error) {
 		if auditErr := store.AuditStrict(AuditEntry{Action: "approve_merge", Allowed: false, Repository: config.Repository, Detail: cause.Error()}); auditErr != nil {
 			return result, fmt.Errorf("%v; persist denied approval audit: %w", cause, auditErr)
@@ -181,7 +184,7 @@ func ApproveMerge(ctx context.Context, options ApproveMergeOptions) (ApproveMerg
 	if findingErr != nil {
 		return fail(findingErr)
 	}
-	if !ok || finding.Status != visualhive.StatusReady || finding.ManualReviewKind != "merge_policy" || !finding.HumanReviewRequired {
+	if !ok || finding.Status != visualhive.StatusReady || finding.ManualReviewKind != "merge_policy" || !finding.HumanReviewRequired || finding.ObservationHumanReviewRequired {
 		return fail(fmt.Errorf("pull request #%d is not a ready Hive repair awaiting merge-policy review", options.PRNumber))
 	}
 	if !strings.EqualFold(finding.RepairCommitSHA, options.ExpectedHeadSHA) {
@@ -195,7 +198,7 @@ func ApproveMerge(ctx context.Context, options ApproveMergeOptions) (ApproveMerg
 	if !gate.Open || gate.Merged || !strings.EqualFold(gate.HeadSHA, options.ExpectedHeadSHA) || !strings.EqualFold(gate.BaseBranch, config.DefaultBranch) {
 		return fail(fmt.Errorf("pull request is not open at the exact approved head"))
 	}
-	policy := integratedPolicy(config)
+	policy := mergePolicyForFinding(integratedPolicy(config), finding)
 	request := mergeActionRequest(config, finding, gate)
 	decision := policy.Authorize(request)
 	approvedDecision, eligible := authorizePathApprovedMerge(policy, request, decision)
@@ -311,7 +314,7 @@ func reconcileStaleMergeApproval(ctx context.Context, stateDir string, config Co
 		return mappingErr
 	}
 	reason := ""
-	if !found || finding.Status != visualhive.StatusReady || !finding.HumanReviewRequired || finding.ManualReviewKind != "merge_policy" || !strings.EqualFold(finding.RepairCommitSHA, approval.HeadSHA) {
+	if !found || finding.Status != visualhive.StatusReady || !finding.HumanReviewRequired || finding.ManualReviewKind != "merge_policy" || finding.ObservationHumanReviewRequired || !strings.EqualFold(finding.RepairCommitSHA, approval.HeadSHA) {
 		reason = "approval no longer maps to exactly one ready merge-policy-held finding"
 	} else {
 		gate, gateErr := client.InspectPullRequestGate(ctx, config.Repository, approval.PRNumber)
@@ -381,6 +384,20 @@ func integratedPolicy(config Config) automation.Policy {
 		AllowedRepositories: []string{config.Repository}, MaxRepairAttempts: repairAttemptLimit(config),
 		AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 	}
+}
+
+func mergePolicyForFinding(policy automation.Policy, finding visualhive.FindingLifecycle) automation.Policy {
+	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), visualhive.RepositoryTestFailureKind) {
+		// Repository-test repairs can touch test files that are globally safe for
+		// ordinary test-adequacy fixes. They must nevertheless be reviewed because
+		// weakening a test could make the original command green. A nil/empty path
+		// list intentionally falls back to Hive's ordinary safe-test defaults, so
+		// use one valid pattern that cannot match a repository path. This produces
+		// only the normal, exactly approvable path-policy hold without expanding or
+		// mutating the installed auto-merge policy.
+		policy.AllowedAutoMergePaths = []string{"__hive_repository_test_requires_exact_approval__"}
+	}
+	return policy
 }
 
 func mergeActionRequest(config Config, finding visualhive.FindingLifecycle, gate hivegithub.PullRequestGate) automation.ActionRequest {

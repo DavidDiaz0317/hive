@@ -21,6 +21,9 @@ type packageJSON struct {
 }
 
 func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
+	if err := validateOrdinarySetupCheckout(root); err != nil {
+		return RepositoryInspection{}, err
+	}
 	inspection := RepositoryInspection{
 		DefaultBranch:  defaultBranch,
 		Permissions:    map[string]bool{},

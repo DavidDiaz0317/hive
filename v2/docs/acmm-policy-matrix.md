@@ -1,5 +1,7 @@
 # ACMM Policy Matrix
 
+> This matrix documents the legacy multi-agent service. The integrated Hive + Visual Hive product exposes the simpler `advisory`, `issues`, `repair-pr`, and `auto-merge` authority levels documented in the [integrated quickstart](integrated-quickstart.md). `repair-pr` is open-PRs-only; only `auto-merge` permits Hive to merge.
+
 This matrix is enforced by central action policy and the GitHub proxy. Agent templates describe intent but do not grant authority. Coverage depth is configured separately and never escalates GitHub writes.
 
 | Level | Issues | Repair branches/PRs | Merge |

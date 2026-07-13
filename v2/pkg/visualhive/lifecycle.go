@@ -2,7 +2,9 @@ package visualhive
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +73,8 @@ type FindingLifecycle struct {
 	BeadID                         string          `json:"bead_id,omitempty"`
 	IssueNumber                    int             `json:"issue_number,omitempty"`
 	IssueURL                       string          `json:"issue_url,omitempty"`
+	IssueWriterID                  int64           `json:"issue_writer_id,omitempty"`
+	IssueWriterLogin               string          `json:"issue_writer_login,omitempty"`
 	Branch                         string          `json:"branch,omitempty"`
 	RepairCommitSHA                string          `json:"repair_commit_sha,omitempty"`
 	PRNumber                       int             `json:"pr_number,omitempty"`
@@ -125,6 +129,7 @@ type LifecycleState struct {
 }
 
 type LifecycleAuditEntry struct {
+	ReceiptID             string    `json:"receipt_id"`
 	Timestamp             time.Time `json:"timestamp"`
 	Action                string    `json:"action"`
 	Allowed               bool      `json:"allowed"`
@@ -144,6 +149,7 @@ type ApplyLifecycleOptions struct {
 	VerifiedMergeAncestorSHA         string
 	MaxActiveIssues                  int
 	PreferRepairable                 bool
+	DisableIssuePublication          bool
 }
 
 type ApplyLifecycleResult struct {
@@ -162,11 +168,12 @@ type ApplyLifecycleResult struct {
 }
 
 type LifecycleStore struct {
-	mu        sync.Mutex
-	dir       string
-	statePath string
-	auditPath string
-	state     LifecycleState
+	mu            sync.Mutex
+	dir           string
+	statePath     string
+	auditPath     string
+	state         LifecycleState
+	auditReceipts map[string]bool
 }
 
 func NewLifecycleStore(dir string) (*LifecycleStore, error) {
@@ -186,8 +193,12 @@ func NewLifecycleStore(dir string) (*LifecycleStore, error) {
 			ReplayKeys:    map[string]string{},
 			Outbox:        []*OutboxEntry{},
 		},
+		auditReceipts: map[string]bool{},
 	}
 	if err := store.load(); err != nil {
+		return nil, err
+	}
+	if err := store.loadAuditReceipts(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -207,14 +218,25 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	result := ApplyLifecycleResult{BundleID: manifest.BundleID}
 	if priorDigest, exists := s.state.ReplayKeys[manifest.ReplayProtection.Key]; exists {
 		if priorDigest != manifest.OverallDigest {
-			s.auditLocked(LifecycleAuditEntry{Action: "bundle_replay", Allowed: false, Repository: manifest.Source.Repository, BundleID: manifest.BundleID, Detail: "replay key reused with a different digest"})
+			if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "bundle_replay", Allowed: false, Repository: manifest.Source.Repository, BundleID: manifest.BundleID, Detail: "replay key reused with a different digest"}); err != nil {
+				return result, err
+			}
 			return result, fmt.Errorf("bundle replay key was reused with a different digest")
 		}
 		result.Idempotent = true
-		s.auditLocked(LifecycleAuditEntry{Action: "bundle_replay", Allowed: true, Repository: manifest.Source.Repository, BundleID: manifest.BundleID, Detail: "idempotent retry"})
+		if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "bundle_replay", Allowed: true, Repository: manifest.Source.Repository, BundleID: manifest.BundleID, Detail: "idempotent retry"}); err != nil {
+			return result, err
+		}
 		return result, nil
 	}
 	backup := cloneLifecycleState(s.state)
+	audit := func(entry LifecycleAuditEntry) error {
+		if err := s.auditLockedStrict(entry); err != nil {
+			s.state = backup
+			return err
+		}
+		return nil
+	}
 
 	now := time.Now().UTC()
 	targetRef := options.TargetRef
@@ -238,7 +260,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				continue
 			}
 			ambiguousLegacyCanonicals[observation.RepositoryFingerprint] = legacyMatches
-			s.auditLocked(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "ambiguous exact legacy canonical ownership; no existing issue was adopted"})
+			if err := audit(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "ambiguous exact legacy canonical ownership; no existing issue was adopted"}); err != nil {
+				return result, err
+			}
 			continue
 		}
 		legacy := legacyMatches[0].finding
@@ -271,7 +295,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		}
 		legacy.PendingMarkerMigrationFrom = lifecycleMarker(legacy.RepositoryFingerprint)
 		attachCanonicalPublicationIdentity(legacy, manifest.Source.Repository, observation)
-		s.auditLocked(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: true, Repository: legacy.Repository, RepositoryFingerprint: legacy.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: fmt.Sprintf("preserved issue #%d and existing repair identity for exact source fingerprint and issue kind", legacy.IssueNumber)})
+		if err := audit(LifecycleAuditEntry{Action: "migrate_legacy_canonical", Allowed: true, Repository: legacy.Repository, RepositoryFingerprint: legacy.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: fmt.Sprintf("preserved issue #%d and existing repair identity for exact source fingerprint and issue kind", legacy.IssueNumber)}); err != nil {
+			return result, err
+		}
 	}
 
 	observedFingerprints := make(map[string]bool, len(manifest.Observations))
@@ -301,7 +327,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			}
 			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
 				result.IgnoredAbsent++
-				s.auditLocked(LifecycleAuditEntry{Action: "resolve_finding", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: reason})
+				if err := audit(LifecycleAuditEntry{Action: "resolve_finding", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: reason}); err != nil {
+					return result, err
+				}
 				continue
 			}
 			updateFindingFromObservation(finding, manifest, observation)
@@ -316,12 +344,14 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			setVerificationEvidence(finding, manifest, options)
 			result.Resolved++
 			result.Updated++
-			if finding.IssueNumber > 0 {
+			if finding.IssueNumber > 0 && !options.DisableIssuePublication {
 				if s.enqueueLocked(outboxForFinding(OutboxCloseIssue, finding, manifest, now)) {
 					result.OutboxCreated++
 				}
 			}
-			s.auditLocked(LifecycleAuditEntry{Action: "resolve_finding", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "authoritative target-ref absence"})
+			if err := audit(LifecycleAuditEntry{Action: "resolve_finding", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "authoritative target-ref absence"}); err != nil {
+				return result, err
+			}
 			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 			continue
 		}
@@ -384,7 +414,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		}
 		if deferredReason != "" {
 			result.Deferred++
-			s.auditLocked(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: deferredReason})
+			if err := audit(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: deferredReason}); err != nil {
+				return result, err
+			}
 			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 			continue
 		}
@@ -397,7 +429,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			}
 		} else if !publicationSet[observation.RepositoryFingerprint] {
 			result.Deferred++
-			s.auditLocked(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "active issue work-in-progress limit reached"})
+			if err := audit(LifecycleAuditEntry{Action: "defer_open_issue", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "active issue work-in-progress limit reached"}); err != nil {
+				return result, err
+			}
 			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 			continue
 		}
@@ -422,20 +456,24 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				if ownerReopened {
 					ownerAction = OutboxReopenIssue
 				}
-				if s.enqueueLocked(outboxForFinding(ownerAction, owner, manifest, now)) {
+				if !options.DisableIssuePublication && s.enqueueLocked(outboxForFinding(ownerAction, owner, manifest, now)) {
 					result.OutboxCreated++
 				}
 				result.Updated++
 				result.FindingIDs = append(result.FindingIDs, owner.RepositoryFingerprint)
-				s.auditLocked(LifecycleAuditEntry{Action: string(ownerAction), Allowed: true, Repository: owner.Repository, RepositoryFingerprint: owner.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "updated the existing exact-root publication owner"})
+				if err := audit(LifecycleAuditEntry{Action: string(ownerAction), Allowed: true, Repository: owner.Repository, RepositoryFingerprint: owner.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: "updated the existing exact-root publication owner"}); err != nil {
+					return result, err
+				}
 				result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 				continue
 			}
 		}
-		if s.enqueueLocked(outboxForFinding(action, finding, manifest, now)) {
+		if !options.DisableIssuePublication && s.enqueueLocked(outboxForFinding(action, finding, manifest, now)) {
 			result.OutboxCreated++
 		}
-		s.auditLocked(LifecycleAuditEntry{Action: string(action), Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID})
+		if err := audit(LifecycleAuditEntry{Action: string(action), Allowed: true, Repository: finding.Repository, RepositoryFingerprint: finding.RepositoryFingerprint, BundleID: manifest.BundleID}); err != nil {
+			return result, err
+		}
 		result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 	}
 
@@ -456,7 +494,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				continue
 			}
 			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
-				s.auditLocked(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: reason})
+				if err := audit(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: reason}); err != nil {
+					return result, err
+				}
 				continue
 			}
 			finding.Status = StatusResolved
@@ -468,11 +508,13 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			setVerificationEvidence(finding, manifest, options)
 			result.Resolved++
 			result.Updated++
-			if finding.IssueNumber > 0 && s.enqueueLocked(outboxForFinding(OutboxCloseIssue, finding, manifest, now)) {
+			if finding.IssueNumber > 0 && !options.DisableIssuePublication && s.enqueueLocked(outboxForFinding(OutboxCloseIssue, finding, manifest, now)) {
 				result.OutboxCreated++
 			}
 			result.FindingIDs = append(result.FindingIDs, key)
-			s.auditLocked(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: "omitted from exhaustive evaluated-contract inventory"})
+			if err := audit(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: "omitted from exhaustive evaluated-contract inventory"}); err != nil {
+				return result, err
+			}
 		}
 	}
 
@@ -732,6 +774,10 @@ func severityRank(value string) int {
 
 func issueKindRank(value string) int {
 	switch value {
+	case RepositoryTestFailureKind:
+		// A failing repository plan blocks every repair PR check and therefore
+		// must consume a bounded WIP slot before non-blocking quality findings.
+		return 5
 	case "visual_regression", "selector_contract_failure", "screenshot_diff", "mutation_survivor", "test_adequacy_gap", "accessibility_failure", "console_error", "network_error", "security_failure":
 		return 4
 	case "workflow_safety", "provider_governance":
@@ -753,6 +799,46 @@ func (s *LifecycleStore) PendingOutbox() []OutboxEntry {
 		}
 	}
 	return entries
+}
+
+// CancelPendingIssuePublication durably consumes issue side effects when an
+// operator downgrades the installation to advisory authority. Findings and
+// beads remain intact; no GitHub mutation is attempted or implied.
+func (s *LifecycleStore) CancelPendingIssuePublication(reason string) (int, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return 0, fmt.Errorf("outbox cancellation reason is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backup := cloneLifecycleState(s.state)
+	now := time.Now().UTC()
+	cancelled := 0
+	for _, entry := range s.state.Outbox {
+		if entry == nil || entry.CompletedAt != nil {
+			continue
+		}
+		entry.CompletedAt = &now
+		entry.LastError = "cancelled without publication: " + truncate(reason, 1900)
+		if err := s.auditLockedStrict(LifecycleAuditEntry{
+			Action: "cancel_issue_publication", Allowed: true, Repository: entry.Repository,
+			RepositoryFingerprint: entry.RepositoryFingerprint, BundleID: entry.BundleID,
+			Detail: truncate(reason, 4096),
+		}); err != nil {
+			s.state = backup
+			return 0, err
+		}
+		cancelled++
+	}
+	if cancelled == 0 {
+		return 0, nil
+	}
+	s.state.UpdatedAt = now
+	if err := s.persistLocked(); err != nil {
+		s.state = backup
+		return 0, err
+	}
+	return cancelled, nil
 }
 
 func (s *LifecycleStore) Snapshot() LifecycleState {
@@ -785,6 +871,14 @@ func (s *LifecycleStore) MarkOutboxAttempt(id string, actionErr error) error {
 		entry.LastError = ""
 		entry.CompletedAt = &now
 	}
+	detail := fmt.Sprintf("outbox=%s action=%s attempt=%d completed=%t", entry.ID, entry.Action, entry.Attempts, actionErr == nil)
+	if actionErr != nil {
+		detail += " error=" + entry.LastError
+	}
+	if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "outbox_" + string(entry.Action), Allowed: actionErr == nil, Repository: entry.Repository, RepositoryFingerprint: entry.RepositoryFingerprint, BundleID: entry.BundleID, Detail: detail}); err != nil {
+		s.state = backup
+		return err
+	}
 	s.state.UpdatedAt = time.Now().UTC()
 	if err := s.persistLocked(); err != nil {
 		s.state = backup
@@ -794,6 +888,10 @@ func (s *LifecycleStore) MarkOutboxAttempt(id string, actionErr error) error {
 }
 
 func (s *LifecycleStore) RecordAuthorization(repositoryFingerprint, action string, allowed bool, detail string) {
+	_ = s.RecordAuthorizationStrict(repositoryFingerprint, action, allowed, detail)
+}
+
+func (s *LifecycleStore) RecordAuthorizationStrict(repositoryFingerprint, action string, allowed bool, detail string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	finding := s.state.Findings[repositoryFingerprint]
@@ -802,7 +900,42 @@ func (s *LifecycleStore) RecordAuthorization(repositoryFingerprint, action strin
 		entry.Repository = finding.Repository
 		entry.BundleID = finding.LastBundleID
 	}
-	s.auditLocked(entry)
+	return s.auditLockedStrict(entry)
+}
+
+// BindIssueWriter durably records the immutable author identity used to own a
+// lifecycle issue before any remote issue mutation. Authentication may rotate,
+// but issue discovery, update, closure, and uninstall remain bound to this
+// original GitHub user identity.
+func (s *LifecycleStore) BindIssueWriter(repositoryFingerprint string, writerID int64, writerLogin string) error {
+	writerLogin = strings.TrimSpace(writerLogin)
+	if writerID <= 0 || writerLogin == "" {
+		return fmt.Errorf("immutable lifecycle issue writer ID and login are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backup := cloneLifecycleState(s.state)
+	finding := s.state.Findings[repositoryFingerprint]
+	if finding == nil {
+		return fmt.Errorf("finding %s not found", repositoryFingerprint)
+	}
+	if finding.IssueWriterID > 0 || strings.TrimSpace(finding.IssueWriterLogin) != "" {
+		if finding.IssueWriterID != writerID || !strings.EqualFold(strings.TrimSpace(finding.IssueWriterLogin), writerLogin) {
+			return fmt.Errorf("finding %s is already bound to immutable lifecycle issue writer %s/%d", repositoryFingerprint, finding.IssueWriterLogin, finding.IssueWriterID)
+		}
+		return nil
+	}
+	finding.IssueWriterID, finding.IssueWriterLogin = writerID, writerLogin
+	if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "bind_issue_writer", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID, Detail: fmt.Sprintf("writer=%s/%d", writerLogin, writerID)}); err != nil {
+		s.state = backup
+		return err
+	}
+	s.state.UpdatedAt = time.Now().UTC()
+	if err := s.persistLocked(); err != nil {
+		s.state = backup
+		return err
+	}
+	return nil
 }
 
 func (s *LifecycleStore) MarkIssueOpened(repositoryFingerprint string, number int, issueURL string) error {
@@ -1070,11 +1203,14 @@ func (s *LifecycleStore) ResetStalePostMergeVerification(repositoryFingerprint, 
 	finding.ClosedAt = nil
 	finding.ValidationRunID = ""
 	finding.ValidationRunURL = ""
-	s.auditLocked(LifecycleAuditEntry{
+	if err := s.auditLockedStrict(LifecycleAuditEntry{
 		Action: "reset_stale_post_merge_verification", Allowed: true, Repository: finding.Repository,
 		RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID,
 		Detail: fmt.Sprintf("discarded stale verification run %s at %s", runID, commitSHA),
-	})
+	}); err != nil {
+		s.state = backup
+		return err
+	}
 	s.state.UpdatedAt = now
 	if err := s.persistLocked(); err != nil {
 		s.state = backup
@@ -1106,18 +1242,24 @@ func (s *LifecycleStore) MarkIssueClosed(repositoryFingerprint string, beadStore
 		return fmt.Errorf("finding %s not found", repositoryFingerprint)
 	}
 	if finding.Status != StatusResolved {
-		s.auditLocked(LifecycleAuditEntry{Action: "issue_closed", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, Detail: "finding is not resolved"})
+		if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "issue_closed", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID, Detail: "finding is not resolved"}); err != nil {
+			return err
+		}
 		return fmt.Errorf("cannot close issue from %s", finding.Status)
 	}
 	now := time.Now().UTC()
 	finding.Status, finding.ClosedAt = StatusIssueClosed, &now
 	finding.ManualReviewKind, finding.ManualReviewReason, finding.HumanReviewRequired = "", "", false
+	if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "issue_closed", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID, Detail: fmt.Sprintf("issue=%d verification_run=%s merge=%s", finding.IssueNumber, finding.ValidationRunID, finding.MergeSHA)}); err != nil {
+		s.state = backup
+		return err
+	}
 	if finding.BeadID != "" {
 		if err := beadStore.Close(finding.BeadID); err != nil {
+			s.state = backup
 			return err
 		}
 	}
-	s.auditLocked(LifecycleAuditEntry{Action: "issue_closed", Allowed: true, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint})
 	s.state.UpdatedAt = now
 	if err := s.persistLocked(); err != nil {
 		s.state = backup
@@ -1145,10 +1287,16 @@ func (s *LifecycleStore) updateFinding(repositoryFingerprint, action string, upd
 		return fmt.Errorf("finding %s not found", repositoryFingerprint)
 	}
 	if err := update(finding); err != nil {
-		s.auditLocked(LifecycleAuditEntry{Action: action, Allowed: false, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, Detail: err.Error()})
+		if auditErr := s.auditLockedStrict(LifecycleAuditEntry{Action: action, Allowed: false, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID, Detail: err.Error()}); auditErr != nil {
+			return auditErr
+		}
 		return err
 	}
-	s.auditLocked(LifecycleAuditEntry{Action: action, Allowed: true, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint})
+	detail := fmt.Sprintf("status=%s issue=%d pr=%d repair=%s merge=%s validation_run=%s bundle_digest=%s", finding.Status, finding.IssueNumber, finding.PRNumber, finding.RepairCommitSHA, finding.MergeSHA, finding.ValidationRunID, finding.LastBundleDigest)
+	if err := s.auditLockedStrict(LifecycleAuditEntry{Action: action, Allowed: true, Repository: finding.Repository, RepositoryFingerprint: repositoryFingerprint, BundleID: finding.LastBundleID, Detail: detail}); err != nil {
+		s.state = backup
+		return err
+	}
 	s.state.UpdatedAt = time.Now().UTC()
 	if err := s.persistLocked(); err != nil {
 		s.state = backup
@@ -1209,6 +1357,9 @@ func (s *LifecycleStore) load() error {
 		s.state.Outbox = []*OutboxEntry{}
 	}
 	for _, finding := range s.state.Findings {
+		if finding != nil && (finding.IssueWriterID > 0) != (strings.TrimSpace(finding.IssueWriterLogin) != "") {
+			return fmt.Errorf("lifecycle finding %s has a partial immutable issue writer identity", finding.RepositoryFingerprint)
+		}
 		if finding != nil && finding.Status == StatusIssueClosed && (finding.HumanReviewRequired || finding.ManualReviewKind != "" || finding.ManualReviewReason != "") {
 			finding.HumanReviewRequired, finding.ManualReviewKind, finding.ManualReviewReason = false, "", ""
 			migrated = true
@@ -1228,29 +1379,126 @@ func (s *LifecycleStore) persistLocked() error {
 		return fmt.Errorf("marshal lifecycle state: %w", err)
 	}
 	temporary := s.statePath + ".tmp"
-	if err := os.WriteFile(temporary, append(data, '\n'), 0o600); err != nil {
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lifecycle state transaction: %w", err)
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporary)
+		}
+	}()
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("write lifecycle state: %w", err)
 	}
-	if err := os.Rename(temporary, s.statePath); err != nil {
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync lifecycle state: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close lifecycle state transaction: %w", err)
+	}
+	if err := durableReplaceLifecycleFile(temporary, s.statePath); err != nil {
 		return fmt.Errorf("publish lifecycle state: %w", err)
 	}
+	removeTemporary = false
+	return nil
+}
+
+func (s *LifecycleStore) auditLockedStrict(entry LifecycleAuditEntry) error {
+	entry.Timestamp = time.Now().UTC()
+	entry.ReceiptID = lifecycleAuditReceipt(entry)
+	if s.auditReceipts[entry.ReceiptID] {
+		return nil
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshal lifecycle audit receipt: %w", err)
+	}
+	info, statErr := os.Lstat(s.auditPath)
+	if statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("Visual Hive lifecycle audit path is linked or non-regular")
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect lifecycle audit path: %w", statErr)
+	}
+	created := errors.Is(statErr, os.ErrNotExist)
+	file, err := os.OpenFile(s.auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lifecycle audit: %w", err)
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write lifecycle audit receipt: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync lifecycle audit receipt: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close lifecycle audit receipt: %w", err)
+	}
+	if created {
+		if err := syncLifecycleParentDirectory(s.auditPath); err != nil {
+			return err
+		}
+	}
+	s.auditReceipts[entry.ReceiptID] = true
 	return nil
 }
 
 func (s *LifecycleStore) auditLocked(entry LifecycleAuditEntry) {
-	entry.Timestamp = time.Now().UTC()
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return
+	_ = s.auditLockedStrict(entry)
+}
+
+func lifecycleAuditReceipt(entry LifecycleAuditEntry) string {
+	entry.Timestamp = time.Time{}
+	entry.ReceiptID = ""
+	data, _ := json.Marshal(entry)
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func (s *LifecycleStore) loadAuditReceipts() error {
+	file, err := os.Open(s.auditPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	file, err := os.OpenFile(s.auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return
+		return fmt.Errorf("open lifecycle audit receipts: %w", err)
 	}
 	defer file.Close()
-	writer := bufio.NewWriter(file)
-	_, _ = writer.Write(append(data, '\n'))
-	_ = writer.Flush()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect lifecycle audit receipts: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("Visual Hive lifecycle audit path is linked or non-regular")
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	line := 0
+	for scanner.Scan() {
+		line++
+		var entry LifecycleAuditEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return fmt.Errorf("parse lifecycle audit receipt line %d: %w", line, err)
+		}
+		receipt := strings.TrimSpace(entry.ReceiptID)
+		if receipt == "" {
+			receipt = lifecycleAuditReceipt(entry)
+		}
+		if len(receipt) != sha256.Size*2 {
+			return fmt.Errorf("lifecycle audit receipt line %d has invalid identity", line)
+		}
+		s.auditReceipts[receipt] = true
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read lifecycle audit receipts: %w", err)
+	}
+	return nil
 }
 
 func (s *LifecycleStore) sortStateLocked() {
@@ -1401,8 +1649,9 @@ func refsEquivalent(left, right string) bool {
 }
 
 func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions, presentRoots map[string]bool) (bool, string) {
-	allowed, reason := resolutionAllowed(finding, manifest, targetRef, options)
-	if !allowed || finding == nil || finding.RootCauseKey == "" || finding.IssueNumber <= 0 {
+	resolutionSubject := s.publicationResolutionSubjectLocked(finding)
+	allowed, reason := resolutionAllowed(resolutionSubject, manifest, targetRef, options)
+	if !allowed || finding == nil || finding.RootCauseKey == "" {
 		return allowed, reason
 	}
 	if presentRoots[finding.RootCauseKey] {
@@ -1412,11 +1661,28 @@ func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, 
 		if related == nil || related == finding || related.RootCauseKey != finding.RootCauseKey || !strings.EqualFold(related.Repository, finding.Repository) || related.Status == StatusResolved || related.Status == StatusIssueClosed {
 			continue
 		}
-		if relatedAllowed, relatedReason := resolutionAllowed(related, manifest, targetRef, options); !relatedAllowed {
+		if relatedAllowed, relatedReason := resolutionAllowed(s.publicationResolutionSubjectLocked(related), manifest, targetRef, options); !relatedAllowed {
 			return false, fmt.Sprintf("root %q is not authoritatively absent: %s", finding.RootCauseKey, relatedReason)
 		}
 	}
 	return true, ""
+}
+
+// A deferred derivative is part of its canonical publication rather than an
+// independent issue. Some derivative handoff observations intentionally have
+// no affected contract of their own. Resolve them from the canonical owner's
+// exact contract and post-merge verification proof; otherwise the metadata-only
+// derivative can permanently prevent the canonical issue from closing after
+// the root disappears from an exhaustive scan.
+func (s *LifecycleStore) publicationResolutionSubjectLocked(finding *FindingLifecycle) *FindingLifecycle {
+	if finding == nil || finding.IssueNumber > 0 || len(finding.AffectedContracts) != 0 || finding.PublicationRole != "derivative" || finding.PublicationFingerprint == "" || finding.RootCauseKey == "" {
+		return finding
+	}
+	owner := s.state.Findings[finding.PublicationFingerprint]
+	if owner == nil || owner == finding || owner.PublicationRole != "canonical" || owner.RootCauseKey != finding.RootCauseKey || !strings.EqualFold(owner.Repository, finding.Repository) || owner.IssueNumber <= 0 {
+		return finding
+	}
+	return owner
 }
 
 func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions) (bool, string) {

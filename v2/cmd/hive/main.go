@@ -40,6 +40,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/notify"
 	"github.com/kubestellar/hive/v2/pkg/policies"
 	"github.com/kubestellar/hive/v2/pkg/proxy"
+	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/scheduler"
 	"github.com/kubestellar/hive/v2/pkg/snapshot"
 	"github.com/kubestellar/hive/v2/pkg/tokens"
@@ -52,6 +53,9 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == repair.ContainmentProbeCommand {
+		os.Exit(repair.RunContainmentProbeChild())
+	}
 	if len(os.Args) > 1 && os.Args[1] == "visual" {
 		os.Exit(runVisualCommand(os.Args[2:]))
 	}
@@ -60,7 +64,7 @@ func main() {
 	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "setup", "status", "doctor", "start", "stop", "daemon", "pause", "resume", "run", "approve-merge", "revoke-merge-approval", "retry-repair", "recover-dispatch", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
+		case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
 			os.Exit(runIntegratedCommand(os.Args[1], os.Args[2:]))
 		}
 	}

@@ -33,6 +33,7 @@ type WorkflowDispatchIntent struct {
 	RepositoryID                string    `json:"repository_id"`
 	WorkflowFile                string    `json:"workflow_file"`
 	Ref                         string    `json:"ref"`
+	Operation                   string    `json:"operation,omitempty"`
 	CorrelationID               string    `json:"correlation_id"`
 	ExpectedDisplayTitle        string    `json:"expected_display_title"`
 	PreparedAt                  time.Time `json:"prepared_at"`
@@ -53,20 +54,31 @@ type WorkflowDispatchIntent struct {
 }
 
 func newWorkflowDispatchIntent(config Config, workflowFile, ref string) (WorkflowDispatchIntent, error) {
+	return newWorkflowDispatchIntentForOperation(config, workflowFile, ref, "production", "", time.Time{})
+}
+
+func newWorkflowDispatchIntentForOperation(config Config, workflowFile, ref, operation, correlation string, preparedAt time.Time) (WorkflowDispatchIntent, error) {
 	buffer := make([]byte, 32)
-	if _, err := rand.Read(buffer); err != nil {
-		return WorkflowDispatchIntent{}, fmt.Errorf("generate workflow dispatch correlation: %w", err)
+	if strings.TrimSpace(correlation) == "" {
+		if _, err := rand.Read(buffer); err != nil {
+			return WorkflowDispatchIntent{}, fmt.Errorf("generate workflow dispatch correlation: %w", err)
+		}
+		correlation = hex.EncodeToString(buffer)
 	}
-	correlation := hex.EncodeToString(buffer)
+	if preparedAt.IsZero() {
+		preparedAt = time.Now().UTC()
+	}
+	correlation = strings.ToLower(strings.TrimSpace(correlation))
 	intent := WorkflowDispatchIntent{
 		SchemaVersion:        WorkflowDispatchSchema,
 		Repository:           strings.TrimSpace(config.Repository),
 		RepositoryID:         strings.TrimSpace(config.RepositoryID),
 		WorkflowFile:         strings.TrimSpace(workflowFile),
 		Ref:                  strings.TrimSpace(ref),
+		Operation:            strings.TrimSpace(operation),
 		CorrelationID:        correlation,
 		ExpectedDisplayTitle: workflowDispatchDisplayTitle(correlation),
-		PreparedAt:           time.Now().UTC(),
+		PreparedAt:           preparedAt.UTC(),
 	}
 	if err := validateWorkflowDispatchIntent(intent); err != nil {
 		return WorkflowDispatchIntent{}, err
@@ -80,6 +92,9 @@ func workflowDispatchDisplayTitle(correlation string) string {
 
 func (s *Store) SaveWorkflowDispatchIntent(intent WorkflowDispatchIntent) error {
 	intent.SchemaVersion = WorkflowDispatchSchema
+	if strings.TrimSpace(intent.Operation) == "" {
+		intent.Operation = "production"
+	}
 	if !intent.DispatchAttemptedAt.IsZero() && intent.RequestDigest == "" {
 		digest, err := workflowDispatchRequestDigest(intent)
 		if err != nil {
@@ -109,6 +124,9 @@ func (s *Store) LoadWorkflowDispatchIntent() (WorkflowDispatchIntent, bool, erro
 	if err := json.Unmarshal(data, &intent); err != nil {
 		return WorkflowDispatchIntent{}, false, fmt.Errorf("decode workflow dispatch intent: %w", err)
 	}
+	if strings.TrimSpace(intent.Operation) == "" {
+		intent.Operation = "production"
+	}
 	if err := validateWorkflowDispatchIntent(intent); err != nil {
 		return WorkflowDispatchIntent{}, false, err
 	}
@@ -121,7 +139,7 @@ func (s *Store) DeleteWorkflowDispatchIntent() error {
 
 func validateWorkflowDispatchIntent(intent WorkflowDispatchIntent) error {
 	if intent.SchemaVersion != WorkflowDispatchSchema || strings.TrimSpace(intent.Repository) == "" || strings.TrimSpace(intent.RepositoryID) == "" ||
-		strings.TrimSpace(intent.WorkflowFile) == "" || strings.TrimSpace(intent.Ref) == "" || !workflowDispatchCorrelationPattern.MatchString(intent.CorrelationID) ||
+		strings.TrimSpace(intent.WorkflowFile) == "" || strings.TrimSpace(intent.Ref) == "" || (intent.Operation != "production" && intent.Operation != setupBaselineWorkflowOperation) || !workflowDispatchCorrelationPattern.MatchString(intent.CorrelationID) ||
 		intent.ExpectedDisplayTitle != workflowDispatchDisplayTitle(intent.CorrelationID) || intent.PreparedAt.IsZero() {
 		return fmt.Errorf("workflow dispatch intent is incomplete or invalid")
 	}
@@ -165,13 +183,14 @@ func workflowDispatchRequestDigest(intent WorkflowDispatchIntent) (string, error
 		RepositoryID         string    `json:"repository_id"`
 		WorkflowFile         string    `json:"workflow_file"`
 		Ref                  string    `json:"ref"`
+		Operation            string    `json:"operation,omitempty"`
 		CorrelationID        string    `json:"correlation_id"`
 		ExpectedDisplayTitle string    `json:"expected_display_title"`
 		PreparedAt           time.Time `json:"prepared_at"`
 		AttemptedAt          time.Time `json:"attempted_at"`
 	}{
 		SchemaVersion: intent.SchemaVersion, Repository: intent.Repository, RepositoryID: intent.RepositoryID,
-		WorkflowFile: intent.WorkflowFile, Ref: intent.Ref, CorrelationID: intent.CorrelationID,
+		WorkflowFile: intent.WorkflowFile, Ref: intent.Ref, Operation: dispatchDigestOperation(intent.Operation), CorrelationID: intent.CorrelationID,
 		ExpectedDisplayTitle: intent.ExpectedDisplayTitle, PreparedAt: intent.PreparedAt, AttemptedAt: intent.DispatchAttemptedAt,
 	}
 	data, err := json.Marshal(record)
@@ -186,10 +205,21 @@ func WorkflowDispatchNeedsRecovery(intent WorkflowDispatchIntent) bool {
 	return !intent.DispatchAttemptedAt.IsZero() && intent.DispatchAcknowledgedAt.IsZero() && intent.RunID == 0
 }
 
+func dispatchDigestOperation(operation string) string {
+	if strings.TrimSpace(operation) == "" || operation == "production" {
+		return ""
+	}
+	return strings.TrimSpace(operation)
+}
+
 func validateWorkflowDispatchBinding(intent WorkflowDispatchIntent, config Config, workflowFile, ref string) error {
+	return validateWorkflowDispatchOperationBinding(intent, config, workflowFile, ref, "production")
+}
+
+func validateWorkflowDispatchOperationBinding(intent WorkflowDispatchIntent, config Config, workflowFile, ref, operation string) error {
 	if intent.Repository != strings.TrimSpace(config.Repository) || intent.RepositoryID != strings.TrimSpace(config.RepositoryID) ||
-		intent.WorkflowFile != strings.TrimSpace(workflowFile) || intent.Ref != strings.TrimSpace(ref) {
-		return fmt.Errorf("durable workflow dispatch intent is bound to a different repository, workflow, or ref")
+		intent.WorkflowFile != strings.TrimSpace(workflowFile) || intent.Ref != strings.TrimSpace(ref) || intent.Operation != strings.TrimSpace(operation) {
+		return fmt.Errorf("durable workflow dispatch intent is bound to a different repository, workflow, ref, or operation")
 	}
 	return nil
 }

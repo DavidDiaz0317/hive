@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +37,7 @@ func TestRefreshOwnedRepairBranchPrunesStaleStateAndKeepsAttempt(t *testing.T) {
 		return head
 	}
 	mutationCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		head := remoteHead()
 		mergeableState := "clean"
@@ -53,7 +52,7 @@ func TestRefreshOwnedRepairBranchPrunesStaleStateAndKeepsAttempt(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/19":
-			_, _ = fmt.Fprintf(writer, `{"number":19,"html_url":"https://github.com/owner/repo/pull/19","state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable":true,"mergeable_state":%q,"head":{"ref":%q,"sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, mergeableState, branch, head, baseSHA)
+			_, _ = fmt.Fprintf(writer, `{"number":19,"changed_files":1,"html_url":"https://github.com/owner/repo/pull/19","state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable":true,"mergeable_state":%q,"head":{"ref":%q,"sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, mergeableState, branch, head, baseSHA)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/19/files":
 			_, _ = io.WriteString(writer, `[{"filename":"visual-hive.config.yaml"}]`)
 		case request.Method == http.MethodPut && request.URL.Path == "/repos/owner/repo/pulls/19/update-branch":
@@ -276,7 +275,7 @@ func TestRepairRefreshWALRecoversBeforeAndAfterExactLeasePush(t *testing.T) {
 				}
 				return strings.TrimSpace(string(data))
 			}
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				writer.Header().Set("Content-Type", "application/json")
 				switch request.URL.Path {
 				case "/repos/owner/repo":
@@ -284,7 +283,7 @@ func TestRepairRefreshWALRecoversBeforeAndAfterExactLeasePush(t *testing.T) {
 				case "/repos/owner/repo/branches/main/protection":
 					_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"checks":[{"context":"visual-hive","app_id":42}]},"enforce_admins":{"enabled":true}}`)
 				case "/repos/owner/repo/pulls/19":
-					_, _ = fmt.Fprintf(writer, `{"number":19,"state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable_state":"clean","head":{"ref":%q,"sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, branch, remoteHead(), baseSHA)
+					_, _ = fmt.Fprintf(writer, `{"number":19,"changed_files":1,"state":"open","merged":false,"body":"<!-- hive-repair: finding -->","mergeable_state":"clean","head":{"ref":%q,"sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, branch, remoteHead(), baseSHA)
 				case "/repos/owner/repo/pulls/19/files":
 					_, _ = io.WriteString(writer, `[{"filename":"visual-hive.config.yaml"}]`)
 				default:
