@@ -19,12 +19,13 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     outputs:
       release_version: ${{ steps.metadata.outputs.release_version }}
       release_tag: ${{ steps.metadata.outputs.release_tag }}
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '16edc8ab5737314123cbad5823e63cfff0bad386' }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '8e73a5faae327ed2658933d681596e2f077032ce' }}
       RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || '' }}
       RELEASE_VERSION: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:
@@ -37,6 +38,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "DavidDiaz0317/hive" ]] || {
+            echo "Integrated releases are fork-only and may publish only from DavidDiaz0317/hive (got $GITHUB_REPOSITORY)." >&2
+            exit 1
+          }
           [[ "$VISUAL_HIVE_REF" =~ ^[a-f0-9]{40}$ ]]
           [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
           if [[ -n "$RELEASE_TAG" ]]; then
@@ -80,11 +85,11 @@ jobs:
           VISUAL_HIVE_GIT_COMMIT: ${{ env.VISUAL_HIVE_REF }}
         run: |
           npm ci
+          npx --no-install playwright install --with-deps chromium
           npm run build
           npm run typecheck
           npm test
           npm run lint
-          npx --no-install playwright install --with-deps chromium
           npm run demo:all
           node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
 
@@ -107,11 +112,58 @@ jobs:
             ["node-v${NODE_VERSION}-win-x64.zip"]="7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29"
           )
           for archive in "${!expected[@]}"; do
-            curl --fail --location --silent --show-error "$base/$archive" -o ".release/node/$archive"
+            curl --fail --location --silent --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors "$base/$archive" -o ".release/node/$archive"
             printf '%s  %s\n' "${expected[$archive]}" "$archive" | (cd .release/node && sha256sum --check --strict -)
           done
           tar -xJf ".release/node/node-v${NODE_VERSION}-linux-x64.tar.xz" -C .release/node
           unzip -q ".release/node/node-v${NODE_VERSION}-win-x64.zip" -d .release/node
+      - name: Assemble complete pinned Node runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          linux_source=".release/node/node-v${NODE_VERSION}-linux-x64"
+          windows_source=".release/node/node-v${NODE_VERSION}-win-x64"
+          linux_runtime="$GITHUB_WORKSPACE/.release/runtime-linux"
+          windows_runtime="$GITHUB_WORKSPACE/.release/runtime-windows"
+          mkdir -p "$linux_runtime/node_modules" "$windows_runtime/node_modules"
+          cp "$linux_source/bin/node" "$linux_runtime/node"
+          cp "$linux_source/LICENSE" "$linux_runtime/LICENSE.node.txt"
+          cp -RL "$linux_source/lib/node_modules/npm" "$linux_runtime/node_modules/npm"
+          cp -RL "$linux_source/lib/node_modules/corepack" "$linux_runtime/node_modules/corepack"
+          cp v2/runtime-launchers/linux/npm v2/runtime-launchers/linux/npx v2/runtime-launchers/linux/corepack \
+            v2/runtime-launchers/linux/pnpm v2/runtime-launchers/linux/pnpx v2/runtime-launchers/linux/yarn v2/runtime-launchers/linux/yarnpkg "$linux_runtime/"
+          chmod 0755 "$linux_runtime/node" "$linux_runtime/npm" "$linux_runtime/npx" "$linux_runtime/corepack" \
+            "$linux_runtime/pnpm" "$linux_runtime/pnpx" "$linux_runtime/yarn" "$linux_runtime/yarnpkg"
+
+          cp "$windows_source/node.exe" "$windows_runtime/node.exe"
+          cp "$windows_source/LICENSE" "$windows_runtime/LICENSE.node.txt"
+          cp "$windows_source/npm.cmd" "$windows_source/npx.cmd" "$windows_source/corepack.cmd" "$windows_runtime/"
+          cp -RL "$windows_source/node_modules/npm" "$windows_runtime/node_modules/npm"
+          cp -RL "$windows_source/node_modules/corepack" "$windows_runtime/node_modules/corepack"
+          cp v2/runtime-launchers/windows/pnpm.cmd v2/runtime-launchers/windows/pnpx.cmd \
+            v2/runtime-launchers/windows/yarn.cmd v2/runtime-launchers/windows/yarnpkg.cmd "$windows_runtime/"
+          if find "$linux_runtime" "$windows_runtime" -type l -print -quit | grep -q .; then
+            echo "Complete Node runtime contains a symbolic link" >&2
+            exit 1
+          fi
+          "$linux_runtime/node" "$linux_runtime/node_modules/npm/bin/npm-cli.js" --version
+          "$linux_runtime/node" "$linux_runtime/node_modules/corepack/dist/corepack.js" --version
+          runtime_digest_before="$(find "$linux_runtime" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"
+          export COREPACK_HOME="$RUNNER_TEMP/hive-release-corepack"
+          case "$COREPACK_HOME" in "$linux_runtime"/*) exit 1 ;; esac
+          "$linux_runtime/corepack" install --global pnpm@9.15.9
+          "$linux_runtime/corepack" install --global yarn@1.22.22
+          test "$("$linux_runtime/pnpm" --version)" = "9.15.9"
+          test "$("$linux_runtime/yarn" --version)" = "1.22.22"
+          pnpm_fixture="$RUNNER_TEMP/hive-pnpm-frozen"
+          yarn_fixture="$RUNNER_TEMP/hive-yarn-frozen"
+          mkdir -p "$pnpm_fixture" "$yarn_fixture"
+          printf '%s\n' '{"name":"hive-pnpm-smoke","private":true,"packageManager":"pnpm@9.15.9"}' > "$pnpm_fixture/package.json"
+          (cd "$pnpm_fixture" && "$linux_runtime/pnpm" install --lockfile-only --ignore-scripts && "$linux_runtime/pnpm" install --frozen-lockfile --ignore-scripts)
+          printf '%s\n' '{"name":"hive-yarn-smoke","private":true,"packageManager":"yarn@1.22.22"}' > "$yarn_fixture/package.json"
+          (cd "$yarn_fixture" && "$linux_runtime/yarn" install --ignore-scripts --non-interactive && "$linux_runtime/yarn" install --frozen-lockfile --ignore-scripts --non-interactive)
+          runtime_digest_after="$(find "$linux_runtime" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"
+          test "$runtime_digest_after" = "$runtime_digest_before"
       - name: Build Hive fork binaries
         working-directory: v2
         shell: bash
@@ -131,6 +183,7 @@ jobs:
             --hive "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --hive-commit "$GITHUB_SHA" \
             --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
             --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-linux-x64/bin/node" \
+            --node-runtime "$GITHUB_WORKSPACE/.release/runtime-linux" \
             --node-license "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-linux-x64/LICENSE" \
             --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
             --target-os linux --target-arch amd64 --output "$linux_root"
@@ -138,6 +191,7 @@ jobs:
             --hive "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" --hive-commit "$GITHUB_SHA" \
             --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
             --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/node.exe" \
+            --node-runtime "$GITHUB_WORKSPACE/.release/runtime-windows" \
             --node-license "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/LICENSE" \
             --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
             --target-os windows --target-arch amd64 --output "$windows_root"
@@ -163,6 +217,12 @@ jobs:
           proof="$RUNNER_TEMP/hive-linux-release-smoke"
           HIVE_RELEASE_DIR="$GITHUB_WORKSPACE/.release/dist" HIVE_SKIP_ATTESTATION=1 \
             sh v2/test/integrated-installer-linux-release-smoke.sh .release/dist/install-integrated.sh "$RELEASE_VERSION" "$proof"
+      - name: Prove Linux persistent scheduler and installer transition harness
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/hive -run '^(TestSystemdServiceManagerInstallStartInspectAndUninstall|TestDaemonServiceLifecycleRecoversForcedKillAndUninstalls|TestInstallerTransitionDurablyStopsAndRestartsExactOwnedSchedulers)$' -count=1 -timeout 4m
       - name: Retain installer artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -182,10 +242,22 @@ jobs:
       contents: read
     needs: build
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.25.6
+          cache-dependency-path: v2/go.sum
+      - name: Prove persistent Windows scheduler recovery
+        working-directory: v2
+        shell: pwsh
+        env:
+          HIVE_TEST_WINDOWS_TASK_SCHEDULER: "1"
+          HIVE_TEST_WINDOWS_TASK_RESTART: "1"
+        run: go test ./cmd/hive -run '^TestWindowsPersistentDaemonStartsAndStopsThroughTaskScheduler$' -count=1 -timeout 4m
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hive-integrated-${{ github.sha }}
@@ -198,16 +270,224 @@ jobs:
           $work = Join-Path $env:RUNNER_TEMP "hive-windows-release-smoke"
           $install = Join-Path $work "installed"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
-          & ./.release/dist/install-integrated.ps1 -Version $env:RELEASE_VERSION -ReleaseDir .release/dist -SkipAttestation -NoPath -NoCodexSkill -InstallDir $install
-          & (Join-Path $install "runtime/node.exe") (Join-Path $install "visual-hive/visual-hive.mjs") --version
-          $plan = & (Join-Path $install "hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $work "state") --json | ConvertFrom-Json
-          if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Release Hive did not produce a valid setup plan." }
+          $originalPath = $env:PATH
+          $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $originalCodexHome = $env:CODEX_HOME
+          try {
+            $env:CODEX_HOME = Join-Path $work "codex-home"
+            $installOutput = (& ./.release/dist/install-integrated.ps1 -Version $env:RELEASE_VERSION -ReleaseDir .release/dist -SkipAttestation -InstallDir $install 6>&1 | Out-String)
+            $expectedHive = [IO.Path]::GetFullPath((Join-Path $install "hive.exe"))
+            $resolvedHive = (@(Get-Command hive -CommandType Application -ErrorAction Stop)[0]).Source
+            if ([IO.Path]::GetFullPath($resolvedHive) -ne $expectedHive) { throw "Default installer PATH did not resolve the activated Hive." }
+            if (-not (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "skills/hive/SKILL.md") -PathType Leaf)) { throw "Default installer did not install the Hive Codex skill." }
+            if ($installOutput -notmatch [regex]::Escape("& `"$expectedHive`" setup")) { throw "Installer did not print its exact absolute setup command." }
+            & (Join-Path $install "runtime/node.exe") (Join-Path $install "visual-hive/visual-hive.mjs") --version
+            $savedPath = $env:PATH
+            $env:PATH = (Join-Path $install "runtime") + ";" + (Join-Path $env:SystemRoot "System32") + ";" + $env:SystemRoot
+            foreach ($launcher in @("node.exe", "npm.cmd", "npx.cmd", "corepack.cmd", "pnpm.cmd", "pnpx.cmd", "yarn.cmd", "yarnpkg.cmd")) {
+              $resolved = (Get-Command $launcher -ErrorAction Stop).Source
+              if ([IO.Path]::GetFullPath($resolved) -ne [IO.Path]::GetFullPath((Join-Path $install "runtime/$launcher"))) { throw "Launcher escaped the installed runtime: $launcher -> $resolved" }
+            }
+            & (Join-Path $install "runtime/npm.cmd") --version
+            & (Join-Path $install "runtime/corepack.cmd") --version
+            $env:COREPACK_HOME = Join-Path $work "corepack-cache"
+            if ([IO.Path]::GetFullPath($env:COREPACK_HOME).StartsWith([IO.Path]::GetFullPath($install), [StringComparison]::OrdinalIgnoreCase)) { throw "Corepack cache must stay outside the immutable install." }
+            & (Join-Path $install "runtime/corepack.cmd") install --global pnpm@9.15.9
+            & (Join-Path $install "runtime/corepack.cmd") install --global yarn@1.22.22
+            if ((& (Join-Path $install "runtime/pnpm.cmd") --version).Trim() -ne "9.15.9") { throw "Bundled pnpm launcher failed." }
+            if ((& (Join-Path $install "runtime/yarn.cmd") --version).Trim() -ne "1.22.22") { throw "Bundled Yarn launcher failed." }
+            $env:PATH = $savedPath
+            $plan = & (Join-Path $install "hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $work "state") --json | ConvertFrom-Json
+            if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Release Hive did not produce a valid setup plan." }
+          } finally {
+            $env:PATH = $originalPath
+            [Environment]::SetEnvironmentVariable("Path", $originalUserPath, "User")
+            $env:CODEX_HOME = $originalCodexHome
+          }
           & ./v2/test/integrated-installer-windows-failure-smoke.ps1 -Installer ./.release/dist/install-integrated.ps1 -ReleaseDir .release/dist -Version $env:RELEASE_VERSION -WorkRoot (Join-Path $work "failure-smoke")
 
+  provider-containment:
+    permissions:
+      contents: read
+    needs: build
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.25.6
+          cache-dependency-path: v2/go.sum
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.1
+      - name: Install Linux containment prerequisite
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends apparmor-profiles bubblewrap
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test -r "$profile"
+          sudo apparmor_parser -r "$profile"
+          test -x "$(command -v bwrap)"
+      - name: Install exact reviewed native Codex artifact (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hive-codex-gate"
+          cd "$RUNNER_TEMP/hive-codex-gate"
+          npm install --ignore-scripts --no-save @openai/codex@0.144.1
+          codex_path="$(find "$RUNNER_TEMP/hive-codex-gate/node_modules/@openai" -type f -name codex -path '*/vendor/*' -print -quit)"
+          test -n "$codex_path"
+          chmod 500 "$codex_path"
+          printf '%s' "$codex_path" > "$RUNNER_TEMP/hive-real-codex-path"
+      - name: Install exact reviewed native Codex artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "hive-codex-gate"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          Push-Location $root
+          try { npm install --ignore-scripts --no-save @openai/codex@0.144.1 } finally { Pop-Location }
+          $codex = Get-ChildItem -LiteralPath (Join-Path $root "node_modules/@openai") -Recurse -File -Filter codex.exe |
+            Where-Object { $_.FullName -match '[\\/]vendor[\\/]' } | Select-Object -First 1
+          if (-not $codex) { throw "Exact native Codex artifact was not installed." }
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "hive-real-codex-path") -Value $codex.FullName -NoNewline
+      - name: Prove credential-free native Health and no-model containment (Linux)
+        if: runner.os == 'Linux'
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CODEX_HOME="$RUNNER_TEMP/hive-release-codex-empty-home"
+          mkdir -m 700 "$CODEX_HOME"
+          export HIVE_REAL_CODEX="$(cat "$RUNNER_TEMP/hive-real-codex-path")"
+          test "$($HIVE_REAL_CODEX --version)" = "codex-cli 0.144.1"
+          go test ./pkg/repair -run '^TestCodexProviderRealNoModelHealthPreflightWithoutAuthorization$' -count=1 -timeout 2m
+      - name: Prove credential-free native Health and no-model containment (Windows)
+        if: runner.os == 'Windows'
+        working-directory: v2
+        shell: pwsh
+        run: |
+          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP "hive-release-codex-empty-home"
+          New-Item -ItemType Directory -Path $env:CODEX_HOME -Force | Out-Null
+          $env:HIVE_REAL_CODEX = Get-Content -Raw (Join-Path $env:RUNNER_TEMP "hive-real-codex-path")
+          if ((& $env:HIVE_REAL_CODEX --version).Trim() -ne "codex-cli 0.144.1") { throw "Reviewed Codex version mismatch." }
+          go test ./pkg/repair -run '^TestCodexProviderRealNoModelHealthPreflightWithoutAuthorization$' -count=1 -timeout 2m
+
+  provider-authenticated-supplemental:
+    permissions:
+      contents: read
+    needs: build
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}
+    steps:
+      - name: Record optional authenticated gate is not configured
+        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 == ''
+        shell: bash
+        run: echo "Optional authenticated Codex release coverage is not configured; credential-free containment remains mandatory."
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        with:
+          go-version: 1.25.6
+          cache-dependency-path: v2/go.sum
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        with:
+          node-version: 22.23.1
+      - name: Install Linux containment prerequisite (supplemental)
+        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends apparmor-profiles bubblewrap
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test -r "$profile"
+          sudo apparmor_parser -r "$profile"
+          test -x "$(command -v bwrap)"
+      - name: Install exact reviewed native Codex artifact (Linux supplemental)
+        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/hive-codex-gate"
+          cd "$RUNNER_TEMP/hive-codex-gate"
+          npm install --ignore-scripts --no-save @openai/codex@0.144.1
+          codex_path="$(find node_modules/@openai -type f -name codex -path '*/vendor/*' -print -quit)"
+          test -n "$codex_path"
+          chmod 500 "$codex_path"
+          printf '%s' "$codex_path" > "$RUNNER_TEMP/hive-real-codex-path"
+      - name: Install exact reviewed native Codex artifact (Windows supplemental)
+        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "hive-codex-gate"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          Push-Location $root
+          try { npm install --ignore-scripts --no-save @openai/codex@0.144.1 } finally { Pop-Location }
+          $codex = Get-ChildItem -LiteralPath (Join-Path $root "node_modules/@openai") -Recurse -File -Filter codex.exe |
+            Where-Object { $_.FullName -match '[\\/]vendor[\\/]' } | Select-Object -First 1
+          if (-not $codex) { throw "Exact native Codex artifact was not installed." }
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "hive-real-codex-path") -Value $codex.FullName -NoNewline
+      - name: Install optional Codex authorization (Linux)
+        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CODEX_HOME="$RUNNER_TEMP/hive-release-codex-home"
+          mkdir -m 700 "$CODEX_HOME"
+          printf '%s' "$HIVE_RELEASE_CODEX_AUTH_JSON_B64" | base64 --decode > "$CODEX_HOME/auth.json"
+          chmod 600 "$CODEX_HOME/auth.json"
+      - name: Install optional Codex authorization (Windows)
+        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        shell: pwsh
+        run: |
+          $home = Join-Path $env:RUNNER_TEMP "hive-release-codex-home"
+          New-Item -ItemType Directory -Path $home -Force | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $home "auth.json"), [Convert]::FromBase64String($env:HIVE_RELEASE_CODEX_AUTH_JSON_B64))
+      - name: Prove authenticated structured containment (Linux supplemental)
+        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        working-directory: v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CODEX_HOME="$RUNNER_TEMP/hive-release-codex-home"
+          export HIVE_REAL_CODEX="$(cat "$RUNNER_TEMP/hive-real-codex-path")"
+          go test ./pkg/repair -run '^(TestCodexProviderRealWorktreeInstructionsAndToolsAreIsolated|TestCodexProviderRealStructuredContainmentDeniesReadWriteAndNetwork)$' -count=1 -timeout 8m
+      - name: Prove authenticated structured containment (Windows supplemental)
+        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        working-directory: v2
+        shell: pwsh
+        run: |
+          $env:CODEX_HOME = Join-Path $env:RUNNER_TEMP "hive-release-codex-home"
+          $env:HIVE_REAL_CODEX = Get-Content -Raw (Join-Path $env:RUNNER_TEMP "hive-real-codex-path")
+          go test ./pkg/repair -run '^(TestCodexProviderRealWorktreeInstructionsAndToolsAreIsolated|TestCodexProviderRealStructuredContainmentDeniesReadWriteAndNetwork)$' -count=1 -timeout 8m
+
   publish:
-    needs: [build, windows-smoke]
+    needs: [build, windows-smoke, provider-containment]
     if: github.event_name == 'push' && needs.build.outputs.release_tag != ''
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write

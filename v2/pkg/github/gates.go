@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	gh "github.com/google/go-github/v72/github"
 )
@@ -53,6 +54,7 @@ type PullRequestGate struct {
 	RequiredCheckStates          []string           `json:"required_check_states"`
 	RequiredCheckNames           []string           `json:"required_check_names"`
 	VisualHiveVerdictGreen       bool               `json:"visual_hive_verdict_green"`
+	VisualHiveRequired           bool               `json:"visual_hive_required"`
 	VisualHiveProvenanceVerified bool               `json:"visual_hive_provenance_verified"`
 	VisualHiveCheckState         string             `json:"visual_hive_check_state,omitempty"`
 	VisualHiveCheckRunID         int64              `json:"visual_hive_check_run_id,omitempty"`
@@ -272,7 +274,7 @@ func (c *Client) InspectPullRequestGate(ctx context.Context, repository string, 
 		gate.MergeableKnown, gate.Mergeable = true, pull.GetMergeable()
 	}
 	gate.Hold = gate.Draft || hasHoldLabel(pull.Labels)
-	gate.ChangedFiles, err = c.listPullRequestFiles(ctx, owner, repo, number)
+	gate.ChangedFiles, err = c.listPullRequestFiles(ctx, owner, repo, number, pull.GetChangedFiles())
 	if err != nil {
 		return gate, err
 	}
@@ -302,6 +304,7 @@ func (c *Client) InspectPullRequestGate(ctx context.Context, repository string, 
 	for _, required := range identities {
 		state := states[checkIdentityKey(required.Context, required.AppID)]
 		if exactCheckName(required.Context) == visualHivePullRequestContext && required.AppID == expectedVisualAppID {
+			gate.VisualHiveRequired = true
 			if !visualProofLoaded {
 				visualProof, visualProofFound, err = c.verifyPullRequestWorkflowCheck(ctx, owner, repo, pull, candidates[checkIdentityKey(required.Context, required.AppID)], expectedVisualAppID)
 				if err != nil {
@@ -333,13 +336,37 @@ func (c *Client) InspectPullRequestGate(ctx context.Context, repository string, 
 			gate.VisualHiveVerdictGreen = true
 		}
 	}
-	if rules.requiredReviews > 0 {
-		approvals, changesRequested, reviewErr := c.reviewState(ctx, owner, repo, number)
-		if reviewErr != nil {
-			return gate, reviewErr
+	// Bootstrap baseline review occurs before Hive activates its conservative
+	// required-check protection. Still prove the exact GitHub-Actions-App-bound
+	// Visual Hive PR workflow; normal merge policy continues to require branch
+	// protection separately and cannot use this as a protection bypass.
+	if !visualProofLoaded {
+		visualProof, visualProofFound, err = c.verifyPullRequestWorkflowCheck(ctx, owner, repo, pull, candidates[checkIdentityKey(visualHivePullRequestContext, expectedVisualAppID)], expectedVisualAppID)
+		if err != nil {
+			return gate, err
 		}
-		gate.HumanReviewRequired = approvals < rules.requiredReviews || changesRequested
+		state := "pending"
+		if visualProofFound {
+			state = visualProof.State
+			gate.VisualHiveProvenanceVerified = true
+			gate.VisualHiveCheckState = state
+			gate.VisualHiveCheckRunID = visualProof.CheckRunID
+			gate.VisualHiveWorkflowRunID = visualProof.WorkflowRunID
+			gate.VisualHiveWorkflowPath = visualProof.WorkflowPath
+			gate.VisualHiveWorkflowEvent = visualProof.WorkflowEvent
+			gate.VisualHiveVerdictGreen = state == "success"
+		}
+		gate.Checks = replaceRequiredCheckObservation(gate.Checks, CheckObservation{
+			ID: visualProof.CheckRunID, Name: visualHivePullRequestContext, State: state, URL: visualProof.URL, AppID: expectedVisualAppID,
+			ProvenanceVerified: visualProofFound, WorkflowRunID: visualProof.WorkflowRunID,
+			WorkflowPath: visualProof.WorkflowPath, WorkflowEvent: visualProof.WorkflowEvent,
+		})
 	}
+	approvals, changesRequested, reviewErr := c.reviewState(ctx, owner, repo, number)
+	if reviewErr != nil {
+		return gate, reviewErr
+	}
+	gate.HumanReviewRequired = approvals < rules.requiredReviews || changesRequested
 	return gate, nil
 }
 
@@ -445,6 +472,66 @@ func (c *Client) DeleteBaselineBranchExact(ctx context.Context, repository, bran
 	return c.deleteHiveBranchExact(ctx, repository, branch, expectedHeadSHA, "hive/baseline-")
 }
 
+// DeleteAuthorizerTransferBranchExact removes only the dedicated transfer ref
+// while it still points at the exact durable managed head. It is used by the
+// audited old-authorizer cancel path and never accepts a generic Hive branch.
+func (c *Client) DeleteAuthorizerTransferBranchExact(ctx context.Context, repository, branch, expectedHeadSHA string) (bool, error) {
+	return c.deleteHiveBranchExact(ctx, repository, branch, expectedHeadSHA, "hive/authorizer-transfer-")
+}
+
+// DeleteAuthorizerTransferBranchDescendantExact retires a transfer ref after
+// an audited cancellation when GitHub updated the PR branch. The current ref is
+// deleted only if GitHub proves the durable Hive commit is its ancestor.
+func (c *Client) DeleteAuthorizerTransferBranchDescendantExact(ctx context.Context, repository, branch, ownedAncestorSHA string) (bool, string, error) {
+	return c.deleteHiveBranchDescendantExact(ctx, repository, branch, ownedAncestorSHA, "hive/authorizer-transfer-")
+}
+
+// DeleteUninstallBranchDescendantExact is the equivalent exact descendant-only
+// retirement path for a cancelled uninstall cleanup ref.
+func (c *Client) DeleteUninstallBranchDescendantExact(ctx context.Context, repository, branch, ownedAncestorSHA string) (bool, string, error) {
+	return c.deleteHiveBranchDescendantExact(ctx, repository, branch, ownedAncestorSHA, "hive/uninstall-")
+}
+
+// DeleteSetupBaselineBranchDescendantExact retires only the dedicated setup
+// baseline review ref at an exact Hive-owned commit or proven descendant.
+func (c *Client) DeleteSetupBaselineBranchDescendantExact(ctx context.Context, repository, branch, ownedAncestorSHA string) (bool, string, error) {
+	return c.deleteHiveBranchDescendantExact(ctx, repository, branch, ownedAncestorSHA, "hive/setup-baseline-")
+}
+
+func (c *Client) deleteHiveBranchDescendantExact(ctx context.Context, repository, branch, ownedAncestorSHA, requiredPrefix string) (bool, string, error) {
+	owner, repo, err := splitFullRepository(repository)
+	if err != nil {
+		return false, "", err
+	}
+	branch = strings.TrimSpace(branch)
+	ownedAncestorSHA = strings.ToLower(strings.TrimSpace(ownedAncestorSHA))
+	if !strings.HasPrefix(branch, requiredPrefix) || !exactManagedSHA(ownedAncestorSHA) {
+		return false, "", fmt.Errorf("exact Hive %s branch and immutable owned ancestor are required", strings.TrimSuffix(strings.TrimPrefix(requiredPrefix, "hive/"), "-"))
+	}
+	ref, response, err := c.client.Git.GetRef(ctx, owner, repo, "heads/"+branch)
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("read Hive branch %s for descendant retirement: %w", branch, err)
+	}
+	currentHead := strings.ToLower(strings.TrimSpace(ref.GetObject().GetSHA()))
+	if ref.GetRef() != "refs/heads/"+branch || !exactManagedSHA(currentHead) {
+		return false, "", fmt.Errorf("Hive branch %s returned an invalid exact ref", branch)
+	}
+	if currentHead != ownedAncestorSHA {
+		comparison, _, err := c.client.Repositories.CompareCommits(ctx, owner, repo, ownedAncestorSHA, currentHead, nil)
+		if err != nil {
+			return false, currentHead, fmt.Errorf("prove Hive branch %s descends from owned commit %s: %w", branch, ownedAncestorSHA, err)
+		}
+		if !strings.EqualFold(comparison.GetStatus(), "ahead") || comparison.GetBehindBy() != 0 {
+			return false, currentHead, fmt.Errorf("refusing to delete moved Hive branch %s because %s is not a descendant of owned commit %s", branch, currentHead, ownedAncestorSHA)
+		}
+	}
+	deleted, err := c.deleteHiveBranchExact(ctx, repository, branch, currentHead, requiredPrefix)
+	return deleted, currentHead, err
+}
+
 func (c *Client) deleteHiveBranchExact(ctx context.Context, repository, branch, expectedHeadSHA, requiredPrefix string) (bool, error) {
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
@@ -471,26 +558,60 @@ func (c *Client) deleteHiveBranchExact(ctx context.Context, repository, branch, 
 	return true, nil
 }
 
-func (c *Client) listPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]string, error) {
-	files := []string{}
+const (
+	maxPullRequestFiles     = 3000
+	maxPullRequestFilePages = maxPullRequestFiles / 100
+	maxPullRequestReviews   = 10000
+	maxPullReviewPages      = maxPullRequestReviews / 100
+)
+
+func (c *Client) listPullRequestFiles(ctx context.Context, owner, repo string, number, expectedCount int) ([]string, error) {
+	if expectedCount < 0 || expectedCount > maxPullRequestFiles {
+		return nil, fmt.Errorf("pull request #%d reports %d changed files; Hive requires a complete inventory of at most %d files", number, expectedCount, maxPullRequestFiles)
+	}
+	files := make([]string, 0, expectedCount)
+	seen := make(map[string]struct{}, expectedCount)
 	options := &gh.ListOptions{PerPage: 100}
+	pages := 0
 	for {
+		pages++
+		if pages > maxPullRequestFilePages {
+			return nil, fmt.Errorf("file inventory for pull request #%d exceeded the bounded %d-page GitHub response", number, maxPullRequestFilePages)
+		}
 		page, response, err := c.client.PullRequests.ListFiles(ctx, owner, repo, number, options)
 		if err != nil {
 			return nil, fmt.Errorf("list files for pull request #%d: %w", number, err)
 		}
+		if response == nil {
+			return nil, fmt.Errorf("list files for pull request #%d returned no pagination metadata", number)
+		}
 		for _, file := range page {
-			if name := strings.TrimPrefix(file.GetFilename(), "./"); name != "" {
-				files = append(files, name)
+			name := strings.TrimPrefix(strings.TrimSpace(file.GetFilename()), "./")
+			if name == "" {
+				return nil, fmt.Errorf("file inventory for pull request #%d contains an empty path", number)
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return nil, fmt.Errorf("file inventory for pull request #%d contains duplicate path %s", number, name)
+			}
+			seen[name] = struct{}{}
+			files = append(files, name)
+			if len(files) > expectedCount {
+				return nil, fmt.Errorf("file inventory for pull request #%d exceeds the reported changed-file count %d", number, expectedCount)
 			}
 		}
 		if response.NextPage == 0 {
 			break
 		}
+		if response.NextPage <= options.Page {
+			return nil, fmt.Errorf("file inventory for pull request #%d returned non-progressing pagination", number)
+		}
 		options.Page = response.NextPage
 	}
+	if len(files) != expectedCount {
+		return nil, fmt.Errorf("file inventory for pull request #%d is incomplete: received %d of %d reported changed files", number, len(files), expectedCount)
+	}
 	sort.Strings(files)
-	return uniqueStrings(files), nil
+	return files, nil
 }
 
 func (c *Client) requiredMergeRules(ctx context.Context, owner, repo, branch string) (branchMergeRules, error) {
@@ -522,7 +643,7 @@ func (c *Client) requiredMergeRules(ctx context.Context, owner, repo, branch str
 	} else if response == nil || response.StatusCode != http.StatusNotFound {
 		return branchMergeRules{}, fmt.Errorf("read branch protection for %s: %w", branch, err)
 	}
-	branchRules, rulesResponse, rulesErr := c.client.Repositories.GetRulesForBranch(ctx, owner, repo, branch, &gh.ListOptions{PerPage: 100})
+	branchRules, rulesResponse, rulesErr := c.allRulesForBranch(ctx, owner, repo, branch)
 	if rulesErr != nil {
 		if rulesResponse != nil && rulesResponse.StatusCode == http.StatusNotFound {
 			return rules, nil
@@ -552,6 +673,49 @@ func (c *Client) requiredMergeRules(ctx context.Context, owner, repo, branch str
 		}
 	}
 	return rules, nil
+}
+
+func (c *Client) allRulesForBranch(ctx context.Context, owner, repo, branch string) (*gh.BranchRules, *gh.Response, error) {
+	combined := &gh.BranchRules{}
+	page := 1
+	var last *gh.Response
+	for page > 0 {
+		current, response, err := c.client.Repositories.GetRulesForBranch(ctx, owner, repo, branch, &gh.ListOptions{Page: page, PerPage: 100})
+		if err != nil {
+			return nil, response, err
+		}
+		last = response
+		if current != nil {
+			destination, source := reflect.ValueOf(combined).Elem(), reflect.ValueOf(current).Elem()
+			for index := 0; index < destination.NumField(); index++ {
+				if destination.Field(index).Kind() == reflect.Slice {
+					destination.Field(index).Set(reflect.AppendSlice(destination.Field(index), source.Field(index)))
+				}
+			}
+		}
+		if branchRuleCount(combined) > 512 {
+			return nil, response, fmt.Errorf("applicable branch rule inventory exceeds the strict 512-rule bound")
+		}
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+		page = response.NextPage
+	}
+	return combined, last, nil
+}
+
+func branchRuleCount(rules *gh.BranchRules) int {
+	if rules == nil {
+		return 0
+	}
+	value := reflect.ValueOf(rules).Elem()
+	total := 0
+	for index := 0; index < value.NumField(); index++ {
+		if value.Field(index).Kind() == reflect.Slice {
+			total += value.Field(index).Len()
+		}
+	}
+	return total
 }
 
 func (c *Client) checkObservations(ctx context.Context, owner, repo, sha string) ([]CheckObservation, map[string]string, map[string][]*gh.CheckRun, error) {
@@ -645,8 +809,12 @@ type pullRequestCheckProof struct {
 
 func (c *Client) verifyPullRequestWorkflowCheck(ctx context.Context, owner, repo string, pull *gh.PullRequest, candidates []*gh.CheckRun, expectedAppID int64) (pullRequestCheckProof, bool, error) {
 	for _, check := range candidates {
+		if check == nil {
+			continue
+		}
+		checkAssociationPresent, checkAssociationMatches := pullRequestAssociationStatus(check.PullRequests, pull)
 		if check.GetID() <= 0 || check.GetName() != visualHivePullRequestContext || check.GetApp().GetID() != expectedAppID ||
-			check.GetHeadSHA() != pull.GetHead().GetSHA() || check.GetCheckSuite().GetID() <= 0 || !pullRequestAssociationMatches(check.PullRequests, pull) {
+			check.GetHeadSHA() != pull.GetHead().GetSHA() || check.GetCheckSuite().GetID() <= 0 || (checkAssociationPresent && !checkAssociationMatches) {
 			continue
 		}
 		options := &gh.ListWorkflowRunsOptions{
@@ -711,18 +879,21 @@ func replaceRequiredCheckObservation(observations []CheckObservation, replacemen
 
 func exactPullRequestWorkflowRun(run *gh.WorkflowRun, repository string, pull *gh.PullRequest, check *gh.CheckRun) bool {
 	checkState := normalizeCheckState(check.GetStatus(), check.GetConclusion())
+	checkAssociationPresent, checkAssociationMatches := pullRequestAssociationStatus(check.PullRequests, pull)
+	runAssociationPresent, runAssociationMatches := pullRequestAssociationStatus(run.PullRequests, pull)
+	exactAssociation := (checkAssociationPresent || runAssociationPresent) && (!checkAssociationPresent || checkAssociationMatches) && (!runAssociationPresent || runAssociationMatches)
 	return run.GetID() > 0 && run.GetName() == visualHivePullRequestWorkflowName && exactWorkflowPath(run.GetPath()) == visualHivePullRequestWorkflowPath &&
 		run.GetEvent() == visualHivePullRequestEvent && run.GetHeadSHA() == pull.GetHead().GetSHA() &&
 		(pull.GetHead().GetRef() == "" || run.GetHeadBranch() == pull.GetHead().GetRef()) && run.GetCheckSuiteID() == check.GetCheckSuite().GetID() &&
 		normalizeCheckState(run.GetStatus(), run.GetConclusion()) == checkState &&
 		(run.GetRepository().GetFullName() == "" || strings.EqualFold(run.GetRepository().GetFullName(), repository)) &&
 		(run.GetHeadRepository().GetFullName() == "" || pull.GetHead().GetRepo().GetFullName() == "" || strings.EqualFold(run.GetHeadRepository().GetFullName(), pull.GetHead().GetRepo().GetFullName())) &&
-		pullRequestAssociationMatches(run.PullRequests, pull)
+		exactAssociation
 }
 
-func pullRequestAssociationMatches(associations []*gh.PullRequest, pull *gh.PullRequest) bool {
+func pullRequestAssociationStatus(associations []*gh.PullRequest, pull *gh.PullRequest) (bool, bool) {
 	if len(associations) == 0 {
-		return true
+		return false, false
 	}
 	for _, association := range associations {
 		if association.GetNumber() != pull.GetNumber() ||
@@ -732,9 +903,9 @@ func pullRequestAssociationMatches(associations []*gh.PullRequest, pull *gh.Pull
 			(association.GetBase().GetRef() != "" && association.GetBase().GetRef() != pull.GetBase().GetRef()) {
 			continue
 		}
-		return true
+		return true, true
 	}
-	return false
+	return true, false
 }
 
 func exactWorkflowPath(value string) string {
@@ -825,21 +996,63 @@ func uniqueRequiredCheckIdentities(checks []RequiredCheckIdentity) []RequiredChe
 }
 
 func (c *Client) reviewState(ctx context.Context, owner, repo string, number int) (int, bool, error) {
-	reviews, _, err := c.client.PullRequests.ListReviews(ctx, owner, repo, number, &gh.ListOptions{PerPage: 100})
-	if err != nil {
-		return 0, false, fmt.Errorf("list reviews for pull request #%d: %w", number, err)
+	type currentReview struct {
+		state       string
+		submittedAt time.Time
+		id          int64
 	}
-	latest := map[string]string{}
-	for _, review := range reviews {
-		login := strings.ToLower(review.GetUser().GetLogin())
-		if login != "" {
-			latest[login] = strings.ToLower(review.GetState())
+	latest := map[int64]currentReview{}
+	seen := map[int64]struct{}{}
+	options := &gh.ListOptions{PerPage: 100}
+	pages, total := 0, 0
+	for {
+		pages++
+		if pages > maxPullReviewPages {
+			return 0, false, fmt.Errorf("review inventory for pull request #%d exceeded the bounded %d-page GitHub response", number, maxPullReviewPages)
 		}
+		reviews, response, err := c.client.PullRequests.ListReviews(ctx, owner, repo, number, options)
+		if err != nil {
+			return 0, false, fmt.Errorf("list reviews for pull request #%d: %w", number, err)
+		}
+		if response == nil {
+			return 0, false, fmt.Errorf("list reviews for pull request #%d returned no pagination metadata", number)
+		}
+		for _, review := range reviews {
+			total++
+			if total > maxPullRequestReviews {
+				return 0, false, fmt.Errorf("review inventory for pull request #%d exceeds the bounded %d-review limit", number, maxPullRequestReviews)
+			}
+			reviewID, reviewerID := review.GetID(), review.GetUser().GetID()
+			if reviewID <= 0 || reviewerID <= 0 {
+				return 0, false, fmt.Errorf("review inventory for pull request #%d contains an incomplete immutable review identity", number)
+			}
+			if _, duplicate := seen[reviewID]; duplicate {
+				return 0, false, fmt.Errorf("review inventory for pull request #%d contains duplicate review ID %d", number, reviewID)
+			}
+			seen[reviewID] = struct{}{}
+			state := strings.ToLower(strings.TrimSpace(review.GetState()))
+			if state != "approved" && state != "changes_requested" {
+				continue
+			}
+			submittedAt := review.GetSubmittedAt().Time
+			candidate := currentReview{state: state, submittedAt: submittedAt, id: reviewID}
+			prior, exists := latest[reviewerID]
+			if !exists || candidate.submittedAt.After(prior.submittedAt) || candidate.submittedAt.Equal(prior.submittedAt) && candidate.id > prior.id {
+				latest[reviewerID] = candidate
+			}
+		}
+		if response.NextPage == 0 {
+			break
+		}
+		if response.NextPage <= options.Page {
+			return 0, false, fmt.Errorf("review inventory for pull request #%d returned non-progressing pagination", number)
+		}
+		options.Page = response.NextPage
 	}
 	approvals, changes := 0, false
-	for _, state := range latest {
-		approvals += boolInt(state == "approved")
-		changes = changes || state == "changes_requested"
+	for _, review := range latest {
+		approvals += boolInt(review.state == "approved")
+		changes = changes || review.state == "changes_requested"
 	}
 	return approvals, changes, nil
 }
@@ -848,9 +1061,10 @@ func classifyGatePaths(gate *PullRequestGate) {
 	for _, file := range gate.ChangedFiles {
 		lower := strings.ToLower(strings.ReplaceAll(file, "\\", "/"))
 		gate.WorkflowChanged = gate.WorkflowChanged || strings.HasPrefix(lower, ".github/workflows/")
-		gate.BaselineChanged = gate.BaselineChanged || strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__")
+		setupSnapshot := strings.HasPrefix(lower, ".visual-hive/snapshots/")
+		gate.BaselineChanged = gate.BaselineChanged || setupSnapshot || strings.Contains(lower, "baseline") || strings.Contains(lower, "__screenshots__")
 		baselineImage := strings.HasSuffix(lower, ".png") &&
-			(strings.HasPrefix(lower, "visual-hive.baselines/") || strings.Contains(lower, "/__screenshots__/"))
+			(setupSnapshot || strings.HasPrefix(lower, "visual-hive.baselines/") || strings.Contains(lower, "/__screenshots__/"))
 		if baselineImage {
 			// A reviewed snapshot may legitimately describe an auth or deploy
 			// screen. Its filename is not evidence that authentication or

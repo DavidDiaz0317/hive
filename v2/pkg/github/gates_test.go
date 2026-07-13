@@ -11,13 +11,30 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	gh "github.com/google/go-github/v72/github"
 )
+
+// newPullRequestGateTestServer supplies the empty review inventory used by
+// gate tests that are not specifically exercising review-state behavior.
+// Production inspection always reads this endpoint and fails closed if it is
+// unavailable, so the common fixture must model the endpoint explicitly.
+func newPullRequestGateTestServer(handler http.HandlerFunc) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/owner/repo/pulls/") && strings.HasSuffix(request.URL.Path, "/reviews") {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `[]`)
+			return
+		}
+		handler(writer, request)
+	}))
+}
 
 func TestInspectPullRequestGateAndMergeExactSHA(t *testing.T) {
 	mergeSHASeen := ""
 	pullReads := 0
 	diffReads := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
@@ -28,7 +45,7 @@ func TestInspectPullRequestGateAndMergeExactSHA(t *testing.T) {
 			_, _ = io.WriteString(writer, "diff --git a/tests/widget.test.ts b/tests/widget.test.ts\n-old\n+new\n")
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
 			pullReads++
-			_, _ = io.WriteString(writer, `{"number":7,"state":"open","draft":false,"html_url":"https://example.test/pull/7","mergeable":true,"mergeable_state":"clean","head":{"sha":"abc","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":7,"changed_files":1,"state":"open","draft":false,"html_url":"https://example.test/pull/7","mergeable":true,"mergeable_state":"clean","head":{"sha":"abc","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":[]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -86,6 +103,63 @@ func writePullRequestWorkflowRun(writer http.ResponseWriter, suiteID, runID int6
 	_, _ = fmt.Fprintf(writer, `{"total_count":1,"workflow_runs":[{"id":%d,"name":"Visual Hive PR","path":".github/workflows/visual-hive-pr.yml","event":"pull_request","head_branch":%q,"head_sha":%q,"status":%q,"conclusion":%q,"check_suite_id":%d,"repository":{"full_name":"owner/repo"},"head_repository":{"full_name":"owner/repo"},"pull_requests":[{"number":%d,"head":{"sha":%q,"ref":%q},"base":{"sha":%q,"ref":%q}}]}]}`, runID, headRef, head, status, conclusion, suiteID, number, head, headRef, base, baseRef)
 }
 
+func TestInspectPullRequestGateVerifiesVisualHiveProvenanceWithoutProtection(t *testing.T) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
+			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/9":
+			_, _ = io.WriteString(writer, `{"number":9,"changed_files":1,"state":"open","draft":false,"html_url":"https://example.test/pull/9","mergeable":true,"mergeable_state":"clean","head":{"sha":"bootstrap-head","ref":"hive/setup-baseline-123","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"bootstrap-base"},"labels":[]}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/9/files":
+			_, _ = io.WriteString(writer, `[{"filename":".visual-hive/snapshots/linux/home.png"}]`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
+			http.Error(writer, "missing", http.StatusNotFound)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/rules/branches/main":
+			http.Error(writer, "missing", http.StatusNotFound)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/commits/bootstrap-head/check-runs":
+			_, _ = io.WriteString(writer, `{"total_count":1,"check_runs":[{"id":901,"name":"visual-hive","app":{"id":42},"check_suite":{"id":902},"head_sha":"bootstrap-head","status":"completed","conclusion":"success","html_url":"https://example.test/run/903"}]}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/visual-hive-pr.yml/runs":
+			writePullRequestWorkflowRun(writer, 902, 903, 9, "bootstrap-head", "bootstrap-base", "hive/setup-baseline-123", "main", "success")
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/commits/bootstrap-head/status":
+			_, _ = io.WriteString(writer, `{"state":"success","statuses":[]}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/9/reviews":
+			_, _ = io.WriteString(writer, `[]`)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	gate, err := client.InspectPullRequestGate(context.Background(), "owner/repo", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gate.BranchProtectionConfigured || gate.BranchProtectionEnabled || gate.VisualHiveRequired || len(gate.RequiredCheckNames) != 0 || len(gate.RequiredCheckStates) != 0 {
+		t.Fatalf("unconfigured bootstrap acquired imaginary protection: %+v", gate)
+	}
+	if !gate.BaselineChanged || gate.SecuritySensitive || gate.DeploymentChanged || gate.WorkflowChanged {
+		t.Fatalf("hosted snapshot path was not classified as a restricted baseline-only change: %+v", gate)
+	}
+	if !gate.VisualHiveVerdictGreen || !gate.VisualHiveProvenanceVerified || gate.VisualHiveCheckState != "success" ||
+		gate.VisualHiveCheckRunID != 901 || gate.VisualHiveWorkflowRunID != 903 || gate.VisualHiveWorkflowPath != visualHivePullRequestWorkflowPath ||
+		gate.VisualHiveWorkflowEvent != visualHivePullRequestEvent {
+		t.Fatalf("unprotected exact Visual Hive workflow provenance was not verified: %+v", gate)
+	}
+}
+
+func TestClassifyGatePathsTreatsVisualHiveSnapshotsAsRestrictedBaselineImages(t *testing.T) {
+	gate := PullRequestGate{ChangedFiles: []string{".visual-hive/snapshots/linux/auth/deploy.png"}}
+	classifyGatePaths(&gate)
+	if !gate.BaselineChanged {
+		t.Fatal("Visual Hive hosted snapshot did not trigger the generic baseline merge restriction")
+	}
+	if gate.SecuritySensitive || gate.DeploymentChanged || gate.WorkflowChanged {
+		t.Fatalf("reviewed image filename was misclassified as application code: %+v", gate)
+	}
+}
+
 func TestMergePullRequestExactRejectsLiveRefDrift(t *testing.T) {
 	for name, live := range map[string]struct {
 		head   string
@@ -100,11 +174,11 @@ func TestMergePullRequestExactRejectsLiveRefDrift(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			mergeRequests := 0
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				writer.Header().Set("Content-Type", "application/json")
 				switch {
 				case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
-					_, _ = io.WriteString(writer, `{"number":7,"state":"`+live.state+`","head":{"sha":"`+live.head+`"},"base":{"ref":"`+live.branch+`","sha":"`+live.base+`"}}`)
+					_, _ = io.WriteString(writer, `{"number":7,"changed_files":1,"state":"`+live.state+`","head":{"sha":"`+live.head+`"},"base":{"ref":"`+live.branch+`","sha":"`+live.base+`"}}`)
 				case request.Method == http.MethodPut && request.URL.Path == "/repos/owner/repo/pulls/7/merge":
 					mergeRequests++
 					_, _ = io.WriteString(writer, `{"merged":true,"sha":"must-not-merge"}`)
@@ -137,7 +211,7 @@ func TestMergePullRequestExactRejectsCompleteGateDriftDuringDurableAuthorization
 		t.Run(change, func(t *testing.T) {
 			phase := "authorized"
 			mergeRequests := 0
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				writer.Header().Set("Content-Type", "application/json")
 				switch {
 				case request.URL.Path == "/apps/github-actions":
@@ -150,7 +224,7 @@ func TestMergePullRequestExactRejectsCompleteGateDriftDuringDurableAuthorization
 					if phase == "changed" && change == "hold added" {
 						labels = `[{"name":"do-not-merge"}]`
 					}
-					_, _ = fmt.Fprintf(writer, `{"number":7,"state":"open","draft":false,"mergeable":true,"mergeable_state":"clean","head":{"sha":"abc","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":%s}`, labels)
+					_, _ = fmt.Fprintf(writer, `{"number":7,"changed_files":1,"state":"open","draft":false,"mergeable":true,"mergeable_state":"clean","head":{"sha":"abc","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":%s}`, labels)
 				case request.URL.Path == "/repos/owner/repo/pulls/7/files":
 					_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 				case request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -197,7 +271,7 @@ func TestMergePullRequestExactRejectsCompleteGateDriftDuringDurableAuthorization
 
 func TestEnsureMinimumBranchProtectionCreatesOnlyWhenAbsent(t *testing.T) {
 	updates := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -238,7 +312,7 @@ func TestEnsureMinimumBranchProtectionRejectsUnboundExpectedIdentity(t *testing.
 
 func TestEnsureMinimumBranchProtectionRejectsExistingPolicyMissingVisualHive(t *testing.T) {
 	updates := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection" {
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["organization-ci"]},"required_pull_request_reviews":{"required_approving_review_count":2}}`)
@@ -259,7 +333,7 @@ func TestEnsureMinimumBranchProtectionRejectsExistingPolicyMissingVisualHive(t *
 
 func TestEnsureMinimumVisualHiveProtectionResolvesAndBindsGitHubActionsApp(t *testing.T) {
 	updates := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
@@ -292,7 +366,7 @@ func TestEnsureMinimumVisualHiveProtectionResolvesAndBindsGitHubActionsApp(t *te
 }
 
 func TestEnsureMinimumBranchProtectionRejectsNameOnlyVisualHive(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection" {
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":true,"contexts":["visual-hive"]},"enforce_admins":{"enabled":true}}`)
@@ -310,7 +384,7 @@ func TestEnsureMinimumBranchProtectionRejectsNameOnlyVisualHive(t *testing.T) {
 
 func TestEnsureMinimumBranchProtectionRejectsNonStrictExistingPolicy(t *testing.T) {
 	updates := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection" {
 			_, _ = io.WriteString(writer, `{"required_status_checks":{"strict":false,"contexts":["visual-hive"]}}`)
@@ -331,7 +405,7 @@ func TestEnsureMinimumBranchProtectionRejectsNonStrictExistingPolicy(t *testing.
 }
 
 func TestBranchProtectionDoesNotAssumeRulesetHasNoWriterBypass(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/repos/owner/repo/branches/main/protection":
@@ -352,13 +426,13 @@ func TestBranchProtectionDoesNotAssumeRulesetHasNoWriterBypass(t *testing.T) {
 }
 
 func TestInspectPullRequestGateUnionsClassicAndRulesetChecksButFailsClosedOnUnknownBypass(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/17":
-			_, _ = io.WriteString(writer, `{"number":17,"state":"open","mergeable":true,"head":{"sha":"head-17","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-17"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":17,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-17","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-17"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/17/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/exact.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -392,7 +466,7 @@ func TestInspectPullRequestGateUnionsClassicAndRulesetChecksButFailsClosedOnUnkn
 }
 
 func TestBranchProtectionFailsClosedForUnsupportedApplicableRulesetRule(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/repos/owner/repo/branches/main/protection":
@@ -412,9 +486,34 @@ func TestBranchProtectionFailsClosedForUnsupportedApplicableRulesetRule(t *testi
 	}
 }
 
+func TestApplicableBranchRulesAreExhaustivelyPaginated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path != "/repos/owner/repo/rules/branches/main" {
+			http.Error(writer, "unexpected", http.StatusNotFound)
+			return
+		}
+		if request.URL.Query().Get("page") == "2" {
+			_, _ = io.WriteString(writer, `[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"page-two-security","integration_id":77}],"strict_required_status_checks_policy":true}}]`)
+			return
+		}
+		writer.Header().Set("Link", fmt.Sprintf(`<http://%s%s?page=2&per_page=100>; rel="next"`, request.Host, request.URL.Path))
+		_, _ = io.WriteString(writer, `[{"type":"required_deployments","parameters":{"required_deployment_environments":["production"]}}]`)
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	rules, _, err := client.allRulesForBranch(context.Background(), "owner", "repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branchRuleCount(rules) != 2 || len(rules.RequiredStatusChecks) != 1 || rules.RequiredStatusChecks[0].Parameters.RequiredStatusChecks[0].Context != "page-two-security" {
+		t.Fatalf("applicable branch rules were truncated before page two: %+v", rules)
+	}
+}
+
 func TestDeleteRepairBranchRequiresExactUnmovedHead(t *testing.T) {
 	deleted := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-proof":
@@ -441,7 +540,7 @@ func TestDeleteRepairBranchRequiresExactUnmovedHead(t *testing.T) {
 
 func TestDeleteBaselineBranchRequiresExactReviewedHead(t *testing.T) {
 	deleted := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/baseline-proof":
@@ -468,13 +567,13 @@ func TestDeleteBaselineBranchRequiresExactReviewedHead(t *testing.T) {
 }
 
 func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/8":
-			_, _ = io.WriteString(writer, `{"number":8,"state":"open","draft":true,"mergeable":false,"head":{"sha":"def"},"base":{"ref":"main"},"labels":[{"name":"hold"}]}`)
+			_, _ = io.WriteString(writer, `{"number":8,"changed_files":4,"state":"open","draft":true,"mergeable":false,"head":{"sha":"def"},"base":{"ref":"main"},"labels":[{"name":"hold"}]}`)
 		case "/repos/owner/repo/pulls/8/files":
 			_, _ = io.WriteString(writer, `[{"filename":".github/workflows/release.yml"},{"filename":"tests/__screenshots__/home.png"},{"filename":"src/auth/session.ts"},{"filename":"deploy/app.yaml"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -499,13 +598,13 @@ func TestInspectPullRequestGateKeepsUnsafeAndPendingSignals(t *testing.T) {
 }
 
 func TestInspectPullRequestGateTreatsNonStrictProtectionAsUnsafe(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/11":
-			_, _ = io.WriteString(writer, `{"number":11,"state":"open","mergeable":true,"head":{"sha":"head-11"},"base":{"ref":"main","sha":"base-11"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":11,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-11"},"base":{"ref":"main","sha":"base-11"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/11/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -531,13 +630,13 @@ func TestInspectPullRequestGateTreatsNonStrictProtectionAsUnsafe(t *testing.T) {
 }
 
 func TestInspectPullRequestGateGreenProductionCannotMaskRedPRWorkflow(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/10":
-			_, _ = io.WriteString(writer, `{"number":10,"state":"open","mergeable":true,"head":{"sha":"same-head","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-10"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":10,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"same-head","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-10"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/10/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -575,13 +674,13 @@ func TestInspectPullRequestGateGreenProductionCannotMaskRedPRWorkflow(t *testing
 }
 
 func TestInspectPullRequestGateGreenManualCheckCannotMaskMissingPRWorkflow(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/12":
-			_, _ = io.WriteString(writer, `{"number":12,"state":"open","mergeable":true,"head":{"sha":"head-12","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-12"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":12,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-12","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-12"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/12/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -608,13 +707,13 @@ func TestInspectPullRequestGateGreenManualCheckCannotMaskMissingPRWorkflow(t *te
 }
 
 func TestInspectPullRequestGateRejectsWrongPRBaseAssociation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/13":
-			_, _ = io.WriteString(writer, `{"number":13,"state":"open","mergeable":true,"head":{"sha":"head-13","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-13"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":13,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-13","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-13"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/13/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/widget.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -641,13 +740,13 @@ func TestInspectPullRequestGateRejectsWrongPRBaseAssociation(t *testing.T) {
 }
 
 func TestInspectPullRequestGateUsesExactRequiredContextAndApp(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/14":
-			_, _ = io.WriteString(writer, `{"number":14,"state":"open","mergeable":true,"head":{"sha":"head-14","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-14"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":14,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-14","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-14"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/14/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/exact.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -674,13 +773,13 @@ func TestInspectPullRequestGateUsesExactRequiredContextAndApp(t *testing.T) {
 }
 
 func TestInspectPullRequestGateRejectsVisualHiveFromUnexpectedApp(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/16":
-			_, _ = io.WriteString(writer, `{"number":16,"state":"open","mergeable":true,"head":{"sha":"head-16"},"base":{"ref":"main","sha":"base-16"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":16,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-16"},"base":{"ref":"main","sha":"base-16"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/16/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/exact.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -705,13 +804,13 @@ func TestInspectPullRequestGateRejectsVisualHiveFromUnexpectedApp(t *testing.T) 
 }
 
 func TestInspectPullRequestGateRejectsAdminBypassProtection(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/15":
-			_, _ = io.WriteString(writer, `{"number":15,"state":"open","mergeable":true,"head":{"sha":"head-15"},"base":{"ref":"main","sha":"base-15"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":15,"changed_files":1,"state":"open","mergeable":true,"head":{"sha":"head-15"},"base":{"ref":"main","sha":"base-15"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/15/files":
 			_, _ = io.WriteString(writer, `[{"filename":"tests/exact.test.ts"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -748,13 +847,13 @@ func TestBaselineImageNameDoesNotImplyAuthCodeChange(t *testing.T) {
 }
 
 func TestInspectPullRequestGateReportsExternalMerge(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newPullRequestGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case "/repos/owner/repo/pulls/9":
-			_, _ = io.WriteString(writer, `{"number":9,"state":"closed","merged":true,"merge_commit_sha":"merge-123","merged_by":{"login":"outside-user"},"head":{"sha":"head-123","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":9,"changed_files":1,"state":"closed","merged":true,"merge_commit_sha":"merge-123","merged_by":{"login":"outside-user"},"head":{"sha":"head-123","ref":"feature","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-123"},"labels":[]}`)
 		case "/repos/owner/repo/pulls/9/files":
 			_, _ = io.WriteString(writer, `[{"filename":"index.html"}]`)
 		case "/repos/owner/repo/branches/main/protection":
@@ -778,5 +877,114 @@ func TestInspectPullRequestGateReportsExternalMerge(t *testing.T) {
 	}
 	if gate.Open || !gate.Merged || gate.MergeSHA != "merge-123" || gate.MergedBy != "outside-user" || gate.HeadSHA != "head-123" || gate.BaseSHA != "base-123" || !gate.VisualHiveVerdictGreen {
 		t.Fatalf("external merge signals were lost: %+v", gate)
+	}
+}
+
+func TestExactPullRequestWorkflowRunRequiresExactAssociationFromCheckOrRun(t *testing.T) {
+	head, base := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	repository := &gh.Repository{FullName: gh.Ptr("owner/repo")}
+	pull := &gh.PullRequest{
+		Number: gh.Ptr(7), Head: &gh.PullRequestBranch{Ref: gh.Ptr("hive/repair-proof"), SHA: gh.Ptr(head), Repo: repository},
+		Base: &gh.PullRequestBranch{Ref: gh.Ptr("main"), SHA: gh.Ptr(base), Repo: repository},
+	}
+	check := &gh.CheckRun{
+		ID: gh.Ptr(int64(101)), Name: gh.Ptr(visualHivePullRequestContext), HeadSHA: gh.Ptr(head),
+		Status: gh.Ptr("completed"), Conclusion: gh.Ptr("success"), CheckSuite: &gh.CheckSuite{ID: gh.Ptr(int64(501))},
+	}
+	run := &gh.WorkflowRun{
+		ID: gh.Ptr(int64(601)), Name: gh.Ptr(visualHivePullRequestWorkflowName), Path: gh.Ptr(visualHivePullRequestWorkflowPath),
+		Event: gh.Ptr(visualHivePullRequestEvent), HeadSHA: gh.Ptr(head), HeadBranch: gh.Ptr("hive/repair-proof"), CheckSuiteID: gh.Ptr(int64(501)),
+		Status: gh.Ptr("completed"), Conclusion: gh.Ptr("success"), Repository: repository, HeadRepository: repository,
+	}
+	if exactPullRequestWorkflowRun(run, "owner/repo", pull, check) {
+		t.Fatal("same-head check and workflow with both PR association arrays absent were accepted")
+	}
+	exactAssociation := &gh.PullRequest{Number: gh.Ptr(7), Head: pull.Head, Base: pull.Base}
+	check.PullRequests = []*gh.PullRequest{exactAssociation}
+	if !exactPullRequestWorkflowRun(run, "owner/repo", pull, check) {
+		t.Fatal("exact CheckRun PR/base association was not accepted when WorkflowRun association was absent")
+	}
+	wrongBase := &gh.PullRequest{Number: gh.Ptr(7), Head: pull.Head, Base: &gh.PullRequestBranch{Ref: gh.Ptr("release"), SHA: gh.Ptr(strings.Repeat("c", 40))}}
+	run.PullRequests = []*gh.PullRequest{wrongBase}
+	if exactPullRequestWorkflowRun(run, "owner/repo", pull, check) {
+		t.Fatal("same-head workflow associated with a different PR base was accepted")
+	}
+}
+
+func TestListPullRequestFilesRequiresCompleteBoundedUniqueInventory(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("page") {
+		case "", "0":
+			writer.Header().Set("Link", fmt.Sprintf("<%s/repos/owner/repo/pulls/7/files?page=2>; rel=\"next\"", "http://"+request.Host))
+			_, _ = io.WriteString(writer, `[{"filename":"tests/one.test.ts"}]`)
+		case "2":
+			_, _ = io.WriteString(writer, `[{"filename":"tests/two.test.ts"}]`)
+		default:
+			http.Error(writer, "unexpected page", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	files, err := client.listPullRequestFiles(context.Background(), "owner", "repo", 7, 2)
+	if err != nil || requests != 2 || len(files) != 2 || files[0] != "tests/one.test.ts" || files[1] != "tests/two.test.ts" {
+		t.Fatalf("complete inventory = %v requests=%d err=%v", files, requests, err)
+	}
+	if _, err := client.listPullRequestFiles(context.Background(), "owner", "repo", 7, maxPullRequestFiles+1); err == nil || !strings.Contains(err.Error(), "at most 3000") {
+		t.Fatalf("oversized changed-file count was not rejected before enumeration: %v", err)
+	}
+}
+
+func TestListPullRequestFilesRejectsCountMismatchAndDuplicates(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing":   `[{"filename":"tests/one.test.ts"}]`,
+		"duplicate": `[{"filename":"tests/one.test.ts"},{"filename":"tests/one.test.ts"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(writer, body)
+			}))
+			defer server.Close()
+			client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			if _, err := client.listPullRequestFiles(context.Background(), "owner", "repo", 7, 2); err == nil {
+				t.Fatal("non-exact changed-file inventory was accepted")
+			}
+		})
+	}
+}
+
+func TestReviewStatePaginatesAndUsesLatestDecisiveReviewPerImmutableUser(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("page") == "2" {
+			_, _ = io.WriteString(writer, `[{"id":102,"state":"CHANGES_REQUESTED","submitted_at":"2026-07-12T12:00:00Z","user":{"id":55,"login":"reviewer-renamed"}},{"id":103,"state":"APPROVED","submitted_at":"2026-07-12T12:01:00Z","user":{"id":77,"login":"other"}}]`)
+			return
+		}
+		writer.Header().Set("Link", fmt.Sprintf("<%s/repos/owner/repo/pulls/7/reviews?page=2>; rel=\"next\"", "http://"+request.Host))
+		_, _ = io.WriteString(writer, `[{"id":101,"state":"APPROVED","submitted_at":"2026-07-12T11:00:00Z","user":{"id":55,"login":"reviewer"}}]`)
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	approvals, changes, err := client.reviewState(context.Background(), "owner", "repo", 7)
+	if err != nil || approvals != 1 || !changes {
+		t.Fatalf("review state approvals=%d changes=%t err=%v", approvals, changes, err)
+	}
+}
+
+func TestReviewStateRejectsDuplicateReviewAcrossPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("page") != "2" {
+			writer.Header().Set("Link", fmt.Sprintf("<%s/repos/owner/repo/pulls/7/reviews?page=2>; rel=\"next\"", "http://"+request.Host))
+		}
+		_, _ = io.WriteString(writer, `[{"id":101,"state":"APPROVED","submitted_at":"2026-07-12T11:00:00Z","user":{"id":55,"login":"reviewer"}}]`)
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	if _, _, err := client.reviewState(context.Background(), "owner", "repo", 7); err == nil || !strings.Contains(err.Error(), "duplicate review ID") {
+		t.Fatalf("duplicate review inventory was not rejected: %v", err)
 	}
 }

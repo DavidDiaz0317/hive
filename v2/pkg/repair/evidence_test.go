@@ -2,6 +2,7 @@ package repair
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,15 +48,139 @@ func TestLoadEvidenceSummaryFiltersToFindingSignalAndContracts(t *testing.T) {
 	}
 }
 
-func TestLoadEvidenceSummaryRejectsCredentials(t *testing.T) {
+func TestLoadEvidenceSummaryBindsExactRepositoryTestFailure(t *testing.T) {
 	root := t.TempDir()
-	verdict := `{"allContributions":[{"source":"playwright","kind":"console_error","status":"failed","gating":true,"contractId":"app","reason":"github_pat_abcdefghijklmnopqrstuvwxyz123456","key":"playwright.console_error.app"}]}`
+	failed, err := visualhive.NewRepositoryTestResult("npm --prefix dashboard run test:all", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding := visualhive.FindingLifecycle{
+		Fingerprint: "repository-test:" + failed.Digest, RootCauseKey: "repository-test-failure/" + failed.Digest,
+		IssueKind: visualhive.RepositoryTestFailureKind, ValidationCommand: failed.Command, AffectedContracts: []string{failed.Contract},
+	}
+	summary, err := LoadEvidenceSummary(root, finding)
+	if err != nil || !strings.Contains(summary, "source=github_actions_job_step") || !strings.Contains(summary, "exit=nonzero") || !strings.Contains(summary, failed.Command) {
+		t.Fatalf("exact repository test evidence was not summarized: %q err=%v", summary, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "repository-tests.tsv"), []byte("0\tnpm --prefix dashboard run test:all\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if summaryAfterTamper, err := LoadEvidenceSummary(root, finding); err != nil || summaryAfterTamper != summary {
+		t.Fatalf("target-writable ledger influenced runner-owned repair evidence: before=%q after=%q err=%v", summary, summaryAfterTamper, err)
+	}
+	finding.ValidationCommand = "python -m pytest -q"
+	if _, err := LoadEvidenceSummary(root, finding); !errors.Is(err, ErrNoActionableEvidence) {
+		t.Fatalf("mismatched repository command was accepted: %v", err)
+	}
+	finding.ValidationCommand = failed.Command
+	finding.RootCauseKey += "-tampered"
+	if _, err := LoadEvidenceSummary(root, finding); !errors.Is(err, ErrNoActionableEvidence) {
+		t.Fatalf("tampered repository finding identity was accepted: %v", err)
+	}
+}
+
+func TestLoadEvidenceSummaryUsesCanonicalAPI500Contribution(t *testing.T) {
+	root := t.TempDir()
+	verdict := `{"schemaVersion":"visual-hive.verdict.v1","allContributions":[
+{"source":"mutation","kind":"mutation_adequacy","status":"failed","gating":true,"reason":"Mutation score 0% is below minimum 80%.","key":"mutation.mutation_adequacy"},
+{"source":"mutation","kind":"mutation_survivor","status":"failed","gating":true,"operator":"api-500","contractId":"dashboard-shell","targetId":"localPreview","reason":"api-500 survived selected contracts. Safe repository-scoped repair: update contract \"dashboard-shell\" in visual-hive.config.yaml so selectors.textMustNotExist includes the exact first-party marker \"visual-hive api-500 mutation\"; do not invent or replace this marker.","key":"mutation.mutation_survivor.api-500"},
+{"source":"mutation","kind":"mutation_survivor","status":"failed","gating":true,"operator":"empty-data","contractId":"dashboard-shell","targetId":"localPreview","reason":"unrelated survivor","key":"mutation.mutation_survivor.empty-data"}
+]}`
 	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(verdict), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{Title: "console_error", AffectedContracts: []string{"app"}})
-	if err == nil || !strings.Contains(err.Error(), "unsafe") {
-		t.Fatalf("expected credential rejection, got %v", err)
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "mutation_survivor", RootCauseKey: "mutation/api%2D500/localPreview/dashboard-shell",
+		Title: "[Visual Hive] Mutation survived: api-500", AffectedContracts: []string{"dashboard-shell"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "mutation.mutation_survivor.api-500") ||
+		!strings.Contains(summary, "visual-hive.config.yaml") ||
+		!strings.Contains(summary, "visual-hive api-500 mutation") ||
+		!strings.Contains(summary, "operator=api-500") ||
+		strings.Contains(summary, "empty-data") || strings.Contains(summary, "unrelated") {
+		t.Fatalf("unexpected canonical api-500 evidence summary: %s", summary)
+	}
+
+	legacySummary, legacyErr := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "mutation_survivor", Title: "[Visual Hive] Mutation survived: api-500", AffectedContracts: []string{"dashboard-shell"},
+	})
+	if legacyErr != nil || legacySummary != summary {
+		t.Fatalf("strict legacy title binding changed the exact summary: summary=%q err=%v", legacySummary, legacyErr)
+	}
+}
+
+func TestLoadEvidenceSummaryRejectsUnboundMutationContribution(t *testing.T) {
+	valid := `{"allContributions":[{"source":"mutation","kind":"mutation_survivor","status":"failed","gating":true,"operator":"api-500","contractId":"dashboard-shell","targetId":"localPreview","reason":"exact guidance","key":"mutation.mutation_survivor.api-500"}]}`
+	for _, test := range []struct {
+		name    string
+		verdict string
+		finding visualhive.FindingLifecycle
+	}{
+		{name: "missing operator", verdict: strings.Replace(valid, `"operator":"api-500",`, "", 1)},
+		{name: "wrong key", verdict: strings.Replace(valid, `mutation.mutation_survivor.api-500`, `mutation.mutation_survivor.empty-data`, 1)},
+		{name: "wrong source", verdict: strings.Replace(valid, `"source":"mutation"`, `"source":"triage"`, 1)},
+		{name: "wrong root operator", verdict: valid, finding: visualhive.FindingLifecycle{RootCauseKey: "mutation/empty-data/localPreview/dashboard-shell"}},
+		{name: "wrong root target", verdict: valid, finding: visualhive.FindingLifecycle{RootCauseKey: "mutation/api-500/deployPreview/dashboard-shell"}},
+		{name: "case changed root contract", verdict: valid, finding: visualhive.FindingLifecycle{RootCauseKey: "mutation/api-500/localPreview/Dashboard-shell"}},
+		{name: "case changed contribution contract", verdict: strings.Replace(valid, `"contractId":"dashboard-shell"`, `"contractId":"Dashboard-shell"`, 1)},
+		{name: "root and finding contract mismatch", verdict: valid, finding: visualhive.FindingLifecycle{RootCauseKey: "mutation/api-500/localPreview/other-shell"}},
+		{name: "invalid legacy title", verdict: valid, finding: visualhive.FindingLifecycle{Title: "Mutation needs review: api-500"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(test.verdict), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			finding := test.finding
+			finding.IssueKind = "mutation_survivor"
+			finding.AffectedContracts = []string{"dashboard-shell"}
+			if finding.RootCauseKey == "" && finding.Title == "" {
+				finding.RootCauseKey = "mutation/api-500/localPreview/dashboard-shell"
+			}
+			if _, err := LoadEvidenceSummary(root, finding); !errors.Is(err, ErrNoActionableEvidence) {
+				t.Fatalf("unbound mutation contribution was repairable: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadEvidenceSummaryEscapesMutationControlCharacters(t *testing.T) {
+	root := t.TempDir()
+	verdict := `{"allContributions":[{"source":"mutation","kind":"mutation_survivor","status":"failed","gating":true,"operator":"api-500","contractId":"dash\nboard","targetId":"local\tpreview","reason":"line one\r\nline two","key":"mutation.mutation_survivor.api-500"}]}`
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(verdict), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "mutation_survivor", Title: "[Visual Hive] Mutation survived: api-500",
+		AffectedContracts: []string{"dash\nboard"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(summary, "\r\n\t") || !strings.Contains(summary, `contract=dash\nboard`) || !strings.Contains(summary, `target=local\tpreview`) || !strings.Contains(summary, `reason=line one\r\nline two`) {
+		t.Fatalf("mutation evidence was not serialized as one safe line: %q", summary)
+	}
+}
+
+func TestLoadEvidenceSummaryRejectsCredentials(t *testing.T) {
+	tests := []struct{ value, rule string }{
+		{value: "github_pat_abcdefghijklmnopqrstuvwxyz123456", rule: "github-token-v1"},
+		{value: "AKIAABCDEFGHIJKLMNOP", rule: "aws-access-key-id-v1"},
+		{value: `clientSecret = "actual-operator-value-must-not-leave"`, rule: "sensitive-assignment-v2"},
+	}
+	for _, test := range tests {
+		root := t.TempDir()
+		verdict := `{"allContributions":[{"source":"playwright","kind":"console_error","status":"failed","gating":true,"contractId":"app","reason":` + fmt.Sprintf("%q", test.value) + `,"key":"playwright.console_error.app"}]}`
+		if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(verdict), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{Title: "console_error", AffectedContracts: []string{"app"}})
+		if err == nil || !strings.Contains(err.Error(), test.rule) || strings.Contains(err.Error(), test.value) {
+			t.Fatalf("expected non-disclosing credential rejection for %s, got %v", test.rule, err)
+		}
 	}
 }
 

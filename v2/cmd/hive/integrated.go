@@ -22,6 +22,8 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
+const defaultVisualHiveRepository = "DavidDiaz0317/visual-hive"
+
 func runIntegratedCommand(command string, args []string) int {
 	switch command {
 	case "setup":
@@ -36,6 +38,8 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedStop(args)
 	case "daemon":
 		return runIntegratedDaemon(args)
+	case "installer-transition":
+		return runInstallerTransition(args)
 	case "pause", "resume":
 		return runIntegratedPause(command, args)
 	case "set-coverage", "set-automation":
@@ -48,18 +52,95 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedRun(args)
 	case "approve-merge":
 		return runIntegratedApproveMerge(args)
+	case "approve-baseline":
+		return runIntegratedApproveBaseline(args)
 	case "revoke-merge-approval":
 		return runIntegratedRevokeMergeApproval(args)
 	case "retry-repair":
 		return runIntegratedRetryRepair(args)
 	case "recover-dispatch":
 		return runIntegratedRecoverDispatch(args)
+	case "transfer-setup-authorizer":
+		return runIntegratedAuthorizerTransfer(args)
 	case "upgrade", "rollback", "uninstall":
 		return runIntegratedManagement(command, args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown integrated Hive command %q\n", command)
 		return 2
 	}
+}
+
+func runIntegratedAuthorizerTransfer(args []string) int {
+	flags := flag.NewFlagSet("hive transfer-setup-authorizer", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
+	newAuthorizer := flags.String("new-authorizer", "", "exact GitHub login of the proposed human setup authorizer")
+	reason := flags.String("reason", "", "bounded accountable reason for transferring setup authority")
+	cancelTransfer := flags.Bool("cancel", false, "audit and abort an unmerged transfer, closing its exact PR and deleting its exact-head branch")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
+	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if !*cancelTransfer && (strings.TrimSpace(*newAuthorizer) == "" || strings.TrimSpace(*reason) == "") {
+		fmt.Fprintln(os.Stderr, "--new-authorizer and an accountable --reason are required")
+		return 2
+	}
+	token := resolveGitHubToken(*githubTokenEnv)
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "GitHub authorization is required")
+		return 2
+	}
+	daemon := readIntegratedDaemonStatus(*stateDir)
+	wasRunning := daemon.Running
+	restartInterval := 15 * time.Minute
+	if daemon.IntervalSeconds >= 60 {
+		restartInterval = time.Duration(daemon.IntervalSeconds) * time.Second
+	}
+	if wasRunning {
+		if _, err := stopIntegratedDaemon(*stateDir); err != nil {
+			fmt.Fprintln(os.Stderr, "setup authorizer transfer could not stop the persistent scheduler:", err)
+			return 1
+		}
+	}
+	client := hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), *githubAPIURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	result, err := integrated.RunAuthorizerTransfer(ctx, integrated.AuthorizerTransferOptions{
+		StateDir: *stateDir, NewAuthorizer: *newAuthorizer, Reason: *reason, Cancel: *cancelTransfer, GitHub: client,
+	})
+	if wasRunning {
+		if _, startErr := ensureIntegratedDaemonStarted(*stateDir, restartInterval); startErr != nil {
+			if err == nil {
+				fmt.Fprintln(os.Stderr, "setup authorizer transfer succeeded but scheduler restart failed:", startErr)
+				return 1
+			}
+		}
+	}
+	if err != nil {
+		if *jsonOutput {
+			_ = encodeJSON(map[string]any{"schema_version": "hive.setup-authorizer-transfer.v1", "error": err.Error(), "partial": result})
+		} else {
+			fmt.Fprintln(os.Stderr, "setup authorizer transfer failed:", err)
+		}
+		return 1
+	}
+	if *jsonOutput {
+		return encodeJSON(result)
+	}
+	if result.Completed {
+		fmt.Printf("Setup authorizer transferred to %s (numeric ID %d) after exact merge verification.\n", result.NewAuthorizerLogin, result.NewAuthorizerID)
+		return 0
+	}
+	if result.Cancelled {
+		fmt.Printf("Setup authorizer transfer cancelled; authority remains with %s (numeric ID %d).\n", result.OldAuthorizerLogin, result.OldAuthorizerID)
+		return 0
+	}
+	fmt.Printf("Setup authorizer transfer PR ready: %s\n", result.PRURL)
+	fmt.Printf("Local authority remains with %s (numeric ID %d). After the exact PR merges, run: %s\n", result.OldAuthorizerLogin, result.OldAuthorizerID, result.NextCommand)
+	fmt.Printf("To abort before merge through the supported audited path, run: %s\n", result.CancelCommand)
+	return 0
 }
 
 func runIntegratedRecoverDispatch(args []string) int {
@@ -226,6 +307,68 @@ func runIntegratedApproveMerge(args []string) int {
 	return 0
 }
 
+func runIntegratedApproveBaseline(args []string) int {
+	flags := flag.NewFlagSet("hive approve-baseline", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
+	repositoryID := flags.String("repo-id", "", "exact immutable repository ID returned by --plan")
+	runID := flags.Int64("run-id", 0, "exact hosted capture workflow run ID returned by --plan")
+	artifactID := flags.Int64("artifact-id", 0, "exact verified hosted artifact ID returned by --plan")
+	prNumber := flags.Int("pr", 0, "exact held setup baseline PR number returned by --plan")
+	headSHA := flags.String("head", "", "exact candidate-only PR head SHA returned by --plan")
+	baseSHA := flags.String("base", "", "exact reviewed base SHA returned by --plan")
+	diffDigest := flags.String("diff-digest", "", "exact reviewed raw diff SHA-256 returned by --plan")
+	candidateDigest := flags.String("candidate-digest", "", "exact hosted candidate list digest returned by --plan")
+	actorID := flags.Int64("actor-id", 0, "exact numeric setup authorizer ID returned by --plan")
+	planDigest := flags.String("plan-digest", "", "exact complete approval plan digest returned by --plan")
+	reason := flags.String("reason", "", "bounded accountable reason for approving the exact hosted baseline set")
+	planOnly := flags.Bool("plan", false, "read-only: inspect and bind every hosted artifact, PR, diff, candidate, and authorizer field")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
+	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if !*planOnly && (strings.TrimSpace(*repositoryID) == "" || *runID <= 0 || *artifactID <= 0 || *prNumber <= 0 || strings.TrimSpace(*headSHA) == "" ||
+		strings.TrimSpace(*baseSHA) == "" || strings.TrimSpace(*diffDigest) == "" || strings.TrimSpace(*candidateDigest) == "" || *actorID <= 0 ||
+		strings.TrimSpace(*planDigest) == "" || strings.TrimSpace(*reason) == "") {
+		fmt.Fprintln(os.Stderr, "apply requires every exact --repo-id, --run-id, --artifact-id, --pr, --head, --base, --diff-digest, --candidate-digest, --actor-id, --plan-digest, and --reason returned by --plan")
+		return 2
+	}
+	token := resolveGitHubToken(*githubTokenEnv)
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "GitHub authorization is required")
+		return 2
+	}
+	client := hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), *githubAPIURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	result, err := integrated.ApproveSetupBaseline(ctx, integrated.ApproveSetupBaselineOptions{
+		StateDir: *stateDir, PlanOnly: *planOnly, ExpectedRepositoryID: *repositoryID, ExpectedCaptureRunID: *runID, ExpectedArtifactID: *artifactID,
+		ExpectedPRNumber: *prNumber, ExpectedHeadSHA: *headSHA, ExpectedBaseSHA: *baseSHA, ExpectedDiffDigest: *diffDigest,
+		ExpectedCandidateDigest: *candidateDigest, ExpectedActorID: *actorID, ExpectedPlanDigest: *planDigest, Reason: *reason, GitHub: client,
+	})
+	if err != nil {
+		if *jsonOutput {
+			_ = encodeJSON(map[string]any{"schema_version": "hive.approve-setup-baseline.v1", "error": err.Error(), "partial": result})
+		} else {
+			fmt.Fprintln(os.Stderr, "approve setup baseline failed:", err)
+		}
+		return 1
+	}
+	if *jsonOutput {
+		return encodeJSON(result)
+	}
+	if result.Planned {
+		fmt.Printf("Setup baseline approval plan bound run %d, artifact %d, PR #%d, actor ID %d, and candidate digest %s. Apply: %s\n", result.CaptureRunID, result.ArtifactID, result.PRNumber, result.ActorID, result.CandidateDigest, result.ApplyCommand)
+	} else if result.Merged {
+		fmt.Printf("Approved and merged exact setup baselines at %s. Run: %s\n", result.MergeSHA, result.NextCommand)
+	} else {
+		fmt.Printf("Approved exact setup baselines; Hive will merge after all exact gates pass. Run: %s\n", result.NextCommand)
+	}
+	return 0
+}
+
 func runIntegratedRevokeMergeApproval(args []string) int {
 	flags := flag.NewFlagSet("hive revoke-merge-approval", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
@@ -272,7 +415,8 @@ func runIntegratedManagement(command string, args []string) int {
 	visualRef := ""
 	flags.StringVar(&visualRef, "version", "", "immutable Visual Hive commit SHA")
 	flags.StringVar(&visualRef, "visual-hive-ref", "", "immutable Visual Hive commit SHA")
-	deleteState := flags.Bool("delete-state", false, "permanently delete managed local state after opening the uninstall PR")
+	deleteState := flags.Bool("delete-state", false, "request exact post-merge uninstall finalization; preparation always preserves state")
+	cancelPending := flags.Bool("cancel", false, "cancel the exact pending unmerged uninstall cleanup and keep automation paused")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
@@ -281,6 +425,10 @@ func runIntegratedManagement(command string, args []string) int {
 	}
 	if command != "uninstall" && visualRef == "" && command != "rollback" {
 		fmt.Fprintln(os.Stderr, "--visual-hive-ref is required")
+		return 2
+	}
+	if *cancelPending && (command != "uninstall" || *deleteState) {
+		fmt.Fprintln(os.Stderr, "--cancel is only valid for uninstall and cannot be combined with --delete-state")
 		return 2
 	}
 	managementRuntimeCommand := ""
@@ -325,7 +473,7 @@ func runIntegratedManagement(command string, args []string) int {
 	}
 	token := resolveGitHubToken(*githubTokenEnv)
 	if token == "" {
-		if wasRunning && command != "uninstall" {
+		if wasRunning {
 			_, _ = ensureIntegratedDaemonStarted(*stateDir, restartInterval)
 		}
 		fmt.Fprintln(os.Stderr, "GitHub authorization is required")
@@ -337,10 +485,11 @@ func runIntegratedManagement(command string, args []string) int {
 	result, err := integrated.RunManagement(ctx, integrated.ManagementOptions{
 		Operation: integrated.ManagementOperation(command), StateDir: *stateDir, VisualHiveRef: visualRef,
 		VisualHiveCommand: managementRuntimeCommand, VisualHiveArgs: managementRuntimeArgs,
-		DeleteState: *deleteState, GitHub: client,
+		DeleteState: *deleteState, Cancel: *cancelPending, GitHub: client,
 	})
 	if err != nil {
-		if wasRunning && command != "uninstall" {
+		shouldRestart := shouldRestartManagementScheduler(command, *stateDir)
+		if wasRunning && shouldRestart {
 			_, _ = ensureIntegratedDaemonStarted(*stateDir, restartInterval)
 		}
 		if *jsonOutput {
@@ -359,12 +508,37 @@ func runIntegratedManagement(command string, args []string) int {
 	if *jsonOutput {
 		return encodeJSON(result)
 	}
+	if result.StateDeleted {
+		fmt.Printf("%s finalized; managed local state deleted after exact cleanup verification.\n", command)
+		return 0
+	}
+	if result.Cancelled {
+		fmt.Println("Pending uninstall cancelled; its exact unmerged PR/ref were retired and automation remains paused. Run hive resume explicitly or start uninstall again.")
+		return 0
+	}
+	if result.FinalizationPending {
+		if result.PRURL != "" {
+			fmt.Printf("%s cleanup PR ready: %s\n", command, result.PRURL)
+		} else {
+			fmt.Printf("%s target is already clean.\n", command)
+		}
+		fmt.Printf("State preserved. After the cleanup merge and lifecycle reconciliation, run: %s\n", result.NextCommand)
+		return 0
+	}
 	if result.Idempotent && result.PRURL == "" {
 		fmt.Printf("%s already at the requested state.\n", command)
 	} else {
 		fmt.Printf("%s PR ready: %s\n", command, result.PRURL)
 	}
 	return 0
+}
+
+func shouldRestartManagementScheduler(command, stateDir string) bool {
+	if command != "uninstall" {
+		return true
+	}
+	current, exists, err := loadExistingSetupConfig(stateDir)
+	return err == nil && exists && !current.Paused
 }
 
 func runIntegratedRun(args []string) int {
@@ -414,7 +588,7 @@ func runSetupCommand(args []string) int {
 	visualHive := flags.Bool("visual-hive", true, "install Visual Hive deterministic testing")
 	visualCommand := flags.String("visual-hive-command", "", "Visual Hive CLI launcher; defaults to the packaged runtime")
 	visualHome := flags.String("visual-hive-home", os.Getenv("HIVE_VISUAL_HIVE_HOME"), "directory containing an immutable Visual Hive release bundle")
-	visualRepo := flags.String("visual-hive-repo", valueOrEnv("VISUAL_HIVE_REPOSITORY", "DavidDiaz0317/visual-hive"), "Visual Hive source repository")
+	visualRepo := flags.String("visual-hive-repo", valueOrEnv("VISUAL_HIVE_REPOSITORY", defaultVisualHiveRepository), "Visual Hive source repository")
 	visualRef := flags.String("visual-hive-ref", os.Getenv("VISUAL_HIVE_REF"), "immutable Visual Hive commit SHA")
 	maxActiveIssues := flags.Int("max-active-issues", 5, "maximum concurrently open Hive-managed findings")
 	maxRepairAttempts := flags.Int("max-repair-attempts", 4, "maximum bounded model-backed repair attempts per finding")
@@ -427,8 +601,12 @@ func runSetupCommand(args []string) int {
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
 	var providerArgs stringListFlag
 	var visualArgs stringListFlag
+	var autoMergePaths stringListFlag
+	var autoMergeRisks stringListFlag
 	flags.Var(&providerArgs, "provider-arg", "repair provider launcher argument; repeatable")
 	flags.Var(&visualArgs, "visual-hive-arg", "Visual Hive launcher argument before the CLI subcommand; repeatable")
+	flags.Var(&autoMergePaths, "auto-merge-path", "repository-relative glob eligible for autonomous merge; repeatable (default: test-only paths)")
+	flags.Var(&autoMergeRisks, "auto-merge-risk", "eligible risk tier: automatic, low, medium, or restricted; repeatable (default: automatic)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -472,6 +650,11 @@ func runSetupCommand(args []string) int {
 	}
 	coverage := integrated.Coverage(strings.ToLower(strings.TrimSpace(*coverageValue)))
 	automationMode := integrated.Automation(strings.ToLower(strings.TrimSpace(*automationValue)))
+	parsedAutoMergeRisks, riskErr := parseAutoMergeRiskFlags(autoMergeRisks)
+	if riskErr != nil {
+		fmt.Fprintln(os.Stderr, "setup failed:", riskErr)
+		return 2
+	}
 	token := resolveGitHubToken(*githubTokenEnv)
 	var client *hivegithub.Client
 	if token != "" {
@@ -484,23 +667,13 @@ func runSetupCommand(args []string) int {
 			return 2
 		}
 	}
-	if !*planOnly && *visualHive {
-		resolvedCommand, resolvedArgs, resolveErr := resolveVisualHiveLauncher(*visualCommand, visualArgs, *visualHome)
+	if *visualHive {
+		resolvedCommand, resolvedArgs, resolvedRef, resolveErr := resolveSetupVisualHive(*visualCommand, visualArgs, *visualHome, *visualRef)
 		if resolveErr != nil {
 			fmt.Fprintln(os.Stderr, "setup failed:", resolveErr)
 			return 2
 		}
-		*visualCommand, visualArgs = resolvedCommand, resolvedArgs
-		if len(visualArgs) > 0 && filepath.Base(visualArgs[0]) == "visual-hive.mjs" {
-			manifest, manifestErr := integrated.ValidateVisualHiveRelease(visualArgs[0], *visualRef)
-			if manifestErr != nil {
-				fmt.Fprintln(os.Stderr, "setup failed:", manifestErr)
-				return 2
-			}
-			if *visualRef == "" {
-				*visualRef = manifest.GitCommit
-			}
-		}
+		*visualCommand, visualArgs, *visualRef = resolvedCommand, resolvedArgs, resolvedRef
 	}
 	if !*planOnly {
 		providerCtx, providerCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -516,6 +689,10 @@ func runSetupCommand(args []string) int {
 	restartInterval := *runInterval
 	if !*planOnly {
 		daemon := readIntegratedDaemonStatus(*stateDir)
+		if authErr := requirePersistentGitHubAuthorization(*start || daemon.Running); authErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", authErr)
+			return 2
+		}
 		if daemon.Running {
 			wasRunning = true
 			if daemon.IntervalSeconds >= 60 {
@@ -538,9 +715,13 @@ func runSetupCommand(args []string) int {
 		VisualHive: *visualHive, StateDir: *stateDir, Apply: !*planOnly, Start: shouldStart,
 		VisualHiveCommand: *visualCommand, VisualHiveArgs: append([]string(nil), visualArgs...),
 		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client,
-		MaxActiveIssues:   *maxActiveIssues,
-		MaxRepairAttempts: *maxRepairAttempts,
-		Policy:            automation.Policy{ACMMLevel: acmm, Mode: mode, AllowedRepositories: []string{*repository}, MaxRepairAttempts: *maxRepairAttempts},
+		MaxActiveIssues:        *maxActiveIssues,
+		MaxRepairAttempts:      *maxRepairAttempts,
+		AllowedAutoMergePaths:  append([]string(nil), autoMergePaths...),
+		AllowedAutoMergeRisk:   parsedAutoMergeRisks,
+		AutoMergePathsExplicit: explicit["auto-merge-path"],
+		AutoMergeRiskExplicit:  explicit["auto-merge-risk"],
+		Policy:                 automation.Policy{ACMMLevel: acmm, Mode: mode, AllowedRepositories: []string{*repository}, MaxRepairAttempts: *maxRepairAttempts},
 	})
 	if err != nil {
 		if wasRunning {
@@ -573,9 +754,28 @@ func runSetupCommand(args []string) int {
 			fmt.Println("Persistent Hive started; it will retry safely until the setup PR is merged, then complete trusted activation and the first production cycle.")
 		}
 	} else {
-		fmt.Printf("Setup plan for %s: coverage=%s automation=%s ACMM=L%d\n", result.Plan.Repository, result.Plan.Coverage, result.Plan.Automation, result.Plan.ACMMLevel)
+		fmt.Printf("Setup plan for %s: coverage=%s automation=%s ACMM=L%d Visual-Hive=%s@%s\n", result.Plan.Repository, result.Plan.Coverage, result.Plan.Automation, result.Plan.ACMMLevel, result.Plan.VisualHiveRepository, result.Plan.VisualHiveRef)
 	}
 	return 0
+}
+
+func parseAutoMergeRiskFlags(values []string) ([]automation.RiskTier, error) {
+	result := make([]automation.RiskTier, 0, len(values))
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "automatic":
+			result = append(result, automation.RiskAutomatic)
+		case "low":
+			result = append(result, automation.RiskLow)
+		case "medium":
+			result = append(result, automation.RiskMedium)
+		case "restricted":
+			result = append(result, automation.RiskRestricted)
+		default:
+			return nil, fmt.Errorf("auto-merge risk %q must be automatic, low, medium, or restricted", value)
+		}
+	}
+	return result, nil
 }
 
 func loadExistingSetupConfig(stateDir string) (integrated.Config, bool, error) {
@@ -681,11 +881,14 @@ func runIntegratedStatus(args []string) int {
 	providerErr := provider.Health(providerCtx)
 	providerCancel()
 	ready = ready && providerErr == nil
+	daemon := readIntegratedDaemonStatus(*stateDir)
+	daemonReady := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
+	ready = ready && daemonReady
 	status := map[string]any{
 		"schema_version": "hive.status.v1", "state_dir": *stateDir, "config": config, "paused": config.Paused, "pause_requested": pauseRequested, "production_ready": ready,
-		"readiness_checks": liveChecks, "provider_ready": providerErr == nil, "provider_message": errorOr(providerErr, "provider authenticated"),
+		"readiness_checks": liveChecks, "provider_ready": providerErr == nil, "provider_message": errorOr(providerErr, "provider authenticated"), "daemon_ready": daemonReady,
 	}
-	status["daemon"] = readIntegratedDaemonStatus(*stateDir)
+	status["daemon"] = daemon
 	if approval, exists, approvalErr := store.LoadMergeApproval(); approvalErr != nil {
 		status["merge_approval_error"] = approvalErr.Error()
 		status["production_ready"] = false
@@ -723,47 +926,67 @@ func runIntegratedStatus(args []string) int {
 	} else if exists {
 		status["repair_refresh"] = refresh
 	}
-	lifecyclePath := filepath.Join(*stateDir, "visual-hive", "visual-hive-lifecycle.json")
-	if _, statErr := os.Stat(lifecyclePath); statErr == nil {
-		if lifecycle, lifecycleErr := visualhive.NewLifecycleStore(filepath.Dir(lifecyclePath)); lifecycleErr == nil {
-			snapshot := lifecycle.Snapshot()
-			counts := map[visualhive.LifecycleStatus]int{}
-			items := []map[string]any{}
-			for _, finding := range snapshot.Findings {
-				if finding == nil {
-					continue
-				}
-				counts[finding.Status]++
-				item := map[string]any{
-					"fingerprint": finding.RepositoryFingerprint, "recurrence": finding.Recurrences, "status": finding.Status,
-					"issue_number": finding.IssueNumber, "issue_url": finding.IssueURL, "pr_number": finding.PRNumber, "pr_url": finding.PRURL,
-					"branch": finding.Branch, "repair_commit_sha": finding.RepairCommitSHA, "repair_attempts": finding.RepairAttempts,
-					"human_review_required": finding.HumanReviewRequired, "manual_review_kind": finding.ManualReviewKind, "manual_review_reason": finding.ManualReviewReason,
-				}
-				if finding.HumanReviewRequired && finding.ManualReviewKind == "merge_policy" && finding.PRNumber > 0 && strings.TrimSpace(finding.RepairCommitSHA) != "" {
-					item["next_command"] = fmt.Sprintf("hive approve-merge --state-dir %q --pr %d --head %s --plan --json", *stateDir, finding.PRNumber, finding.RepairCommitSHA)
-				}
-				items = append(items, item)
-			}
-			status["lifecycle"] = map[string]any{"counts": counts, "findings": items, "pending_outbox": len(lifecycle.PendingOutbox())}
+	if retirements, exists, retirementErr := store.LoadRepairBranchRetirements(); retirementErr != nil {
+		status["repair_branch_retirement_error"] = retirementErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		status["repair_branch_retirements"] = map[string]any{
+			"migration_completed": retirements.MigrationCompleted, "pending": len(retirements.Entries), "entries": retirements.Entries,
+			"message": "Exact superseded-PR and merged repair-branch retirement is durable; pending entries block production evidence and issue closure until reconciled by hive run or uninstall.",
+		}
+		if !retirements.MigrationCompleted || len(retirements.Entries) != 0 {
+			status["production_ready"] = false
 		}
 	}
-	repairPath := filepath.Join(*stateDir, "repair", "repair-worker-state.json")
-	if _, statErr := os.Stat(repairPath); statErr == nil {
-		if repairState, repairErr := repair.NewStore(filepath.Dir(repairPath)); repairErr == nil {
-			snapshot := repairState.Snapshot()
-			status["repairs"] = snapshot
-			resumable := []map[string]any{}
-			for _, attempt := range snapshot.Attempts {
-				if attempt == nil || attempt.Stage != repair.StageFailed || (attempt.LastFailureClass != repair.FailureInfrastructure && attempt.LastFailureClass != repair.FailurePatchEngine) {
-					continue
-				}
-				command := fmt.Sprintf("hive retry-repair --state-dir %q --finding %q --recurrence %d --attempt %d --failure-class %s --failure-id %q --reason <reason>", *stateDir, attempt.RepositoryFingerprint, attempt.Recurrence, attempt.Attempt, attempt.LastFailureClass, attempt.LastFailureID)
-				resumable = append(resumable, map[string]any{"finding": attempt.RepositoryFingerprint, "recurrence": attempt.Recurrence, "attempt": attempt.Attempt, "failure_class": attempt.LastFailureClass, "failure_id": attempt.LastFailureID, "next_command": command})
-			}
-			status["resumable_repairs"] = resumable
+	if transfer, exists, transferErr := store.LoadAuthorizerTransferIntent(); transferErr != nil {
+		status["setup_authorizer_transfer_error"] = transferErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		status["setup_authorizer_transfer"] = map[string]any{
+			"intent": transfer, "next_command": integrated.AuthorizerTransferNextCommand(*stateDir, transfer),
+			"cancel_command": integrated.AuthorizerTransferCancelCommand(*stateDir),
+			"message":        "Production mutations are fail-closed until the exact transfer is finalized or cancelled by the old authorizer before merge.",
+		}
+		status["production_ready"] = false
+	}
+	if rebind, exists, rebindErr := store.LoadSetupBaselineRebindIntent(); rebindErr != nil {
+		status["setup_baseline_rebind_error"] = rebindErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		status["setup_baseline_rebind"] = map[string]any{
+			"intent": rebind, "phase": rebind.Phase, "next_command": integrated.SetupBaselineRebindNextCommand(rebind),
+			"message": "Production remains fail-closed while Hive idempotently retires the obsolete hosted capture, review PR/ref, and dispatch before binding the changed setup.",
+		}
+		status["production_ready"] = false
+	}
+	if baseline, exists, baselineErr := store.LoadSetupBaselineIntent(); baselineErr != nil {
+		status["setup_baseline_error"] = baselineErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		next := fmt.Sprintf("hive run --state-dir %q --json", *stateDir)
+		if baseline.Phase == integrated.SetupBaselinePROpen {
+			next = fmt.Sprintf("hive approve-baseline --state-dir %q --plan --json", *stateDir)
+		}
+		status["setup_baseline"] = map[string]any{
+			"intent": baseline, "phase": baseline.Phase, "next_command": next,
+			"message": "Production and lifecycle writes remain fail-closed until hosted capture, exact authorizer approval, Hive merge, and a full trusted production verification complete.",
+		}
+		if baseline.Phase != integrated.SetupBaselineProductionVerified || baseline.PendingAudit != nil {
+			status["production_ready"] = false
 		}
 	}
+	if uninstall, exists, uninstallErr := store.LoadUninstallIntent(); uninstallErr != nil {
+		status["uninstall_error"] = uninstallErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		status["uninstall"] = map[string]any{
+			"intent": uninstall, "next_command": integrated.UninstallNextCommand(*stateDir),
+			"cancel_command": integrated.UninstallCancelCommand(*stateDir),
+			"message":        "Automation is paused. Finalize only after the exact cleanup PR merges, or cancel the exact unmerged PR/ref and restart uninstall.",
+		}
+		status["production_ready"] = false
+	}
+	populateOperationalStateStatus(status, *stateDir)
 	if *jsonOutput {
 		return encodeJSON(status)
 	}
@@ -783,6 +1006,122 @@ func workflowDispatchRecoveryStatus(stateDir string, dispatch integrated.Workflo
 		"retry_plan_command":  fmt.Sprintf("%s --action retry --correlation %s --plan --json", base, dispatch.CorrelationID),
 		"revoke_plan_command": fmt.Sprintf("%s --action revoke --correlation %s --plan --json", base, dispatch.CorrelationID),
 		"message":             "Hive found no exact run for an unacknowledged dispatch transport result. Automation is fail-closed until an operator completes an exact plan/apply recovery.",
+	}
+}
+
+func populateOperationalStateStatus(status map[string]any, stateDir string) {
+	lifecycle, lifecycleExists, lifecycleErr := loadOptionalLifecycleStore(stateDir)
+	if lifecycleErr != nil {
+		status["lifecycle_state_error"] = lifecycleErr.Error()
+		status["production_ready"] = false
+	} else if lifecycleExists {
+		snapshot := lifecycle.Snapshot()
+		counts := map[visualhive.LifecycleStatus]int{}
+		items := []map[string]any{}
+		for _, finding := range snapshot.Findings {
+			if finding == nil {
+				continue
+			}
+			counts[finding.Status]++
+			item := map[string]any{
+				"fingerprint": finding.RepositoryFingerprint, "recurrence": finding.Recurrences, "status": finding.Status,
+				"issue_number": finding.IssueNumber, "issue_url": finding.IssueURL, "pr_number": finding.PRNumber, "pr_url": finding.PRURL,
+				"branch": finding.Branch, "repair_commit_sha": finding.RepairCommitSHA, "repair_attempts": finding.RepairAttempts,
+				"human_review_required": finding.HumanReviewRequired, "manual_review_kind": finding.ManualReviewKind, "manual_review_reason": finding.ManualReviewReason,
+			}
+			if finding.HumanReviewRequired && !finding.ObservationHumanReviewRequired && finding.ManualReviewKind == "merge_policy" && finding.PRNumber > 0 && strings.TrimSpace(finding.RepairCommitSHA) != "" {
+				item["next_command"] = fmt.Sprintf("hive approve-merge --state-dir %q --pr %d --head %s --plan --json", stateDir, finding.PRNumber, finding.RepairCommitSHA)
+			}
+			items = append(items, item)
+		}
+		status["lifecycle"] = map[string]any{"counts": counts, "findings": items, "pending_outbox": len(lifecycle.PendingOutbox())}
+	}
+
+	repairState, repairExists, repairErr := loadOptionalRepairStore(stateDir)
+	if repairErr != nil {
+		status["repair_state_error"] = repairErr.Error()
+		status["production_ready"] = false
+	} else if repairExists {
+		snapshot := repairState.Snapshot()
+		status["repairs"] = snapshot
+		resumable := []map[string]any{}
+		for _, attempt := range snapshot.Attempts {
+			if attempt == nil || attempt.Stage != repair.StageFailed || (attempt.LastFailureClass != repair.FailureInfrastructure && attempt.LastFailureClass != repair.FailurePatchEngine) {
+				continue
+			}
+			resumable = append(resumable, resumableRepairStatus(stateDir, *attempt))
+		}
+		status["resumable_repairs"] = resumable
+	}
+}
+
+func resumableRepairStatus(stateDir string, attempt repair.Attempt) map[string]any {
+	reasonTemplate := "describe the corrected infrastructure or patch-engine cause"
+	attestation := repair.RequiredRecoveredProviderAttestation(attempt)
+	if attestation != "" {
+		reasonTemplate = "describe the completed historical patch provenance review; " + attestation
+	}
+	command := fmt.Sprintf("hive retry-repair --state-dir %q --finding %q --recurrence %d --attempt %d --failure-class %s --failure-id %q --reason %q --json", stateDir, attempt.RepositoryFingerprint, attempt.Recurrence, attempt.Attempt, attempt.LastFailureClass, attempt.LastFailureID, reasonTemplate)
+	return map[string]any{
+		"finding":                     attempt.RepositoryFingerprint,
+		"recurrence":                  attempt.Recurrence,
+		"attempt":                     attempt.Attempt,
+		"failure_class":               attempt.LastFailureClass,
+		"failure_id":                  attempt.LastFailureID,
+		"reason_template":             reasonTemplate,
+		"required_reason_attestation": attestation,
+		"next_command":                command,
+		"next_command_template":       command,
+	}
+}
+
+func loadOptionalLifecycleStore(stateDir string) (*visualhive.LifecycleStore, bool, error) {
+	path := filepath.Join(stateDir, "visual-hive", "visual-hive-lifecycle.json")
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("inspect durable lifecycle state: %w", err)
+	}
+	store, err := visualhive.NewLifecycleStore(filepath.Dir(path))
+	if err != nil {
+		return nil, true, fmt.Errorf("load durable lifecycle state: %w", err)
+	}
+	return store, true, nil
+}
+
+func loadOptionalRepairStore(stateDir string) (*repair.Store, bool, error) {
+	path := filepath.Join(stateDir, "repair", "repair-worker-state.json")
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("inspect durable repair state: %w", err)
+	}
+	store, err := repair.NewStore(filepath.Dir(path))
+	if err != nil {
+		return nil, true, fmt.Errorf("load durable repair state: %w", err)
+	}
+	return store, true, nil
+}
+
+func workflowDispatchDoctorCheck(store *integrated.Store) doctorCheck {
+	intent, exists, err := store.LoadWorkflowDispatchIntent()
+	if err != nil {
+		return doctorCheck{Name: "workflow_dispatch_state", OK: false, Message: err.Error()}
+	}
+	if exists && integrated.WorkflowDispatchNeedsRecovery(intent) {
+		return doctorCheck{Name: "workflow_dispatch_state", OK: false, Message: "ambiguous workflow dispatch requires the exact plan/apply recovery shown by hive status --json"}
+	}
+	return doctorCheck{Name: "workflow_dispatch_state", OK: true, Message: ternary(exists, "workflow dispatch checkpoint is valid", "no workflow dispatch recovery is pending")}
+}
+
+func operationalStateDoctorChecks(stateDir string) []doctorCheck {
+	_, lifecycleExists, lifecycleErr := loadOptionalLifecycleStore(stateDir)
+	_, repairExists, repairErr := loadOptionalRepairStore(stateDir)
+	return []doctorCheck{
+		{Name: "lifecycle_state", OK: lifecycleErr == nil, Message: errorOr(lifecycleErr, ternary(lifecycleExists, "durable lifecycle state is valid", "lifecycle state is not initialized yet"))},
+		{Name: "repair_state", OK: repairErr == nil, Message: errorOr(repairErr, ternary(repairExists, "durable repair state is valid", "repair state is not initialized yet"))},
 	}
 }
 
@@ -823,6 +1162,59 @@ func runIntegratedDoctor(args []string) int {
 		checks = append(checks, doctorCheck{Name: "merge_approval_state", OK: approvalErr == nil, Message: errorOr(approvalErr, "merge approval state is valid")})
 		_, _, intentErr := store.LoadMergeIntent()
 		checks = append(checks, doctorCheck{Name: "merge_intent_state", OK: intentErr == nil, Message: errorOr(intentErr, "merge intent state is valid")})
+		retirements, retirementsExist, retirementsErr := store.LoadRepairBranchRetirements()
+		retirementOK := retirementsErr == nil && (!retirementsExist || (retirements.MigrationCompleted && len(retirements.Entries) == 0))
+		retirementMessage := "no exact repair PR/branch retirement is pending"
+		if retirementsErr != nil {
+			retirementMessage = retirementsErr.Error()
+		} else if retirementsExist && !retirements.MigrationCompleted {
+			retirementMessage = "legacy repair branch retirement migration has not completed; hive run performs the bounded migration before production evidence"
+		} else if retirementsExist && len(retirements.Entries) != 0 {
+			retirementMessage = fmt.Sprintf("%d exact repair PR/branch retirement mutation(s) are pending; hive run retries them before production evidence", len(retirements.Entries))
+		}
+		checks = append(checks, doctorCheck{Name: "repair_branch_retirement_state", OK: retirementOK, Message: retirementMessage})
+		transfer, transferExists, transferErr := store.LoadAuthorizerTransferIntent()
+		transferMessage := "no setup authorizer transfer is pending"
+		if transferErr != nil {
+			transferMessage = transferErr.Error()
+		} else if transferExists {
+			transferMessage = fmt.Sprintf("transfer to %s/%d is pending; finish %s or cancel before merge with %s", transfer.NewAuthorizerLogin, transfer.NewAuthorizerID, integrated.AuthorizerTransferNextCommand(*stateDir, transfer), integrated.AuthorizerTransferCancelCommand(*stateDir))
+		}
+		checks = append(checks, doctorCheck{Name: "setup_authorizer_transfer_state", OK: transferErr == nil && !transferExists, Message: transferMessage})
+		rebind, rebindExists, rebindErr := store.LoadSetupBaselineRebindIntent()
+		rebindMessage := "no setup baseline reconfiguration cleanup is pending"
+		if rebindErr != nil {
+			rebindMessage = rebindErr.Error()
+		} else if rebindExists {
+			rebindMessage = fmt.Sprintf("setup baseline reconfiguration phase %s is pending; retry %s", rebind.Phase, integrated.SetupBaselineRebindNextCommand(rebind))
+		}
+		checks = append(checks, doctorCheck{Name: "setup_baseline_rebind_state", OK: rebindErr == nil && !rebindExists, Message: rebindMessage})
+		baseline, baselineExists, baselineErr := store.LoadSetupBaselineIntent()
+		baselineMessage := "no setup baseline capture is required"
+		baselineOK := baselineErr == nil
+		if baselineErr != nil {
+			baselineMessage = baselineErr.Error()
+		} else if baselineExists && (baseline.Phase != integrated.SetupBaselineProductionVerified || baseline.PendingAudit != nil) {
+			baselineOK = false
+			next := fmt.Sprintf("hive run --state-dir %q --json", *stateDir)
+			if baseline.Phase == integrated.SetupBaselinePROpen {
+				next = fmt.Sprintf("hive approve-baseline --state-dir %q --plan --json", *stateDir)
+			}
+			baselineMessage = fmt.Sprintf("setup baseline phase %s or its durable audit receipt is pending; next=%s", baseline.Phase, next)
+		} else if baselineExists {
+			baselineMessage = fmt.Sprintf("setup baselines completed full trusted production verification in run %d at %s", baseline.ProductionRunID, baseline.ProductionHeadSHA)
+		}
+		checks = append(checks, doctorCheck{Name: "setup_baseline_state", OK: baselineOK, Message: baselineMessage})
+		uninstall, uninstallExists, uninstallErr := store.LoadUninstallIntent()
+		uninstallMessage := "no uninstall cleanup is pending"
+		if uninstallErr != nil {
+			uninstallMessage = uninstallErr.Error()
+		} else if uninstallExists {
+			uninstallMessage = fmt.Sprintf("uninstall phase %s is pending; finish %s or cancel the exact unmerged cleanup with %s", uninstall.Phase, integrated.UninstallNextCommand(*stateDir), integrated.UninstallCancelCommand(*stateDir))
+		}
+		checks = append(checks, doctorCheck{Name: "uninstall_state", OK: uninstallErr == nil && !uninstallExists, Message: uninstallMessage})
+		checks = append(checks, workflowDispatchDoctorCheck(store))
+		checks = append(checks, operationalStateDoctorChecks(*stateDir)...)
 		_, gitErr := os.Stat(filepath.Join(config.CheckoutDir, ".git"))
 		checks = append(checks, doctorCheck{Name: "checkout", OK: gitErr == nil, Message: errorOr(gitErr, "managed checkout is present")})
 		immutable := len(config.VisualHiveRef) == 40
@@ -834,6 +1226,19 @@ func runIntegratedDoctor(args []string) int {
 		providerErr := provider.Health(ctx)
 		cancel()
 		checks = append(checks, doctorCheck{Name: "provider", OK: providerErr == nil, Message: errorOr(providerErr, "Codex provider is authenticated")})
+		daemon := readIntegratedDaemonStatus(*stateDir)
+		daemonOK := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
+		daemonMessage := "persistent scheduler service is installed, exact, and running"
+		if daemon.Service == nil || !daemon.Service.Managed {
+			daemonMessage = "persistent scheduler service is not installed; run hive start"
+		} else if daemon.Service.InspectionError != "" {
+			daemonMessage = daemon.Service.InspectionError
+		} else if !daemonServiceReady(daemon.Service) {
+			daemonMessage = "persistent scheduler registration is incomplete or disabled; run hive start to repair it"
+		} else if !daemon.RuntimeRunning {
+			daemonMessage = "persistent scheduler is enabled but its runtime is still in crash-recovery backoff"
+		}
+		checks = append(checks, doctorCheck{Name: "persistent_scheduler", OK: daemonOK, Message: daemonMessage})
 		var client *hivegithub.Client
 		if token := resolveGitHubToken(*githubTokenEnv); token != "" {
 			client = hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), *githubAPIURL)
@@ -905,6 +1310,27 @@ func resolveVisualHiveLauncher(command string, args []string, home string) (stri
 		return visualHive, append([]string(nil), args...), nil
 	}
 	return "", nil, fmt.Errorf("immutable Visual Hive runtime not found; install the integrated Hive bundle or pass --visual-hive-home")
+}
+
+func resolveSetupVisualHive(command string, args []string, home, configuredRef string) (string, []string, string, error) {
+	resolvedCommand, resolvedArgs, err := resolveVisualHiveLauncher(command, args, home)
+	if err != nil {
+		return "", nil, "", err
+	}
+	configuredRef = strings.ToLower(strings.TrimSpace(configuredRef))
+	if len(resolvedArgs) > 0 && filepath.Base(resolvedArgs[0]) == "visual-hive.mjs" {
+		manifest, manifestErr := integrated.ValidateVisualHiveRelease(resolvedArgs[0], configuredRef)
+		if manifestErr != nil {
+			return "", nil, "", manifestErr
+		}
+		if configuredRef == "" {
+			configuredRef = strings.ToLower(manifest.GitCommit)
+		}
+	}
+	if len(configuredRef) != 40 {
+		return "", nil, "", fmt.Errorf("Visual Hive setup requires an immutable 40-character commit SHA")
+	}
+	return resolvedCommand, resolvedArgs, configuredRef, nil
 }
 
 func resolveIntegratedProvider(ctx context.Context, provider, command string, args []string) (string, error) {
@@ -1205,6 +1631,10 @@ func resolveGitHubToken(envName string) string {
 	if token := strings.TrimSpace(os.Getenv(envName)); token != "" {
 		return token
 	}
+	return resolveGitHubCLIToken()
+}
+
+var githubCLIToken = func() string {
 	command := exec.Command("gh", "auth", "token")
 	command.Stderr = io.Discard
 	output, err := command.Output()
@@ -1212,6 +1642,17 @@ func resolveGitHubToken(envName string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func resolveGitHubCLIToken() string {
+	return githubCLIToken()
+}
+
+func requirePersistentGitHubAuthorization(start bool) error {
+	if !start || resolveGitHubCLIToken() != "" {
+		return nil
+	}
+	return fmt.Errorf("persistent --start requires GitHub CLI credential-store authorization; run gh auth login, verify gh auth token succeeds, then rerun setup (environment-only tokens are deliberately not copied into the service)")
 }
 
 func defaultIntegratedStateDir() string {

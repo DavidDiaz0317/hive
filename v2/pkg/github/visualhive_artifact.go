@@ -24,14 +24,18 @@ const (
 )
 
 type VisualHiveArtifactRequest struct {
-	Repository          string
-	WorkflowRunID       int64
-	ArtifactID          int64
-	SourceArtifactID    int64
-	FetchSourceArtifact bool
-	DestinationDir      string
-	TargetRef           string
-	MaxACMM             int
+	Repository             string
+	WorkflowRunID          int64
+	ArtifactID             int64
+	SourceArtifactID       int64
+	FetchSourceArtifact    bool
+	DestinationDir         string
+	TargetRef              string
+	MaxACMM                int
+	ExpectedWorkflowName   string
+	ExpectedWorkflowPath   string
+	ExpectedRunName        string
+	AllowFailedWorkflowRun bool
 }
 
 type VerifiedVisualHiveArtifact struct {
@@ -44,6 +48,8 @@ type VerifiedVisualHiveArtifact struct {
 	HeadBranch         string `json:"head_branch"`
 	Event              string `json:"event"`
 	WorkflowName       string `json:"workflow_name"`
+	WorkflowRunName    string `json:"workflow_run_name"`
+	WorkflowPath       string `json:"workflow_path"`
 	RunURL             string `json:"run_url"`
 	ManifestPath       string `json:"manifest_path"`
 	SourceArtifactPath string `json:"source_artifact_path"`
@@ -159,11 +165,33 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if err != nil {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify Visual Hive workflow run: %w", err)
 	}
-	if run.GetID() != request.WorkflowRunID || run.GetConclusion() != "success" || run.GetEvent() == "pull_request" || strings.TrimSpace(run.GetHeadSHA()) == "" {
-		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run is not a successful non-PR run")
+	allowedConclusion := run.GetConclusion() == "success" || (request.AllowFailedWorkflowRun && run.GetConclusion() == "failure")
+	if run.GetID() != request.WorkflowRunID || run.GetStatus() != "completed" || !allowedConclusion || run.GetEvent() == "pull_request" || strings.TrimSpace(run.GetHeadSHA()) == "" {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run is not an allowed completed non-PR run")
 	}
 	if targetRef := strings.TrimPrefix(strings.TrimSpace(request.TargetRef), "refs/heads/"); targetRef != "" && run.GetHeadBranch() != targetRef {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run branch %q does not match target branch %q", run.GetHeadBranch(), targetRef)
+	}
+	if run.GetWorkflowID() <= 0 {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run did not identify its workflow definition")
+	}
+	definition, _, err := c.client.Actions.GetWorkflowByID(ctx, owner, repo, run.GetWorkflowID())
+	if err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify Visual Hive workflow definition: %w", err)
+	}
+	definitionPath := strings.TrimPrefix(strings.TrimSpace(strings.Split(definition.GetPath(), "@")[0]), "/")
+	runPath := strings.TrimPrefix(strings.TrimSpace(strings.Split(run.GetPath(), "@")[0]), "/")
+	if definition.GetID() != run.GetWorkflowID() || strings.TrimSpace(definition.GetName()) == "" || definitionPath == "" || definitionPath != runPath {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition does not match the exact workflow run")
+	}
+	if request.ExpectedWorkflowName != "" && (definition.GetName() != request.ExpectedWorkflowName || run.GetName() != request.ExpectedWorkflowName) {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition or run name mismatch")
+	}
+	if request.ExpectedWorkflowPath != "" && !workflowPathMatches(definition.GetPath(), request.ExpectedWorkflowPath) {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition path mismatch")
+	}
+	if request.ExpectedRunName != "" && run.GetDisplayTitle() != request.ExpectedRunName {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive correlated workflow run name mismatch")
 	}
 	artifact, err := c.findRunArtifact(ctx, owner, repo, request.WorkflowRunID, request.ArtifactID)
 	if err != nil {
@@ -205,7 +233,8 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 		RepositoryID: strconv.FormatInt(repository.GetID(), 10), WorkflowRunID: strconv.FormatInt(request.WorkflowRunID, 10),
 		ArtifactID: strconv.FormatInt(request.ArtifactID, 10), ArtifactName: artifact.GetName(), CommitSHA: run.GetHeadSHA(),
 		SourceArtifactID: strconv.FormatInt(sourceArtifactID, 10),
-		HeadBranch:       run.GetHeadBranch(), Event: run.GetEvent(), WorkflowName: run.GetName(), RunURL: run.GetHTMLURL(), ManifestPath: manifestPath,
+		HeadBranch:       run.GetHeadBranch(), Event: run.GetEvent(), WorkflowName: definition.GetName(), WorkflowRunName: run.GetName(),
+		WorkflowPath: definitionPath, RunURL: run.GetHTMLURL(), ManifestPath: manifestPath,
 	}
 	bundle, err := visualhive.ValidateBundle(manifestPath, visualhive.ValidationOptions{
 		MaxACMM: request.MaxACMM, VerifiedProvenance: true, ExpectedRepository: request.Repository,

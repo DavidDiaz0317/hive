@@ -504,6 +504,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 		{name: "repository identity", stage: StagePushed, mutate: func(f *visualhive.FindingLifecycle) { f.Repository = "owner/other" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			repository, _ := seedGitRepository(t)
 			state, err := NewStore(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
@@ -522,7 +523,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 			pulls := &fakePRClient{state: state}
 			worker := &Worker{
 				Config: Config{
-					RepositoryDir: t.TempDir(), WorktreeRoot: t.TempDir(), BaseBranch: "main",
+					RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main",
 					Policy: automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo", "owner/other"}, MaxRepairAttempts: 3},
 				},
 				Provider: &healthFailureProvider{}, State: state, Lifecycle: lifecycle, GitHub: pulls,
@@ -548,6 +549,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 }
 
 func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
+	repository, _ := seedGitRepository(t)
 	state, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -565,7 +567,7 @@ func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
 	pulls := &fakePRClient{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: t.TempDir(), WorktreeRoot: t.TempDir(), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main",
 			Policy: automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 		},
 		Provider: &healthFailureProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: pulls,
@@ -711,6 +713,7 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 }
 
 func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
+	repository, _ := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -726,7 +729,7 @@ func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
 	}
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
-		Config:   Config{RepositoryDir: t.TempDir(), WorktreeRoot: t.TempDir(), BaseBranch: "main"},
+		Config:   Config{RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main"},
 		Provider: &healthFailureProvider{}, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{state: state},
 	}
 	finding := visualhive.FindingLifecycle{

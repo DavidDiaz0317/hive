@@ -111,6 +111,14 @@ func (s *Store) ResumeRetry(request RetryRequest) (Attempt, error) {
 	if err := validateRetryCheckpoint(*attempt); err != nil {
 		return deny(err)
 	}
+	if attempt.RecoveredPatchAttempt > 0 {
+		if attempt.ResumeStage != StageModelComplete || attempt.PreparationCleanupPending || !validRecoveredPatchProvenance(*attempt) || !recoveredPatchDigestMatches(*attempt) {
+			return deny(fmt.Errorf("recovered patch retry checkpoint has invalid exact provenance"))
+		}
+		if !strings.Contains(safeExcerpt(request.Reason), recoveredProviderAttestation(*attempt)) {
+			return deny(fmt.Errorf("recovered patch retry reason must attest the historical read-only Codex provider identity with %s", recoveredProviderAttestation(*attempt)))
+		}
+	}
 
 	entry.Allowed = true
 	entry.Phase = "intent"
@@ -118,6 +126,9 @@ func (s *Store) ResumeRetry(request RetryRequest) (Attempt, error) {
 	entry.TransactionID = retryTransactionID(request, now, attempt.ResumeStage)
 	transactionID = entry.TransactionID
 	entry.Detail = fmt.Sprintf("resume %s from %s without incrementing model attempt %d", attempt.ResumeStage, attempt.LastFailureClass, attempt.Attempt)
+	if attempt.RecoveredPatchAttempt > 0 {
+		entry.Detail += fmt.Sprintf("; authorize recovered source attempt %d patch %s provider %s replay %s", attempt.RecoveredPatchAttempt, attempt.RecoveredPatchSHA256, attempt.RecoveredProviderSHA256, attempt.PreparationReplayProof)
+	}
 	if err := s.appendRetryAuditLocked(entry); err != nil {
 		return Attempt{}, fmt.Errorf("persist allowed retry audit: %w", err)
 	}
@@ -131,9 +142,16 @@ func (s *Store) ResumeRetry(request RetryRequest) (Attempt, error) {
 	updated.RetryActor = request.Actor
 	updated.RetryReason = safeExcerpt(request.Reason)
 	updated.RetryTransactionID = transactionID
+	if updated.RecoveredPatchAttempt > 0 {
+		updated.RecoveredPatchAuthorized = true
+	}
 	updated.UpdatedAt = now
 	s.data.Attempts[request.RepositoryFingerprint] = &updated
 	desired := cloneState(s.data)
+	if err := validatePersistedRepairState(desired); err != nil {
+		s.data = previous
+		return Attempt{}, fmt.Errorf("validate resumed repair checkpoint: %w", err)
+	}
 	if err := s.persistLocked(); err != nil {
 		if reconcileErr := s.reconcilePersistFailureLocked(err, previous, desired); reconcileErr != nil {
 			return Attempt{}, fmt.Errorf("persist resumed repair checkpoint: %w", reconcileErr)

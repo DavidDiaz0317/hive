@@ -3586,6 +3586,9 @@ func (m *Manager) SeedPauseState(name string, pausedAt time.Time, trigger, reaso
 }
 
 func (m *Manager) Resume(ctx context.Context, name, trigger, reason string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.Lock()
 	agent, ok := m.agents[name]
 	if !ok {

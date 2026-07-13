@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,7 @@ type evidenceContribution struct {
 	Status     string `json:"status"`
 	Gating     bool   `json:"gating"`
 	Mode       string `json:"mode"`
+	Operator   string `json:"operator"`
 	ContractID string `json:"contractId"`
 	TargetID   string `json:"targetId"`
 	Reason     string `json:"reason"`
@@ -90,6 +92,10 @@ type testCreationRecommendation struct {
 // fetched source artifact. It deliberately does not expose arbitrary repository
 // prose or large artifact payloads to the repair model.
 func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (string, error) {
+	issueKind := strings.ToLower(strings.TrimSpace(finding.IssueKind))
+	if issueKind == visualhive.RepositoryTestFailureKind {
+		return loadRepositoryTestEvidenceSummary(finding)
+	}
 	if strings.TrimSpace(root) == "" {
 		return "", nil
 	}
@@ -114,10 +120,13 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 	if len(verdict.AllContributions) > 2048 {
 		return "", fmt.Errorf("verified Visual Hive verdict has too many contributions")
 	}
-	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
+	if issueKind == "test_adequacy_gap" {
 		return loadTestCreationEvidenceSummary(root, finding)
 	}
 
+	if issueKind == "mutation_survivor" {
+		return loadMutationSurvivorEvidenceSummary(verdict, finding)
+	}
 	contracts := make(map[string]bool, len(finding.AffectedContracts))
 	for _, contract := range finding.AffectedContracts {
 		contracts[strings.ToLower(strings.TrimSpace(contract))] = true
@@ -132,9 +141,15 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 		if status != "failed" && status != "blocked" && status != "warning" {
 			continue
 		}
-		if signal := strings.ToLower(strings.TrimSpace(contribution.Kind)); signal != "" && strings.Contains(title, signal) {
-			matched = append(matched, contribution)
+		signal := strings.ToLower(strings.TrimSpace(contribution.Kind))
+		if signal == "" || (signal != issueKind && !strings.Contains(title, signal)) {
+			continue
 		}
+		operator := strings.ToLower(strings.TrimSpace(contribution.Operator))
+		if operator != "" && !containsEvidenceToken(title, operator) {
+			continue
+		}
+		matched = append(matched, contribution)
 	}
 	if len(matched) == 0 {
 		for _, contribution := range verdict.AllContributions {
@@ -157,20 +172,15 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 	lines := make([]string, 0, len(matched))
 	seen := map[string]bool{}
 	for _, contribution := range matched {
-		values := []string{contribution.Key, contribution.Source, contribution.Kind, contribution.Status, contribution.ContractID, contribution.TargetID, contribution.Reason}
-		valid := true
+		values := []string{contribution.Key, contribution.Source, contribution.Kind, contribution.Status, contribution.Operator, contribution.ContractID, contribution.TargetID, contribution.Reason}
 		for index, value := range values {
-			value = strings.TrimSpace(value)
-			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
-				valid = false
-				break
+			safe, err := safeEvidenceValue(value)
+			if err != nil {
+				return "", err
 			}
-			values[index] = value
+			values[index] = safe
 		}
-		if !valid {
-			return "", fmt.Errorf("verified Visual Hive evidence contains an unsafe value")
-		}
-		line := fmt.Sprintf("- key=%s source=%s kind=%s status=%s contract=%s target=%s reason=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6])
+		line := fmt.Sprintf("- key=%s source=%s kind=%s status=%s operator=%s contract=%s target=%s reason=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7])
 		if !seen[line] {
 			seen[line] = true
 			lines = append(lines, line)
@@ -182,6 +192,192 @@ func LoadEvidenceSummary(root string, finding visualhive.FindingLifecycle) (stri
 		return "", fmt.Errorf("verified Visual Hive evidence summary exceeds limit")
 	}
 	return string(bytes.Clone([]byte(summary))), nil
+}
+
+func loadRepositoryTestEvidenceSummary(finding visualhive.FindingLifecycle) (string, error) {
+	command := strings.TrimSpace(finding.ValidationCommand)
+	if command == "" || len(finding.AffectedContracts) != 1 {
+		return "", fmt.Errorf("%w: repository test finding lacks one exact command contract", ErrNoActionableEvidence)
+	}
+	// The lifecycle finding was created only from independently queried GitHub
+	// job-step conclusions. Reconstruct and validate its stable command identity;
+	// never re-read a target-writable workspace ledger for repair prompting.
+	result, err := visualhive.NewRepositoryTestResult(command, 1)
+	if err != nil || finding.AffectedContracts[0] != result.Contract || finding.RootCauseKey != "repository-test-failure/"+result.Digest || finding.Fingerprint != "repository-test:"+result.Digest {
+		return "", fmt.Errorf("%w: repository test finding identity does not match its verified command", ErrNoActionableEvidence)
+	}
+	safeCommand, safeErr := safeEvidenceValue(result.Command)
+	if safeErr != nil {
+		return "", safeErr
+	}
+	return fmt.Sprintf("- key=repository_test.%s source=github_actions_job_step kind=%s status=failed exit=nonzero contract=%s command=%s required_scope=smallest_fix_without_weakening_test_plan", result.Digest, visualhive.RepositoryTestFailureKind, result.Contract, safeCommand), nil
+}
+
+func loadMutationSurvivorEvidenceSummary(verdict verdictEvidence, finding visualhive.FindingLifecycle) (string, error) {
+	operator, targetID, contracts, rootBound, err := mutationBindingForFinding(finding)
+	if err != nil {
+		return "", err
+	}
+	expectedKey := "mutation.mutation_survivor." + operator
+	matched := make([]evidenceContribution, 0, 1)
+	for _, contribution := range verdict.AllContributions {
+		if contribution.Source != "mutation" || contribution.Kind != "mutation_survivor" || contribution.Status != "failed" || !contribution.Gating ||
+			contribution.Operator != operator || contribution.Key != expectedKey || !contracts[contribution.ContractID] ||
+			(rootBound && contribution.TargetID != targetID) {
+			continue
+		}
+		matched = append(matched, contribution)
+	}
+	if len(matched) != 1 {
+		return "", fmt.Errorf("%w for exact mutation operator %q (matched %d canonical contributions)", ErrNoActionableEvidence, operator, len(matched))
+	}
+	contribution := matched[0]
+	values := []string{contribution.Key, contribution.Source, contribution.Kind, contribution.Status, contribution.Operator, contribution.ContractID, contribution.TargetID, contribution.Reason}
+	for index, value := range values {
+		safe, safeErr := safeEvidenceValue(value)
+		if safeErr != nil {
+			return "", safeErr
+		}
+		values[index] = safe
+	}
+	return fmt.Sprintf("- key=%s source=%s kind=%s status=%s operator=%s contract=%s target=%s reason=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]), nil
+}
+
+func mutationBindingForFinding(finding visualhive.FindingLifecycle) (string, string, map[string]bool, bool, error) {
+	contracts := make(map[string]bool, len(finding.AffectedContracts))
+	for _, contract := range finding.AffectedContracts {
+		if contract == "" || len(contract) > 512 || contracts[contract] {
+			return "", "", nil, false, fmt.Errorf("%w: mutation survivor has invalid affected contracts", ErrNoActionableEvidence)
+		}
+		contracts[contract] = true
+	}
+	if len(contracts) == 0 {
+		return "", "", nil, false, fmt.Errorf("%w: mutation survivor has no affected contracts", ErrNoActionableEvidence)
+	}
+
+	root := strings.TrimSpace(finding.RootCauseKey)
+	if root != "" {
+		parts := strings.Split(root, "/")
+		if len(parts) != 4 || parts[0] != "mutation" {
+			return "", "", nil, false, fmt.Errorf("%w: mutation survivor has incompatible root cause key", ErrNoActionableEvidence)
+		}
+		operator, err := url.PathUnescape(parts[1])
+		if err != nil || !safeEvidenceOperator(operator) {
+			return "", "", nil, false, fmt.Errorf("%w: mutation survivor root has an invalid operator", ErrNoActionableEvidence)
+		}
+		targetID, err := url.PathUnescape(parts[2])
+		if err != nil || !safeMutationIdentity(targetID) {
+			return "", "", nil, false, fmt.Errorf("%w: mutation survivor root has an invalid target", ErrNoActionableEvidence)
+		}
+		rootContracts := make(map[string]bool)
+		for _, encoded := range strings.Split(parts[3], ",") {
+			contract, decodeErr := url.PathUnescape(encoded)
+			if decodeErr != nil || !safeMutationIdentity(contract) || rootContracts[contract] {
+				return "", "", nil, false, fmt.Errorf("%w: mutation survivor root has invalid contracts", ErrNoActionableEvidence)
+			}
+			rootContracts[contract] = true
+		}
+		if len(rootContracts) != len(contracts) {
+			return "", "", nil, false, fmt.Errorf("%w: mutation survivor root contracts do not match the finding", ErrNoActionableEvidence)
+		}
+		for contract := range rootContracts {
+			if !contracts[contract] {
+				return "", "", nil, false, fmt.Errorf("%w: mutation survivor root contracts do not match the finding", ErrNoActionableEvidence)
+			}
+		}
+		return operator, targetID, rootContracts, true, nil
+	}
+	const prefix = "[visual hive] mutation survived:"
+	title := strings.TrimSpace(finding.Title)
+	lower := strings.ToLower(title)
+	if !strings.HasPrefix(lower, prefix) {
+		return "", "", nil, false, fmt.Errorf("%w: legacy mutation survivor title does not have the exact operator prefix", ErrNoActionableEvidence)
+	}
+	operator := strings.TrimSpace(title[len(prefix):])
+	if !safeEvidenceOperator(operator) {
+		return "", "", nil, false, fmt.Errorf("%w: legacy mutation survivor title has an invalid operator", ErrNoActionableEvidence)
+	}
+	return operator, "", contracts, false, nil
+}
+
+func safeMutationIdentity(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 512 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func safeEvidenceOperator(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '.' || character == '_' || character == '+' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func safeEvidenceValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.ContainsRune(value, '\x00') || len(value) > 4096 {
+		return "", fmt.Errorf("verified Visual Hive evidence contains an unsafe value")
+	}
+	if err := validateRepairTextSecrets(value, "verified Visual Hive evidence"); err != nil {
+		return "", err
+	}
+	var result strings.Builder
+	result.Grow(len(value))
+	for _, character := range value {
+		switch character {
+		case '\n':
+			result.WriteString(`\n`)
+		case '\r':
+			result.WriteString(`\r`)
+		case '\t':
+			result.WriteString(`\t`)
+		default:
+			if character < 0x20 || character == 0x7f {
+				return "", fmt.Errorf("verified Visual Hive evidence contains an unsafe control character")
+			}
+			result.WriteRune(character)
+		}
+	}
+	return result.String(), nil
+}
+
+func containsEvidenceToken(value, token string) bool {
+	value, token = strings.ToLower(value), strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	for offset := 0; offset <= len(value)-len(token); {
+		index := strings.Index(value[offset:], token)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !evidenceTokenCharacter(value[index-1])
+		after := index + len(token)
+		afterOK := after == len(value) || !evidenceTokenCharacter(value[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func evidenceTokenCharacter(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_'
 }
 
 func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLifecycle) (string, error) {
@@ -222,11 +418,11 @@ func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLife
 			recommendation.Title, strings.Join(recommendation.Rationale, ","), strings.Join(recommendation.SuggestedTests, ","), strings.Join(recommendation.Artifacts, ","),
 		}
 		for index, value := range values {
-			value = strings.TrimSpace(value)
-			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
-				return "", fmt.Errorf("verified Visual Hive test-creation evidence contains an unsafe value")
+			safe, err := safeEvidenceValue(value)
+			if err != nil {
+				return "", err
 			}
-			values[index] = strings.ReplaceAll(value, "\n", "\\n")
+			values[index] = safe
 		}
 		lines = append(lines, fmt.Sprintf("- key=test_creation.%s gap=%s source=%s kind=%s priority=%s title=%s rationale=%s suggested_tests=%s artifacts=%s required_scope=test_files_only", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]))
 	}
@@ -284,11 +480,11 @@ func loadCoverageEvidenceSummary(root string, finding visualhive.FindingLifecycl
 		}
 		values := []string{item.ID, item.Kind, item.ContractID, item.TargetID, item.Route, item.Viewport, item.Title, strings.Join(item.Rationale, ","), strings.Join(item.SuggestedTests, ","), item.SuggestedConfigYAML}
 		for index, value := range values {
-			value = strings.TrimSpace(value)
-			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
-				return "", fmt.Errorf("verified Visual Hive coverage evidence contains an unsafe value")
+			safe, err := safeEvidenceValue(value)
+			if err != nil {
+				return "", err
 			}
-			values[index] = strings.ReplaceAll(value, "\n", "\\n")
+			values[index] = safe
 		}
 		lines = append(lines, fmt.Sprintf("- key=coverage.%s source=coverage kind=%s status=warning contract=%s target=%s route=%s viewport=%s reason=%s rationale=%s suggested_tests=%s suggested_config=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]))
 	}
@@ -298,11 +494,11 @@ func loadCoverageEvidenceSummary(root string, finding visualhive.FindingLifecycl
 		}
 		values := []string{item.ID, item.Kind, item.ContractID, item.TargetID, item.Route, item.Viewport, item.Message, item.RecommendedAction, strings.Join(item.Evidence, ","), recommendations[strings.TrimSpace(item.ID)]}
 		for index, value := range values {
-			value = strings.TrimSpace(value)
-			if strings.ContainsRune(value, '\x00') || len(value) > 4096 || providerSecret.MatchString(value) {
-				return "", fmt.Errorf("verified Visual Hive coverage evidence contains an unsafe value")
+			safe, err := safeEvidenceValue(value)
+			if err != nil {
+				return "", err
 			}
-			values[index] = strings.ReplaceAll(value, "\n", "\\n")
+			values[index] = safe
 		}
 		lines = append(lines, fmt.Sprintf("- key=coverage.%s source=coverage kind=%s status=warning contract=%s target=%s route=%s viewport=%s reason=%s action=%s evidence=%s suggested_config=%s", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]))
 	}

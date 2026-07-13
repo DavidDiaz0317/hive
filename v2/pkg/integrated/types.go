@@ -48,56 +48,67 @@ type RepositoryInspection struct {
 }
 
 type SetupPlan struct {
-	SchemaVersion     string               `json:"schema_version"`
-	GeneratedAt       time.Time            `json:"generated_at"`
-	Repository        string               `json:"repository"`
-	Coverage          Coverage             `json:"coverage"`
-	Automation        Automation           `json:"automation"`
-	Provider          string               `json:"provider"`
-	ACMMLevel         int                  `json:"acmm_level"`
-	MaxActiveIssues   int                  `json:"max_active_issues"`
-	MaxRepairAttempts int                  `json:"max_repair_attempts"`
-	VisualHive        bool                 `json:"visual_hive"`
-	Inspection        RepositoryInspection `json:"inspection"`
-	TestingLayers     []string             `json:"testing_layers"`
-	FilesToManage     []string             `json:"files_to_manage"`
-	RequiredActions   []string             `json:"required_actions"`
-	Warnings          []string             `json:"warnings"`
-	ReadOnly          bool                 `json:"read_only"`
+	SchemaVersion         string                `json:"schema_version"`
+	GeneratedAt           time.Time             `json:"generated_at"`
+	Repository            string                `json:"repository"`
+	Coverage              Coverage              `json:"coverage"`
+	Automation            Automation            `json:"automation"`
+	Provider              string                `json:"provider"`
+	ACMMLevel             int                   `json:"acmm_level"`
+	MaxActiveIssues       int                   `json:"max_active_issues"`
+	MaxRepairAttempts     int                   `json:"max_repair_attempts"`
+	AllowedAutoMergePaths []string              `json:"allowed_auto_merge_paths"`
+	AllowedAutoMergeRisk  []automation.RiskTier `json:"allowed_auto_merge_risk"`
+	VisualHive            bool                  `json:"visual_hive"`
+	VisualHiveRepository  string                `json:"visual_hive_repository"`
+	VisualHiveRef         string                `json:"visual_hive_ref"`
+	Inspection            RepositoryInspection  `json:"inspection"`
+	TestingLayers         []string              `json:"testing_layers"`
+	FilesToManage         []string              `json:"files_to_manage"`
+	RequiredActions       []string              `json:"required_actions"`
+	Warnings              []string              `json:"warnings"`
+	ReadOnly              bool                  `json:"read_only"`
 }
 
 type Config struct {
-	SchemaVersion          string                `json:"schema_version"`
-	Repository             string                `json:"repository"`
-	RepositoryID           string                `json:"repository_id,omitempty"`
-	DefaultBranch          string                `json:"default_branch"`
-	Coverage               Coverage              `json:"coverage"`
-	Automation             Automation            `json:"automation"`
-	Provider               string                `json:"provider"`
-	ProviderCommand        string                `json:"provider_command"`
-	ProviderArgs           []string              `json:"provider_args,omitempty"`
-	ACMMLevel              int                   `json:"acmm_level"`
-	MaxActiveIssues        int                   `json:"max_active_issues"`
-	MaxRepairAttempts      int                   `json:"max_repair_attempts"`
-	VisualHive             bool                  `json:"visual_hive"`
-	VisualHiveRepo         string                `json:"visual_hive_repo"`
-	VisualHiveRef          string                `json:"visual_hive_ref"`
-	VisualHiveCommand      string                `json:"visual_hive_command"`
-	VisualHiveArgs         []string              `json:"visual_hive_args,omitempty"`
-	VisualHiveConfigDigest string                `json:"visual_hive_config_digest,omitempty"`
-	TestCommands           [][]string            `json:"test_commands"`
-	AllowedRepairPaths     []string              `json:"allowed_repair_paths"`
-	AllowedAutoMergePaths  []string              `json:"allowed_auto_merge_paths"`
-	AllowedAutoMergeRisk   []automation.RiskTier `json:"allowed_auto_merge_risk"`
-	CheckoutDir            string                `json:"checkout_dir"`
-	StateDir               string                `json:"state_dir"`
-	Paused                 bool                  `json:"paused"`
-	SetupBranch            string                `json:"setup_branch,omitempty"`
-	SetupPRNumber          int                   `json:"setup_pr_number,omitempty"`
-	SetupPRURL             string                `json:"setup_pr_url,omitempty"`
-	InstalledAt            time.Time             `json:"installed_at"`
-	UpdatedAt              time.Time             `json:"updated_at"`
-	PreviousVersion        string                `json:"previous_version,omitempty"`
+	SchemaVersion                     string                   `json:"schema_version"`
+	Repository                        string                   `json:"repository"`
+	RepositoryID                      string                   `json:"repository_id,omitempty"`
+	DefaultBranch                     string                   `json:"default_branch"`
+	Coverage                          Coverage                 `json:"coverage"`
+	Automation                        Automation               `json:"automation"`
+	Provider                          string                   `json:"provider"`
+	ProviderCommand                   string                   `json:"provider_command"`
+	ProviderArgs                      []string                 `json:"provider_args,omitempty"`
+	ACMMLevel                         int                      `json:"acmm_level"`
+	MaxActiveIssues                   int                      `json:"max_active_issues"`
+	MaxRepairAttempts                 int                      `json:"max_repair_attempts"`
+	VisualHive                        bool                     `json:"visual_hive"`
+	VisualHiveRepo                    string                   `json:"visual_hive_repo"`
+	VisualHiveRef                     string                   `json:"visual_hive_ref"`
+	VisualHiveCommand                 string                   `json:"visual_hive_command"`
+	VisualHiveArgs                    []string                 `json:"visual_hive_args,omitempty"`
+	VisualHiveConfigDigest            string                   `json:"visual_hive_config_digest,omitempty"`
+	SetupBaselineRequired             bool                     `json:"setup_baseline_required,omitempty"`
+	SetupBaselineContractDigest       string                   `json:"setup_baseline_contract_digest,omitempty"`
+	SetupBaselineInitialDigest        string                   `json:"setup_baseline_initial_digest,omitempty"`
+	SetupBaselineInitialCandidates    []SetupBaselineCandidate `json:"setup_baseline_initial_candidates,omitempty"`
+	TestCommands                      [][]string               `json:"test_commands"`
+	AllowedRepairPaths                []string                 `json:"allowed_repair_paths"`
+	AllowedAutoMergePaths             []string                 `json:"allowed_auto_merge_paths"`
+	AllowedAutoMergeRisk              []automation.RiskTier    `json:"allowed_auto_merge_risk"`
+	CheckoutDir                       string                   `json:"checkout_dir"`
+	StateDir                          string                   `json:"state_dir"`
+	Paused                            bool                     `json:"paused"`
+	SetupBranch                       string                   `json:"setup_branch,omitempty"`
+	SetupPRNumber                     int                      `json:"setup_pr_number,omitempty"`
+	SetupPRURL                        string                   `json:"setup_pr_url,omitempty"`
+	SetupHeadSHA                      string                   `json:"setup_head_sha,omitempty"`
+	SetupAuthorizationActorID         int64                    `json:"setup_authorization_actor_id,omitempty"`
+	SetupAuthorizationPreviousActorID int64                    `json:"setup_authorization_previous_actor_id,omitempty"`
+	InstalledAt                       time.Time                `json:"installed_at"`
+	UpdatedAt                         time.Time                `json:"updated_at"`
+	PreviousVersion                   string                   `json:"previous_version,omitempty"`
 }
 
 type SetupResult struct {
@@ -111,4 +122,11 @@ type SetupResult struct {
 	CommitSHA                   string    `json:"commit_sha,omitempty"`
 	PRNumber                    int       `json:"pr_number,omitempty"`
 	PRURL                       string    `json:"pr_url,omitempty"`
+	SetupAuthorizationContext   string    `json:"setup_authorization_context,omitempty"`
+	SetupAuthorizationStatusID  int64     `json:"setup_authorization_status_id,omitempty"`
+	SetupAuthorizationCreatorID int64     `json:"setup_authorization_creator_id,omitempty"`
+	SetupAuthorizationReused    bool      `json:"setup_authorization_reused,omitempty"`
+	SetupBaselinePending        bool      `json:"setup_baseline_pending,omitempty"`
+	SetupBaselinePhase          string    `json:"setup_baseline_phase,omitempty"`
+	SetupBaselineNextCommand    string    `json:"setup_baseline_next_command,omitempty"`
 }

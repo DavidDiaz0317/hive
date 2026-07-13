@@ -297,6 +297,9 @@ func authorizeLiveMergeIntent(ctx context.Context, stateDir string, installed Co
 		!strings.EqualFold(finding.RepairCommitSHA, gate.HeadSHA) || finding.RepositoryFingerprint != expectedFinding.RepositoryFingerprint {
 		return MergeIntent{}, nil, automation.Decision{}, fmt.Errorf("live lifecycle no longer contains the exact ready Hive repair authorized for merge")
 	}
+	if finding.ObservationHumanReviewRequired {
+		return MergeIntent{}, nil, automation.Decision{}, fmt.Errorf("live lifecycle requires observation-level human review that merge-policy approval cannot override")
+	}
 	if !gate.Open || gate.Merged || !gate.VisualHiveProvenanceVerified || !strings.EqualFold(strings.TrimSpace(gate.VisualHiveCheckState), "success") ||
 		gate.VisualHiveWorkflowPath != ".github/workflows/visual-hive-pr.yml" || gate.VisualHiveWorkflowEvent != "pull_request" {
 		return MergeIntent{}, nil, automation.Decision{}, fmt.Errorf("live pull request gate lacks an exact successful Visual Hive PR workflow proof")
@@ -329,7 +332,7 @@ func authorizeLiveMergeIntent(ctx context.Context, stateDir string, installed Co
 		return MergeIntent{}, activeApproval, automation.Decision{}, fmt.Errorf("durable Hive manual-review hold has no exact active merge approval")
 	}
 
-	policy := integratedPolicy(liveConfig)
+	policy := mergePolicyForFinding(integratedPolicy(liveConfig), finding)
 	request := mergeActionRequest(liveConfig, finding, gate)
 	decision := policy.Authorize(request)
 	if activeApproval != nil && !decision.Allowed {
@@ -398,6 +401,7 @@ func prepareMergeIntent(ctx context.Context, stateDir string, config Config, fin
 	if err != nil {
 		return MergeIntent{}, fmt.Errorf("bind merge writer identity: %w", err)
 	}
+	policy = mergePolicyForFinding(policy, finding)
 	request := mergeActionRequest(config, finding, gate)
 	if !decision.Allowed || decision.Action != automation.ActionMergePR {
 		return MergeIntent{}, fmt.Errorf("cannot persist a merge intent without the exact allowed merge decision")

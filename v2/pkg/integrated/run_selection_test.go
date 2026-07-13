@@ -77,15 +77,96 @@ func TestRepairPreparationAndPinnedCLIEnvironment(t *testing.T) {
 	}
 }
 
-func TestNestedSourceChangesAreNeverAutomaticRisk(t *testing.T) {
+func TestSourceChangesRemainLowRiskButTestOnlyChangesAreAutomatic(t *testing.T) {
 	if risk := mergeRisk([]string{"dashboard/src/App.tsx"}); risk != automation.RiskLow {
 		t.Fatalf("nested application source risk = %v, want low", risk)
 	}
-	if risk := mergeRisk([]string{"dashboard/src/App.test.tsx"}); risk != automation.RiskLow {
-		t.Fatalf("a source-tree test remains low path risk before the auto-merge allowlist is evaluated, got %v", risk)
+	if risk := mergeRisk([]string{"dashboard/src/App.test.tsx"}); risk != automation.RiskAutomatic {
+		t.Fatalf("source-tree test-only risk = %v, want automatic", risk)
 	}
 	if risk := mergeRisk([]string{"tests/App.test.tsx"}); risk != automation.RiskAutomatic {
 		t.Fatalf("dedicated test path risk = %v, want automatic", risk)
+	}
+	if risk := mergeRisk([]string{"dashboard/src/App.test.tsx", "dashboard/src/App.tsx"}); risk != automation.RiskLow {
+		t.Fatalf("mixed test and application source risk = %v, want low", risk)
+	}
+}
+
+func TestRepositoryTestFailureExpandsRepairPathsWithoutExpandingAutoMerge(t *testing.T) {
+	configured := []string{"src/**", "**/*.test.*"}
+	ordinary := repairPathsForFinding(configured, visualhive.FindingLifecycle{IssueKind: "mutation_survivor"})
+	if len(ordinary) != len(configured) {
+		t.Fatalf("ordinary finding inherited dependency repair authority: %v", ordinary)
+	}
+	repositoryFailure := repairPathsForFinding(configured, visualhive.FindingLifecycle{IssueKind: visualhive.RepositoryTestFailureKind})
+	joined := strings.Join(repositoryFailure, "\n")
+	for _, expected := range []string{"**/package.json", "**/package-lock.json", "**/pyproject.toml", "**/go.mod"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("repository-test repair paths lack %s: %v", expected, repositoryFailure)
+		}
+	}
+	config := Config{AllowedAutoMergePaths: []string{"**/*.test.*"}}
+	if strings.Contains(strings.Join(config.AllowedAutoMergePaths, "\n"), "package") {
+		t.Fatal("per-finding dependency repair authority leaked into auto-merge paths")
+	}
+}
+
+func TestRepositoryTestFailureIsSelectedBeforeOrdinaryOpenFinding(t *testing.T) {
+	state := visualhive.LifecycleState{Findings: map[string]*visualhive.FindingLifecycle{
+		"a-ordinary": {RepositoryFingerprint: "a-ordinary", IssueKind: "mutation_survivor", Status: visualhive.StatusIssueOpen, IssueNumber: 1},
+		"z-blocking": {RepositoryFingerprint: "z-blocking", IssueKind: visualhive.RepositoryTestFailureKind, Status: visualhive.StatusIssueOpen, IssueNumber: 2},
+	}}
+	if selected := selectedRepairKey(state); selected != "z-blocking" {
+		t.Fatalf("blocking repository-test failure was starved by fingerprint order: %q", selected)
+	}
+	if active, ok := activeRepairFinding(state); !ok || active.RepositoryFingerprint != "z-blocking" {
+		t.Fatalf("orchestration selected a different open issue than the worker: ok=%t finding=%+v", ok, active)
+	}
+	state.Findings["a-ordinary"].Status = visualhive.StatusRepairRunning
+	if selected := selectedRepairKey(state); selected != "a-ordinary" {
+		t.Fatalf("existing active repair lost repository concurrency ownership: %q", selected)
+	}
+	if active, ok := activeRepairFinding(state); !ok || active.RepositoryFingerprint != "a-ordinary" {
+		t.Fatalf("existing active repair was shadowed by another open issue: ok=%t finding=%+v", ok, active)
+	}
+}
+
+func TestMergePolicyRecheckIsDeterministicBoundedAndObservationSafe(t *testing.T) {
+	state := visualhive.LifecycleState{Findings: map[string]*visualhive.FindingLifecycle{
+		"held-b": {
+			RepositoryFingerprint: "held-b", Status: visualhive.StatusReady, IssueNumber: 3, PRNumber: 4,
+			RepairCommitSHA: strings.Repeat("a", 40), HumanReviewRequired: true, ManualReviewKind: "merge_policy",
+		},
+		"held-a": {
+			RepositoryFingerprint: "held-a", Status: visualhive.StatusReady, IssueNumber: 5, PRNumber: 6,
+			RepairCommitSHA: strings.Repeat("b", 40), HumanReviewRequired: true, ManualReviewKind: "merge_policy",
+		},
+	}}
+	held := mergePolicyHeldFindings(state)
+	if len(held) != 2 || held[0].RepositoryFingerprint != "held-a" || held[1].RepositoryFingerprint != "held-b" {
+		t.Fatalf("multiple policy holds were not returned deterministically: %+v", held)
+	}
+
+	config := Config{Repository: "owner/repo", DefaultBranch: "main", Automation: AutomationAutoMerge, ACMMLevel: 6, MaxRepairAttempts: 4,
+		AllowedAutoMergePaths: []string{"**/*.test.*"}, AllowedAutoMergeRisk: []automation.RiskTier{automation.RiskAutomatic}}
+	policy := integratedPolicy(config)
+	finding := held[0]
+	gate := hivegithub.PullRequestGate{
+		Number: finding.PRNumber, Open: true, HeadSHA: finding.RepairCommitSHA, BaseSHA: strings.Repeat("c", 40), BaseBranch: "main",
+		MergeableKnown: true, Mergeable: true, ChangedFiles: []string{"src/metrics.test.ts"}, VisualHiveVerdictGreen: true,
+		RequiredCheckNames: []string{"visual-hive"}, RequiredCheckStates: []string{"success"}, BranchProtectionEnabled: true,
+	}
+	if decision, allowed := mergePolicyRecheckDecision(config, policy, finding, gate); !allowed || !decision.Allowed {
+		t.Fatalf("currently authorized exact test-only hold was not recheckable: %+v", decision)
+	}
+	gate.ChangedFiles = []string{"src/metrics.ts"}
+	if decision, allowed := mergePolicyRecheckDecision(config, policy, finding, gate); allowed || decision.Allowed {
+		t.Fatalf("still-denied source hold became recheckable: %+v", decision)
+	}
+	finding.ObservationHumanReviewRequired = true
+	gate.ChangedFiles = []string{"src/metrics.test.ts"}
+	if _, allowed := mergePolicyRecheckDecision(config, policy, finding, gate); allowed {
+		t.Fatal("observation-level review authority was erased by policy recheck")
 	}
 }
 
@@ -250,26 +331,27 @@ func TestReconcileExternallyMergedRepairRejectsMergeWithoutHiveIntent(t *testing
 func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) {
 	closed, deleted := 0, 0
 	marker := "<!-- hive-repair: finding -->"
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	oldHead, currentHead := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls" && request.URL.Query().Get("state") == "open":
-			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":11,"html_url":"https://example.test/pull/11","body":%q,"head":{"ref":"hive/repair-old","sha":"old-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}},{"number":12,"html_url":"https://example.test/pull/12","body":%q,"head":{"ref":"hive/repair-current","sha":"current-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}]`, marker, marker))
+			_, _ = io.WriteString(writer, fmt.Sprintf(`[{"number":11,"html_url":"https://example.test/pull/11","body":%q,"head":{"ref":"hive/repair-old","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}},{"number":12,"html_url":"https://example.test/pull/12","body":%q,"head":{"ref":"hive/repair-current","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}]`, marker, oldHead, marker, currentHead))
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/11":
 			state := "open"
 			if closed > 0 {
 				state = "closed"
 			}
-			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":11,"state":%q,"body":%q,"head":{"ref":"hive/repair-old","sha":"old-head","repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}`, state, marker))
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"number":11,"state":%q,"body":%q,"head":{"ref":"hive/repair-old","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","repo":{"id":123,"full_name":"owner/repo"}}}`, state, marker, oldHead))
 		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/pulls/11":
 			closed++
 			_, _ = io.WriteString(writer, `{"number":11,"state":"closed"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-old":
-			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-old","object":{"sha":"old-head","type":"commit"}}`)
+			_, _ = fmt.Fprintf(writer, `{"ref":"refs/heads/hive/repair-old","object":{"sha":%q,"type":"commit"}}`, oldHead)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/repair-current":
-			_, _ = io.WriteString(writer, `{"ref":"refs/heads/hive/repair-current","object":{"sha":"current-head","type":"commit"}}`)
+			_, _ = fmt.Fprintf(writer, `{"ref":"refs/heads/hive/repair-current","object":{"sha":%q,"type":"commit"}}`, currentHead)
 		case request.Method == http.MethodDelete && request.URL.Path == "/repos/owner/repo/git/refs/heads/hive/repair-old":
 			deleted++
 			writer.WriteHeader(http.StatusNoContent)
@@ -285,7 +367,7 @@ func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) 
 		Findings: map[string]*visualhive.FindingLifecycle{
 			"finding": {
 				Repository: "owner/repo", RepositoryFingerprint: "finding", Status: visualhive.StatusReady,
-				IssueNumber: 10, PRNumber: 12, PRURL: "https://example.test/pull/12", RepairCommitSHA: "current-head",
+				IssueNumber: 10, PRNumber: 12, PRURL: "https://example.test/pull/12", RepairCommitSHA: currentHead,
 				Branch: "hive/repair-current", RepairAttempts: 2, OwningAgentHint: "quality",
 			},
 		},
@@ -304,21 +386,25 @@ func TestReconcileOpenRepairDuplicatesClosesOnlySupersededExactPR(t *testing.T) 
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	policy := automation.Policy{ACMMLevel: 6, Mode: automation.ModeAutoMerge, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 5}
-	if err := reconcileOpenRepairDuplicates(context.Background(), Config{Repository: "owner/repo", DefaultBranch: "main"}, lifecycle, client, policy); err != nil {
+	store, err := NewStore(filepath.Join(t.TempDir(), "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileOpenRepairDuplicates(context.Background(), store, Config{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main"}, lifecycle, client, policy); err != nil {
 		t.Fatal(err)
 	}
 	if closed != 1 || deleted != 1 {
 		t.Fatalf("superseded repair was not closed and deleted exactly once: closed=%d deleted=%d", closed, deleted)
 	}
 	finding, _ := lifecycle.Finding("finding")
-	if finding.PRNumber != 12 || finding.Branch != "hive/repair-current" || finding.RepairCommitSHA != "current-head" {
+	if finding.PRNumber != 12 || finding.Branch != "hive/repair-current" || finding.RepairCommitSHA != currentHead {
 		t.Fatalf("durable current repair was changed: %+v", finding)
 	}
 }
 
 func TestReconcileApprovedBaselineBranchDeletesExactReviewedRef(t *testing.T) {
 	deleted := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
@@ -426,13 +512,13 @@ func TestReconcileExternallyMergedRepairDoesNotImplicitlyMigrateLegacyClosedStat
 
 func newMergedRepairServer(t *testing.T, deleted *int) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	return newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/apps/github-actions":
 			_, _ = io.WriteString(writer, `{"id":42,"slug":"github-actions"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/12":
-			_, _ = io.WriteString(writer, `{"number":12,"state":"closed","merged":true,"merge_commit_sha":"merge-sha","head":{"sha":"repair-sha","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-before"},"labels":[]}`)
+			_, _ = io.WriteString(writer, `{"number":12,"changed_files":1,"state":"closed","merged":true,"merge_commit_sha":"merge-sha","head":{"sha":"repair-sha","ref":"hive/repair-proof","repo":{"full_name":"owner/repo"}},"base":{"ref":"main","sha":"base-before"},"labels":[]}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/12/files":
 			_, _ = io.WriteString(writer, `[{"filename":"index.html"}]`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
@@ -455,7 +541,7 @@ func newMergedRepairServer(t *testing.T, deleted *int) *httptest.Server {
 }
 
 func TestVerifyPostMergeTargetAcceptsOnlyNonConflictingDescendant(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := newIntegratedGateTestServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		filename := ".hive/integrated.json"
 		if strings.Contains(request.URL.Path, "head-conflict") {

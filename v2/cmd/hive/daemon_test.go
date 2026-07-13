@@ -144,6 +144,7 @@ func TestDaemonStatusIsDurableAndReflectsLiveProcess(t *testing.T) {
 		StartedAt: time.Now().UTC(), IntervalSeconds: 900,
 	}
 	status.Executable, _ = os.Executable()
+	status.HiveCommit, status.ExecutableSHA256, _ = currentDaemonExecutableIdentity(status.Executable)
 	if err := writeIntegratedDaemonStatus(stateDir, status); err != nil {
 		t.Fatal(err)
 	}
@@ -216,9 +217,10 @@ func TestDaemonStatusRequiresCurrentLeaseOwner(t *testing.T) {
 	}
 	defer func() { releaseDaemonLease(lease) }()
 	executable, _ := os.Executable()
+	commit, digest, _ := currentDaemonExecutableIdentity(executable)
 	status := integratedDaemonStatus{
 		SchemaVersion: daemonStatusSchema, PID: os.Getpid(), Running: true, Repository: "owner/repo", StateDir: stateDir,
-		Executable: executable, StartedAt: time.Now().UTC(), IntervalSeconds: 900,
+		Executable: executable, HiveCommit: commit, ExecutableSHA256: digest, StartedAt: time.Now().UTC(), IntervalSeconds: 900,
 	}
 	if err := writeIntegratedDaemonStatus(stateDir, status); err != nil {
 		t.Fatal(err)

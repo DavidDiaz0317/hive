@@ -73,7 +73,7 @@ func (c *Client) InspectRepairPullRequestRefreshExact(ctx context.Context, reque
 	if err != nil {
 		return result, err
 	}
-	files, err := c.listPullRequestFiles(ctx, owner, repo, request.PRNumber)
+	files, err := c.listPullRequestFiles(ctx, owner, repo, request.PRNumber, pull.GetChangedFiles())
 	if err != nil {
 		return result, err
 	}

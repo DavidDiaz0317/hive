@@ -357,7 +357,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}, {"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "run_repository_test npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "repository-test-exit-code.txt", "repository-tests.tsv", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "--github-step-summary", "bundle cannot resolve absent findings", "resolution_args+=(--authoritative-for-resolution)"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "name: Hive repository test 002", "name: Hive repository test 003", "visual-hive-execution", "visual-hive-production", "setup-baseline-capture", "setup-baseline-verify", "--bootstrap-baselines", "hive-setup-baselines-${{ inputs.hive_dispatch_id }}", "setup-baseline-manifest.json", `runner: "ubuntu-latest"`, "sudo -u hive-target -- env -i", "env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY", "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-raw-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "Raw evidence contains a symbolic link", "--authoritative-for-resolution"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}
@@ -365,11 +365,11 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	if !containsString(value, "pipeline-exit-code.txt") || !containsString(value, "set +e") {
 		t.Fatal("workflow must publish evidence after a deterministic red verdict")
 	}
-	if strings.Count(value, "persist-credentials: false") != 3 {
-		t.Fatal("production workflow must remove credentials from target, tooling, and guarded seed checkouts")
+	if strings.Count(value, "persist-credentials: false") != len(config.TestCommands)+9 {
+		t.Fatal("production workflow must remove credentials from every isolated repository test, target, verifier, tooling, and guarded seed checkout")
 	}
-	if strings.Count(value, "include-hidden-files: true") != 2 {
-		t.Fatal("both hidden .visual-hive artifact uploads must opt in explicitly")
+	if strings.Count(value, "include-hidden-files: true") != 5 {
+		t.Fatal("raw, independently verified, and lifecycle-bundle uploads must opt in to hidden .visual-hive artifacts")
 	}
 	if !containsString(value, "hive integration-smoke") {
 		t.Fatal("workflow must validate Hive import artifacts before finalizing a lifecycle bundle")
@@ -382,6 +382,23 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	}
 	if !containsString(value, "node --test") {
 		t.Fatal("production workflow must execute the repository unit-test bootstrap")
+	}
+	if !containsString(value, "needs:\n      - visual-hive-execution\n      - repository-test-001") || !containsString(value, "if: ${{ always() && inputs.hive_operation == 'production' }}") {
+		t.Fatal("repository tests and isolated target collection must be runner-owned dependencies of the fresh verifier")
+	}
+	for _, jobID := range []string{"repository-test-001", "repository-test-002", "repository-test-003"} {
+		start := strings.Index(value, "  "+jobID+":\n")
+		if start < 0 {
+			t.Fatalf("production workflow is missing %s", jobID)
+		}
+		rest := value[start+1:]
+		end := strings.Index(rest, "\n  ")
+		if end < 0 {
+			end = len(rest)
+		}
+		if strings.Contains(rest[:end], "continue-on-error: true") {
+			t.Fatalf("repository test %s is not a terminal runner-owned job", jobID)
+		}
 	}
 	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
 		t.Fatalf("workflow has an unsafe write lane:\n%s", value)
@@ -623,19 +640,30 @@ func TestRepositoryTestShellCapturesFailureAndContinues(t *testing.T) {
 }
 
 func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
-	value := pullRequestWorkflow(Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, "run_repository_test node --test", "visual-hive-pr", "pipeline-exit-code.txt", "repository-test-exit-code.txt", "Repository test plan failed", "Enforce deterministic verdict", "baselines list", "--github-step-summary"} {
+	value := pullRequestWorkflow(Config{RepositoryID: "123", DefaultBranch: "main", SetupBranch: "hive/setup-123", SetupAuthorizationActorID: 456, VisualHive: true, VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", TestCommands: [][]string{{"node", "--test"}}})
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "node --test", "visual-hive-execution", "visual-hive-pr-raw-${{ github.run_id }}", "name: visual-hive-pr", "pipeline-exit-code.txt", "Repository test plan failed", "Enforce deterministic verdict", "baselines list", "HIVE_NEEDS_JSON: ${{ toJSON(needs) }}", "HIVE_EXPECTED_REPOSITORY_JOBS", "sudo chown -R root:root .git", "Raw evidence contains a symbolic link",
+		"name: Hive setup authorization", "statuses: read", "HIVE_AUTHORIZER_ID", "diff-tree", "--no-renames", "hive/setup-authorized/", "needs.setup-authorization.outputs.authorized", "setup-bootstrap-repository-failure.v2", "Every unauthorized PR remains blocked",
+		"HIVE_EXPECTED_UNINSTALL_REF: hive/uninstall-123", "operation: ${{ steps.authorize.outputs.operation }}", "HIVE_SETUP_OPERATION", "Exact out-of-band-authorized Hive uninstall", "always() && needs.setup-authorization.outputs.operation != 'uninstall'"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow missing %q", required)
 		}
 	}
-	if containsString(value, "pull_request_target") || containsString(value, "issues: write") || containsString(value, "pull-requests: write") {
+	if containsString(value, "issues: write") || containsString(value, "pull-requests: write") || containsString(value, "statuses: write") {
 		t.Fatalf("pull request workflow has an unsafe write lane:\n%s", value)
 	}
-	if strings.Count(value, "persist-credentials: false") != 2 {
-		t.Fatal("pull request workflow must remove credentials from both target and tooling checkouts")
+	if !containsString(value, "pull_request_target:\n    types: [opened, synchronize, reopened]") {
+		t.Fatal("pull_request_target must be limited to the base-branch uninstall check publisher lane")
 	}
-	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`} {
+	if strings.Count(value, "persist-credentials: false") != 6 {
+		t.Fatal("pull request workflow must remove credentials from every authorization, target, and fresh-verifier checkout")
+	}
+	if !containsString(value, "if: ${{ github.event_name == 'pull_request' && needs.setup-authorization.outputs.operation != 'uninstall' }}") {
+		t.Fatal("every target-execution job must be explicitly pull_request-only and skipped for managed uninstall")
+	}
+	if proof, upload := strings.Index(value, "setup-bootstrap-repository-failure.json"), strings.Index(value, "- name: Upload review evidence"); proof < 0 || upload < 0 || proof > upload {
+		t.Fatal("setup bootstrap proof must be written before the always-run review artifact upload")
+	}
+	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --no-ext-diff --no-textconv --no-renames --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`, "needs: setup-authorization", "if: ${{ always() && (github.event_name == 'pull_request' || needs.setup-authorization.outputs.operation == 'uninstall') }}"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow does not pass untrusted event data through quoted environment variables: missing %q", required)
 		}
@@ -643,9 +671,69 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	if containsString(value, "HIVE_FRESH_SETUP") {
 		t.Fatal("pull request workflow must not let an inconsistent installation self-certify through a reduced fresh-setup lane")
 	}
+	for _, forbidden := range []string{"HIVE_PR_AUTHOR_ASSOCIATION", "HIVE_PR_BODY", "changed.every((file)", "author_association"} {
+		if containsString(value, forbidden) {
+			t.Fatalf("pull request workflow still trusts self-attested setup input %q", forbidden)
+		}
+	}
 	var document any
-	if err := yaml.Unmarshal([]byte(value), &document); err != nil || strings.Contains(value, "%!") {
+	if err := yaml.Unmarshal([]byte(value), &document); err != nil || strings.Contains(value, "%!") || strings.Contains(value, "\t") {
 		t.Fatalf("generated pull-request workflow is invalid: %v\n%s", err, value)
+	}
+	var shellDocument struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				Run  string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal([]byte(value), &shellDocument); err != nil {
+		t.Fatal(err)
+	}
+	bash := workflowBash(t)
+	verdictScript := ""
+	for jobName, job := range shellDocument.Jobs {
+		for _, step := range job.Steps {
+			if strings.TrimSpace(step.Run) == "" {
+				continue
+			}
+			if output, err := exec.Command(bash, "-n", "-c", step.Run).CombinedOutput(); err != nil {
+				t.Fatalf("generated shell is invalid in job %s step %q: %v\n%s\n%s", jobName, step.Name, err, output, step.Run)
+			}
+			if jobName == "visual-hive" && step.Name == "Enforce deterministic verdict" {
+				verdictScript = step.Run
+			}
+		}
+	}
+	if verdictScript == "" {
+		t.Fatal("generated pull-request workflow has no deterministic verdict script")
+	}
+	runVerdict := func(authorized, operation string, withEvidence bool) error {
+		command := exec.Command(bash, "-c", verdictScript)
+		command.Dir = t.TempDir()
+		if withEvidence {
+			writeFixture(t, command.Dir, ".visual-hive/pipeline.json", `{"status":"passed","exitCode":0}`)
+			writeFixture(t, command.Dir, ".visual-hive/verdict.json", `{"summary":{"visualHiveVerdict":"passed"}}`)
+		}
+		command.Env = append(os.Environ(),
+			"HIVE_SETUP_AUTHORIZED="+authorized, "HIVE_SETUP_OPERATION="+operation,
+			`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"success"}}`,
+			`HIVE_EXPECTED_REPOSITORY_JOBS=["repository-test-001"]`,
+			"HIVE_REPOSITORY=owner/repo", "HIVE_HEAD_SHA="+strings.Repeat("a", 40),
+			"HIVE_SETUP_CONTEXT=", "HIVE_SETUP_BINDING_DIGEST=", "HIVE_SETUP_DIFF_DIGEST=",
+			"HIVE_TRUSTED_REBUILD_OUTCOME=success",
+		)
+		return command.Run()
+	}
+	if err := runVerdict("true", "uninstall", false); err != nil {
+		t.Fatalf("exactly authorized uninstall did not satisfy the required visual-hive check: %v", err)
+	}
+	if err := runVerdict("false", "uninstall", false); err == nil {
+		t.Fatal("unauthorized managed uninstall satisfied the required visual-hive check")
+	}
+	if err := runVerdict("false", "setup", true); err != nil {
+		t.Fatalf("ordinary successful PR verdict was changed by the uninstall lane: %v", err)
 	}
 }
 
