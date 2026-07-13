@@ -68,10 +68,8 @@ func (c *Client) FetchAndVerifySetupBaselineArtifact(ctx context.Context, reques
 	if err != nil {
 		return VerifiedSetupBaselineArtifact{}, fmt.Errorf("read setup baseline workflow run: %w", err)
 	}
-	if run.GetID() != request.WorkflowRunID || run.GetEvent() != "workflow_dispatch" || run.GetStatus() != "completed" || run.GetConclusion() != "success" ||
-		!strings.EqualFold(run.GetHeadSHA(), request.CaptureHeadSHA) || run.GetHeadBranch() != request.DefaultBranch ||
-		run.GetDisplayTitle() != request.ExpectedRunName || run.GetName() != request.ExpectedWorkflowName || run.GetWorkflowID() <= 0 {
-		return VerifiedSetupBaselineArtifact{}, fmt.Errorf("setup baseline workflow run violates its exact event, head, ref, name, or successful conclusion binding")
+	if err := validateSetupBaselineWorkflowRun(run, request); err != nil {
+		return VerifiedSetupBaselineArtifact{}, err
 	}
 	definition, _, err := c.client.Actions.GetWorkflowByID(ctx, owner, repo, run.GetWorkflowID())
 	if err != nil {
@@ -111,6 +109,15 @@ func (c *Client) FetchAndVerifySetupBaselineArtifact(ctx context.Context, reques
 		ArtifactName: artifact.GetName(), CaptureHead: strings.ToLower(request.CaptureHeadSHA), HeadBranch: run.GetHeadBranch(),
 		WorkflowName: definition.GetName(), WorkflowPath: filepath.ToSlash(definitionPath), RunURL: run.GetHTMLURL(), ArtifactRoot: root,
 	}, nil
+}
+
+func validateSetupBaselineWorkflowRun(run *gh.WorkflowRun, request SetupBaselineArtifactRequest) error {
+	if run == nil || run.GetID() != request.WorkflowRunID || run.GetEvent() != "workflow_dispatch" || run.GetStatus() != "completed" || run.GetConclusion() != "success" ||
+		!strings.EqualFold(run.GetHeadSHA(), request.CaptureHeadSHA) || run.GetHeadBranch() != request.DefaultBranch ||
+		run.GetDisplayTitle() != request.ExpectedRunName || run.GetWorkflowID() <= 0 {
+		return fmt.Errorf("setup baseline workflow run violates its exact event, head, ref, name, or successful conclusion binding")
+	}
+	return nil
 }
 
 func (c *Client) listAllSetupBaselineWorkflowJobs(ctx context.Context, owner, repo string, runID int64) (*gh.Jobs, error) {

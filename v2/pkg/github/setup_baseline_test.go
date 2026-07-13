@@ -13,6 +13,53 @@ import (
 	gh "github.com/google/go-github/v72/github"
 )
 
+func TestValidateSetupBaselineWorkflowRunUsesCorrelationBoundTitleAndImmutableWorkflowID(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	request := SetupBaselineArtifactRequest{
+		WorkflowRunID:        77,
+		CaptureHeadSHA:       head,
+		DefaultBranch:        "main",
+		ExpectedWorkflowName: "Hive Visual Hive Production",
+		ExpectedRunName:      "Hive Visual Hive Production [correlation]",
+	}
+	valid := func() *gh.WorkflowRun {
+		return &gh.WorkflowRun{
+			ID: gh.Ptr(int64(77)), Event: gh.Ptr("workflow_dispatch"), Status: gh.Ptr("completed"), Conclusion: gh.Ptr("success"),
+			HeadSHA: gh.Ptr(head), HeadBranch: gh.Ptr("main"), DisplayTitle: gh.Ptr(request.ExpectedRunName),
+			Name: gh.Ptr(request.ExpectedRunName), WorkflowID: gh.Ptr(int64(311323607)),
+		}
+	}
+	if err := validateSetupBaselineWorkflowRun(valid(), request); err != nil {
+		t.Fatalf("live correlation-bound run name was rejected before immutable workflow-definition verification: %v", err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*gh.WorkflowRun)
+	}{
+		{name: "id", mutate: func(run *gh.WorkflowRun) { run.ID = gh.Ptr(int64(78)) }},
+		{name: "event", mutate: func(run *gh.WorkflowRun) { run.Event = gh.Ptr("push") }},
+		{name: "status", mutate: func(run *gh.WorkflowRun) { run.Status = gh.Ptr("in_progress") }},
+		{name: "conclusion", mutate: func(run *gh.WorkflowRun) { run.Conclusion = gh.Ptr("failure") }},
+		{name: "head", mutate: func(run *gh.WorkflowRun) { run.HeadSHA = gh.Ptr(strings.Repeat("b", 40)) }},
+		{name: "branch", mutate: func(run *gh.WorkflowRun) { run.HeadBranch = gh.Ptr("other") }},
+		{name: "display title", mutate: func(run *gh.WorkflowRun) { run.DisplayTitle = gh.Ptr("other") }},
+		{name: "workflow id", mutate: func(run *gh.WorkflowRun) { run.WorkflowID = gh.Ptr(int64(0)) }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			run := valid()
+			mutation.mutate(run)
+			if err := validateSetupBaselineWorkflowRun(run, request); err == nil {
+				t.Fatalf("%s mutation retained setup baseline run authority", mutation.name)
+			}
+		})
+	}
+	if err := validateSetupBaselineWorkflowRun(nil, request); err == nil {
+		t.Fatal("nil setup baseline workflow run retained authority")
+	}
+}
+
 func TestValidateSetupBaselineJobInventoryRejectsTruncatedPage(t *testing.T) {
 	head := strings.Repeat("a", 40)
 	job := func(name, conclusion string) *gh.WorkflowJob {
