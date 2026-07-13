@@ -327,6 +327,10 @@ func TestCodexReviewedFeatureInventoryBindsPlatformDefaults(t *testing.T) {
 	if _, ok := platforms["darwin"]; ok {
 		t.Fatal("unshipped platform unexpectedly received a reviewed runtime inventory")
 	}
+	desktopPlatforms := reviewedCodexVersions["codex-cli 0.144.0-alpha.4"]
+	if len(desktopPlatforms) != 1 || desktopPlatforms["windows"] != codexReviewedFeatureInventoryV0144 {
+		t.Fatalf("reviewed Windows desktop runtime is not exact-platform bound: %v", desktopPlatforms)
+	}
 }
 
 func argumentSequencePresent(args []string, expected ...string) bool {
@@ -619,7 +623,11 @@ func TestCodexProviderHealthAuthorizationIsOneShotUnderConcurrency(t *testing.T)
 
 func TestCodexProviderSealsAreRemovedWithoutDeletingUnrelatedTemp(t *testing.T) {
 	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
-	unrelated := filepath.Join(os.TempDir(), "hive-codex-provider-seals-unrelated-"+strings.ReplaceAll(t.Name(), "/", "-"))
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	t.Setenv("TMP", tempRoot)
+	t.Setenv("TEMP", tempRoot)
+	unrelated := filepath.Join(tempRoot, "hive-codex-provider-seals-unrelated-"+strings.ReplaceAll(t.Name(), "/", "-"))
 	if err := os.Mkdir(unrelated, 0o700); err != nil {
 		t.Fatal(err)
 	}

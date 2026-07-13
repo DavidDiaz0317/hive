@@ -116,7 +116,8 @@ __VERIFIER_SCRIPT__
 		"__UNINSTALL_ALLOWED_FILES__", string(uninstallAllowedJSON),
 		"__VERIFIER_SCRIPT__", setupAuthorizationWorkflowVerifierScript(),
 	)
-	return replacer.Replace(value)
+	rendered := replacer.Replace(value)
+	return strings.Replace(rendered, "HIVE_UNINSTALL_REQUIRED_FILES: '[]'", `HIVE_UNINSTALL_REQUIRED_FILES: "[]"`, 1)
 }
 
 func uninstallCheckPublisherWorkflowJob() string {

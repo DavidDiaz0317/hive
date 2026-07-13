@@ -1718,7 +1718,10 @@ func targetPackageInstallShell() string {
             fi
           done < <(find . \( -name package-lock.json -o -name pnpm-lock.yaml -o -name yarn.lock \) -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
           while IFS= read -r -d '' lockfile; do
-            npm --prefix "$(dirname "$lockfile")" ci
+            package_dir="$(dirname "$lockfile")"
+            test -f "$package_dir/package.json"
+            test -f "$package_dir/package-lock.json"
+            (cd "$package_dir" && npm ci)
           done < <(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
           while IFS= read -r -d '' lockfile; do
             enable_corepack
@@ -1845,7 +1848,7 @@ func targetPackageInstallShell() string {
             lockless_package_dirs+=("$package_dir")
           done < <(find . -name package.json -not -path '*/node_modules/*' -not -path './.git/*' -not -path '*/dist/*' -not -path '*/build/*' -not -path '*/coverage/*' -not -path '*/vendor/*' -not -path './.visual-hive/*' -print0 | sort -z)
           for package_dir in "${lockless_package_dirs[@]}"; do
-            npm --prefix "$package_dir" install
+            (cd "$package_dir" && npm install)
           done`
 }
 

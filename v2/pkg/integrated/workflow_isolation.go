@@ -12,6 +12,10 @@ const (
 	downloadArtifactActionSHA = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" // actions/download-artifact v8.0.1
 	visualExecutionJobName    = "visual-hive-execution"
 	isolatedTargetAccount     = "hive-target"
+	isolatedTargetRoot        = "/opt/hive-target"
+	isolatedTargetWorkspace   = isolatedTargetRoot + "/workspace"
+	isolatedTrustedRoot       = isolatedTargetRoot + "/trusted"
+	isolatedTrustedTooling    = isolatedTrustedRoot + "/visual-hive-tooling"
 	setupBaselineCaptureJobID = "setup-baseline-capture"
 	setupBaselineVerifyJobID  = "setup-baseline-verify"
 )
@@ -32,6 +36,12 @@ func isolatedWorkflow(config Config) string {
 	repositoryJobs, repositoryNeeds := isolatedRepositoryTestWorkflowJobs(config, "", "inputs.hive_operation == 'production'")
 	productionNeeds := appendWorkflowNeed(repositoryNeeds, visualExecutionJobName)
 	productionNeeds = strings.Replace(productionNeeds, "    if: ${{ always() }}", "    if: ${{ always() && inputs.hive_operation == 'production' }}", 1)
+	jobs := joinWorkflowJobs(
+		repositoryJobs,
+		isolatedVisualExecutionWorkflowJob(config, false, "inputs.hive_operation == 'production'"),
+		productionAggregatorWorkflowJob(config, productionNeeds),
+		isolatedSetupBaselineCaptureWorkflowJobs(config),
+	)
 	return fmt.Sprintf(`name: Hive Visual Hive Production
 
 on:
@@ -61,9 +71,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-%s
-%s
-%s
 %s
 
   # GitHub allows an App-bound context to become required only after that
@@ -96,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$HIVE_DISPATCH_SHA"
-`, repositoryJobs, isolatedVisualExecutionWorkflowJob(config, false, "inputs.hive_operation == 'production'"), productionAggregatorWorkflowJob(config, productionNeeds), isolatedSetupBaselineCaptureWorkflowJobs(config), checkoutActionSHA)
+`, jobs, checkoutActionSHA)
 }
 
 // isolatedPullRequestWorkflow keeps the protected visual-hive context on a
@@ -107,7 +114,14 @@ func isolatedPullRequestWorkflow(config Config) string {
 	uninstallCheckJob := uninstallCheckPublisherWorkflowJob()
 	repositoryJobs, repositoryNeeds := isolatedRepositoryTestWorkflowJobs(config, "setup-authorization", "github.event_name == 'pull_request' && needs.setup-authorization.outputs.operation != 'uninstall'")
 	aggregatorNeeds := appendWorkflowNeeds(repositoryNeeds, "setup-authorization", visualExecutionJobName)
-	aggregatorNeeds = strings.Replace(aggregatorNeeds, "    if: ${{ always() }}", "    if: ${{ always() && (github.event_name == 'pull_request' || needs.setup-authorization.outputs.operation == 'uninstall') }}", 1)
+	aggregatorNeeds = strings.Replace(aggregatorNeeds, "    if: ${{ always() }}", "    if: ${{ always() && github.event_name == 'pull_request' }}", 1)
+	jobs := joinWorkflowJobs(
+		setupAuthorizationJob,
+		uninstallCheckJob,
+		repositoryJobs,
+		isolatedVisualExecutionWorkflowJob(config, true),
+		pullRequestAggregatorWorkflowJob(config, aggregatorNeeds),
+	)
 	return fmt.Sprintf(`name: Visual Hive PR
 
 on:
@@ -125,11 +139,7 @@ concurrency:
 
 jobs:
 %s
-%s
-%s
-%s
-%s
-`, setupAuthorizationJob, uninstallCheckJob, repositoryJobs, isolatedVisualExecutionWorkflowJob(config, true), pullRequestAggregatorWorkflowJob(config, aggregatorNeeds))
+`, jobs)
 }
 
 func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition string) (string, string) {
@@ -285,8 +295,10 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
         shell: bash
         run: |
           set -euo pipefail
-          mv .hive-visual-tooling "$RUNNER_TEMP/visual-hive-tooling"
-          cli="$RUNNER_TEMP/visual-hive-tooling/packages/cli/dist/index.js"
+%s
+          trusted_tooling=%q
+          sudo mv .hive-visual-tooling "$trusted_tooling"
+          cli="$trusted_tooling/packages/cli/dist/index.js"
           test -f "$cli"
           cli_sha="$(sha256sum "$cli" | cut -d ' ' -f 1)"
           trusted_node="$(readlink -f "$(command -v node)")"
@@ -304,9 +316,8 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           echo "HIVE_VISUAL_HIVE_CLI_SHA=$cli_sha" >> "$GITHUB_ENV"
           echo "HIVE_TRUSTED_NODE=$trusted_node" >> "$GITHUB_ENV"
           echo "HIVE_TRUSTED_NODE_SHA=$trusted_node_sha" >> "$GITHUB_ENV"
-          sudo chown -R root:root "$RUNNER_TEMP/visual-hive-tooling"
-          sudo chmod -R a-w "$RUNNER_TEMP/visual-hive-tooling"
-%s
+          sudo chown -R root:root "$trusted_tooling"
+          sudo chmod -R a-w "$trusted_tooling"
 %s      - name: Install target dependencies in isolated account
         shell: bash
         run: |
@@ -333,18 +344,30 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
         shell: bash
         run: |
           set -euo pipefail
+          target_workspace="${HIVE_TARGET_WORKSPACE:-}"
+          cleanup_target_workspace() {
+            if [ -n "$target_workspace" ] && mountpoint -q "$target_workspace"; then
+              sudo umount "$target_workspace" || true
+            fi
+          }
+          trap cleanup_target_workspace EXIT
+          test -n "$target_workspace"
           sudo pkill -KILL -u %s 2>/dev/null || true
           test "$(sha256sum "$VISUAL_HIVE_CLI" | cut -d ' ' -f 1)" = "$HIVE_VISUAL_HIVE_CLI_SHA"
           test ! -w "$VISUAL_HIVE_CLI"
           test "$(sha256sum "$HIVE_TRUSTED_NODE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_NODE_SHA"
           sudo -u %s -- test ! -w "$HIVE_TRUSTED_NODE"
-          case "$HIVE_TRUSTED_BROWSER_EXECUTABLE" in
-            "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"/*) ;;
-            *) echo "Pinned browser escaped its sealed root" >&2; exit 1 ;;
-          esac
-          test -x "$HIVE_TRUSTED_BROWSER_EXECUTABLE"
-          test "$(sha256sum "$HIVE_TRUSTED_BROWSER_EXECUTABLE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_BROWSER_SHA"
-          sudo -u %s -- test ! -w "$HIVE_TRUSTED_BROWSER_EXECUTABLE"
+          if [ -n "${HIVE_TRUSTED_BROWSER_EXECUTABLE:-}" ] && [ -n "${HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -n "${HIVE_TRUSTED_BROWSER_SHA:-}" ]; then
+            case "$HIVE_TRUSTED_BROWSER_EXECUTABLE" in
+              "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"/*) ;;
+              *) echo "Pinned browser escaped its sealed root" >&2; exit 1 ;;
+            esac
+            test -x "$HIVE_TRUSTED_BROWSER_EXECUTABLE"
+            test "$(sha256sum "$HIVE_TRUSTED_BROWSER_EXECUTABLE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_BROWSER_SHA"
+            sudo -u %s -- test ! -w "$HIVE_TRUSTED_BROWSER_EXECUTABLE"
+          else
+            echo "Pinned browser preparation did not complete" >&2
+          fi
           test "$(git rev-parse HEAD)" = "%s"
           git diff --no-ext-diff --no-textconv --exit-code -- .
           if find .visual-hive -type l -print -quit | grep -q .; then
@@ -353,6 +376,12 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           fi
           test "$(find .visual-hive -type f | wc -l)" -le 5000
           test "$(du -sb .visual-hive | cut -f 1)" -le 1073741824
+          sudo umount "$target_workspace"
+          trap - EXIT
+          if mountpoint -q "$target_workspace"; then
+            echo "Isolated target workspace remained mounted" >&2
+            exit 1
+          fi
       - name: Upload isolated raw Visual evidence
         if: always()
         uses: actions/upload-artifact@%s
@@ -372,7 +401,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 %s
 `, visualExecutionJobName, visualExecutionJobName, gate, checkoutActionSHA, checkoutRef, checkoutActionSHA,
 		config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, config.VisualHiveRef,
-		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10),
+		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10), isolatedTrustedTooling,
 		captureScope, indentWorkflowShell(isolatedTargetDependencyShell(true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
 		isolatedVisualTargetEnvPrefix(), modeArgs, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, checkoutRef, uploadArtifactActionSHA, rawArtifact,
 		indentWorkflowShell(finalEnforcement, 10))
@@ -692,6 +721,22 @@ func runnerOwnedVerifierSetupSteps(config Config, targetRef, condition string) s
 
 func runnerOwnedEvidenceRebuildShell(_ bool) string {
 	return `set -euo pipefail
+runner_workspace="$(readlink -f "$GITHUB_WORKSPACE")"
+review_workspace="` + isolatedTargetWorkspace + `"
+test "$runner_workspace" = "$GITHUB_WORKSPACE"
+test ! -e "` + isolatedTargetRoot + `"
+sudo install -d -o root -g root -m 0755 "` + isolatedTargetRoot + `" "$review_workspace"
+sudo mount --bind "$runner_workspace" "$review_workspace"
+cleanup_review_workspace() {
+  cd "$runner_workspace" || true
+  if mountpoint -q "$review_workspace"; then
+    sudo umount "$review_workspace" || true
+  fi
+}
+trap cleanup_review_workspace EXIT
+mountpoint -q "$review_workspace"
+test "$(stat -Lc '%d:%i' "$review_workspace")" = "$(stat -Lc '%d:%i' "$runner_workspace")"
+cd "$review_workspace"
 test -f "$VISUAL_HIVE_CLI"
 test ! -w "$VISUAL_HIVE_CLI"
 test -d .visual-hive
@@ -735,7 +780,13 @@ const ids = [...new Set([
   ...systemScopes
 ].filter(Boolean))].sort();
 fs.writeFileSync(".visual-hive/evaluated-contracts.txt", ids.join("\n") + "\n");
-NODE`
+NODE
+cleanup_review_workspace
+trap - EXIT
+if mountpoint -q "$review_workspace"; then
+  echo "Runner-owned review workspace remained mounted" >&2
+  exit 1
+fi`
 }
 
 func pullRequestEnforcementShell() string {
@@ -821,6 +872,14 @@ sudo useradd --create-home --shell /bin/bash %s
 sudo install -d -o %s -g %s -m 0755 /home/%s/.local/bin /home/%s/.cache
 python_bin="$(command -v python)"
 (cd / && sudo -u %s -- env -i HOME=/home/%s PATH="$PATH" "$python_bin" -I -m venv /home/%s/.venv)
+target_root=%q
+target_workspace=%q
+trusted_root=%q
+test ! -e "$target_root"
+sudo install -d -o root -g root -m 0755 "$target_root" "$target_workspace" "$trusted_root"
+test -d "$GITHUB_WORKSPACE"
+test ! -L "$GITHUB_WORKSPACE"
+test "$(readlink -f "$GITHUB_WORKSPACE")" = "$GITHUB_WORKSPACE"
 sudo chown -R %s:%s "$GITHUB_WORKSPACE"
 test -d .git
 test ! -L .git
@@ -831,8 +890,14 @@ sudo chmod -R a-w .git
 sudo chown root:root visual-hive.config.yaml
 sudo chmod 0444 visual-hive.config.yaml
 sudo chmod 1777 "$GITHUB_WORKSPACE"
+sudo mount --bind "$GITHUB_WORKSPACE" "$target_workspace"
+mountpoint -q "$target_workspace"
+test "$(stat -Lc '%%d:%%i' "$target_workspace")" = "$(stat -Lc '%%d:%%i' "$GITHUB_WORKSPACE")"
+echo "HIVE_TARGET_WORKSPACE=$target_workspace" >> "$GITHUB_ENV"
 `, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount,
-		isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount)
+		isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount,
+		isolatedTargetRoot, isolatedTargetWorkspace, isolatedTrustedRoot,
+		isolatedTargetAccount, isolatedTargetAccount)
 }
 
 func verifyAndSealTargetCheckoutShell() string {
@@ -862,9 +927,23 @@ done < <(git ls-files -z)
 
 func verifyImmutableTargetCheckoutShell() string {
 	return fmt.Sprintf(`set -euo pipefail
+target_workspace="${HIVE_TARGET_WORKSPACE:-}"
+cleanup_target_workspace() {
+  if [ -n "$target_workspace" ] && mountpoint -q "$target_workspace"; then
+    sudo umount "$target_workspace" || true
+  fi
+}
+trap cleanup_target_workspace EXIT
+test -n "$target_workspace"
 sudo pkill -KILL -u %s 2>/dev/null || true
 test "$(git rev-parse HEAD)" = "$HIVE_TARGET_HEAD_SHA"
 git diff --no-ext-diff --no-textconv --exit-code -- .
+sudo umount "$target_workspace"
+trap - EXIT
+if mountpoint -q "$target_workspace"; then
+  echo "Isolated target workspace remained mounted" >&2
+  exit 1
+fi
 `, isolatedTargetAccount)
 }
 
@@ -877,12 +956,12 @@ elif [ -f requirements.txt ]; then
 fi`
 	trustedBrowser := ""
 	if includeTrustedBrowser {
-		trustedBrowser = `tooling_playwright="$RUNNER_TEMP/visual-hive-tooling/node_modules/@playwright/test/cli.js"
-trusted_browser_path="$RUNNER_TEMP/hive-playwright-${GITHUB_RUN_ID}"
+		trustedBrowser = `tooling_playwright="` + isolatedTrustedTooling + `/node_modules/@playwright/test/cli.js"
+trusted_browser_path="` + isolatedTrustedRoot + `/playwright-${GITHUB_RUN_ID}"
 test ! -e "$trusted_browser_path"
-install -d -m 0755 "$trusted_browser_path"
-PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" node "$tooling_playwright" install --with-deps chromium
-trusted_browser_executable="$(PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" node -e 'const { chromium } = require(process.argv[1]); process.stdout.write(chromium.executablePath())' "$RUNNER_TEMP/visual-hive-tooling/node_modules/playwright")"
+sudo install -d -o root -g root -m 0755 "$trusted_browser_path"
+sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium
+trusted_browser_executable="$(PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" -e 'const { chromium } = require(process.argv[1]); process.stdout.write(chromium.executablePath())' "` + isolatedTrustedTooling + `/node_modules/playwright")"
 trusted_browser_executable="$(readlink -f "$trusted_browser_executable")"
 trusted_browser_path="$(readlink -f "$trusted_browser_path")"
 case "$trusted_browser_executable" in
@@ -892,7 +971,6 @@ esac
 test -x "$trusted_browser_executable"
 sudo chown -R root:root "$trusted_browser_path"
 sudo chmod -R a-w "$trusted_browser_path"
-sudo chmod o+x "$RUNNER_TEMP"
 trusted_browser_sha="$(sha256sum "$trusted_browser_executable" | cut -d ' ' -f 1)"
 sudo -u hive-target -- test ! -w "$trusted_browser_executable"
 echo "HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH=$trusted_browser_path" >> "$GITHUB_ENV"
@@ -903,6 +981,8 @@ echo "HIVE_TRUSTED_BROWSER_SHA=$trusted_browser_sha" >> "$GITHUB_ENV"
 	return fmt.Sprintf(`set -euo pipefail
 %s
 %s bash --noprofile --norc -euo pipefail <<'HIVE_TARGET_DEPENDENCIES'
+test -n "${HIVE_TARGET_WORKSPACE:-}"
+test "$(pwd -P)" = "$HIVE_TARGET_WORKSPACE"
 %s
 %s
 while IFS= read -r -d '' playwright_cli; do
@@ -915,11 +995,11 @@ sudo chown -R %s:%s .visual-hive
 }
 
 func isolatedTargetEnvPrefix() string {
-	return "sudo -u " + isolatedTargetAccount + ` -- env -i HOME=/home/` + isolatedTargetAccount + ` PATH="/home/` + isolatedTargetAccount + `/.local/bin:/home/` + isolatedTargetAccount + `/.venv/bin:$PATH" LANG=C.UTF-8 CI=true PLAYWRIGHT_BROWSERS_PATH=/home/` + isolatedTargetAccount + `/.cache/ms-playwright HIVE_TARGET_PROCESS=1`
+	return "sudo -u " + isolatedTargetAccount + ` -- env -i -C "$HIVE_TARGET_WORKSPACE" HOME=/home/` + isolatedTargetAccount + ` PATH="/home/` + isolatedTargetAccount + `/.local/bin:/home/` + isolatedTargetAccount + `/.venv/bin:$PATH" LANG=C.UTF-8 CI=true PLAYWRIGHT_BROWSERS_PATH=/home/` + isolatedTargetAccount + `/.cache/ms-playwright HIVE_TARGET_WORKSPACE="$HIVE_TARGET_WORKSPACE" HIVE_TARGET_PROCESS=1`
 }
 
 func isolatedVisualTargetEnvPrefix() string {
-	return "sudo -u " + isolatedTargetAccount + ` -- env -i HOME=/home/` + isolatedTargetAccount + ` PATH="/home/` + isolatedTargetAccount + `/.local/bin:/home/` + isolatedTargetAccount + `/.venv/bin:$PATH" LANG=C.UTF-8 CI=true PLAYWRIGHT_BROWSERS_PATH="$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH" HIVE_TARGET_PROCESS=1`
+	return "sudo -u " + isolatedTargetAccount + ` -- env -i -C "$HIVE_TARGET_WORKSPACE" HOME=/home/` + isolatedTargetAccount + ` PATH="/home/` + isolatedTargetAccount + `/.local/bin:/home/` + isolatedTargetAccount + `/.venv/bin:$PATH" LANG=C.UTF-8 CI=true PLAYWRIGHT_BROWSERS_PATH="$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH" HIVE_TARGET_WORKSPACE="$HIVE_TARGET_WORKSPACE" HIVE_TARGET_PROCESS=1`
 }
 
 func workflowNeeds(jobNames []string) string {
@@ -954,6 +1034,17 @@ func workflowNeedLines(jobNames []string) string {
 	return strings.Join(lines, "\n")
 }
 
+func joinWorkflowJobs(jobs ...string) string {
+	joined := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		job = strings.Trim(job, "\n")
+		if job != "" {
+			joined = append(joined, job)
+		}
+	}
+	return strings.Join(joined, "\n\n")
+}
+
 func dedentWorkflowShell(value string) string {
 	lines := strings.Split(strings.Trim(value, "\n"), "\n")
 	for index := range lines {
@@ -966,7 +1057,9 @@ func indentWorkflowShell(value string, spaces int) string {
 	prefix := strings.Repeat(" ", spaces)
 	lines := strings.Split(strings.Trim(value, "\n"), "\n")
 	for index := range lines {
-		lines[index] = prefix + lines[index]
+		if lines[index] != "" {
+			lines[index] = prefix + lines[index]
+		}
 	}
 	return strings.Join(lines, "\n")
 }

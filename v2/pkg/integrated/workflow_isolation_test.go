@@ -72,6 +72,80 @@ func isolationWorkflowConfig() Config {
 	}
 }
 
+func TestGeneratedWorkflowsUseCanonicalYAMLWhitespace(t *testing.T) {
+	config := isolationWorkflowConfig()
+	workflows := map[string]string{
+		"production":   workflow(config),
+		"pull_request": pullRequestWorkflow(config),
+	}
+	for name, value := range workflows {
+		if !strings.HasSuffix(value, "\n") || strings.HasSuffix(value, "\n\n") {
+			t.Fatalf("%s workflow must have exactly one terminal newline", name)
+		}
+		if strings.Contains(value, "\n\n\n") {
+			t.Fatalf("%s workflow contains a non-canonical repeated blank line", name)
+		}
+		for lineNumber, line := range strings.Split(value, "\n") {
+			if strings.TrimRight(line, " \t") != line {
+				t.Fatalf("%s workflow line %d contains trailing whitespace", name, lineNumber+1)
+			}
+		}
+	}
+	if !strings.Contains(workflows["pull_request"], `HIVE_UNINSTALL_REQUIRED_FILES: "[]"`) ||
+		strings.Contains(workflows["pull_request"], `HIVE_UNINSTALL_REQUIRED_FILES: '[]'`) {
+		t.Fatal("pull-request workflow does not use the canonical empty JSON array scalar")
+	}
+}
+
+func TestIsolatedDependencyInstallPinsTheTargetWorkingDirectory(t *testing.T) {
+	shell := isolatedTargetDependencyShell(false)
+	if !strings.Contains(shell, `test "$(pwd -P)" = "$HIVE_TARGET_WORKSPACE"`) {
+		t.Fatal("isolated dependency installation does not verify its inherited runner-owned workspace")
+	}
+	if strings.Contains(shell, `cd "$HIVE_TARGET_WORKSPACE"`) {
+		t.Fatal("isolated dependency installation must not re-traverse non-public hosted-runner ancestors")
+	}
+	account := prepareIsolatedTargetAccountShell()
+	for _, required := range []string{
+		`target_workspace="/opt/hive-target/workspace"`,
+		`sudo mount --bind "$GITHUB_WORKSPACE" "$target_workspace"`,
+		`test "$(stat -Lc '%d:%i' "$target_workspace")" = "$(stat -Lc '%d:%i' "$GITHUB_WORKSPACE")"`,
+		`echo "HIVE_TARGET_WORKSPACE=$target_workspace" >> "$GITHUB_ENV"`,
+	} {
+		if !strings.Contains(account, required) {
+			t.Fatalf("isolated account setup does not bind the exact checkout through a root-controlled path: missing %q", required)
+		}
+	}
+	if strings.Contains(account, `chmod o+x "$RUNNER_WORKSPACE"`) {
+		t.Fatal("isolated account setup widens traversal on the hosted runner workspace")
+	}
+	for _, prefix := range []string{isolatedTargetEnvPrefix(), isolatedVisualTargetEnvPrefix()} {
+		if !strings.Contains(prefix, `env -i -C "$HIVE_TARGET_WORKSPACE"`) {
+			t.Fatalf("isolated target environment does not enter the root-controlled bind mount: %s", prefix)
+		}
+		if !strings.Contains(prefix, `HIVE_TARGET_WORKSPACE="$HIVE_TARGET_WORKSPACE"`) {
+			t.Fatalf("isolated target environment does not bind the runner-owned workspace: %s", prefix)
+		}
+		if strings.Contains(prefix, `-C "$GITHUB_WORKSPACE"`) {
+			t.Fatalf("isolated target environment re-enters the runner-private checkout path: %s", prefix)
+		}
+	}
+	if !strings.Contains(verifyImmutableTargetCheckoutShell(), `sudo umount "$target_workspace"`) {
+		t.Fatal("repository target cleanup does not unmount the isolated checkout")
+	}
+	review := runnerOwnedEvidenceRebuildShell(true)
+	for _, required := range []string{
+		`review_workspace="/opt/hive-target/workspace"`,
+		`sudo mount --bind "$runner_workspace" "$review_workspace"`,
+		`cd "$review_workspace"`,
+		`sudo umount "$review_workspace"`,
+	} {
+		if !strings.Contains(review, required) {
+			t.Fatalf("runner-owned review does not preserve the target evidence root: missing %q", required)
+		}
+	}
+}
+
 func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testing.T) {
 	config := isolationWorkflowConfig()
 	production := workflow(config)
@@ -135,8 +209,8 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 		}
 	}
 	pullAggregator := pullDocument.Jobs["visual-hive"]
-	if !strings.Contains(pullAggregator.If, "github.event_name == 'pull_request'") || !strings.Contains(pullAggregator.If, "operation == 'uninstall'") {
-		t.Fatalf("protected aggregator event gate is incomplete: %q", pullAggregator.If)
+	if !strings.Contains(pullAggregator.If, "github.event_name == 'pull_request'") || strings.Contains(pullAggregator.If, "pull_request_target") || strings.Contains(pullAggregator.If, "operation == 'uninstall'") {
+		t.Fatalf("protected aggregator must be pull_request-only: %q", pullAggregator.If)
 	}
 	for _, step := range pullAggregator.Steps {
 		if step.Name == "Enforce deterministic verdict" || strings.TrimSpace(step.Run) == "" && strings.TrimSpace(step.Uses) == "" {
@@ -181,26 +255,32 @@ func TestTrustedCollectorNodeCannotBeShadowedByTargetPath(t *testing.T) {
 
 func TestTrustedCollectorUsesSealedPinnedBrowser(t *testing.T) {
 	for name, value := range map[string]string{"production": workflow(isolationWorkflowConfig()), "pull-request": pullRequestWorkflow(isolationWorkflowConfig())} {
+		execution := workflowJobText(parseIsolatedWorkflow(t, value).Jobs[visualExecutionJobName])
 		for _, invariant := range []string{
-			`trusted_browser_path="$RUNNER_TEMP/hive-playwright-${GITHUB_RUN_ID}"`,
-			`PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" node "$tooling_playwright" install --with-deps chromium`,
+			`trusted_browser_path="/opt/hive-target/trusted/playwright-${GITHUB_RUN_ID}"`,
+			`sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`,
 			`sudo chown -R root:root "$trusted_browser_path"`,
 			`sudo chmod -R a-w "$trusted_browser_path"`,
-			`sudo chmod o+x "$RUNNER_TEMP"`,
+			`trusted_tooling="/opt/hive-target/trusted/visual-hive-tooling"`,
 			`PLAYWRIGHT_BROWSERS_PATH="$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"`,
 			`test "$(sha256sum "$HIVE_TRUSTED_BROWSER_EXECUTABLE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_BROWSER_SHA"`,
 			`sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_BROWSER_EXECUTABLE"`,
 		} {
-			if !strings.Contains(value, invariant) {
+			if !strings.Contains(execution, invariant) {
 				t.Fatalf("%s workflow lost sealed browser invariant %q", name, invariant)
 			}
 		}
-		if strings.Contains(value, `PLAYWRIGHT_BROWSERS_PATH=/home/hive-target/.cache/ms-playwright HIVE_TARGET_PROCESS=1 "$HIVE_TRUSTED_NODE"`) {
+		if strings.Contains(execution, `PLAYWRIGHT_BROWSERS_PATH=/home/hive-target/.cache/ms-playwright HIVE_TARGET_PROCESS=1 "$HIVE_TRUSTED_NODE"`) {
 			t.Fatalf("%s Visual collector still accepts the target-owned browser cache", name)
+		}
+		if strings.Contains(execution, `mv .hive-visual-tooling "$RUNNER_TEMP/visual-hive-tooling"`) ||
+			strings.Contains(execution, `trusted_browser_path="$RUNNER_TEMP/hive-playwright`) ||
+			strings.Contains(execution, `sudo chmod o+x "$RUNNER_TEMP"`) {
+			t.Fatalf("%s target-readable sealed tooling still traverses the runner-private temp root", name)
 		}
 	}
 	dependencyShell := isolatedTargetDependencyShell(true)
-	install := strings.Index(dependencyShell, `PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" node "$tooling_playwright" install --with-deps chromium`)
+	install := strings.Index(dependencyShell, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
 	targetDependencies := strings.Index(dependencyShell, "HIVE_TARGET_DEPENDENCIES")
 	if install < 0 || targetDependencies < 0 || install > targetDependencies {
 		t.Fatal("trusted browser is installed only after target dependency code")

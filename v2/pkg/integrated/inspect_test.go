@@ -124,7 +124,7 @@ func TestTargetPackageInstallHandlesMixedLockedAndLocklessRoots(t *testing.T) {
 	writeFixture(t, root, "yarn-berry/package.json", `{"packageManager":"yarn@4.9.1"}`)
 	writeFixture(t, root, "yarn-berry/yarn.lock", "# berry")
 	fakeBin := filepath.Join(root, "fake-bin")
-	writeFixture(t, fakeBin, "npm", "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$INSTALL_LOG\"\n")
+	writeFixture(t, fakeBin, "npm", "#!/usr/bin/env bash\nprintf 'npm:%s:%s\\n' \"$(basename \"$PWD\")\" \"$*\" >> \"$INSTALL_LOG\"\n")
 	writeFixture(t, fakeBin, "corepack", "#!/usr/bin/env bash\nexit 0\n")
 	writeFixture(t, fakeBin, "yarn", "#!/usr/bin/env bash\nif [ \"${1:-}\" = --version ]; then case \"$PWD\" in *yarn-berry) echo 4.9.1 ;; *) echo 1.22.22 ;; esac; exit 0; fi\nprintf 'yarn:%s:%s\\n' \"$(basename \"$PWD\")\" \"$*\" >> \"$INSTALL_LOG\"\n")
 	for _, executable := range []string{"npm", "corepack", "yarn"} {
@@ -149,7 +149,7 @@ func TestTargetPackageInstallHandlesMixedLockedAndLocklessRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	value := string(log)
-	for _, expected := range []string{"--prefix ./locked ci", "--prefix ./workspace ci", "--prefix ./lockless install", "--prefix ./workspace/examples/tool install", "yarn:yarn-classic:install --frozen-lockfile", "yarn:yarn-berry:install --immutable"} {
+	for _, expected := range []string{"npm:locked:ci", "npm:workspace:ci", "npm:lockless:install", "npm:tool:install", "yarn:yarn-classic:install --frozen-lockfile", "yarn:yarn-berry:install --immutable"} {
 		if !strings.Contains(value, expected) {
 			t.Fatalf("install plan omitted %q:\n%s", expected, value)
 		}
@@ -663,7 +663,7 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	if proof, upload := strings.Index(value, "setup-bootstrap-repository-failure.json"), strings.Index(value, "- name: Upload review evidence"); proof < 0 || upload < 0 || proof > upload {
 		t.Fatal("setup bootstrap proof must be written before the always-run review artifact upload")
 	}
-	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --no-ext-diff --no-textconv --no-renames --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`, "needs: setup-authorization", "if: ${{ always() && (github.event_name == 'pull_request' || needs.setup-authorization.outputs.operation == 'uninstall') }}"} {
+	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --no-ext-diff --no-textconv --no-renames --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`, "needs: setup-authorization", "if: ${{ always() && github.event_name == 'pull_request' }}"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow does not pass untrusted event data through quoted environment variables: missing %q", required)
 		}

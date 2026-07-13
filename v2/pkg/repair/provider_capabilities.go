@@ -14,6 +14,9 @@ import (
 // feature surface is unsupported until this inventory is explicitly reviewed
 // and updated with corresponding secured-argument and real-provider tests.
 var reviewedCodexVersions = map[string]map[string]string{
+	"codex-cli 0.144.0-alpha.4": {
+		"windows": codexReviewedFeatureInventoryV0144,
+	},
 	"codex-cli 0.144.1": {
 		"linux": strings.NewReplacer(
 			"secret_auth_storage                  stable             true", "secret_auth_storage                  stable             false",
