@@ -134,7 +134,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: visual-hive-pr-${{ github.event.pull_request.number }}
+  group: visual-hive-pr-${{ github.event_name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -830,20 +830,21 @@ const fs = require("fs");
           }
           const repositoryFailed = expected.some((name) => needs[name].result === "failure");
           const pipeline = JSON.parse(fs.readFileSync(".visual-hive/pipeline.json", "utf8"));
+          const report = JSON.parse(fs.readFileSync(".visual-hive/report.json", "utf8"));
           const verdict = JSON.parse(fs.readFileSync(".visual-hive/verdict.json", "utf8"));
           const readiness = fs.existsSync(".visual-hive/readiness.json") ? JSON.parse(fs.readFileSync(".visual-hive/readiness.json", "utf8")) : {};
           const visualVerdict = verdict?.summary?.visualHiveVerdict;
           const visualPassed = needs["visual-hive-execution"].result === "success" && process.env.HIVE_TRUSTED_REBUILD_OUTCOME === "success" && pipeline.exitCode === 0 && ["passed", "warning"].includes(visualVerdict);
-          const summary = pipeline.summary || {};
-          const verdictSummary = pipeline.verdictSummary || {};
-          const contributions = Array.isArray(pipeline.verdictContributions) ? pipeline.verdictContributions : [];
-          const screenshots = (Array.isArray(pipeline.results) ? pipeline.results : []).flatMap((result) => Array.isArray(result.screenshotAssertions) ? result.screenshotAssertions : []);
+          const summary = report.summary || {};
+          const verdictSummary = verdict.summary || {};
+          const contributions = Array.isArray(verdict.gatingContributions) ? verdict.gatingContributions : [];
+          const screenshots = (Array.isArray(report.results) ? report.results : []).flatMap((result) => Array.isArray(result.screenshotAssertions) ? result.screenshotAssertions : []);
           const blocking = contributions.filter((item) => item && item.gating === true && item.status !== "passed");
           const missing = screenshots.filter((item) => item && item.status === "missing_baseline");
           const readinessBlocked = (Array.isArray(readiness.gates) ? readiness.gates : []).filter((gate) => gate && gate.status === "blocked");
           const exclusiveMissingBaselineReadiness = readiness.status === "blocked" && readinessBlocked.some((gate) => gate.id === "baselines:missing-baseline") &&
             readinessBlocked.every((gate) => ["deterministic:status", "baselines:missing-baseline"].includes(gate.id));
-          const exclusiveMissingBaseline = ["failed", "blocked"].includes(pipeline.status) && verdictSummary.visualHiveVerdict === "blocked" &&
+          const exclusiveMissingBaseline = ["failed", "blocked"].includes(report.status) && verdictSummary.visualHiveVerdict === "blocked" &&
             Array.isArray(verdictSummary.failedBecause) && verdictSummary.failedBecause.length === 0 &&
             Number(summary.missingBaselines) > 0 && Number(summary.missingBaselines) === missing.length &&
             Number(summary.visualDiffs || 0) === 0 && Number(summary.consoleErrors || 0) === 0 && Number(summary.pageErrors || 0) === 0 && Number(summary.flowStepsFailed || 0) === 0 &&

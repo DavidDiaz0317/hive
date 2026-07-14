@@ -184,14 +184,22 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if definition.GetID() != run.GetWorkflowID() || strings.TrimSpace(definition.GetName()) == "" || definitionPath == "" || definitionPath != runPath {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition does not match the exact workflow run")
 	}
-	if request.ExpectedWorkflowName != "" && (definition.GetName() != request.ExpectedWorkflowName || run.GetName() != request.ExpectedWorkflowName) {
-		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition or run name mismatch")
+	if request.ExpectedWorkflowName != "" && definition.GetName() != request.ExpectedWorkflowName {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition name mismatch")
 	}
 	if request.ExpectedWorkflowPath != "" && !workflowPathMatches(definition.GetPath(), request.ExpectedWorkflowPath) {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition path mismatch")
 	}
-	if request.ExpectedRunName != "" && run.GetDisplayTitle() != request.ExpectedRunName {
-		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive correlated workflow run name mismatch")
+	if request.ExpectedRunName != "" {
+		if run.GetDisplayTitle() != request.ExpectedRunName {
+			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive correlated workflow run name mismatch")
+		}
+		runtimeName := strings.TrimSpace(run.GetName())
+		if runtimeName != request.ExpectedRunName && runtimeName != request.ExpectedWorkflowName {
+			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow runtime name mismatch")
+		}
+	} else if request.ExpectedWorkflowName != "" && run.GetName() != request.ExpectedWorkflowName {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow runtime name mismatch")
 	}
 	artifact, err := c.findRunArtifact(ctx, owner, repo, request.WorkflowRunID, request.ArtifactID)
 	if err != nil {

@@ -12,7 +12,10 @@ import (
 	"testing"
 )
 
-const repositoryTestJobsHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const (
+	repositoryTestJobsHead    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	repositoryTestJobsRunName = "Hive Visual Hive Production [bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb]"
+)
 
 type repositoryTestJobsFixture struct {
 	t                 *testing.T
@@ -35,7 +38,7 @@ type repositoryTestJobsFixture struct {
 func newRepositoryTestJobsFixture(t *testing.T) *repositoryTestJobsFixture {
 	t.Helper()
 	fixture := &repositoryTestJobsFixture{
-		t: t, runName: "Hive Visual Hive Production", runPath: ".github/workflows/hive-visual-hive.yml@main",
+		t: t, runName: repositoryTestJobsRunName, runPath: ".github/workflows/hive-visual-hive.yml@main",
 		runEvent: "workflow_dispatch", runHead: repositoryTestJobsHead, runStatus: "completed", runConclusion: "success",
 		definitionName: "Hive Visual Hive Production", definitionPath: ".github/workflows/hive-visual-hive.yml", definitionState: "active",
 		pages: [][]string{
@@ -97,11 +100,11 @@ func repositoryTestJobJSON(id int64, name, conclusion string) string {
 			repositoryTestStepJSON(5, "Complete job", "completed", "success"),
 		}, ",") + `]`
 	}
-	return fmt.Sprintf(`{"id":%d,"run_id":77,"name":%q,"head_sha":%q,"status":"completed","conclusion":%q,"workflow_name":"Hive Visual Hive Production"%s}`, id, name, repositoryTestJobsHead, conclusion, steps)
+	return fmt.Sprintf(`{"id":%d,"run_id":77,"name":%q,"head_sha":%q,"status":"completed","conclusion":%q,"workflow_name":%q%s}`, id, name, repositoryTestJobsHead, conclusion, repositoryTestJobsRunName, steps)
 }
 
 func repositoryTestJobWithStepsJSON(id int64, name, conclusion string, steps ...string) string {
-	return fmt.Sprintf(`{"id":%d,"run_id":77,"name":%q,"head_sha":%q,"status":"completed","conclusion":%q,"workflow_name":"Hive Visual Hive Production","steps":[%s]}`, id, name, repositoryTestJobsHead, conclusion, strings.Join(steps, ","))
+	return fmt.Sprintf(`{"id":%d,"run_id":77,"name":%q,"head_sha":%q,"status":"completed","conclusion":%q,"workflow_name":%q,"steps":[%s]}`, id, name, repositoryTestJobsHead, conclusion, repositoryTestJobsRunName, strings.Join(steps, ","))
 }
 
 func repositoryTestStepJSON(number int64, name, status, conclusion string) string {
@@ -274,7 +277,7 @@ func TestVerifyRepositoryTestJobsRejectsRunAndDefinitionSpoofing(t *testing.T) {
 	}{
 		{name: "wrong event", mutate: func(f *repositoryTestJobsFixture) { f.runEvent = "pull_request" }, want: "workflow_dispatch binding"},
 		{name: "wrong head", mutate: func(f *repositoryTestJobsFixture) { f.runHead = strings.Repeat("b", 40) }, want: "workflow_dispatch binding"},
-		{name: "wrong static run name", mutate: func(f *repositoryTestJobsFixture) { f.runName = "spoof" }, want: "workflow_dispatch binding"},
+		{name: "run name diverges from job workflow", mutate: func(f *repositoryTestJobsFixture) { f.runName = "spoof" }, want: "run/head/workflow binding"},
 		{name: "wrong run path", mutate: func(f *repositoryTestJobsFixture) { f.runPath = ".github/workflows/other.yml" }, want: "workflow_dispatch binding"},
 		{name: "disabled definition", mutate: func(f *repositoryTestJobsFixture) { f.definitionState = "disabled_manually" }, want: "active installed workflow"},
 		{name: "wrong definition name", mutate: func(f *repositoryTestJobsFixture) { f.definitionName = "spoof" }, want: "active installed workflow"},

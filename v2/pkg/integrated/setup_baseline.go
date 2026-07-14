@@ -718,19 +718,8 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 		}
 		intent = reset
 	}
-	if intent.Phase != SetupBaselinePending && intent.Phase != SetupBaselineDispatched && intent.CaptureRunID > 0 {
-		dispatch, dispatchExists, dispatchErr := store.LoadWorkflowDispatchIntent()
-		if dispatchErr != nil {
-			return intent, true, dispatchErr
-		}
-		if dispatchExists {
-			if dispatch.Operation != setupBaselineWorkflowOperation || dispatch.CorrelationID != intent.CaptureCorrelation || dispatch.RunID != intent.CaptureRunID {
-				return intent, true, fmt.Errorf("lingering setup baseline dispatch no longer matches the verified capture")
-			}
-			if err := discardWorkflowDispatch(store, dispatch, intent.CaptureRunID); err != nil {
-				return intent, true, fmt.Errorf("finish consuming verified setup baseline dispatch: %w", err)
-			}
-		}
+	if err := reconcileVerifiedSetupBaselineDispatch(store, intent); err != nil {
+		return intent, true, err
 	}
 	if intent.Phase == SetupBaselineProductionVerified {
 		return intent, false, nil
@@ -755,7 +744,7 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 		if err != nil {
 			return intent, true, fmt.Errorf("validate post-baseline production bundle without lifecycle writes: %w", err)
 		}
-		if bundle.Validation.Status != "valid" || !bundle.Validation.Trusted || !bundle.Validation.Authoritative {
+		if !postBaselineProductionValidationAccepted(bundle.Validation.Status, bundle.Validation.Trusted, bundle.Validation.Authoritative) {
 			return intent, true, fmt.Errorf("post-baseline production bundle is not trusted authoritative valid evidence")
 		}
 		if _, err := requireLiveInstalledWorkflowHead(ctx, client, config, workflow.HeadSHA); err != nil {
@@ -887,6 +876,32 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 		}
 	}
 	return intent, true, fmt.Errorf("setup baseline review PR %s is ready; run %s", intent.PRURL, setupBaselinePlanCommand(config.StateDir, intent))
+}
+
+func postBaselineProductionValidationAccepted(status string, trusted, authoritative bool) bool {
+	return status == "passed" && trusted && authoritative
+}
+
+func reconcileVerifiedSetupBaselineDispatch(store *Store, intent SetupBaselineIntent) error {
+	if intent.Phase == SetupBaselinePending || intent.Phase == SetupBaselineDispatched || intent.CaptureRunID <= 0 {
+		return nil
+	}
+	dispatch, exists, err := store.LoadWorkflowDispatchIntent()
+	if err != nil || !exists {
+		return err
+	}
+	// A failed or interrupted post-merge verifier deliberately retains its
+	// exact production checkpoint. Leave it for dispatchAndWait to resume.
+	if intent.Phase == SetupBaselineMerged && dispatch.Operation == "production" {
+		return nil
+	}
+	if dispatch.Operation != setupBaselineWorkflowOperation || dispatch.CorrelationID != intent.CaptureCorrelation || dispatch.RunID != intent.CaptureRunID {
+		return fmt.Errorf("lingering setup baseline dispatch no longer matches the verified capture")
+	}
+	if err := discardWorkflowDispatch(store, dispatch, intent.CaptureRunID); err != nil {
+		return fmt.Errorf("finish consuming verified setup baseline dispatch: %w", err)
+	}
+	return nil
 }
 
 func resetSetupBaselineAfterMergedHeadDrift(ctx context.Context, store *Store, config Config, client *hivegithub.Client, intent SetupBaselineIntent, currentHead string) (SetupBaselineIntent, error) {

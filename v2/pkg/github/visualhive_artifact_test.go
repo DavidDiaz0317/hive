@@ -31,7 +31,7 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case "/repos/owner/repo/actions/runs/42":
-			_, _ = io.WriteString(writer, `{"id":42,"workflow_id":12,"name":"Visual Hive Scheduled","display_title":"Visual Hive Scheduled [correlation]","path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
+			_, _ = io.WriteString(writer, `{"id":42,"workflow_id":12,"name":"Visual Hive Scheduled [correlation]","display_title":"Visual Hive Scheduled [correlation]","path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
 		case "/repos/owner/repo/actions/workflows/12":
 			_, _ = io.WriteString(writer, `{"id":12,"name":"Visual Hive Scheduled","path":".github/workflows/visual-hive.yml","state":"active"}`)
 		case "/repos/owner/repo/actions/runs/42/artifacts":
@@ -68,7 +68,7 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bundle.Validation.Trusted || verified.RepositoryID != "123" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" ||
-		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" {
+		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled [correlation]" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" {
 		t.Fatalf("unexpected verified artifact: bundle=%+v verified=%+v", bundle.Validation, verified)
 	}
 	if data, err := os.ReadFile(filepath.Join(verified.SourceArtifactPath, "verdict.json")); err != nil || !strings.Contains(string(data), "allContributions") {
@@ -106,7 +106,7 @@ func TestFetchAndVerifyVisualHiveBundleSeparatesStaticNameFromCorrelatedTitle(t 
 		displayTitle string
 		want         string
 	}{
-		{name: "spoofed static run name", runName: "Visual Hive Scheduled [correlation]", displayTitle: "Visual Hive Scheduled [correlation]", want: "definition or run name mismatch"},
+		{name: "spoofed runtime name", runName: "spoof", displayTitle: "Visual Hive Scheduled [correlation]", want: "runtime name mismatch"},
 		{name: "spoofed correlated title", runName: "Visual Hive Scheduled", displayTitle: "Visual Hive Scheduled", want: "correlated workflow run name mismatch"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

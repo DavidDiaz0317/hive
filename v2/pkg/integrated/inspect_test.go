@@ -654,6 +654,9 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	if !containsString(value, "pull_request_target:\n    types: [opened, synchronize, reopened]") {
 		t.Fatal("pull_request_target must be limited to the base-branch uninstall check publisher lane")
 	}
+	if !containsString(value, "group: visual-hive-pr-${{ github.event_name }}-${{ github.event.pull_request.number }}") {
+		t.Fatal("pull_request and authorization-only pull_request_target runs must not cancel each other")
+	}
 	if strings.Count(value, "persist-credentials: false") != 6 {
 		t.Fatal("pull request workflow must remove credentials from every authorization, target, and fresh-verifier checkout")
 	}
@@ -716,7 +719,8 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 		command.Dir = t.TempDir()
 		if withEvidence {
 			writeFixture(t, command.Dir, ".visual-hive/pipeline.json", `{"status":"passed","exitCode":0}`)
-			writeFixture(t, command.Dir, ".visual-hive/verdict.json", `{"summary":{"visualHiveVerdict":"passed"}}`)
+			writeFixture(t, command.Dir, ".visual-hive/report.json", `{"status":"passed","summary":{},"results":[]}`)
+			writeFixture(t, command.Dir, ".visual-hive/verdict.json", `{"summary":{"visualHiveVerdict":"passed"},"gatingContributions":[]}`)
 		}
 		command.Env = append(os.Environ(),
 			"HIVE_SETUP_AUTHORIZED="+authorized, "HIVE_SETUP_OPERATION="+operation,

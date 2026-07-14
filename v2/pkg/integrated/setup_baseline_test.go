@@ -760,6 +760,102 @@ func TestActiveSetupBaselinePhaseTableDurablyRebindsBeforeConfigSave(t *testing.
 	}
 }
 
+func TestReconcileVerifiedSetupBaselineDispatchPreservesPostMergeProductionRetry(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	baseline := SetupBaselineIntent{
+		Phase: SetupBaselineMerged, CaptureCorrelation: strings.Repeat("a", 64), CaptureRunID: 77,
+	}
+	production, err := newWorkflowDispatchIntentForOperation(
+		Config{Repository: "owner/repo", RepositoryID: "123"}, "hive-visual-hive.yml", "main", "production", strings.Repeat("b", 64), now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	production.DispatchAttemptedAt, production.DispatchAcknowledgedAt = now, now
+	production.RunID, production.RunURL, production.MatchedAt = 88, "https://example.test/runs/88", now
+	if err := store.SaveWorkflowDispatchIntent(production); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileVerifiedSetupBaselineDispatch(store, baseline); err != nil {
+		t.Fatalf("post-merge production retry was rejected: %v", err)
+	}
+	got, exists, err := store.LoadWorkflowDispatchIntent()
+	if err != nil || !exists || got.Operation != "production" || got.RunID != 88 || got.CorrelationID != production.CorrelationID {
+		t.Fatalf("exact production retry checkpoint was not preserved: exists=%t intent=%+v err=%v", exists, got, err)
+	}
+}
+
+func TestPostBaselineProductionValidationRequiresCanonicalPassedTrustedAuthoritative(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		status        string
+		trusted       bool
+		authoritative bool
+		want          bool
+	}{
+		{name: "canonical", status: "passed", trusted: true, authoritative: true, want: true},
+		{name: "noncanonical status", status: "valid", trusted: true, authoritative: true},
+		{name: "untrusted", status: "passed", authoritative: true},
+		{name: "non-authoritative", status: "passed", trusted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := postBaselineProductionValidationAccepted(test.status, test.trusted, test.authoritative); got != test.want {
+				t.Fatalf("acceptance=%t want=%t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReconcileVerifiedSetupBaselineDispatchConsumesOnlyExactCapture(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		correlation string
+		runID       int64
+		wantError   bool
+	}{
+		{name: "exact", correlation: strings.Repeat("a", 64), runID: 77},
+		{name: "wrong correlation", correlation: strings.Repeat("b", 64), runID: 77, wantError: true},
+		{name: "wrong run", correlation: strings.Repeat("a", 64), runID: 78, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			baseline := SetupBaselineIntent{Phase: SetupBaselineArtifactVerified, CaptureCorrelation: strings.Repeat("a", 64), CaptureRunID: 77}
+			dispatch, err := newWorkflowDispatchIntentForOperation(
+				Config{Repository: "owner/repo", RepositoryID: "123"}, "hive-visual-hive.yml", "main", setupBaselineWorkflowOperation, test.correlation, now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now
+			dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = test.runID, "https://example.test/runs/77", now
+			if err := store.SaveWorkflowDispatchIntent(dispatch); err != nil {
+				t.Fatal(err)
+			}
+			err = reconcileVerifiedSetupBaselineDispatch(store, baseline)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "verified capture") {
+					t.Fatalf("mismatched capture was accepted: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
+				t.Fatalf("exact consumed capture checkpoint remains: exists=%t err=%v", exists, err)
+			}
+		})
+	}
+}
+
 func newSetupBaselineRebindTestClient(t *testing.T, intent SetupBaselineIntent, failClose *bool) (*hivegithub.Client, func()) {
 	t.Helper()
 	closed, branchExists := false, intent.Branch != ""

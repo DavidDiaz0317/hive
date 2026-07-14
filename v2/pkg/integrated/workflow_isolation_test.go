@@ -308,8 +308,14 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 		}
 	}
 	pullRequestExecution := workflowJobText(parseIsolatedWorkflow(t, pullRequestWorkflow(isolationWorkflowConfig())).Jobs["visual-hive"])
-	if !strings.Contains(pullRequestExecution, `["failed", "blocked"].includes(pipeline.status) && verdictSummary.visualHiveVerdict === "blocked"`) {
+	if !strings.Contains(pullRequestExecution, `const report = JSON.parse(fs.readFileSync(".visual-hive/report.json", "utf8"))`) ||
+		!strings.Contains(pullRequestExecution, `["failed", "blocked"].includes(report.status) && verdictSummary.visualHiveVerdict === "blocked"`) {
 		t.Fatal("pull-request verifier does not accept Visual Hive's blocked missing-baseline status")
+	}
+	for _, stale := range []string{"pipeline.summary", "pipeline.verdictSummary", "pipeline.verdictContributions", "pipeline.results"} {
+		if strings.Contains(pullRequestExecution, stale) {
+			t.Fatalf("pull-request verifier still reads %s from the pipeline envelope", stale)
+		}
 	}
 	dependencyShell := isolatedTargetDependencyShell(true)
 	install := strings.Index(dependencyShell, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
@@ -395,7 +401,8 @@ func TestPullRequestEnforcementUsesOnlyRunnerOwnedJobTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFixture(t, filepath.Join(root, ".visual-hive"), "pipeline.json", `{"status":"passed","exitCode":0}`)
-	writeFixture(t, filepath.Join(root, ".visual-hive"), "verdict.json", `{"summary":{"visualHiveVerdict":"passed"}}`)
+	writeFixture(t, filepath.Join(root, ".visual-hive"), "report.json", `{"status":"passed","summary":{},"results":[]}`)
+	writeFixture(t, filepath.Join(root, ".visual-hive"), "verdict.json", `{"summary":{"visualHiveVerdict":"passed"},"gatingContributions":[]}`)
 	baseEnv := append(os.Environ(),
 		`HIVE_EXPECTED_REPOSITORY_JOBS=["repository-test-001"]`,
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"success"}}`,
@@ -440,18 +447,24 @@ func TestPullRequestEnforcementTreatsDerivedReadinessAsMissingBaselineOnly(t *te
 		t.Fatal(err)
 	}
 	writeFixture(t, visualDir, "pipeline.json", `{
-  "status":"blocked","exitCode":1,
+  "schemaVersion":"visual-hive.pipeline.v1","status":"failed","exitCode":1,
+  "steps":[],"artifacts":{}
+}`)
+	writeFixture(t, visualDir, "report.json", `{
+  "schemaVersion":"visual-hive.report.v1","status":"failed",
   "summary":{"missingBaselines":1,"visualDiffs":0,"consoleErrors":0,"pageErrors":0,"flowStepsFailed":0},
-  "verdictSummary":{"visualHiveVerdict":"blocked","failedBecause":[]},
-  "verdictContributions":[
+  "results":[{"screenshotAssertions":[{"status":"missing_baseline","contractId":"app-shell","screenshotName":"desktop","baselinePath":"snapshots/app.png","actualPath":"artifacts/app.png"}]}]
+}`)
+	writeFixture(t, visualDir, "verdict.json", `{
+  "schemaVersion":"visual-hive.verdict.v1",
+  "summary":{"visualHiveVerdict":"blocked","failedBecause":[]},
+  "gatingContributions":[
     {"kind":"deterministic_run","status":"blocked","gating":true},
     {"kind":"contract_result","status":"blocked","gating":true},
     {"kind":"missing_baseline","status":"blocked","gating":true},
     {"kind":"readiness_gate","status":"blocked","gating":true}
-  ],
-  "results":[{"screenshotAssertions":[{"status":"missing_baseline","contractId":"app-shell","screenshotName":"desktop","baselinePath":"snapshots/app.png","actualPath":"artifacts/app.png"}]}]
+  ]
 }`)
-	writeFixture(t, visualDir, "verdict.json", `{"summary":{"visualHiveVerdict":"blocked"}}`)
 	writeFixture(t, visualDir, "readiness.json", `{"status":"blocked","gates":[{"id":"deterministic:status","status":"blocked"},{"id":"baselines:missing-baseline","status":"blocked"},{"id":"mutation:missing","status":"warning"}]}`)
 	environment := append(os.Environ(),
 		`HIVE_EXPECTED_REPOSITORY_JOBS=["repository-test-001"]`,

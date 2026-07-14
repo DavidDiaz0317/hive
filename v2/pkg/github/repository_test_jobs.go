@@ -111,7 +111,8 @@ func (c *Client) VerifyRepositoryTestJobs(ctx context.Context, request Repositor
 	if err != nil {
 		return result, fmt.Errorf("read exact repository-test workflow run: %w", err)
 	}
-	if run.GetID() != request.WorkflowRunID || run.GetWorkflowID() <= 0 || run.GetName() != expectedWorkflowName ||
+	runName := strings.TrimSpace(run.GetName())
+	if run.GetID() != request.WorkflowRunID || run.GetWorkflowID() <= 0 || runName == "" ||
 		!workflowPathMatches(run.GetPath(), expectedWorkflowPath) || run.GetEvent() != "workflow_dispatch" ||
 		!strings.EqualFold(strings.TrimSpace(run.GetHeadSHA()), expectedHead) || run.GetStatus() != "completed" ||
 		(run.GetConclusion() != "success" && run.GetConclusion() != "failure") ||
@@ -165,7 +166,7 @@ func (c *Client) VerifyRepositoryTestJobs(ctx context.Context, request Repositor
 				continue
 			}
 			if job.GetRunID() != request.WorkflowRunID || !strings.EqualFold(strings.TrimSpace(job.GetHeadSHA()), expectedHead) ||
-				job.GetWorkflowName() != expectedWorkflowName || job.GetStatus() != "completed" {
+				strings.TrimSpace(job.GetWorkflowName()) != runName || job.GetStatus() != "completed" {
 				return result, fmt.Errorf("workflow job %q does not match the exact run/head/workflow binding", name)
 			}
 			if requiredSuccessfulJob {
