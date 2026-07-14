@@ -253,18 +253,28 @@ func TestTrustedCollectorNodeCannotBeShadowedByTargetPath(t *testing.T) {
 	}
 }
 
-func TestTrustedCollectorUsesSealedPinnedBrowser(t *testing.T) {
+func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.T) {
 	for name, value := range map[string]string{"production": workflow(isolationWorkflowConfig()), "pull-request": pullRequestWorkflow(isolationWorkflowConfig())} {
 		execution := workflowJobText(parseIsolatedWorkflow(t, value).Jobs[visualExecutionJobName])
 		for _, invariant := range []string{
 			`trusted_browser_path="/opt/hive-target/trusted/playwright-${GITHUB_RUN_ID}"`,
+			`target_browser_staging="/opt/hive-target/playwright-staging-${GITHUB_RUN_ID}"`,
 			`sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`,
+			`PLAYWRIGHT_BROWSERS_PATH="$target_browser_staging"`,
+			`sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/`,
 			`sudo chown -R root:root "$trusted_browser_path"`,
 			`sudo chmod -R a-w "$trusted_browser_path"`,
 			`trusted_tooling="/opt/hive-target/trusted/visual-hive-tooling"`,
+			`HIVE_TRUSTED_BROWSER_MANIFEST=$trusted_browser_manifest`,
+			`Target Playwright runtime lacks a sealed executable binding`,
+			`runtime.chromium.launch({ headless: true })`,
+			`Target Playwright runtime could not launch its exact sealed headless browser`,
+			`Trusted Playwright browser executable is missing before Visual Hive execution`,
 			`PLAYWRIGHT_BROWSERS_PATH="$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"`,
 			`test "$(sha256sum "$HIVE_TRUSTED_BROWSER_EXECUTABLE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_BROWSER_SHA"`,
 			`sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_BROWSER_EXECUTABLE"`,
+			`sudo rm -rf -- "$expected_browser_path"`,
+			`test ! -e "$expected_browser_path"`,
 		} {
 			if !strings.Contains(execution, invariant) {
 				t.Fatalf("%s workflow lost sealed browser invariant %q", name, invariant)
@@ -273,10 +283,22 @@ func TestTrustedCollectorUsesSealedPinnedBrowser(t *testing.T) {
 		if strings.Contains(execution, `PLAYWRIGHT_BROWSERS_PATH=/home/hive-target/.cache/ms-playwright HIVE_TARGET_PROCESS=1 "$HIVE_TRUSTED_NODE"`) {
 			t.Fatalf("%s Visual collector still accepts the target-owned browser cache", name)
 		}
+		if !strings.Contains(value, "permissions:\n      contents: read\n      actions: read") || strings.Contains(execution, "contents: write") || strings.Contains(execution, "id-token: write") {
+			t.Fatalf("%s browser provisioning changed the read-only target-execution permissions", name)
+		}
 		if strings.Contains(execution, `mv .hive-visual-tooling "$RUNNER_TEMP/visual-hive-tooling"`) ||
 			strings.Contains(execution, `trusted_browser_path="$RUNNER_TEMP/hive-playwright`) ||
 			strings.Contains(execution, `sudo chmod o+x "$RUNNER_TEMP"`) {
 			t.Fatalf("%s target-readable sealed tooling still traverses the runner-private temp root", name)
+		}
+		install := strings.Index(value, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
+		targetInstall := strings.Index(value, `PLAYWRIGHT_BROWSERS_PATH="$target_browser_staging"`)
+		seal := strings.Index(value, `sudo chmod -R a-w "$trusted_browser_path"`)
+		preflight := strings.Index(value, "name: Verify sealed Playwright browser handoff")
+		collection := strings.Index(value, "name: Run target-facing Visual Hive collection")
+		cleanup := strings.LastIndex(value, `sudo rm -rf -- "$expected_browser_path"`)
+		if install < 0 || targetInstall < install || seal < targetInstall || preflight < seal || collection < preflight || cleanup < collection {
+			t.Fatalf("%s workflow browser install/seal/preflight/execute/cleanup order is unsafe: install=%d target=%d seal=%d preflight=%d collection=%d cleanup=%d", name, install, targetInstall, seal, preflight, collection, cleanup)
 		}
 	}
 	dependencyShell := isolatedTargetDependencyShell(true)
@@ -284,6 +306,9 @@ func TestTrustedCollectorUsesSealedPinnedBrowser(t *testing.T) {
 	targetDependencies := strings.Index(dependencyShell, "HIVE_TARGET_DEPENDENCIES")
 	if install < 0 || targetDependencies < 0 || install > targetDependencies {
 		t.Fatal("trusted browser is installed only after target dependency code")
+	}
+	if strings.Contains(dependencyShell, isolatedVisualTargetEnvPrefix()+` bash`) {
+		t.Fatal("target dependency code was granted the final trusted browser directory")
 	}
 }
 
@@ -296,8 +321,14 @@ func TestGeneratedIsolationShellsAreExecutable(t *testing.T) {
 				if strings.TrimSpace(step.Run) == "" {
 					continue
 				}
-				if output, err := exec.Command(bash, "-n", "-c", step.Run).CombinedOutput(); err != nil {
-					t.Fatalf("%s job %s step %q has invalid shell: %v\n%s\n%s", name, jobName, step.Name, err, output, step.Run)
+				command := exec.Command(bash, "-n")
+				command.Stdin = strings.NewReader(step.Run)
+				if output, err := command.CombinedOutput(); err != nil {
+					lines := strings.Split(step.Run, "\n")
+					for index := range lines {
+						lines[index] = fmt.Sprintf("%4d: %s", index+1, lines[index])
+					}
+					t.Fatalf("%s job %s step %q has invalid shell: %v\n%s\n%s", name, jobName, step.Name, err, output, strings.Join(lines, "\n"))
 				}
 			}
 		}

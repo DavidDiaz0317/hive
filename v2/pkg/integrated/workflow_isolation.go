@@ -328,6 +328,10 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           HIVE_TARGET_HEAD_SHA: %s
         run: |
 %s
+      - name: Verify sealed Playwright browser handoff
+        shell: bash
+        run: |
+%s
       - name: Run target-facing Visual Hive collection
         id: target_visual_pipeline
         continue-on-error: true
@@ -345,10 +349,17 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
         run: |
           set -euo pipefail
           target_workspace="${HIVE_TARGET_WORKSPACE:-}"
+          expected_browser_path="`+isolatedTrustedRoot+`/playwright-${GITHUB_RUN_ID}"
+          expected_browser_manifest="$RUNNER_TEMP/hive-trusted-playwright-${GITHUB_RUN_ID}.tsv"
+          cleanup_trusted_browser() {
+            sudo rm -rf -- "$expected_browser_path"
+            rm -f -- "$expected_browser_manifest"
+          }
           cleanup_target_workspace() {
             if [ -n "$target_workspace" ] && mountpoint -q "$target_workspace"; then
               sudo umount "$target_workspace" || true
             fi
+            cleanup_trusted_browser
           }
           trap cleanup_target_workspace EXIT
           test -n "$target_workspace"
@@ -357,6 +368,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           test ! -w "$VISUAL_HIVE_CLI"
           test "$(sha256sum "$HIVE_TRUSTED_NODE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_NODE_SHA"
           sudo -u %s -- test ! -w "$HIVE_TRUSTED_NODE"
+%s
           if [ -n "${HIVE_TRUSTED_BROWSER_EXECUTABLE:-}" ] && [ -n "${HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -n "${HIVE_TRUSTED_BROWSER_SHA:-}" ]; then
             case "$HIVE_TRUSTED_BROWSER_EXECUTABLE" in
               "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"/*) ;;
@@ -377,11 +389,14 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           test "$(find .visual-hive -type f | wc -l)" -le 5000
           test "$(du -sb .visual-hive | cut -f 1)" -le 1073741824
           sudo umount "$target_workspace"
+          cleanup_trusted_browser
           trap - EXIT
           if mountpoint -q "$target_workspace"; then
             echo "Isolated target workspace remained mounted" >&2
             exit 1
           fi
+          test ! -e "$expected_browser_path"
+          test ! -e "$expected_browser_manifest"
       - name: Upload isolated raw Visual evidence
         if: always()
         uses: actions/upload-artifact@%s
@@ -403,7 +418,8 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, config.VisualHiveRef,
 		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10), isolatedTrustedTooling,
 		captureScope, indentWorkflowShell(isolatedTargetDependencyShell(true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
-		isolatedVisualTargetEnvPrefix(), modeArgs, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, checkoutRef, uploadArtifactActionSHA, rawArtifact,
+		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedVisualTargetEnvPrefix(), modeArgs, isolatedTargetAccount, isolatedTargetAccount,
+		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedTargetAccount, checkoutRef, uploadArtifactActionSHA, rawArtifact,
 		indentWorkflowShell(finalEnforcement, 10))
 }
 
@@ -954,12 +970,25 @@ func isolatedTargetDependencyShell(includeTrustedBrowser bool) string {
 elif [ -f requirements.txt ]; then
   python -m pip install -r requirements.txt
 fi`
-	trustedBrowser := ""
+	trustedBrowserBefore := ""
+	trustedBrowserAfter := ""
+	targetEnvironment := isolatedTargetEnvPrefix()
 	if includeTrustedBrowser {
-		trustedBrowser = `tooling_playwright="` + isolatedTrustedTooling + `/node_modules/@playwright/test/cli.js"
+		trustedBrowserBefore = `tooling_playwright="` + isolatedTrustedTooling + `/node_modules/@playwright/test/cli.js"
 trusted_browser_path="` + isolatedTrustedRoot + `/playwright-${GITHUB_RUN_ID}"
+target_browser_staging="` + isolatedTargetRoot + `/playwright-staging-${GITHUB_RUN_ID}"
 test ! -e "$trusted_browser_path"
+test ! -e "$target_browser_staging"
 sudo install -d -o root -g root -m 0755 "$trusted_browser_path"
+sudo install -d -o ` + isolatedTargetAccount + ` -g ` + isolatedTargetAccount + ` -m 0700 "$target_browser_staging"
+browser_provisioning_complete=0
+cleanup_browser_provisioning() {
+  sudo rm -rf -- "$target_browser_staging"
+  if [ "$browser_provisioning_complete" -ne 1 ]; then
+    sudo rm -rf -- "$trusted_browser_path"
+  fi
+}
+trap cleanup_browser_provisioning EXIT
 sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium
 trusted_browser_executable="$(PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" -e 'const { chromium } = require(process.argv[1]); process.stdout.write(chromium.executablePath())' "` + isolatedTrustedTooling + `/node_modules/playwright")"
 trusted_browser_executable="$(readlink -f "$trusted_browser_executable")"
@@ -968,14 +997,69 @@ case "$trusted_browser_executable" in
   "$trusted_browser_path"/*) ;;
   *) echo "Pinned browser resolved outside its dedicated root" >&2; exit 1 ;;
 esac
-test -x "$trusted_browser_executable"
+if [ ! -x "$trusted_browser_executable" ]; then
+  echo "Pinned Visual Hive Playwright browser executable is missing after install: $trusted_browser_executable" >&2
+  exit 1
+fi
+`
+		targetEnvironment = strings.Replace(targetEnvironment, "PLAYWRIGHT_BROWSERS_PATH=/home/"+isolatedTargetAccount+"/.cache/ms-playwright", `PLAYWRIGHT_BROWSERS_PATH="$target_browser_staging"`, 1)
+		trustedBrowserAfter = `sudo pkill -KILL -u ` + isolatedTargetAccount + ` 2>/dev/null || true
+test -d "$target_browser_staging"
+if find "$target_browser_staging" -type l -print -quit | grep -q .; then
+  echo "Target Playwright browser staging contains a symbolic link" >&2
+  exit 1
+fi
+if find "$target_browser_staging" ! -type d ! -type f -print -quit | grep -q .; then
+  echo "Target Playwright browser staging contains a non-regular entry" >&2
+  exit 1
+fi
+test "$(find "$target_browser_staging" -type f | wc -l)" -le 10000
+test "$(du -sb "$target_browser_staging" | cut -f 1)" -le 2147483648
+sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/
+sudo rm -rf -- "$target_browser_staging"
+test ! -e "$target_browser_staging"
 sudo chown -R root:root "$trusted_browser_path"
 sudo chmod -R a-w "$trusted_browser_path"
-trusted_browser_sha="$(sha256sum "$trusted_browser_executable" | cut -d ' ' -f 1)"
-sudo -u hive-target -- test ! -w "$trusted_browser_executable"
+sudo -u ` + isolatedTargetAccount + ` -- test ! -w "$trusted_browser_path"
+HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path"
+
+trusted_browser_manifest="$RUNNER_TEMP/hive-trusted-playwright-${GITHUB_RUN_ID}.tsv"
+test ! -e "$trusted_browser_manifest"
+touch "$trusted_browser_manifest"
+chmod 0600 "$trusted_browser_manifest"
+record_trusted_browser() {
+  scope="$1"
+  runtime="$2"
+  executable="$3"
+  case "$scope$runtime$executable" in
+    *$'\n'*|*$'\t'*) echo "Playwright runtime identity contains unsupported whitespace" >&2; exit 1 ;;
+  esac
+  executable="$(readlink -f "$executable")"
+  case "$executable" in
+    "$trusted_browser_path"/*) ;;
+    *) echo "Playwright runtime $runtime resolved outside the sealed browser root: $executable" >&2; exit 1 ;;
+  esac
+  if [ ! -x "$executable" ]; then
+    echo "Playwright browser provisioning incomplete for $runtime: expected executable is missing at $executable (PLAYWRIGHT_BROWSERS_PATH=$trusted_browser_path)" >&2
+    exit 1
+  fi
+  digest="$(sha256sum "$executable" | cut -d ' ' -f 1)"
+  sudo -u ` + isolatedTargetAccount + ` -- test ! -w "$executable"
+  printf '%s\t%s\t%s\t%s\n' "$scope" "$runtime" "$executable" "$digest" >> "$trusted_browser_manifest"
+}
+record_trusted_browser visual-hive "$tooling_playwright" "$trusted_browser_executable"
+while IFS= read -r -d '' playwright_cli; do
+  target_browser_executable="$(` + isolatedVisualTargetEnvPrefix() + ` "$HIVE_TRUSTED_NODE" -e 'const path = require("node:path"); const cli = process.argv[1]; const runtime = require(require.resolve("playwright", { paths: [path.dirname(cli)] })); process.stdout.write(runtime.chromium.executablePath())' "$playwright_cli")"
+  record_trusted_browser target "$playwright_cli" "$target_browser_executable"
+done < <(find "$HIVE_TARGET_WORKSPACE" -path '*/node_modules/@playwright/test/cli.js' -not -path '*/.git/*' -print0 | sort -z)
+test "$(wc -l < "$trusted_browser_manifest")" -ge 1
+chmod 0400 "$trusted_browser_manifest"
+browser_provisioning_complete=1
+trap - EXIT
 echo "HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH=$trusted_browser_path" >> "$GITHUB_ENV"
 echo "HIVE_TRUSTED_BROWSER_EXECUTABLE=$trusted_browser_executable" >> "$GITHUB_ENV"
-echo "HIVE_TRUSTED_BROWSER_SHA=$trusted_browser_sha" >> "$GITHUB_ENV"
+echo "HIVE_TRUSTED_BROWSER_SHA=$(sha256sum "$trusted_browser_executable" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+echo "HIVE_TRUSTED_BROWSER_MANIFEST=$trusted_browser_manifest" >> "$GITHUB_ENV"
 `
 	}
 	return fmt.Sprintf(`set -euo pipefail
@@ -989,9 +1073,56 @@ while IFS= read -r -d '' playwright_cli; do
   node "$playwright_cli" install chromium
 done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.git/*' -print0 | sort -z)
 HIVE_TARGET_DEPENDENCIES
+%s
 mkdir -p .visual-hive
 sudo chown -R %s:%s .visual-hive
-`, trustedBrowser, isolatedTargetEnvPrefix(), targetInstall, pythonInstall, isolatedTargetAccount, isolatedTargetAccount)
+`, trustedBrowserBefore, targetEnvironment, targetInstall, pythonInstall, trustedBrowserAfter, isolatedTargetAccount, isolatedTargetAccount)
+}
+
+func trustedBrowserHandoffVerificationShell() string {
+	return `set -euo pipefail
+expected_browser_path="` + isolatedTrustedRoot + `/playwright-${GITHUB_RUN_ID}"
+if [ "${HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH:-}" != "$expected_browser_path" ]; then
+  echo "Trusted Playwright browser path is missing or changed: expected $expected_browser_path, got ${HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH:-<unset>}" >&2
+  exit 1
+fi
+if [ ! -d "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH" ] || [ -w "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH" ]; then
+  echo "Trusted Playwright browser directory is absent or writable: $HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH" >&2
+  exit 1
+fi
+if [ ! -f "${HIVE_TRUSTED_BROWSER_MANIFEST:-}" ]; then
+  echo "Trusted Playwright browser manifest is missing; provisioning did not complete" >&2
+  exit 1
+fi
+manifest_rows=0
+while IFS="$(printf '\t')" read -r scope runtime executable digest; do
+  test -n "$scope" && test -n "$runtime" && test -n "$executable" && test -n "$digest"
+  case "$executable" in
+    "$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"/*) ;;
+    *) echo "Trusted Playwright manifest executable escaped its sealed root: $executable" >&2; exit 1 ;;
+  esac
+  if [ ! -x "$executable" ]; then
+    echo "Trusted Playwright browser executable is missing before Visual Hive execution: $executable (runtime=$runtime, PLAYWRIGHT_BROWSERS_PATH=$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH)" >&2
+    exit 1
+  fi
+  test "$(sha256sum "$executable" | cut -d ' ' -f 1)" = "$digest"
+  sudo -u ` + isolatedTargetAccount + ` -- test ! -w "$executable"
+  manifest_rows=$((manifest_rows + 1))
+done < "$HIVE_TRUSTED_BROWSER_MANIFEST"
+test "$manifest_rows" -ge 1
+while IFS= read -r -d '' playwright_cli; do
+  expected_executable="$(` + isolatedVisualTargetEnvPrefix() + ` "$HIVE_TRUSTED_NODE" -e 'const path = require("node:path"); const cli = process.argv[1]; const runtime = require(require.resolve("playwright", { paths: [path.dirname(cli)] })); process.stdout.write(runtime.chromium.executablePath())' "$playwright_cli")"
+  expected_executable="$(readlink -f "$expected_executable")"
+  if ! grep -Fq "$(printf 'target\t%s\t%s\t' "$playwright_cli" "$expected_executable")" "$HIVE_TRUSTED_BROWSER_MANIFEST"; then
+    echo "Target Playwright runtime lacks a sealed executable binding: $playwright_cli expects $expected_executable" >&2
+    exit 1
+  fi
+  if ! timeout --signal=KILL 60s ` + isolatedVisualTargetEnvPrefix() + ` "$HIVE_TRUSTED_NODE" -e 'const path = require("node:path"); const cli = process.argv[1]; const runtime = require(require.resolve("playwright", { paths: [path.dirname(cli)] })); (async () => { const browser = await runtime.chromium.launch({ headless: true }); await browser.close(); })().catch(error => { console.error(error); process.exit(1); });' "$playwright_cli"; then
+    echo "Target Playwright runtime could not launch its exact sealed headless browser: $playwright_cli (PLAYWRIGHT_BROWSERS_PATH=$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH)" >&2
+    exit 1
+  fi
+done < <(find "$HIVE_TARGET_WORKSPACE" -path '*/node_modules/@playwright/test/cli.js' -not -path '*/.git/*' -print0 | sort -z)
+`
 }
 
 func isolatedTargetEnvPrefix() string {

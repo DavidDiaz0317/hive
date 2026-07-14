@@ -698,7 +698,9 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 			if strings.TrimSpace(step.Run) == "" {
 				continue
 			}
-			if output, err := exec.Command(bash, "-n", "-c", step.Run).CombinedOutput(); err != nil {
+			command := exec.Command(bash, "-n")
+			command.Stdin = strings.NewReader(step.Run)
+			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("generated shell is invalid in job %s step %q: %v\n%s\n%s", jobName, step.Name, err, output, step.Run)
 			}
 			if jobName == "visual-hive" && step.Name == "Enforce deterministic verdict" {
