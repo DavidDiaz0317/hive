@@ -126,14 +126,14 @@ func TestSetupPlanDisclosesExactVisualHiveDependencyUsedByApply(t *testing.T) {
 		t.Fatalf("resolved read-only setup dependency was rejected: %v", err)
 	}
 	plan := buildSetupPlan(options, RepositoryInspection{DefaultBranch: "main"})
-	if plan.VisualHiveRepository != options.VisualHiveRepo || plan.VisualHiveRef != ref {
+	if plan.StateDir != options.StateDir || plan.VisualHiveRepository != options.VisualHiveRepo || plan.VisualHiveRef != ref {
 		t.Fatalf("plan dependency = %s@%s, want %s@%s", plan.VisualHiveRepository, plan.VisualHiveRef, options.VisualHiveRepo, ref)
 	}
 	data, err := json.Marshal(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, disclosed := range []string{`"visual_hive_repository":"owner/visual-hive"`, `"visual_hive_ref":"` + ref + `"`} {
+	for _, disclosed := range []string{`"state_dir":"` + strings.ReplaceAll(options.StateDir, `\`, `\\`) + `"`, `"visual_hive_repository":"owner/visual-hive"`, `"visual_hive_ref":"` + ref + `"`} {
 		if !strings.Contains(string(data), disclosed) {
 			t.Fatalf("setup plan JSON omitted %s: %s", disclosed, data)
 		}

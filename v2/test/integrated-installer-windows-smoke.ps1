@@ -32,9 +32,9 @@ if (Test-Path -LiteralPath $nodeLicense -PathType Leaf) {
 $distribution = Join-Path $WorkRoot "hive-integrated-$releaseVersion-windows-amd64"
 Push-Location $HiveRoot
 try {
-    go build -trimpath -ldflags "-s -w -X main.gitHash=$hiveCommit -X main.gitShort=$($hiveCommit.Substring(0,12))" -o (Join-Path $WorkRoot "hive.exe") ./cmd/hive
+    go build -trimpath -ldflags "-s -w -X main.gitHash=$hiveCommit -X main.gitShort=$($hiveCommit.Substring(0,12)) -X main.integratedVersion=$releaseVersion" -o (Join-Path $WorkRoot "hive.exe") ./cmd/hive
 	$distributionArgs = @(
-		"run", "./cmd/hive-dist", "--hive", (Join-Path $WorkRoot "hive.exe"), "--hive-commit", $hiveCommit,
+		"run", "./cmd/hive-dist", "--hive", (Join-Path $WorkRoot "hive.exe"), "--hive-commit", $hiveCommit, "--hive-version", $releaseVersion,
 		"--visual-hive", $VisualBundle, "--visual-hive-commit", $visualCommit, "--node", $node,
 		"--node-runtime", $nodeRuntime, "--node-version", $nodeVersion, "--skill", (Join-Path $HiveRoot "skills/hive"),
 		"--target-os", "windows", "--target-arch", "amd64", "--output", $distribution
@@ -81,8 +81,20 @@ try {
 	}
 
     & (Join-Path $installDir "runtime/node.exe") (Join-Path $installDir "visual-hive/visual-hive.mjs") --version | Out-Null
-    $plan = & (Join-Path $installDir "hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $WorkRoot "state") --json | ConvertFrom-Json
-    if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Installed Hive did not produce a read-only setup plan." }
+    $hiveVersionOutput = @(& (Join-Path $installDir "hive.exe") --version)
+    if ($LASTEXITCODE -ne 0 -or $hiveVersionOutput[0] -ne "Hive $releaseVersion" -or $hiveVersionOutput[1] -ne "commit: $hiveCommit") {
+        throw "Installed Hive release identity is incorrect: $($hiveVersionOutput -join '; ')"
+    }
+    $savedUserProfile = $env:USERPROFILE
+    $env:USERPROFILE = Join-Path $WorkRoot "fresh-user-home"
+    New-Item -ItemType Directory -Path $env:USERPROFILE -Force | Out-Null
+    try {
+        $plan = & (Join-Path $installDir "hive.exe") setup --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --json | ConvertFrom-Json
+    } finally {
+        $env:USERPROFILE = $savedUserProfile
+    }
+    if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only -or -not $plan.plan.state_dir) { throw "Installed Hive did not produce a read-only setup plan with its automatic state path." }
+    if ($plan.plan.state_dir -match 'daviddiaz0317--hive-visual-hive-install-proof') { throw "Installed Hive repeated the long repository slug in its default state path: $($plan.plan.state_dir)" }
 } finally {
 	$env:Path = $originalProcessPath
 	$env:CODEX_HOME = $originalCodexHome

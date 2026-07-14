@@ -47,12 +47,16 @@ import (
 )
 
 var (
-	gitHash   = "unknown"
-	gitShort  = "unknown"
-	gitBranch = "unknown"
+	gitHash           = "unknown"
+	gitShort          = "unknown"
+	gitBranch         = "unknown"
+	integratedVersion = "development"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		os.Exit(runVersionCommand(os.Args[1:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == repair.ContainmentProbeCommand {
 		os.Exit(repair.RunContainmentProbeChild())
 	}
@@ -1660,6 +1664,23 @@ func main() {
 			dashSrv.BroadcastAgentStatus(payload)
 		}
 	}
+}
+
+func runVersionCommand(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || (args[0] != "--version" && args[0] != "version") {
+		fmt.Fprintln(stderr, "usage: hive --version")
+		return 2
+	}
+	version := strings.TrimSpace(integratedVersion)
+	commit := strings.ToLower(strings.TrimSpace(gitHash))
+	if version == "" {
+		version = "development"
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	fmt.Fprintf(stdout, "Hive %s\ncommit: %s\n", version, commit)
+	return 0
 }
 
 // Dashboard system-alert IDs for the budget thresholds.

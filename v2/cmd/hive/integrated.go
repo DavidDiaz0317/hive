@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io"
@@ -613,7 +614,12 @@ func runSetupCommand(args []string) int {
 	explicit := map[string]bool{}
 	flags.Visit(func(candidate *flag.Flag) { explicit[candidate.Name] = true })
 	if !explicit["state-dir"] && strings.TrimSpace(os.Getenv("HIVE_STATE_DIR")) == "" && strings.TrimSpace(*repository) != "" {
-		*stateDir = repositoryIntegratedStateDir(*repository)
+		selected, selectErr := repositoryIntegratedStateDir(*repository)
+		if selectErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", selectErr)
+			return 1
+		}
+		*stateDir = selected
 	}
 	prior, hasPrior, priorErr := loadExistingSetupConfig(*stateDir)
 	if priorErr != nil {
@@ -646,7 +652,12 @@ func runSetupCommand(args []string) int {
 		}
 	}
 	if !explicit["state-dir"] && strings.TrimSpace(os.Getenv("HIVE_STATE_DIR")) == "" && !hasPrior {
-		*stateDir = repositoryIntegratedStateDir(*repository)
+		selected, selectErr := repositoryIntegratedStateDir(*repository)
+		if selectErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", selectErr)
+			return 1
+		}
+		*stateDir = selected
 	}
 	coverage := integrated.Coverage(strings.ToLower(strings.TrimSpace(*coverageValue)))
 	automationMode := integrated.Automation(strings.ToLower(strings.TrimSpace(*automationValue)))
@@ -1678,7 +1689,42 @@ func integratedStateRoot() string {
 	return filepath.Join(home, ".hive")
 }
 
-func repositoryIntegratedStateDir(repository string) string {
+func repositoryIntegratedStateDir(repository string) (string, error) {
+	legacy := legacyRepositoryIntegratedStateDir(repository)
+	prior, exists, err := loadExistingSetupConfig(legacy)
+	if err != nil {
+		return "", fmt.Errorf("inspect existing legacy state at %s: %w; rerun with that exact path through --state-dir after resolving the reported state error", legacy, err)
+	}
+	if exists && strings.EqualFold(strings.TrimSpace(prior.Repository), strings.TrimSpace(repository)) {
+		if prior.StateDir != "" && !strings.EqualFold(filepath.Clean(prior.StateDir), filepath.Clean(legacy)) {
+			return "", fmt.Errorf("legacy state at %s embeds a different state path %s; use the original exact --state-dir so Hive can verify it", legacy, prior.StateDir)
+		}
+		return legacy, nil
+	}
+
+	canonical := strings.ToLower(strings.TrimSpace(repository))
+	_, repoName, ok := strings.Cut(canonical, "/")
+	if !ok {
+		repoName = canonical
+	}
+	short := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, repoName)
+	short = strings.Trim(short, "-")
+	if len(short) > 20 {
+		short = strings.TrimRight(short[:20], "-")
+	}
+	if short == "" {
+		short = "repository"
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(canonical)))
+	return filepath.Join(integratedStateRoot(), "repos", short+"-"+digest[:16]), nil
+}
+
+func legacyRepositoryIntegratedStateDir(repository string) string {
 	name := strings.ToLower(strings.TrimSpace(repository))
 	name = strings.NewReplacer("/", "--", "\\", "--").Replace(name)
 	name = strings.Map(func(r rune) rune {

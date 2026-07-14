@@ -170,8 +170,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.release/bin"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12}" -o "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" ./cmd/hive
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12}" -o "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" ./cmd/hive
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12} -X main.integratedVersion=$RELEASE_VERSION" -o "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" ./cmd/hive
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12} -X main.integratedVersion=$RELEASE_VERSION" -o "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" ./cmd/hive
+
+          "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --version | tee "$GITHUB_WORKSPACE/.release/hive-version.txt"
+          grep -Fx "Hive $RELEASE_VERSION" "$GITHUB_WORKSPACE/.release/hive-version.txt"
+          grep -Fx "commit: $GITHUB_SHA" "$GITHUB_WORKSPACE/.release/hive-version.txt"
       - name: Assemble clean-install distributions
         working-directory: v2
         shell: bash
@@ -180,7 +184,7 @@ jobs:
           linux_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ env.RELEASE_VERSION }}-linux-amd64"
           windows_root="$GITHUB_WORKSPACE/.release/dist/hive-integrated-${{ env.RELEASE_VERSION }}-windows-amd64"
           go run ./cmd/hive-dist \
-            --hive "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --hive-commit "$GITHUB_SHA" \
+            --hive "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --hive-commit "$GITHUB_SHA" --hive-version "$RELEASE_VERSION" \
             --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
             --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-linux-x64/bin/node" \
             --node-runtime "$GITHUB_WORKSPACE/.release/runtime-linux" \
@@ -188,7 +192,7 @@ jobs:
             --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
             --target-os linux --target-arch amd64 --output "$linux_root"
           go run ./cmd/hive-dist \
-            --hive "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" --hive-commit "$GITHUB_SHA" \
+            --hive "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" --hive-commit "$GITHUB_SHA" --hive-version "$RELEASE_VERSION" \
             --visual-hive "$GITHUB_WORKSPACE/.release/visual-hive-bundle" --visual-hive-commit "$VISUAL_HIVE_REF" \
             --node "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/node.exe" \
             --node-runtime "$GITHUB_WORKSPACE/.release/runtime-windows" \
@@ -282,6 +286,8 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "skills/hive/SKILL.md") -PathType Leaf)) { throw "Default installer did not install the Hive Codex skill." }
             if ($installOutput -notmatch [regex]::Escape("& `"$expectedHive`" setup")) { throw "Installer did not print its exact absolute setup command." }
             & (Join-Path $install "runtime/node.exe") (Join-Path $install "visual-hive/visual-hive.mjs") --version
+            $hiveVersion = @(& (Join-Path $install "hive.exe") --version)
+            if ($LASTEXITCODE -ne 0 -or $hiveVersion[0] -ne "Hive $env:RELEASE_VERSION" -or $hiveVersion[1] -ne "commit: $env:GITHUB_SHA") { throw "Packaged Hive release identity mismatch: $($hiveVersion -join '; ')" }
             $savedPath = $env:PATH
             $env:PATH = (Join-Path $install "runtime") + ";" + (Join-Path $env:SystemRoot "System32") + ";" + $env:SystemRoot
             foreach ($launcher in @("node.exe", "npm.cmd", "npx.cmd", "corepack.cmd", "pnpm.cmd", "pnpx.cmd", "yarn.cmd", "yarnpkg.cmd")) {
@@ -297,8 +303,16 @@ jobs:
             if ((& (Join-Path $install "runtime/pnpm.cmd") --version).Trim() -ne "9.15.9") { throw "Bundled pnpm launcher failed." }
             if ((& (Join-Path $install "runtime/yarn.cmd") --version).Trim() -ne "1.22.22") { throw "Bundled Yarn launcher failed." }
             $env:PATH = $savedPath
-            $plan = & (Join-Path $install "hive.exe") setup --repo DavidDiaz0317/visual-hive-demo-site --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --state-dir (Join-Path $work "state") --json | ConvertFrom-Json
-            if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only) { throw "Release Hive did not produce a valid setup plan." }
+            $savedUserProfile = $env:USERPROFILE
+            $env:USERPROFILE = Join-Path $work "fresh-user-home"
+            New-Item -ItemType Directory -Path $env:USERPROFILE -Force | Out-Null
+            try {
+              $plan = & (Join-Path $install "hive.exe") setup --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --json | ConvertFrom-Json
+            } finally {
+              $env:USERPROFILE = $savedUserProfile
+            }
+            if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only -or -not $plan.plan.state_dir) { throw "Release Hive did not produce a valid setup plan with an automatic state path." }
+            if ($plan.plan.state_dir -match 'daviddiaz0317--hive-visual-hive-install-proof') { throw "Release Hive repeated the long repository slug in its default state path: $($plan.plan.state_dir)" }
           } finally {
             $env:PATH = $originalPath
             [Environment]::SetEnvironmentVariable("Path", $originalUserPath, "User")

@@ -27,8 +27,10 @@ func validateManagedCheckoutBeforeGitWithLegacy(checkout, repository string, leg
 		return false, err
 	}
 	parent := filepath.Dir(absolute)
-	if filepath.Base(parent) != "checkouts" || filepath.Base(filepath.Dir(parent)) != "integrated" {
-		return false, fmt.Errorf("managed checkout must be the exact Hive state integrated/checkouts leaf")
+	boundedLayout := filepath.Base(absolute) == "checkout" && filepath.Base(parent) == "integrated"
+	legacyLayout := filepath.Base(parent) == "checkouts" && filepath.Base(filepath.Dir(parent)) == "integrated"
+	if !boundedLayout && !legacyLayout {
+		return false, fmt.Errorf("managed checkout must be the exact Hive state integrated/checkout leaf or a verified legacy integrated/checkouts leaf")
 	}
 	if err := ensureOrdinaryDirectoryChain(parent, 0o700); err != nil {
 		return false, fmt.Errorf("managed checkout ancestor is unsafe: %w", err)

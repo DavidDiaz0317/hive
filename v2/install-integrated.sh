@@ -266,16 +266,20 @@ actual_node_sha="$(sha256sum "$distribution_validator_node" | awk '{print $1}')"
 [ "$actual_node_sha" = "$expected_node_sha" ] || { echo "Bundled Node validator digest does not match the release manifest." >&2; exit 1; }
 validate_hive_distribution() {
   validation_root="$1"
-  env -u NODE_OPTIONS -u NODE_PATH "$distribution_validator_node" - "$validation_root" <<'NODE'
+  expected_version="${2:-}"
+  env -u NODE_OPTIONS -u NODE_PATH "$distribution_validator_node" - "$validation_root" "$expected_version" <<'NODE'
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const suppliedRoot = path.resolve(process.argv[2]);
+const expectedVersion = process.argv[3] || '';
 if (fs.lstatSync(suppliedRoot).isSymbolicLink()) throw new Error(`distribution root is a symbolic link: ${suppliedRoot}`);
 const root = fs.realpathSync(suppliedRoot);
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'distribution-manifest.json'), 'utf8'));
 if (manifest.schema_version !== 'hive.integrated-distribution.v1' || manifest.os !== 'linux' || manifest.architecture !== 'amd64') throw new Error('distribution platform mismatch');
 if (!/^[a-f0-9]{40}$/.test(manifest.hive_commit || '') || !/^[a-f0-9]{40}$/.test(manifest.visual_hive_commit || '') || !/^v22\./.test(manifest.node_version || '') || !Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('distribution identity is incomplete');
+if (expectedVersion && manifest.hive_version !== expectedVersion) throw new Error(`distribution Hive version ${manifest.hive_version || '<missing>'} does not match requested release ${expectedVersion}`);
+if (manifest.hive_version && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(manifest.hive_version)) throw new Error('distribution Hive version is unsafe');
 const inventoried = new Set();
 for (const file of manifest.files) {
   if (!file.path || path.posix.isAbsolute(file.path) || file.path.includes('\\') || file.path.split('/').includes('..')) throw new Error(`unsafe inventory path: ${file.path}`);
@@ -387,7 +391,7 @@ NODE
   fi
 }
 
-validate_hive_distribution "$source_dir"
+validate_hive_distribution "$source_dir" "$version"
 
 if [ -e "$install_dir" ] || [ -L "$install_dir" ]; then
   require_recognized_hive_distribution "$install_dir" "existing install target"
@@ -422,7 +426,7 @@ staging_dir="$install_dir.new.$$"
 case "$staging_dir" in "$parent_dir"/*) ;; *) echo "Unsafe staging path." >&2; exit 1 ;; esac
 [ ! -e "$staging_dir" ] && [ ! -L "$staging_dir" ] || { echo "Refusing to overwrite pre-existing staging path $staging_dir; remove it manually after inspection." >&2; exit 1; }
 cp -R "$source_dir" "$staging_dir"
-validate_hive_distribution "$staging_dir"
+validate_hive_distribution "$staging_dir" "$version"
 cp -- "$staging_dir/hive" "$transition_helper"
 chmod 0700 "$transition_helper"
 if [ "$had_previous" = "1" ]; then

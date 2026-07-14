@@ -51,6 +51,7 @@ type SetupPlan struct {
 	SchemaVersion         string                `json:"schema_version"`
 	GeneratedAt           time.Time             `json:"generated_at"`
 	Repository            string                `json:"repository"`
+	StateDir              string                `json:"state_dir"`
 	Coverage              Coverage              `json:"coverage"`
 	Automation            Automation            `json:"automation"`
 	Provider              string                `json:"provider"`

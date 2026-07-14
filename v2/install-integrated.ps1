@@ -112,7 +112,7 @@ try {
     Write-Verbose ("Hive archive extracted at {0:n2}s" -f $installTimer.Elapsed.TotalSeconds)
     $source = Get-ChildItem -LiteralPath $extractDir -Directory | Select-Object -First 1
     if (-not $source) { throw "The integrated Hive archive has no distribution directory." }
-    Test-HiveDistribution -Root $source.FullName -ExpectedOS "windows" -ExpectedArchitecture "amd64"
+    Test-HiveDistribution -Root $source.FullName -ExpectedOS "windows" -ExpectedArchitecture "amd64" -ExpectedVersion $Version
     Write-Verbose ("Hive source inventory verified at {0:n2}s" -f $installTimer.Elapsed.TotalSeconds)
 	if ($hadPreviousInstall) {
 		Assert-HiveRecognizedDistribution -Path $InstallDir -Label "existing install target" -ExpectedOS "windows" -ExpectedArchitecture "amd64"
@@ -146,7 +146,7 @@ try {
     # The final staging->active rename remains the atomic activation boundary.
     Move-Item -LiteralPath $source.FullName -Destination $stagingDir
     $script:HiveTrustedDistributionValidatorNode = Join-Path $stagingDir "runtime\node.exe"
-    Test-HiveDistribution -Root $stagingDir -ExpectedOS "windows" -ExpectedArchitecture "amd64"
+    Test-HiveDistribution -Root $stagingDir -ExpectedOS "windows" -ExpectedArchitecture "amd64" -ExpectedVersion $Version
     Invoke-HiveBundledNodeCommand -FilePath (Join-Path $stagingDir "runtime\node.exe") -ArgumentList @((Join-Path $stagingDir "visual-hive\visual-hive.mjs"), "--version") -Operation "Bundled Visual Hive runtime check" | Out-Null
 	$candidateExecutable = Join-Path $stagingDir "hive.exe"
 	Copy-Item -LiteralPath $candidateExecutable -Destination $transitionHelper
@@ -508,7 +508,7 @@ function Activate-HiveDistribution {
 }
 
 function Test-HiveDistribution {
-    param([Parameter(Mandatory)][string]$Root, [string]$ExpectedOS, [string]$ExpectedArchitecture)
+    param([Parameter(Mandatory)][string]$Root, [string]$ExpectedOS, [string]$ExpectedArchitecture, [string]$ExpectedVersion = "")
     $resolvedRoot = [IO.Path]::GetFullPath($Root)
     $rootItem = Get-Item -LiteralPath $resolvedRoot -Force
     if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -551,7 +551,7 @@ function Test-HiveDistribution {
             throw "Bundled Node runtime check must report an exact Node 22 version; got '$nodeVersion'."
         }
     }
-    Invoke-HiveDistributionNodeValidator -ValidatorNode $validatorNode -Root $resolvedRoot -ExpectedOS $ExpectedOS -ExpectedArchitecture $ExpectedArchitecture
+    Invoke-HiveDistributionNodeValidator -ValidatorNode $validatorNode -Root $resolvedRoot -ExpectedOS $ExpectedOS -ExpectedArchitecture $ExpectedArchitecture -ExpectedVersion $ExpectedVersion
     $script:HiveTrustedDistributionValidatorNode = $validatorNode
 }
 
@@ -560,7 +560,8 @@ function Invoke-HiveDistributionNodeValidator {
         [Parameter(Mandatory)][string]$ValidatorNode,
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ExpectedOS,
-        [Parameter(Mandatory)][string]$ExpectedArchitecture
+        [Parameter(Mandatory)][string]$ExpectedArchitecture,
+        [string]$ExpectedVersion = ""
     )
     $validatorProgram = @'
 const crypto = require("node:crypto");
@@ -570,6 +571,7 @@ const path = require("node:path");
 const suppliedRoot = path.resolve(process.env.HIVE_VALIDATOR_ROOT || "");
 const expectedOS = process.env.HIVE_VALIDATOR_OS;
 const expectedArchitecture = process.env.HIVE_VALIDATOR_ARCHITECTURE;
+const expectedVersion = process.env.HIVE_VALIDATOR_VERSION || "";
 const rootStat = fs.lstatSync(suppliedRoot);
 if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("distribution root is not an ordinary directory");
 const root = fs.realpathSync(suppliedRoot);
@@ -579,6 +581,8 @@ if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 if (manifest.schema_version !== "hive.integrated-distribution.v1" || manifest.os !== expectedOS || manifest.architecture !== expectedArchitecture) throw new Error("distribution platform mismatch");
 if (!/^[a-f0-9]{40}$/u.test(manifest.hive_commit || "") || !/^[a-f0-9]{40}$/u.test(manifest.visual_hive_commit || "") || !/^v22\./u.test(manifest.node_version || "") || !Array.isArray(manifest.files) || manifest.files.length < 1 || manifest.files.length > 50000) throw new Error("distribution identity is incomplete or excessive");
+if (expectedVersion && manifest.hive_version !== expectedVersion) throw new Error(`distribution Hive version ${manifest.hive_version || "<missing>"} does not match requested release ${expectedVersion}`);
+if (manifest.hive_version && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(manifest.hive_version)) throw new Error("distribution Hive version is unsafe");
 const inventoried = new Map();
 const inventoryEntries = [];
 for (const file of manifest.files) {
@@ -658,6 +662,7 @@ process.stdout.write("HIVE_DISTRIBUTION_VALIDATED\n");
     $startInfo.EnvironmentVariables["HIVE_VALIDATOR_ROOT"] = [IO.Path]::GetFullPath($Root)
     $startInfo.EnvironmentVariables["HIVE_VALIDATOR_OS"] = $ExpectedOS
     $startInfo.EnvironmentVariables["HIVE_VALIDATOR_ARCHITECTURE"] = $ExpectedArchitecture
+    $startInfo.EnvironmentVariables["HIVE_VALIDATOR_VERSION"] = $ExpectedVersion
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     $started = $false

@@ -59,13 +59,13 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	}
 	output := filepath.Join(root, "distribution")
 	manifest, err := BuildDistribution(context.Background(), DistributionOptions{
-		HiveBinary: testBinary, HiveCommit: strings.Repeat("b", 40), VisualHiveDir: visualDir, VisualCommit: visualCommit,
+		HiveBinary: testBinary, HiveCommit: strings.Repeat("b", 40), HiveVersion: "v0.4.1-integrated.11", VisualHiveDir: visualDir, VisualCommit: visualCommit,
 		NodeBinary: testBinary, NodeRuntimeDir: runtimeDir, NodeLicense: nodeLicense, NodeVersion: "v22.23.1", SkillDir: skillDir, OutputDir: output,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != DistributionSchema || manifest.VisualHiveVersion != "0.2.0" || len(manifest.Files) < 5 {
+	if manifest.SchemaVersion != DistributionSchema || manifest.HiveVersion != "v0.4.1-integrated.11" || manifest.VisualHiveVersion != "0.2.0" || len(manifest.Files) < 5 {
 		t.Fatalf("unexpected distribution manifest: %+v", manifest)
 	}
 	hiveName := "hive"

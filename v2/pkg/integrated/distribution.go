@@ -23,6 +23,7 @@ var immutableCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
 type DistributionOptions struct {
 	HiveBinary     string
 	HiveCommit     string
+	HiveVersion    string
 	VisualHiveDir  string
 	VisualCommit   string
 	NodeBinary     string
@@ -43,6 +44,7 @@ type DistributionFile struct {
 
 type DistributionManifest struct {
 	SchemaVersion     string             `json:"schema_version"`
+	HiveVersion       string             `json:"hive_version"`
 	HiveCommit        string             `json:"hive_commit"`
 	VisualHiveCommit  string             `json:"visual_hive_commit"`
 	VisualHiveVersion string             `json:"visual_hive_version"`
@@ -57,6 +59,10 @@ type DistributionManifest struct {
 func BuildDistribution(ctx context.Context, options DistributionOptions) (DistributionManifest, error) {
 	if !immutableCommit.MatchString(options.HiveCommit) || !immutableCommit.MatchString(options.VisualCommit) {
 		return DistributionManifest{}, fmt.Errorf("Hive and Visual Hive commits must be immutable 40-character SHA-1 values")
+	}
+	hiveVersion := strings.TrimSpace(options.HiveVersion)
+	if matched, _ := regexp.MatchString(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, hiveVersion); !matched {
+		return DistributionManifest{}, fmt.Errorf("safe Hive integrated release version is required")
 	}
 	for label, source := range map[string]string{"Hive binary": options.HiveBinary, "Visual Hive bundle": options.VisualHiveDir, "Node binary": options.NodeBinary, "complete Node runtime": options.NodeRuntimeDir, "Hive Codex skill": options.SkillDir} {
 		if strings.TrimSpace(source) == "" {
@@ -167,7 +173,7 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 		return DistributionManifest{}, err
 	}
 	manifest := DistributionManifest{
-		SchemaVersion: DistributionSchema, HiveCommit: options.HiveCommit, VisualHiveCommit: options.VisualCommit,
+		SchemaVersion: DistributionSchema, HiveVersion: hiveVersion, HiveCommit: options.HiveCommit, VisualHiveCommit: options.VisualCommit,
 		VisualHiveVersion: visualManifest.Version, NodeVersion: nodeVersion, OS: targetOS, Architecture: targetArch, Files: files,
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")

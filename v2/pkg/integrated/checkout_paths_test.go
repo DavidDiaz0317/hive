@@ -1,11 +1,63 @@
 package integrated
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestBoundedManagedCheckoutClonesLongRepositoryAndIsIdempotent(t *testing.T) {
+	const repository = "DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243"
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	runCheckoutFixtureGit(t, root, "init", "--bare", remote)
+	runCheckoutFixtureGit(t, root, "init", "-b", "main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("bounded checkout fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCheckoutFixtureGit(t, seed, "add", "README.md")
+	runCheckoutFixtureGit(t, seed, "-c", "user.name=Hive Test", "-c", "user.email=hive@example.invalid", "commit", "-m", "seed")
+	runCheckoutFixtureGit(t, seed, "remote", "add", "origin", remote)
+	runCheckoutFixtureGit(t, seed, "push", "-u", "origin", "main")
+	runCheckoutFixtureGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	oldCloneURL := setupRepositoryCloneURL
+	setupRepositoryCloneURL = func(string) string { return remote }
+	t.Cleanup(func() { setupRepositoryCloneURL = oldCloneURL })
+	checkout := filepath.Join(root, "state", "integrated", "checkout")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	branch, err := ensureCheckout(ctx, repository, checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch != "main" {
+		t.Fatalf("default branch = %q, want main", branch)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".git", managedCheckoutOwnerFile)); err != nil {
+		t.Fatalf("bounded clone lacks ownership marker: %v", err)
+	}
+	secondBranch, err := ensureCheckout(ctx, repository, checkout)
+	if err != nil || secondBranch != "main" {
+		t.Fatalf("repeated bounded checkout = %q, %v", secondBranch, err)
+	}
+}
+
+func runCheckoutFixtureGit(t *testing.T, directory string, args ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = directory
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+	}
+}
 
 func TestSetupCheckoutRejectsLinkedManagedParentWithoutOutsideWrite(t *testing.T) {
 	checkout, outside := t.TempDir(), t.TempDir()

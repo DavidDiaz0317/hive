@@ -37,6 +37,7 @@ var (
 	strictPackageRunPattern = regexp.MustCompile(`^(npm|pnpm|yarn)[[:space:]]+(--silent[[:space:]]+)?run[[:space:]]+([A-Za-z0-9_.:-]+)([[:space:]]+--([[:space:]]+[A-Za-z0-9_./:@%+=,-]+)*)?$`)
 	safeShellTokenPattern   = regexp.MustCompile(`^[A-Za-z0-9_./:@%+=,\\-]+$`)
 	environmentTokenPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+=,\\-]+$`)
+	setupRepositoryCloneURL = func(repository string) string { return "https://github.com/" + repository + ".git" }
 )
 
 type packageScriptInvocation struct {
@@ -122,10 +123,13 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		}
 		legacyCheckout = &legacyManagedCheckoutProof{Config: prior, LiveRepositoryID: liveRepositoryID}
 	}
-	checkout := filepath.Join(store.Dir(), "checkouts", safeRepoName(options.Repository))
-	defaultBranch, err := ensureCheckoutWithLegacy(ctx, options.Repository, checkout, legacyCheckout)
+	checkout, err := managedSetupCheckoutPath(store.Dir(), options.StateDir, options.Repository, prior, hasPrior)
 	if err != nil {
 		return SetupResult{}, err
+	}
+	defaultBranch, err := ensureCheckoutWithLegacy(ctx, options.Repository, checkout, legacyCheckout)
+	if err != nil {
+		return SetupResult{}, fmt.Errorf("setup checkout in state directory %s: %w", options.StateDir, err)
 	}
 	if err := validateOrdinarySetupCheckout(checkout); err != nil {
 		return SetupResult{}, err
@@ -136,6 +140,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	if options.GitHub != nil {
 		enrichRemoteInspection(ctx, options.GitHub, options.Repository, &inspection)
+	}
+	if !options.Apply && strings.TrimSpace(inspection.RepositoryID) != "" {
+		if err := ensureStateOwnershipMarker(options.StateDir, Config{Repository: options.Repository, RepositoryID: inspection.RepositoryID}); err != nil {
+			return SetupResult{}, fmt.Errorf("bind planned state directory to exact repository identity: %w", err)
+		}
 	}
 	options = effectiveSetupAutoMergePolicy(options, prior, hasPrior)
 	plan := buildSetupPlan(options, inspection)
@@ -765,6 +774,7 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 	managedFiles := managedSetupFiles(options.VisualHive)
 	return SetupPlan{
 		SchemaVersion: PlanSchema, GeneratedAt: time.Now().UTC(), Repository: options.Repository,
+		StateDir: options.StateDir,
 		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
 		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
 		VisualHiveRepository: options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef, Inspection: inspection,
@@ -835,7 +845,7 @@ func ensureCheckoutWithLegacy(ctx context.Context, repository, checkout string, 
 		if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
 			return "", err
 		}
-		if _, err := git(ctx, filepath.Dir(checkout), "clone", "--origin", "origin", "https://github.com/"+repository+".git", checkout); err != nil {
+		if _, err := git(ctx, filepath.Dir(checkout), "clone", "--origin", "origin", setupRepositoryCloneURL(repository), checkout); err != nil {
 			return "", fmt.Errorf("clone target repository: %w", err)
 		}
 		if err := writeManagedCheckoutOwner(checkout, repository); err != nil {
@@ -2046,6 +2056,22 @@ func safeOutput(value string) string {
 
 func safeRepoName(repository string) string {
 	return strings.ReplaceAll(strings.ToLower(repository), "/", "-")
+}
+
+func managedSetupCheckoutPath(storeDir, stateDir, repository string, prior Config, hasPrior bool) (string, error) {
+	current := filepath.Join(storeDir, "checkout")
+	if !hasPrior {
+		return current, nil
+	}
+	if strings.TrimSpace(prior.StateDir) == "" || !sameFilesystemPath(prior.StateDir, stateDir) {
+		return "", fmt.Errorf("durable setup state path does not match selected state directory %s", stateDir)
+	}
+	candidate := strings.TrimSpace(prior.CheckoutDir)
+	legacy := filepath.Join(storeDir, "checkouts", safeRepoName(repository))
+	if candidate == "" || (!sameFilesystemPath(candidate, current) && !sameFilesystemPath(candidate, legacy)) {
+		return "", fmt.Errorf("durable setup checkout path is outside the supported bounded or legacy state layout")
+	}
+	return filepath.Clean(candidate), nil
 }
 
 func cloneCommands(values [][]string) [][]string {

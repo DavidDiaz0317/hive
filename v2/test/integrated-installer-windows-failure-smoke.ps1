@@ -334,7 +334,7 @@ try {
     [IO.File]::WriteAllText($nodeSentinel, "previous installation", $utf8NoBom)
     $nodeSentinelHash = (Get-FileHash -LiteralPath $nodeSentinel -Algorithm SHA256).Hash
     $nodeFailure = Invoke-InstallerProcess -Name "node-fail" -RequestedVersion $Version -LocalReleaseDir $nodeFailureRelease -SkipAttestation
-    Assert-InstallerFailure $nodeFailure "Bundled Node runtime check failed with exit code"
+    Assert-InstallerFailure $nodeFailure "Bundled Node runtime check must report an exact Node 22 version"
     Test-HiveDistribution -Root $nodeInstall -ExpectedOS "windows" -ExpectedArchitecture "amd64"
     Assert-SentinelUnchanged -Path $nodeSentinel -ExpectedHash $nodeSentinelHash
 

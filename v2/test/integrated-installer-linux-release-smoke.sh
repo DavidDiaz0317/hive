@@ -15,18 +15,19 @@ mkdir -p "$HOME"
 
 sh "$installer"
 "$HIVE_INSTALL_DIR/runtime/node" "$HIVE_INSTALL_DIR/visual-hive/visual-hive.mjs" --version
+"$HIVE_INSTALL_DIR/hive" --version | grep -Fx "Hive $version"
 # Use the exact launcher printed by the installer. This proves the second
 # command works in the same shell even when ~/.local/bin is not on PATH.
 "$HOME/.local/bin/hive" setup \
-  --repo DavidDiaz0317/visual-hive-demo-site \
+  --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 \
   --coverage comprehensive \
   --automation advisory \
   --provider codex \
   --visual-hive \
   --plan \
-  --state-dir "$work_root/state" \
   --json > "$work_root/setup-plan.json"
 grep -q '"schema_version": "hive.setup-plan.v1"' "$work_root/setup-plan.json"
+grep -q '"state_dir": ' "$work_root/setup-plan.json"
 grep -q '"read_only": true' "$work_root/setup-plan.json"
 
 # Installation paths are ownership boundaries. Reject unsafe/common parents and

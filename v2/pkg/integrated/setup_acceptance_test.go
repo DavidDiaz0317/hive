@@ -66,7 +66,7 @@ func TestInstalledVisualHiveBundleSetupApplyAndMergedRerunIsIdempotent(t *testin
 	// Production Git commands deliberately strip ambient GIT_CONFIG_* URL
 	// rewrites. Seed the already state-owned checkout explicitly so this test
 	// exercises that security boundary instead of depending on a process hook.
-	checkout := filepath.Join(stateDir, "integrated", "checkouts", "owner-repo")
+	checkout := filepath.Join(stateDir, "integrated", "checkout")
 	if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
 		t.Fatal(err)
 	}

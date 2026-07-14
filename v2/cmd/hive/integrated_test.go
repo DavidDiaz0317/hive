@@ -269,7 +269,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 
 	t.Setenv("HIVE_GITHUB_TOKEN", "test-token")
 	stateDir := filepath.Join(root, "state")
-	checkout := filepath.Join(stateDir, "integrated", "checkouts", "owner-repo")
+	checkout := filepath.Join(stateDir, "integrated", "checkout")
 	if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	if err := json.Unmarshal(output, &result); err != nil {
 		t.Fatalf("decode setup plan JSON: %v: %s", err, output)
 	}
-	if result.Applied || !result.Plan.ReadOnly || result.Plan.VisualHiveRepository != defaultVisualHiveRepository || result.Plan.VisualHiveRef != visualRef {
+	if result.Applied || !result.Plan.ReadOnly || result.Plan.StateDir != stateDir || result.Plan.VisualHiveRepository != defaultVisualHiveRepository || result.Plan.VisualHiveRef != visualRef {
 		t.Fatalf("setup plan did not emit the installed dependency: %+v", result.Plan)
 	}
 }
