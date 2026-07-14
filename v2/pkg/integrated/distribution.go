@@ -19,7 +19,18 @@ import (
 const DistributionSchema = "hive.integrated-distribution.v1"
 
 const linuxVisualHiveLauncher = `#!/bin/sh
-root_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)" || {
+launcher="$0"
+while [ -L "$launcher" ]; do
+  target="$(readlink -- "$launcher")" || {
+    echo "Hive Visual Hive launcher error: could not resolve the installed launcher symlink: $launcher. Reinstall the immutable integrated Hive release." >&2
+    exit 126
+  }
+  case "$target" in
+    /*) launcher="$target" ;;
+    *) launcher="$(dirname -- "$launcher")/$target" ;;
+  esac
+done
+root_dir="$(CDPATH= cd -- "$(dirname -- "$launcher")/.." && pwd -P)" || {
   echo "Hive Visual Hive launcher error: could not resolve the integrated installation root. Reinstall the immutable integrated Hive release." >&2
   exit 126
 }

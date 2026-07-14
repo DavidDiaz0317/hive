@@ -55,6 +55,7 @@ test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visua
 launcher_path="$work_root/launcher-path"
 mkdir -p "$launcher_path"
 ln -s "$(command -v dirname)" "$launcher_path/dirname"
+ln -s "$(command -v readlink)" "$launcher_path/readlink"
 (
   PATH="$HOME/.local/bin:$launcher_path"
   export PATH

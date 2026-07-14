@@ -164,9 +164,30 @@ func TestVisualHiveLaunchersBindBundledRuntime(t *testing.T) {
 	}
 	argsFile := filepath.Join(t.TempDir(), "received arguments.txt")
 	arguments := []string{"--flag", "two words", `quote"inside`}
-	command := exec.Command(launcher, arguments...)
+	externalDir := filepath.Join(t.TempDir(), "external launcher with spaces")
+	if err := os.MkdirAll(externalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	externalLauncher := filepath.Join(externalDir, "visual-hive")
+	if err := os.Symlink(launcher, externalLauncher); err != nil {
+		t.Fatal(err)
+	}
+	toolDir := filepath.Join(t.TempDir(), "restricted launcher tools")
+	if err := os.MkdirAll(toolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"dirname", "readlink"} {
+		resolved, lookupErr := exec.LookPath(name)
+		if lookupErr != nil {
+			t.Fatal(lookupErr)
+		}
+		if err := os.Symlink(resolved, filepath.Join(toolDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.Command(externalLauncher, arguments...)
 	command.Dir = t.TempDir()
-	command.Env = append(os.Environ(), "HIVE_TEST_VISUAL_ARGS="+argsFile, "HIVE_TEST_VISUAL_EXIT=37")
+	command.Env = append(os.Environ(), "PATH="+toolDir, "HIVE_TEST_VISUAL_ARGS="+argsFile, "HIVE_TEST_VISUAL_EXIT=37")
 	output, runErr := command.CombinedOutput()
 	exitErr, ok := runErr.(*exec.ExitError)
 	if !ok || exitErr.ExitCode() != 37 {

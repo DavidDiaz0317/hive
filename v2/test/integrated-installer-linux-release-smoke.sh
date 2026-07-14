@@ -19,6 +19,7 @@ launcher_path="$work_root/launcher-path"
 arbitrary_cwd="$work_root/arbitrary working directory"
 mkdir -p "$launcher_path" "$arbitrary_cwd"
 ln -s "$(command -v dirname)" "$launcher_path/dirname"
+ln -s "$(command -v readlink)" "$launcher_path/readlink"
 (
   cd "$arbitrary_cwd"
   PATH="$HOME/.local/bin:$launcher_path"
