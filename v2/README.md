@@ -2,7 +2,7 @@
 
 AI agent orchestrator for GitHub repositories. A single Go binary that enumerates issues and PRs, classifies them by complexity, and dispatches work to AI agents (Claude, Copilot, Gemini, Goose) on adaptive cadences.
 
-For the production Hive + Visual Hive product, start with [the integrated quickstart](docs/integrated-quickstart.md). The signed integrated installer needs no Go, Node, Docker, npm, or sibling Visual Hive checkout and supports CLI, MCP, and `/hive` setup through a real hosted issue/repair/PR lifecycle.
+For the production Hive + Visual Hive product, start with [the integrated quickstart](docs/integrated-quickstart.md). The integrated installer needs no Go, Node, Docker, npm, or sibling Visual Hive checkout and supports CLI, MCP, and `/hive` setup through a real hosted issue/repair/PR lifecycle. See [downloads and verification](docs/integrated-downloads.md), the [code-signing policy](docs/integrated-code-signing-policy.md), and the [privacy and data-handling notice](docs/integrated-privacy.md).
 
 ## Quick Start (Docker)
 
