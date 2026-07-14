@@ -839,7 +839,7 @@ const fs = require("fs");
           const screenshots = (Array.isArray(pipeline.results) ? pipeline.results : []).flatMap((result) => Array.isArray(result.screenshotAssertions) ? result.screenshotAssertions : []);
           const blocking = contributions.filter((item) => item && item.gating === true && item.status !== "passed");
           const missing = screenshots.filter((item) => item && item.status === "missing_baseline");
-          const exclusiveMissingBaseline = pipeline.status === "failed" && verdictSummary.visualHiveVerdict === "blocked" &&
+          const exclusiveMissingBaseline = ["failed", "blocked"].includes(pipeline.status) && verdictSummary.visualHiveVerdict === "blocked" &&
             Array.isArray(verdictSummary.failedBecause) && verdictSummary.failedBecause.length === 0 &&
             Number(summary.missingBaselines) > 0 && Number(summary.missingBaselines) === missing.length &&
             Number(summary.visualDiffs || 0) === 0 && Number(summary.consoleErrors || 0) === 0 && Number(summary.pageErrors || 0) === 0 && Number(summary.flowStepsFailed || 0) === 0 &&

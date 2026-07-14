@@ -168,7 +168,7 @@ func TestIntegratedReleasePinsFinalVisualHiveDependency(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(data)
-	const visualRef = "64c854baf0cc992e1975d96144e98ef2f07108bf"
+	const visualRef = "6891c7fcc831eac8d560ea933d2e72e21a39a475"
 	for _, invariant := range []string{
 		"repository: DavidDiaz0317/visual-hive",
 		"VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '" + visualRef + "' }}",

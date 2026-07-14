@@ -307,6 +307,10 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 			t.Fatalf("%s workflow browser install/seal/preflight/execute/cleanup order is unsafe: install=%d target=%d seal=%d preflight=%d collection=%d cleanup=%d", name, install, targetInstall, seal, preflight, collection, cleanup)
 		}
 	}
+	pullRequestExecution := workflowJobText(parseIsolatedWorkflow(t, pullRequestWorkflow(isolationWorkflowConfig())).Jobs["visual-hive"])
+	if !strings.Contains(pullRequestExecution, `["failed", "blocked"].includes(pipeline.status) && verdictSummary.visualHiveVerdict === "blocked"`) {
+		t.Fatal("pull-request verifier does not accept Visual Hive's blocked missing-baseline status")
+	}
 	dependencyShell := isolatedTargetDependencyShell(true)
 	install := strings.Index(dependencyShell, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
 	targetDependencies := strings.Index(dependencyShell, "HIVE_TARGET_DEPENDENCIES")
