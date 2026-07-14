@@ -1,5 +1,15 @@
 # Current acceptance blockers
 
+## VH-SETUP-008
+
+- Acceptance stage: final clean-room setup / pre-setup baseline inventory
+- Observed error: the automatic Windows checkout reached 150 characters, and `git show <commit>:.visual-hive/snapshots/app-shell-visual-stability__app-shell-desktop__desktop.png` failed with `Filename too long` when the checkout plus revision-path probe reached 273 characters.
+- Root cause: pre-setup baseline inventory read a path-qualified revision even though `git ls-tree` had already returned the exact baseline blob SHA. Git for Windows probes the revision-path argument relative to the checkout before resolving it as an object, crossing the legacy path boundary.
+- Subsystem: Hive integrated setup baseline inventory (`v2/pkg/integrated`).
+- Planned fix: validate the exact blob SHA returned by `git ls-tree` and read that object with `git cat-file blob <sha>`, preserving committed-object binding, canonical PNG validation, and safe stderr handling.
+- Focused test: use the reproduced long checkout and exact baseline path, prove the committed blob wins over a mutated working-tree file, and retain rejection of a committed non-PNG blob.
+- State: verified-stage
+
 ## VH-SETUP-001
 
 - Acceptance stage: hosted setup checks / deterministic verifier

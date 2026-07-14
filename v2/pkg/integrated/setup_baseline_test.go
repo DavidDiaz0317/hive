@@ -136,6 +136,71 @@ func TestExistingVisualBaselinesIgnoresStaleUntrackedSnapshots(t *testing.T) {
 	}
 }
 
+func TestSetupBaselineInventoryAtCommitReadsLongWindowsPathsByBlobID(t *testing.T) {
+	checkout := filepath.Join(t.TempDir(), "checkout")
+	for len(checkout) < 150 {
+		checkout = filepath.Join(checkout, "bounded-state")
+	}
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(arguments ...string) string {
+		t.Helper()
+		command := exec.Command("git", append([]string{"-C", checkout}, arguments...)...)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", arguments, err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	runGit("init", "-b", "main")
+	runGit("config", "user.name", "Hive test")
+	runGit("config", "user.email", "hive@example.invalid")
+
+	path := ".visual-hive/snapshots/app-shell-visual-stability__app-shell-desktop__desktop.png"
+	content := append([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}, []byte("reviewed baseline")...)
+	absolute := filepath.Join(checkout, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(absolute, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-f", path)
+	runGit("commit", "-m", "review baseline")
+	head := runGit("rev-parse", "HEAD")
+	if len(checkout)+1+len(head)+1+len(path) <= 260 {
+		t.Fatalf("regression fixture does not cross the Windows Git path boundary: checkout=%d revision_path=%d", len(checkout), len(head)+1+len(path))
+	}
+
+	// The inventory is bound to the committed blob, not a mutable checkout file.
+	if err := os.WriteFile(absolute, []byte("working tree mutation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, digest, err := setupBaselineInventoryAtCommit(context.Background(), checkout, head)
+	if err != nil {
+		t.Fatalf("read long-path baseline inventory: %v", err)
+	}
+	wantHash := sha256.Sum256(content)
+	want := SetupBaselineCandidate{Path: path, SHA256: hex.EncodeToString(wantHash[:]), Bytes: int64(len(content))}
+	wantDigest, err := setupBaselineCandidateDigest([]SetupBaselineCandidate{want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0] != want || digest != wantDigest {
+		t.Fatalf("unexpected committed baseline inventory: candidates=%+v digest=%q", candidates, digest)
+	}
+
+	if err := os.WriteFile(absolute, []byte("not a PNG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-f", path)
+	runGit("commit", "-m", "invalid baseline")
+	if _, _, err := setupBaselineInventoryAtCommit(context.Background(), checkout, runGit("rev-parse", "HEAD")); err == nil || !strings.Contains(err.Error(), "read canonical pre-setup PNG") {
+		t.Fatalf("non-PNG baseline was not rejected: %v", err)
+	}
+}
+
 func TestCreateSetupBaselineProposalRejectsArtifactMutationAfterDurableSave(t *testing.T) {
 	root := t.TempDir()
 	content := append([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}, []byte("hosted-linux-baseline")...)

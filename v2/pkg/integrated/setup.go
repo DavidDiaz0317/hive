@@ -1220,13 +1220,11 @@ func setupBaselineInventoryAtCommit(ctx context.Context, checkout, commitSHA str
 		metadata, relative, ok := strings.Cut(record, "\t")
 		fields := strings.Fields(metadata)
 		relative = filepath.ToSlash(relative)
-		if !ok || len(fields) != 3 || (fields[0] != "100644" && fields[0] != "100755") || fields[1] != "blob" ||
+		if !ok || len(fields) != 3 || (fields[0] != "100644" && fields[0] != "100755") || fields[1] != "blob" || !immutableCommit.MatchString(strings.ToLower(fields[2])) ||
 			!strings.HasPrefix(relative, ".visual-hive/snapshots/") || !strings.HasSuffix(strings.ToLower(relative), ".png") {
 			return nil, "", fmt.Errorf("pre-setup baseline entry %q is not a canonical regular PNG blob", relative)
 		}
-		blob := exec.CommandContext(ctx, "git", "-C", checkout, "show", commitSHA+":"+relative)
-		blob.Env = safeEnvironment()
-		content, readErr := blob.Output()
+		content, readErr := readSetupBaselineBlob(ctx, checkout, strings.ToLower(fields[2]))
 		if readErr != nil || len(content) <= 8 || !bytes.Equal(content[:8], []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}) {
 			return nil, "", fmt.Errorf("read canonical pre-setup PNG %s: %w", relative, readErr)
 		}
@@ -1236,6 +1234,17 @@ func setupBaselineInventoryAtCommit(ctx context.Context, checkout, commitSHA str
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
 	digest, err := setupBaselineCandidateDigest(candidates)
 	return candidates, digest, err
+}
+
+func readSetupBaselineBlob(ctx context.Context, checkout, objectSHA string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "git", "-C", checkout, "cat-file", "blob", objectSHA)
+	command.Env = safeEnvironment()
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		return nil, fmt.Errorf("git cat-file blob %s: %w: %s", objectSHA, err, safeOutput(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }
 
 func writeManagedFiles(root string, config Config, inspection RepositoryInspection) error {
