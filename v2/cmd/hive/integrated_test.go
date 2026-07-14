@@ -338,6 +338,44 @@ func TestPersistentSetupRejectsEnvironmentOnlyGitHubToken(t *testing.T) {
 	}
 }
 
+func TestDeferredSchedulerIntentDoesNotStartBeforeDoctorPrerequisites(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir,
+		CheckoutDir: filepath.Join(stateDir, "missing-checkout"), Paused: true,
+		ProviderCommand: filepath.Join(stateDir, "missing-provider"), VisualHiveRef: strings.Repeat("a", 40),
+	}
+	if err := store.Save(config); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordDeferredSchedulerStart(stateDir, config.Repository, 15*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if status := readIntegratedDaemonStatus(stateDir); status.Running || status.RuntimeRunning || daemonServiceReady(status.Service) {
+		t.Fatalf("recording --start installed or ran the scheduler before readiness: %+v", status)
+	}
+	activated, err := activateDeferredSchedulerIfReady(stateDir, "HIVE_TEST_MISSING_TOKEN", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated {
+		t.Fatal("scheduler activated while doctor prerequisites were red")
+	}
+	if _, exists, err := store.LoadSchedulerStartIntent(); err != nil || !exists {
+		t.Fatalf("deferred scheduler intent was not preserved: exists=%t err=%v", exists, err)
+	}
+	if err := clearDeferredSchedulerStart(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := store.LoadSchedulerStartIntent(); err != nil || exists {
+		t.Fatalf("explicit stop semantics did not cancel deferred start: exists=%t err=%v", exists, err)
+	}
+}
+
 func runSetupPlanTestGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	command := exec.Command("git", args...)

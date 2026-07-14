@@ -526,6 +526,7 @@ func validateManagedIntegratedStateInventory(integratedDir, stateDir string, con
 		protectionActivationFile: true, authorizerTransferIntentFile: true,
 		repairRefreshFile: true, repairRetirementFile: true, setupBaselineFile: true,
 		setupBaselineRebindFile: true, uninstallIntentFile: true, workflowDispatchFile: true,
+		schedulerStartIntentFile: true,
 	}
 	managedDaemonFiles := map[string]bool{"daemon.json": true, "daemon.lease": true, "daemon.log": true}
 	entries, err := os.ReadDir(integratedDir)

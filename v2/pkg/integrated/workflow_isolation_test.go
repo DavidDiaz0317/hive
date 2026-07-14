@@ -432,6 +432,52 @@ func TestPullRequestEnforcementUsesOnlyRunnerOwnedJobTopology(t *testing.T) {
 	}
 }
 
+func TestPullRequestEnforcementTreatsDerivedReadinessAsMissingBaselineOnly(t *testing.T) {
+	bash := workflowBash(t)
+	root := t.TempDir()
+	visualDir := filepath.Join(root, ".visual-hive")
+	if err := os.MkdirAll(visualDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, visualDir, "pipeline.json", `{
+  "status":"blocked","exitCode":1,
+  "summary":{"missingBaselines":1,"visualDiffs":0,"consoleErrors":0,"pageErrors":0,"flowStepsFailed":0},
+  "verdictSummary":{"visualHiveVerdict":"blocked","failedBecause":[]},
+  "verdictContributions":[
+    {"kind":"deterministic_run","status":"blocked","gating":true},
+    {"kind":"contract_result","status":"blocked","gating":true},
+    {"kind":"missing_baseline","status":"blocked","gating":true},
+    {"kind":"readiness_gate","status":"blocked","gating":true}
+  ],
+  "results":[{"screenshotAssertions":[{"status":"missing_baseline","contractId":"app-shell","screenshotName":"desktop","baselinePath":"snapshots/app.png","actualPath":"artifacts/app.png"}]}]
+}`)
+	writeFixture(t, visualDir, "verdict.json", `{"summary":{"visualHiveVerdict":"blocked"}}`)
+	writeFixture(t, visualDir, "readiness.json", `{"status":"blocked","gates":[{"id":"deterministic:status","status":"blocked"},{"id":"baselines:missing-baseline","status":"blocked"},{"id":"mutation:missing","status":"warning"}]}`)
+	environment := append(os.Environ(),
+		`HIVE_EXPECTED_REPOSITORY_JOBS=["repository-test-001"]`,
+		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"success"}}`,
+		"HIVE_TRUSTED_REBUILD_OUTCOME=failure", "HIVE_SETUP_OPERATION=setup", "HIVE_SETUP_AUTHORIZED=true",
+		"HIVE_REPOSITORY=owner/repo", "HIVE_HEAD_SHA="+strings.Repeat("a", 40),
+		"HIVE_SETUP_CONTEXT=context", "HIVE_SETUP_BINDING_DIGEST=binding", "HIVE_SETUP_DIFF_DIGEST=diff",
+	)
+	run := func() error {
+		command := exec.Command(bash, "-e", "-o", "pipefail", "-c", pullRequestEnforcementShell())
+		command.Dir = root
+		command.Env = environment
+		return command.Run()
+	}
+	if err := run(); err != nil {
+		t.Fatalf("derived missing-baseline readiness did not enter the supported setup handoff: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(visualDir, "setup-baseline-required.json")); err != nil {
+		t.Fatalf("setup baseline handoff proof missing: %v", err)
+	}
+	writeFixture(t, visualDir, "readiness.json", `{"status":"blocked","gates":[{"id":"deterministic:status","status":"blocked"},{"id":"baselines:missing-baseline","status":"blocked"},{"id":"security:posture","status":"blocked"}]}`)
+	if err := run(); err == nil {
+		t.Fatal("independent readiness blocker was misclassified as missing-baseline-only")
+	}
+}
+
 func parseIsolatedWorkflow(t *testing.T, value string) isolatedWorkflowDocument {
 	t.Helper()
 	var document isolatedWorkflowDocument

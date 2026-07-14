@@ -130,4 +130,7 @@ type SetupResult struct {
 	SetupBaselinePending        bool      `json:"setup_baseline_pending,omitempty"`
 	SetupBaselinePhase          string    `json:"setup_baseline_phase,omitempty"`
 	SetupBaselineNextCommand    string    `json:"setup_baseline_next_command,omitempty"`
+	SchedulerStartRequested     bool      `json:"scheduler_start_requested,omitempty"`
+	SchedulerStartPending       bool      `json:"scheduler_start_pending,omitempty"`
+	SchedulerStartMessage       string    `json:"scheduler_start_message,omitempty"`
 }

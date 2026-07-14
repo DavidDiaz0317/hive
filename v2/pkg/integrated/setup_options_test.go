@@ -94,7 +94,7 @@ func TestAutoMergeSetupPlanExplainsPostMergeActivation(t *testing.T) {
 		}
 	}
 	message := setupActivationMessage(AutomationAutoMerge, true, true)
-	if !strings.Contains(message, "already-started") || !strings.Contains(message, "before any lifecycle write") {
+	if !strings.Contains(message, "durably recorded") || !strings.Contains(message, "non-scheduler doctor checks are green") || !strings.Contains(message, "before any lifecycle write") {
 		t.Fatalf("started setup result does not explain automatic activation: %q", message)
 	}
 }

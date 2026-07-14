@@ -72,6 +72,10 @@ func runIntegratedStart(args []string) int {
 		fmt.Fprintln(os.Stderr, "start Hive:", err)
 		return 1
 	}
+	if err := clearDeferredSchedulerStart(*stateDir); err != nil {
+		fmt.Fprintln(os.Stderr, "Hive scheduler started, but clearing deferred start state failed:", err)
+		return 1
+	}
 	if *jsonOutput {
 		return encodeJSON(status)
 	}
@@ -161,6 +165,10 @@ func runIntegratedStop(args []string) int {
 	status, err := stopIntegratedDaemon(*stateDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "stop Hive:", err)
+		return 1
+	}
+	if err := clearDeferredSchedulerStart(*stateDir); err != nil {
+		fmt.Fprintln(os.Stderr, "Hive scheduler stopped, but canceling deferred start failed:", err)
 		return 1
 	}
 	if *jsonOutput {

@@ -571,6 +571,14 @@ func runIntegratedRun(args []string) int {
 		}
 		return 1
 	}
+	activated, activationErr := activateDeferredSchedulerIfReady(*stateDir, *githubTokenEnv, *githubAPIURL)
+	if activationErr != nil {
+		fmt.Fprintln(os.Stderr, "Hive production run completed, but deferred scheduler activation failed:", activationErr)
+		return 1
+	}
+	if activated {
+		fmt.Fprintln(os.Stderr, "Hive setup and doctor prerequisites are green; the requested persistent scheduler is now running.")
+	}
 	if *jsonOutput {
 		return encodeJSON(result)
 	}
@@ -697,10 +705,27 @@ func runSetupCommand(args []string) int {
 		*providerCommand = resolvedProviderCommand
 	}
 	wasRunning := false
+	hadPendingStart := false
 	restartInterval := *runInterval
 	if !*planOnly {
+		if hasPrior {
+			store, storeErr := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+			if storeErr != nil {
+				fmt.Fprintln(os.Stderr, "setup failed: inspect deferred scheduler start:", storeErr)
+				return 1
+			}
+			if intent, pending, intentErr := store.LoadSchedulerStartIntent(); intentErr != nil {
+				fmt.Fprintln(os.Stderr, "setup failed: inspect deferred scheduler start:", intentErr)
+				return 1
+			} else if pending {
+				hadPendingStart = true
+				if intent.IntervalSeconds >= 60 {
+					restartInterval = time.Duration(intent.IntervalSeconds) * time.Second
+				}
+			}
+		}
 		daemon := readIntegratedDaemonStatus(*stateDir)
-		if authErr := requirePersistentGitHubAuthorization(*start || daemon.Running); authErr != nil {
+		if authErr := requirePersistentGitHubAuthorization(*start || daemon.Running || hadPendingStart); authErr != nil {
 			fmt.Fprintln(os.Stderr, "setup failed:", authErr)
 			return 2
 		}
@@ -715,7 +740,7 @@ func runSetupCommand(args []string) int {
 			}
 		}
 	}
-	shouldStart := *start || wasRunning
+	shouldStart := *start || wasRunning || hadPendingStart
 	acmm := acmmForIntegratedAutomation(automationMode)
 	mode := automationModeForIntegrated(automationMode)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -748,9 +773,35 @@ func runSetupCommand(args []string) int {
 		}
 	}
 	if shouldStart && result.Applied {
-		if _, startErr := ensureIntegratedDaemonStarted(*stateDir, restartInterval); startErr != nil {
-			fmt.Fprintln(os.Stderr, "setup applied but persistent startup failed:", startErr)
-			return 1
+		result.SchedulerStartRequested = true
+		if wasRunning && result.Idempotent {
+			if _, startErr := ensureIntegratedDaemonStarted(*stateDir, restartInterval); startErr != nil {
+				fmt.Fprintln(os.Stderr, "setup remained unchanged but persistent scheduler restart failed:", startErr)
+				return 1
+			}
+			if clearErr := clearDeferredSchedulerStart(*stateDir); clearErr != nil {
+				fmt.Fprintln(os.Stderr, "setup remained unchanged but clearing deferred scheduler state failed:", clearErr)
+				return 1
+			}
+			result.SchedulerStartMessage = "Persistent scheduler remained active after the idempotent setup check."
+		} else {
+			if intentErr := recordDeferredSchedulerStart(*stateDir, *repository, restartInterval); intentErr != nil {
+				fmt.Fprintln(os.Stderr, "setup applied but recording deferred persistent startup failed:", intentErr)
+				return 1
+			}
+			result.SchedulerStartPending = true
+			result.SchedulerStartMessage = "Persistent scheduler start is recorded and will activate only after the setup PR is merged and every other doctor check is green."
+			if result.Idempotent {
+				activated, activationErr := activateDeferredSchedulerIfReady(*stateDir, *githubTokenEnv, *githubAPIURL)
+				if activationErr != nil {
+					fmt.Fprintln(os.Stderr, "setup is unchanged but deferred persistent startup failed:", activationErr)
+					return 1
+				}
+				if activated {
+					result.SchedulerStartPending = false
+					result.SchedulerStartMessage = "Setup and doctor prerequisites are green; the persistent scheduler is running."
+				}
+			}
 		}
 	}
 	if *jsonOutput {
@@ -761,8 +812,8 @@ func runSetupCommand(args []string) int {
 		if result.ActivationMessage != "" {
 			fmt.Println(result.ActivationMessage)
 		}
-		if shouldStart {
-			fmt.Println("Persistent Hive started; it will retry safely until the setup PR is merged, then complete trusted activation and the first production cycle.")
+		if result.SchedulerStartMessage != "" {
+			fmt.Println(result.SchedulerStartMessage)
 		}
 	} else {
 		fmt.Printf("Setup plan for %s: coverage=%s automation=%s ACMM=L%d Visual-Hive=%s@%s\n", result.Plan.Repository, result.Plan.Coverage, result.Plan.Automation, result.Plan.ACMMLevel, result.Plan.VisualHiveRepository, result.Plan.VisualHiveRef)
@@ -900,6 +951,13 @@ func runIntegratedStatus(args []string) int {
 		"readiness_checks": liveChecks, "provider_ready": providerErr == nil, "provider_message": errorOr(providerErr, "provider authenticated"), "daemon_ready": daemonReady,
 	}
 	status["daemon"] = daemon
+	if schedulerIntent, exists, schedulerIntentErr := store.LoadSchedulerStartIntent(); schedulerIntentErr != nil {
+		status["scheduler_start_intent_error"] = schedulerIntentErr.Error()
+		status["production_ready"] = false
+	} else if exists {
+		status["scheduler_start_pending"] = true
+		status["scheduler_start_intent"] = schedulerIntent
+	}
 	if approval, exists, approvalErr := store.LoadMergeApproval(); approvalErr != nil {
 		status["merge_approval_error"] = approvalErr.Error()
 		status["production_ready"] = false
@@ -1152,15 +1210,32 @@ func runIntegratedDoctor(args []string) int {
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
+	checks := collectIntegratedDoctorChecks(*stateDir, *githubTokenEnv, *githubAPIURL, true)
+	ready := doctorChecksReady(checks)
+	output := map[string]any{"schema_version": "hive.doctor.v1", "production_ready": ready, "checks": checks}
+	if *jsonOutput {
+		_ = encodeJSON(output)
+	} else {
+		for _, check := range checks {
+			fmt.Printf("[%s] %s: %s\n", ternary(check.OK, "ok", "fail"), check.Name, check.Message)
+		}
+	}
+	if !ready {
+		return 1
+	}
+	return 0
+}
+
+func collectIntegratedDoctorChecks(stateDir, githubTokenEnv, githubAPIURL string, includeScheduler bool) []doctorCheck {
 	checks := []doctorCheck{}
-	store, storeErr := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+	store, storeErr := integrated.NewStore(filepath.Join(stateDir, "integrated"))
 	config, configErr := integrated.Config{}, storeErr
 	if storeErr == nil {
 		config, configErr = store.Load()
 	}
 	checks = append(checks, doctorCheck{Name: "config", OK: configErr == nil, Message: errorOr(configErr, "persistent config loaded")})
 	if configErr == nil {
-		pauseRequested, pauseErr := integrated.PauseRequested(*stateDir)
+		pauseRequested, pauseErr := integrated.PauseRequested(stateDir)
 		automationActive := !config.Paused && !pauseRequested && pauseErr == nil
 		message := "repository automation is active"
 		if pauseErr != nil {
@@ -1189,7 +1264,7 @@ func runIntegratedDoctor(args []string) int {
 		if transferErr != nil {
 			transferMessage = transferErr.Error()
 		} else if transferExists {
-			transferMessage = fmt.Sprintf("transfer to %s/%d is pending; finish %s or cancel before merge with %s", transfer.NewAuthorizerLogin, transfer.NewAuthorizerID, integrated.AuthorizerTransferNextCommand(*stateDir, transfer), integrated.AuthorizerTransferCancelCommand(*stateDir))
+			transferMessage = fmt.Sprintf("transfer to %s/%d is pending; finish %s or cancel before merge with %s", transfer.NewAuthorizerLogin, transfer.NewAuthorizerID, integrated.AuthorizerTransferNextCommand(stateDir, transfer), integrated.AuthorizerTransferCancelCommand(stateDir))
 		}
 		checks = append(checks, doctorCheck{Name: "setup_authorizer_transfer_state", OK: transferErr == nil && !transferExists, Message: transferMessage})
 		rebind, rebindExists, rebindErr := store.LoadSetupBaselineRebindIntent()
@@ -1207,9 +1282,9 @@ func runIntegratedDoctor(args []string) int {
 			baselineMessage = baselineErr.Error()
 		} else if baselineExists && (baseline.Phase != integrated.SetupBaselineProductionVerified || baseline.PendingAudit != nil) {
 			baselineOK = false
-			next := fmt.Sprintf("hive run --state-dir %q --json", *stateDir)
+			next := fmt.Sprintf("hive run --state-dir %q --json", stateDir)
 			if baseline.Phase == integrated.SetupBaselinePROpen {
-				next = fmt.Sprintf("hive approve-baseline --state-dir %q --plan --json", *stateDir)
+				next = fmt.Sprintf("hive approve-baseline --state-dir %q --plan --json", stateDir)
 			}
 			baselineMessage = fmt.Sprintf("setup baseline phase %s or its durable audit receipt is pending; next=%s", baseline.Phase, next)
 		} else if baselineExists {
@@ -1221,11 +1296,11 @@ func runIntegratedDoctor(args []string) int {
 		if uninstallErr != nil {
 			uninstallMessage = uninstallErr.Error()
 		} else if uninstallExists {
-			uninstallMessage = fmt.Sprintf("uninstall phase %s is pending; finish %s or cancel the exact unmerged cleanup with %s", uninstall.Phase, integrated.UninstallNextCommand(*stateDir), integrated.UninstallCancelCommand(*stateDir))
+			uninstallMessage = fmt.Sprintf("uninstall phase %s is pending; finish %s or cancel the exact unmerged cleanup with %s", uninstall.Phase, integrated.UninstallNextCommand(stateDir), integrated.UninstallCancelCommand(stateDir))
 		}
 		checks = append(checks, doctorCheck{Name: "uninstall_state", OK: uninstallErr == nil && !uninstallExists, Message: uninstallMessage})
 		checks = append(checks, workflowDispatchDoctorCheck(store))
-		checks = append(checks, operationalStateDoctorChecks(*stateDir)...)
+		checks = append(checks, operationalStateDoctorChecks(stateDir)...)
 		_, gitErr := os.Stat(filepath.Join(config.CheckoutDir, ".git"))
 		checks = append(checks, doctorCheck{Name: "checkout", OK: gitErr == nil, Message: errorOr(gitErr, "managed checkout is present")})
 		immutable := len(config.VisualHiveRef) == 40
@@ -1237,43 +1312,44 @@ func runIntegratedDoctor(args []string) int {
 		providerErr := provider.Health(ctx)
 		cancel()
 		checks = append(checks, doctorCheck{Name: "provider", OK: providerErr == nil, Message: errorOr(providerErr, "Codex provider is authenticated")})
-		daemon := readIntegratedDaemonStatus(*stateDir)
-		daemonOK := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
-		daemonMessage := "persistent scheduler service is installed, exact, and running"
-		if daemon.Service == nil || !daemon.Service.Managed {
-			daemonMessage = "persistent scheduler service is not installed; run hive start"
-		} else if daemon.Service.InspectionError != "" {
-			daemonMessage = daemon.Service.InspectionError
-		} else if !daemonServiceReady(daemon.Service) {
-			daemonMessage = "persistent scheduler registration is incomplete or disabled; run hive start to repair it"
-		} else if !daemon.RuntimeRunning {
-			daemonMessage = "persistent scheduler is enabled but its runtime is still in crash-recovery backoff"
+		if includeScheduler {
+			daemon := readIntegratedDaemonStatus(stateDir)
+			daemonOK := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
+			daemonMessage := "persistent scheduler service is installed, exact, and running"
+			if daemon.Service == nil || !daemon.Service.Managed {
+				if _, pending, intentErr := store.LoadSchedulerStartIntent(); intentErr != nil {
+					daemonMessage = "persistent scheduler start intent is unreadable: " + intentErr.Error()
+				} else if pending {
+					daemonMessage = "persistent scheduler start is requested and will activate after setup and all other doctor checks are green"
+				} else {
+					daemonMessage = "persistent scheduler service is not installed; run hive start"
+				}
+			} else if daemon.Service.InspectionError != "" {
+				daemonMessage = daemon.Service.InspectionError
+			} else if !daemonServiceReady(daemon.Service) {
+				daemonMessage = "persistent scheduler registration is incomplete or disabled; run hive start to repair it"
+			} else if !daemon.RuntimeRunning {
+				daemonMessage = "persistent scheduler is enabled but its runtime is still in crash-recovery backoff"
+			}
+			checks = append(checks, doctorCheck{Name: "persistent_scheduler", OK: daemonOK, Message: daemonMessage})
 		}
-		checks = append(checks, doctorCheck{Name: "persistent_scheduler", OK: daemonOK, Message: daemonMessage})
 		var client *hivegithub.Client
-		if token := resolveGitHubToken(*githubTokenEnv); token != "" {
-			client = hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), *githubAPIURL)
+		if token := resolveGitHubToken(githubTokenEnv); token != "" {
+			client = hivegithub.NewClient(token, "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), githubAPIURL)
 		}
 		ctx, cancelLive := context.WithTimeout(context.Background(), 45*time.Second)
 		checks = append(checks, liveRepositoryChecks(ctx, client, config)...)
 		cancelLive()
 	}
+	return checks
+}
+
+func doctorChecksReady(checks []doctorCheck) bool {
 	ready := true
 	for _, check := range checks {
 		ready = ready && check.OK
 	}
-	output := map[string]any{"schema_version": "hive.doctor.v1", "production_ready": ready, "checks": checks}
-	if *jsonOutput {
-		_ = encodeJSON(output)
-	} else {
-		for _, check := range checks {
-			fmt.Printf("[%s] %s: %s\n", ternary(check.OK, "ok", "fail"), check.Name, check.Message)
-		}
-	}
-	if !ready {
-		return 1
-	}
-	return 0
+	return ready
 }
 
 func resolveVisualHiveLauncher(command string, args []string, home string) (string, []string, error) {

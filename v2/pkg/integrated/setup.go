@@ -424,7 +424,7 @@ func setupActivationMessage(automation Automation, started, pending bool) string
 		return "Exact GitHub-Actions-App-bound PR visual-hive protection is durably activated; Hive verifies the producing PR workflow provenance before merge and hive doctor verifies live policy without changing it."
 	}
 	if started {
-		return "Merge the exact managed setup PR. The already-started Hive scheduler will verify the installed files, complete one trusted default-branch Visual Hive run, and then activate exact GitHub-Actions-App-bound protection before any lifecycle write."
+		return "Merge the exact managed setup PR and complete the trusted setup run. Hive has durably recorded the scheduler request and will activate it only after all non-scheduler doctor checks are green, before any lifecycle write."
 	}
 	return "Merge the exact managed setup PR, then run hive start or hive run. Hive will complete one trusted default-branch Visual Hive run and activate exact GitHub-Actions-App-bound protection before any lifecycle write."
 }
@@ -792,7 +792,7 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 func setupRequiredActions(automation Automation) []string {
 	actions := []string{"Review and merge the exact setup PR"}
 	if automation == AutomationAutoMerge {
-		actions = append(actions, "Leave the started scheduler running, or run hive start/hive run; Hive will complete one trusted scan and activate exact-App-bound protection before lifecycle writes")
+		actions = append(actions, "Complete the setup PR and trusted setup run to activate exact-App-bound protection; a requested scheduler starts only after all non-scheduler doctor checks are green, or run hive start explicitly later")
 	}
 	return append(actions, "Run hive doctor and confirm production_ready=true")
 }
@@ -1985,7 +1985,7 @@ func quickstart(config Config, inspection RepositoryInspection) string {
 func setupPRBody(marker string, plan SetupPlan) string {
 	activation := ""
 	if plan.Automation == AutomationAutoMerge {
-		activation = " After this exact PR is merged, the already-started scheduler (or the next `hive start`/`hive run`) verifies these files and the exact production workflow provenance, completes the production verdict plus actively guarded PR-context eligibility seed, and only then activates exact GitHub-Actions-App-bound branch protection. Merge gating still accepts `visual-hive` only from the exact PR workflow; no lifecycle write occurs before activation."
+		activation = " After this exact PR is merged, the next trusted `hive run` verifies these files and the exact production workflow provenance, completes the production verdict plus actively guarded PR-context eligibility seed, and only then activates exact GitHub-Actions-App-bound branch protection. A scheduler requested during setup remains deferred until those non-scheduler doctor gates are green. Merge gating still accepts `visual-hive` only from the exact PR workflow; no lifecycle write occurs before activation."
 	}
 	return fmt.Sprintf("%s\n\nInstalls Hive + Visual Hive as one production testing and repair experience.\n\n- Coverage: **%s**\n- Automation authority: **%s**\n- ACMM enforcement: **L%d**\n- Active issue WIP limit: **%d**\n- Repair attempt limit: **%d**\n- Provider: **%s**\n- Visual Hive source: `%s@%s`\n- Detected languages: %s\n- Testing layers: %s\n\nThe Visual workflow is read-only and uploads provenance-bound evidence. Hive is the only GitHub lifecycle writer.%s", marker, plan.Coverage, plan.Automation, plan.ACMMLevel, plan.MaxActiveIssues, plan.MaxRepairAttempts, plan.Provider, plan.VisualHiveRepository, plan.VisualHiveRef, strings.Join(plan.Inspection.Languages, ", "), strings.Join(plan.TestingLayers, ", "), activation)
 }
