@@ -371,6 +371,9 @@ func verifySetupBaselineArtifact(root string, intent SetupBaselineIntent) ([]Set
 }
 
 func setupBaselineCandidateDigest(candidates []SetupBaselineCandidate) (string, error) {
+	if candidates == nil {
+		candidates = []SetupBaselineCandidate{}
+	}
 	data, err := json.Marshal(candidates)
 	if err != nil {
 		return "", err

@@ -397,6 +397,41 @@ func mergedSetupBaselineIntentFixture(t *testing.T, phase string) (SetupBaseline
 	return intent, config, rawDiff
 }
 
+func TestEmptySetupBaselineInventoryHasOneCanonicalDigestAfterJSONRoundTrip(t *testing.T) {
+	nilDigest, err := setupBaselineCandidateDigest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyDigest, err := setupBaselineCandidateDigest([]SetupBaselineCandidate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nilDigest != emptyDigest {
+		t.Fatalf("nil and empty setup baseline inventories have different digests: nil=%s empty=%s", nilDigest, emptyDigest)
+	}
+	now := time.Now().UTC()
+	intent := SetupBaselineIntent{
+		SchemaVersion: SetupBaselineSchema, Phase: SetupBaselinePending, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
+		AuthorizerID: 42, SetupPRNumber: 1, SetupPRURL: "https://example.test/pull/1", SetupHeadSHA: strings.Repeat("a", 40),
+		VisualHiveConfigDigest: strings.Repeat("b", 64), ScreenshotContractDigest: strings.Repeat("c", 64), InitialBaselineDigest: emptyDigest,
+		InitialBaselineCandidates: []SetupBaselineCandidate{}, CreatedAt: now, UpdatedAt: now,
+	}
+	data, err := json.Marshal(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTripped SetupBaselineIntent
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatal(err)
+	}
+	if roundTripped.InitialBaselineCandidates != nil {
+		t.Fatalf("omitempty round trip unexpectedly retained empty inventory: %#v", roundTripped.InitialBaselineCandidates)
+	}
+	if err := validateSetupBaselineIntent(roundTripped); err != nil {
+		t.Fatalf("empty setup baseline inventory became invalid after durable JSON round trip: %v", err)
+	}
+}
+
 func newMergedSetupBaselineRetirementServer(t *testing.T, intent SetupBaselineIntent, rawDiff, refHead string, deletes, failures *int) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
