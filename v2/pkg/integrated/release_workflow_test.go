@@ -255,8 +255,9 @@ func TestLinuxReleaseSmokeSupportsCommitSHARehearsals(t *testing.T) {
 	}
 	smoke := string(data)
 	for _, invariant := range []string{
+		`if ! printf '%s\n' "$version" | grep -Eq`,
+		`Branch-only Linux integrated installer smoke passed`,
 		`published_version="$version"`,
-		`published_version=v0.0.0-integrated.0`,
 		`published_asset="hive-integrated-$published_version-linux-amd64.tar.gz"`,
 		`sha256sum "$published_asset"`,
 		`--version "$published_version"`,
@@ -272,6 +273,14 @@ func TestLinuxReleaseSmokeSupportsCommitSHARehearsals(t *testing.T) {
 		if !strings.Contains(smoke, invariant) {
 			t.Fatalf("Linux release smoke lost branch-rehearsal published-trust fixture %q", invariant)
 		}
+	}
+	branchExit := strings.Index(smoke, `Branch-only Linux integrated installer smoke passed`)
+	publishedFixture := strings.Index(smoke, `attestation_bin="$work_root/attestation-bin"`)
+	if branchExit < 0 || publishedFixture < 0 || branchExit > publishedFixture {
+		t.Fatal("commit-SHA rehearsal must exit before exercising tag-only provenance")
+	}
+	if strings.Contains(smoke, `published_version=v0.0.0-integrated.0`) {
+		t.Fatal("commit-SHA rehearsal must not relabel immutable release bytes with a synthetic tag identity")
 	}
 }
 

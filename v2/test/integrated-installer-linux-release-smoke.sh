@@ -170,17 +170,18 @@ test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
 # installer must bind provenance to the exact tag ref and tag/source commit,
 # then re-resolve that commit after verification.
 test -n "$release_dir"
+if ! printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$'; then
+  # A workflow_dispatch rehearsal has a commit-SHA release identity. Renaming
+  # those immutable bytes to a tag would correctly fail the packaged identity
+  # check, so leave the tag-only provenance simulation to the publishing run.
+  echo "Branch-only Linux integrated installer smoke passed: $work_root"
+  exit 0
+fi
 attestation_bin="$work_root/attestation-bin"
 attestation_marker="$work_root/attestation-verified"
 download_dir_marker="$work_root/release-download-dir"
 release_commit=0123456789abcdef0123456789abcdef01234567
 published_version="$version"
-if ! printf '%s\n' "$published_version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$'; then
-  # A workflow_dispatch rehearsal correctly names its assembled archive with
-  # the commit SHA. Exercise the published-only trust path through a valid
-  # synthetic tag name while retaining the exact assembled archive bytes.
-  published_version=v0.0.0-integrated.0
-fi
 published_release_dir="$work_root/published-release"
 published_asset="hive-integrated-$published_version-linux-amd64.tar.gz"
 mkdir -p "$published_release_dir"
