@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -72,13 +73,131 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		hiveName = "hive.exe"
 	}
-	for _, required := range []string{hiveName, filepath.Join("runtime", nodeName), filepath.Join("runtime", "LICENSE.node.txt"), filepath.Join("visual-hive", "visual-hive.mjs"), filepath.Join("skills", "hive", "SKILL.md"), filepath.Join("skills", "hive", "agents", "openai.yaml"), "distribution-manifest.json"} {
+	launcherPath := filepath.FromSlash(visualHiveLauncherPath(runtime.GOOS))
+	for _, required := range []string{hiveName, filepath.Join("runtime", nodeName), filepath.Join("runtime", "LICENSE.node.txt"), filepath.Join("visual-hive", "visual-hive.mjs"), launcherPath, filepath.Join("skills", "hive", "SKILL.md"), filepath.Join("skills", "hive", "agents", "openai.yaml"), "distribution-manifest.json"} {
 		if _, err := os.Stat(filepath.Join(output, required)); err != nil {
 			t.Fatalf("missing distribution file %s: %v", required, err)
 		}
 	}
+	launcherInventoried := false
+	for _, file := range manifest.Files {
+		if file.Path == filepath.ToSlash(launcherPath) {
+			launcherInventoried = true
+			break
+		}
+	}
+	if !launcherInventoried {
+		t.Fatalf("Visual Hive launcher %s is not bound into the release inventory", launcherPath)
+	}
 	if _, err := BuildDistribution(context.Background(), DistributionOptions{OutputDir: output}); err == nil || !strings.Contains(err.Error(), "commit") {
 		t.Fatal("existing or incomplete distribution must not be overwritten")
+	}
+}
+
+func TestVisualHiveLaunchersBindBundledRuntime(t *testing.T) {
+	windowsRoot := filepath.Join(t.TempDir(), "Windows install with spaces")
+	if err := writeVisualHiveLauncher(windowsRoot, "windows"); err != nil {
+		t.Fatal(err)
+	}
+	windowsData, err := os.ReadFile(filepath.Join(windowsRoot, "visual-hive.cmd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowsLauncher := string(windowsData)
+	for _, required := range []string{
+		`%~dp0runtime\node.exe`,
+		`%~dp0visual-hive\visual-hive.mjs`,
+		`"%HIVE_NODE%" "%HIVE_VISUAL_ENTRYPOINT%" %*`,
+		`exit /b %HIVE_VISUAL_EXIT%`,
+		`bundled Node runtime is missing`,
+		`Visual Hive entrypoint is missing`,
+		`Reinstall the immutable integrated Hive release`,
+	} {
+		if !strings.Contains(windowsLauncher, required) {
+			t.Fatalf("Windows Visual Hive launcher lost %q:\n%s", required, windowsLauncher)
+		}
+	}
+	if strings.Contains(windowsLauncher, "\nnode ") || strings.Contains(windowsLauncher, "\r\nnode ") {
+		t.Fatal("Windows Visual Hive launcher must not invoke a globally resolved node command")
+	}
+
+	if runtime.GOOS == "windows" {
+		windowsLauncherPath := filepath.Join(windowsRoot, "visual-hive.cmd")
+		assertFailure := func(want string) {
+			t.Helper()
+			command := exec.Command("cmd.exe", "/d", "/c", "call", windowsLauncherPath, "--version")
+			output, runErr := command.CombinedOutput()
+			exitErr, ok := runErr.(*exec.ExitError)
+			if !ok || exitErr.ExitCode() != 127 || !strings.Contains(string(output), want) || !strings.Contains(string(output), "Reinstall the immutable integrated Hive release") {
+				t.Fatalf("Windows Visual Hive launcher failure was not actionable: err=%v output=%s", runErr, output)
+			}
+		}
+		assertFailure("bundled Node runtime is missing")
+		if err := os.MkdirAll(filepath.Join(windowsRoot, "runtime"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(windowsRoot, "runtime", "node.exe"), []byte("test placeholder\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		assertFailure("Visual Hive entrypoint is missing")
+		return
+	}
+	linuxRoot := filepath.Join(t.TempDir(), "Linux install with spaces")
+	if err := writeVisualHiveLauncher(linuxRoot, "linux"); err != nil {
+		t.Fatal(err)
+	}
+	launcher := filepath.Join(linuxRoot, "bin", "visual-hive")
+	node := filepath.Join(linuxRoot, "runtime", "node")
+	entrypoint := filepath.Join(linuxRoot, "visual-hive", "visual-hive.mjs")
+	if err := os.MkdirAll(filepath.Dir(node), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(entrypoint), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeNode := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HIVE_TEST_VISUAL_ARGS\"\nexit \"${HIVE_TEST_VISUAL_EXIT:-0}\"\n"
+	if err := os.WriteFile(node, []byte(fakeNode), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entrypoint, []byte("// test Visual Hive entrypoint\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	argsFile := filepath.Join(t.TempDir(), "received arguments.txt")
+	arguments := []string{"--flag", "two words", `quote"inside`}
+	command := exec.Command(launcher, arguments...)
+	command.Dir = t.TempDir()
+	command.Env = append(os.Environ(), "HIVE_TEST_VISUAL_ARGS="+argsFile, "HIVE_TEST_VISUAL_EXIT=37")
+	output, runErr := command.CombinedOutput()
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 37 {
+		t.Fatalf("Linux Visual Hive launcher did not preserve the bundled process exit code: err=%v output=%s", runErr, output)
+	}
+	receivedData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := strings.Split(strings.TrimSuffix(string(receivedData), "\n"), "\n")
+	want := append([]string{entrypoint}, arguments...)
+	if strings.Join(received, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("Linux Visual Hive launcher arguments = %#v, want %#v", received, want)
+	}
+
+	if err := os.Remove(node); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr = exec.Command(launcher, "--version").CombinedOutput()
+	if exitErr, ok = runErr.(*exec.ExitError); !ok || exitErr.ExitCode() != 127 || !strings.Contains(string(output), "bundled Node runtime is missing or not executable") || !strings.Contains(string(output), "Reinstall the immutable integrated Hive release") {
+		t.Fatalf("missing bundled Node failure was not actionable: err=%v output=%s", runErr, output)
+	}
+	if err := os.WriteFile(node, []byte(fakeNode), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(entrypoint); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr = exec.Command(launcher, "--version").CombinedOutput()
+	if exitErr, ok = runErr.(*exec.ExitError); !ok || exitErr.ExitCode() != 127 || !strings.Contains(string(output), "Visual Hive entrypoint is missing") || !strings.Contains(string(output), "Reinstall the immutable integrated Hive release") {
+		t.Fatalf("missing Visual Hive entrypoint failure was not actionable: err=%v output=%s", runErr, output)
 	}
 }
 

@@ -50,7 +50,7 @@ Compress-Archive -LiteralPath $distribution -DestinationPath $asset -Compression
 $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath "$asset.sha256" -Value "$hash  $([IO.Path]::GetFileName($asset))" -Encoding ascii
 
-$installDir = Join-Path $WorkRoot "installed"
+$installDir = Join-Path $WorkRoot "Hive-Clean Install"
 $earlierHiveDir = Join-Path $WorkRoot "earlier-hive"
 New-Item -ItemType Directory -Path $earlierHiveDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $WorkRoot "hive.exe") -Destination (Join-Path $earlierHiveDir "hive.exe")
@@ -80,7 +80,32 @@ try {
 		throw "Installer default path did not install the packaged Hive Codex skill."
 	}
 
-    & (Join-Path $installDir "runtime/node.exe") (Join-Path $installDir "visual-hive/visual-hive.mjs") --version | Out-Null
+    $savedVisualPath = $env:Path
+    try {
+        $env:Path = "$installDir;$(Join-Path $env:SystemRoot 'System32');$env:SystemRoot"
+        if (Get-Command node -CommandType Application -ErrorAction SilentlyContinue) {
+            throw "Visual Hive clean-install smoke unexpectedly retained a global Node command."
+        }
+        $resolvedVisualHive = (@(Get-Command visual-hive -CommandType Application -ErrorAction Stop)[0]).Source
+        $expectedVisualHive = Join-Path $installDir "visual-hive.cmd"
+        if (-not [string]::Equals([IO.Path]::GetFullPath($resolvedVisualHive), [IO.Path]::GetFullPath($expectedVisualHive), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Installed Visual Hive resolved outside the activated distribution: $resolvedVisualHive"
+        }
+        $arbitraryCwd = Join-Path $WorkRoot "arbitrary working directory"
+        New-Item -ItemType Directory -Path $arbitraryCwd -Force | Out-Null
+        Push-Location $arbitraryCwd
+        try {
+            $visualVersionOutput = (& $resolvedVisualHive --version | Out-String).Trim()
+            $visualVersionExit = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+        if ($visualVersionExit -ne 0 -or $visualVersionOutput -ne [string]$visualManifest.version) {
+            throw "Installed Visual Hive release identity is incorrect without global Node: exit=$visualVersionExit output=$visualVersionOutput"
+        }
+    } finally {
+        $env:Path = $savedVisualPath
+    }
     $hiveVersionOutput = @(& (Join-Path $installDir "hive.exe") --version)
     if ($LASTEXITCODE -ne 0 -or $hiveVersionOutput[0] -ne "Hive $releaseVersion" -or $hiveVersionOutput[1] -ne "commit: $hiveCommit") {
         throw "Installed Hive release identity is incorrect: $($hiveVersionOutput -join '; ')"

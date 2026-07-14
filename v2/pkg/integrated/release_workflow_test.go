@@ -211,6 +211,48 @@ func TestIntegratedReleaseShipsCompletePackageManagerRuntime(t *testing.T) {
 	}
 }
 
+func TestIntegratedReleaseProvesVisualHiveLauncherWithoutGlobalNode(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, invariant := range []string{
+		`PATH="$launcher_path" "$linux_root/bin/visual-hive" --version`,
+		`$install = Join-Path $work "Hive-Clean Install"`,
+		`Get-Command visual-hive -CommandType Application`,
+		`Get-Command node -CommandType Application -ErrorAction SilentlyContinue`,
+		`Join-Path $install "visual-hive.cmd"`,
+		`Packaged Visual Hive identity mismatch without global Node`,
+	} {
+		if !strings.Contains(workflow, invariant) {
+			t.Fatalf("integrated release lost no-global-Node Visual Hive launcher proof %q", invariant)
+		}
+	}
+
+	installerChecks := map[string][]string{
+		"../../install-integrated.ps1": {
+			`inventoried.has("visual-hive.cmd")`,
+		},
+		"../../install-integrated.sh": {
+			`visual_link_path="$HOME/.local/bin/visual-hive"`,
+			`ln -s "$install_dir/bin/visual-hive" "$visual_link_path"`,
+			`inventoried.has('bin/visual-hive')`,
+		},
+	}
+	for path, invariants := range installerChecks {
+		installer, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, invariant := range invariants {
+			if !strings.Contains(string(installer), invariant) {
+				t.Fatalf("integrated installer %s lost Visual Hive launcher ownership invariant %q", path, invariant)
+			}
+		}
+	}
+}
+
 func TestRootReadmeLeadsWithSignedIntegratedQuickstart(t *testing.T) {
 	data, err := os.ReadFile("../../../README.md")
 	if err != nil {

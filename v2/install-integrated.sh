@@ -120,12 +120,16 @@ committed=0
 had_previous=0
 link_backup_complete=0
 link_candidate_installed=0
+visual_link_backup_complete=0
+visual_link_candidate_installed=0
 skill_backup_complete=0
 skill_copy_started=0
 parent_dir="$(dirname "$install_dir")"
 backup_dir="$install_dir.previous"
 link_path="$HOME/.local/bin/hive"
 link_backup="$link_path.previous.$$"
+visual_link_path="$HOME/.local/bin/visual-hive"
+visual_link_backup="$visual_link_path.previous.$$"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 skill_target="$codex_home/skills/hive"
 skill_backup="$skill_target.previous.$$"
@@ -151,6 +155,10 @@ rollback() {
     rm -f -- "$link_path" || rollback_failed=1
     if [ "$link_backup_complete" = "1" ] && { [ -e "$link_backup" ] || [ -L "$link_backup" ]; }; then mv -- "$link_backup" "$link_path" || rollback_failed=1; fi
   fi
+	if [ "$visual_link_backup_complete" = "1" ] || [ "$visual_link_candidate_installed" = "1" ]; then
+	  rm -f -- "$visual_link_path" || rollback_failed=1
+	  if [ "$visual_link_backup_complete" = "1" ] && { [ -e "$visual_link_backup" ] || [ -L "$visual_link_backup" ]; }; then mv -- "$visual_link_backup" "$visual_link_path" || rollback_failed=1; fi
+	fi
 	if [ "$activated" = "1" ]; then
 	  case "$install_dir" in "$parent_dir"/*)
 		candidate_removed=1
@@ -185,7 +193,7 @@ finish() {
     if rollback; then
 	  echo "Hive installation failed; the previous installation, launcher, and Codex skill were restored; persistent schedulers were also restored." >&2
     else
-      echo "Hive installation failed and rollback was incomplete; inspect $backup_dir, $link_backup, and $skill_backup." >&2
+      echo "Hive installation failed and rollback was incomplete; inspect $backup_dir, $link_backup, $visual_link_backup, and $skill_backup." >&2
     fi
   fi
   cleanup
@@ -305,7 +313,9 @@ walk(root);
 const expectedActual = new Set([...inventoried, 'distribution-manifest.json']);
 for (const file of actual) if (!expectedActual.has(file)) throw new Error(`uninventoried distribution file: ${file}`);
 for (const file of expectedActual) if (!actual.includes(file)) throw new Error(`missing distribution file: ${file}`);
-for (const required of ['hive', 'runtime/node', 'visual-hive/visual-hive.mjs', 'visual-hive/release-manifest.json', 'skills/hive/SKILL.md', 'skills/hive/agents/openai.yaml']) {
+const requiredFiles = ['hive', 'runtime/node', 'visual-hive/visual-hive.mjs', 'visual-hive/release-manifest.json', 'skills/hive/SKILL.md', 'skills/hive/agents/openai.yaml'];
+if (expectedVersion || inventoried.has('bin/visual-hive')) requiredFiles.push('bin/visual-hive');
+for (const required of requiredFiles) {
   if (!fs.statSync(path.join(root, ...required.split('/'))).isFile()) throw new Error(`missing ${required}`);
 }
 NODE
@@ -411,6 +421,17 @@ if [ -e "$link_backup" ] || [ -L "$link_backup" ]; then
   echo "Refusing to overwrite pre-existing launcher backup $link_backup; move it aside manually after inspection." >&2
   exit 1
 fi
+if [ -e "$visual_link_path" ] || [ -L "$visual_link_path" ]; then
+  if [ ! -e "$install_dir" ]; then
+    echo "Refusing to replace launcher $visual_link_path because no recognized current Hive installation owns it. Move it aside manually; no existing bytes were changed." >&2
+    exit 1
+  fi
+  require_recognized_hive_launcher "$visual_link_path" "$install_dir/bin/visual-hive"
+fi
+if [ -e "$visual_link_backup" ] || [ -L "$visual_link_backup" ]; then
+  echo "Refusing to overwrite pre-existing launcher backup $visual_link_backup; move it aside manually after inspection." >&2
+  exit 1
+fi
 if [ -e "$skill_target" ] || [ -L "$skill_target" ]; then
   current_skill=""
   [ -e "$install_dir" ] && current_skill="$install_dir/skills/hive"
@@ -470,6 +491,12 @@ if [ -e "$link_path" ] || [ -L "$link_path" ]; then
 fi
 ln -s "$install_dir/hive" "$link_path"
 link_candidate_installed=1
+if [ -e "$visual_link_path" ] || [ -L "$visual_link_path" ]; then
+  mv -- "$visual_link_path" "$visual_link_backup"
+  visual_link_backup_complete=1
+fi
+ln -s "$install_dir/bin/visual-hive" "$visual_link_path"
+visual_link_candidate_installed=1
 
 mkdir -p "$codex_home/skills"
 case "$skill_target" in "$codex_home"/skills/*) ;; *) echo "Unsafe Codex skill path." >&2; exit 1 ;; esac
@@ -499,6 +526,7 @@ if [ -e "$backup_dir" ] || [ -L "$backup_dir" ]; then
   fi
 fi
 [ ! -e "$link_backup" ] && [ ! -L "$link_backup" ] || rm -rf -- "$link_backup" || echo "Warning: prior launcher backup remains at $link_backup" >&2
+[ ! -e "$visual_link_backup" ] && [ ! -L "$visual_link_backup" ] || rm -rf -- "$visual_link_backup" || echo "Warning: prior Visual Hive launcher backup remains at $visual_link_backup" >&2
 [ ! -e "$skill_backup" ] || rm -rf -- "$skill_backup" || echo "Warning: prior skill backup remains at $skill_backup" >&2
 
 echo "Hive $version installed at $install_dir"

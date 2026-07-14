@@ -51,7 +51,16 @@ export HIVE_SKIP_ATTESTATION=1
 export HIVE_INSTALL_DIR="$work_root/installed"
 mkdir -p "$HOME"
 sh "$hive_root/install-integrated.sh"
-"$HIVE_INSTALL_DIR/runtime/node" "$HIVE_INSTALL_DIR/visual-hive/visual-hive.mjs" --version
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
+launcher_path="$work_root/launcher-path"
+mkdir -p "$launcher_path"
+ln -s "$(command -v dirname)" "$launcher_path/dirname"
+(
+  PATH="$HOME/.local/bin:$launcher_path"
+  export PATH
+  ! command -v node >/dev/null 2>&1
+  visual-hive --version
+)
 "$HIVE_INSTALL_DIR/hive" --version | grep -Fx "Hive $release_version"
 "$HIVE_INSTALL_DIR/hive" --version | grep -Fx "commit: $hive_commit"
 "$HIVE_INSTALL_DIR/hive" setup --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --json > "$work_root/setup-plan.json"

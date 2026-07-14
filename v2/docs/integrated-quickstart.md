@@ -63,7 +63,7 @@ Publication does not require a model credential. Its mandatory Linux and Windows
 
 An explicit install directory must be an absolute, dedicated Hive leaf; filesystem roots, home directories, common parent directories, and generic workspace/data leaves are rejected. Before an upgrade moves or removes either the active directory or its `.previous` backup, the installer independently verifies the exact integrated-distribution schema, platform, immutable commits, complete file inventory, hashes, and required launchers. An unrelated or modified directory is never adopted or deleted: move it aside manually after inspection, or choose a new dedicated install directory and retry.
 
-The Linux `~/.local/bin/hive` launcher and the `${CODEX_HOME:-~/.codex}/skills/hive` directory are protected by the same ownership rule. Hive replaces them only when the launcher points to the exact recognized active distribution and the skill has an exact packaged inventory. A same-named script, directory, modified skill, symlink, or junction is preserved and installation stops with the path to move aside. On Windows, use `-NoCodexSkill` if you intentionally want to retain a different skill with that name; on Linux, set `CODEX_HOME` to a clean location.
+The Linux `~/.local/bin/hive` and `~/.local/bin/visual-hive` launchers and the `${CODEX_HOME:-~/.codex}/skills/hive` directory are protected by the same ownership rule. Hive replaces them only when each launcher points to the exact recognized active distribution and the skill has an exact packaged inventory. A same-named script, directory, modified skill, symlink, or junction is preserved and installation stops with the path to move aside. On Windows, use `-NoCodexSkill` if you intentionally want to retain a different skill with that name; on Linux, set `CODEX_HOME` to a clean location.
 
 This integrated product is released and installed from the maintained `DavidDiaz0317/hive` fork only. The commands above intentionally bind provenance to that repository. Do not publish integrated tags or assets to, push integration branches to, or open integration pull requests against `kubestellar/hive`; its deployment instructions are retained only for the legacy service. A different fork is a different trust root and must use its own exact repository in every download, attestation, and installer argument.
 
@@ -78,6 +78,8 @@ Repair automation requires a reviewed native Codex executable. Release validatio
 ## Set up a repository
 
 For an agent-driven, noninteractive production installation, use the platform's exact second command. The Windows installer adds Hive to the current PowerShell process; the Linux installer deliberately does not edit shell profiles, so its absolute launcher works immediately even when `~/.local/bin` was absent from the original `PATH`.
+
+After either installer completes, `hive --version` and `visual-hive --version` use only the activated distribution. The Visual Hive launcher resolves the bundled Node runtime relative to that recognized installation and does not require a global `node` command.
 
 Windows PowerShell:
 

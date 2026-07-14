@@ -14,7 +14,18 @@ export HIVE_INSTALL_DIR="$work_root/installed"
 mkdir -p "$HOME"
 
 sh "$installer"
-"$HIVE_INSTALL_DIR/runtime/node" "$HIVE_INSTALL_DIR/visual-hive/visual-hive.mjs" --version
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
+launcher_path="$work_root/launcher-path"
+arbitrary_cwd="$work_root/arbitrary working directory"
+mkdir -p "$launcher_path" "$arbitrary_cwd"
+ln -s "$(command -v dirname)" "$launcher_path/dirname"
+(
+  cd "$arbitrary_cwd"
+  PATH="$HOME/.local/bin:$launcher_path"
+  export PATH
+  ! command -v node >/dev/null 2>&1
+  visual-hive --version
+)
 "$HIVE_INSTALL_DIR/hive" --version | grep -Fx "Hive $version"
 # Use the exact launcher printed by the installer. This proves the second
 # command works in the same shell even when ~/.local/bin is not on PATH.
@@ -84,10 +95,22 @@ grep -q 'existing .previous backup' "$work_root/unrecognized-backup.log"
 test ! -e "$backup_target"
 test "$(sha256sum "$unrecognized_backup/unrelated-backup.bin" | awk '{print $1}')" = "$backup_hash"
 
+# The immediately preceding integrated release had no inventoried Linux
+# Visual Hive launcher. Preserve that exact legacy shape as a recognized
+# upgrade source while requiring the incoming candidate to add the launcher.
+rm -- "$HIVE_INSTALL_DIR/bin/visual-hive"
+"$HIVE_INSTALL_DIR/runtime/node" - "$HIVE_INSTALL_DIR/distribution-manifest.json" <<'NODE'
+const fs = require('node:fs');
+const manifestPath = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+manifest.files = manifest.files.filter(file => file.path !== 'bin/visual-hive');
+fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+NODE
 # A valid exact prior Hive tree upgrades idempotently and cleans only its
 # recognized backup.
 sh "$installer"
-"$HIVE_INSTALL_DIR/runtime/node" "$HIVE_INSTALL_DIR/visual-hive/visual-hive.mjs" --version
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
+PATH="$HOME/.local/bin:$launcher_path" visual-hive --version
 test ! -e "$HIVE_INSTALL_DIR.previous"
 
 # A failure after activation must restore the previous install and launcher.
@@ -107,6 +130,7 @@ test "$(sha256sum "$work_root/transaction-sentinel" | awk '{print $1}')" = "$tra
 test "$(sha256sum "$HIVE_INSTALL_DIR/distribution-manifest.json" | awk '{print $1}')" = "$prior_manifest_hash"
 test "$(sha256sum "$HIVE_INSTALL_DIR/hive" | awk '{print $1}')" = "$prior_hive_hash"
 test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
 
 # Secondary install targets are ownership boundaries too. An unrelated
 # executable or skill named hive must fail before activation and remain exact.
@@ -123,6 +147,21 @@ test "$(sha256sum "$HOME/.local/bin/hive" | awk '{print $1}')" = "$unrelated_lau
 rm -- "$HOME/.local/bin/hive"
 ln -s "$owned_link_target" "$HOME/.local/bin/hive"
 
+# The Visual Hive command is an equally strict ownership boundary. A
+# same-named unrelated launcher must survive a refused upgrade byte-for-byte.
+owned_visual_link_target="$(readlink "$HOME/.local/bin/visual-hive")"
+rm -- "$HOME/.local/bin/visual-hive"
+printf '%s\n' unrelated-visual-launcher > "$HOME/.local/bin/visual-hive"
+unrelated_visual_launcher_hash="$(sha256sum "$HOME/.local/bin/visual-hive" | awk '{print $1}')"
+if sh "$installer" >"$work_root/unrelated-visual-launcher.log" 2>&1; then
+  echo "unrelated Visual Hive launcher collision unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'not the launcher owned by the recognized Hive installation' "$work_root/unrelated-visual-launcher.log"
+test "$(sha256sum "$HOME/.local/bin/visual-hive" | awk '{print $1}')" = "$unrelated_visual_launcher_hash"
+rm -- "$HOME/.local/bin/visual-hive"
+ln -s "$owned_visual_link_target" "$HOME/.local/bin/visual-hive"
+
 collision_codex="$work_root/unrelated-codex"
 mkdir -p "$collision_codex/skills/hive"
 printf '%s\n' unrelated-skill > "$collision_codex/skills/hive/do-not-delete.txt"
@@ -134,6 +173,7 @@ fi
 grep -q 'not an exact packaged Hive skill' "$work_root/unrelated-skill.log"
 test "$(sha256sum "$collision_codex/skills/hive/do-not-delete.txt" | awk '{print $1}')" = "$unrelated_skill_hash"
 test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
 
 # If moving a pre-existing skill to its backup fails, rollback must not delete
 # that untouched skill. Wrap only mv so the failure is deterministic and leave
@@ -165,6 +205,7 @@ test "$(sha256sum "$work_root/transaction-sentinel" | awk '{print $1}')" = "$tra
 test "$(sha256sum "$HIVE_INSTALL_DIR/distribution-manifest.json" | awk '{print $1}')" = "$prior_manifest_hash"
 test "$(sha256sum "$HIVE_INSTALL_DIR/hive" | awk '{print $1}')" = "$prior_hive_hash"
 test "$(readlink "$HOME/.local/bin/hive")" = "$HIVE_INSTALL_DIR/hive"
+test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
 
 # Exercise the published-release trust policy with a fake gh transport. The
 # installer must bind provenance to the exact tag ref and tag/source commit,
@@ -259,5 +300,6 @@ chmod +x "$attestation_bin/gh"
   sh "$installer" --version "$published_version" --repo "$repository"
 )
 test -f "$attestation_marker"
-"$work_root/install-attested/runtime/node" "$work_root/install-attested/visual-hive/visual-hive.mjs" --version
+test "$(readlink "$work_root/attested-home/.local/bin/visual-hive")" = "$work_root/install-attested/bin/visual-hive"
+PATH="$work_root/attested-home/.local/bin:$launcher_path" visual-hive --version
 echo "Signed Linux integrated installer smoke passed: $work_root"

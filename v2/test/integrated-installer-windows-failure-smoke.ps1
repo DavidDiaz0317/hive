@@ -297,6 +297,23 @@ try {
     Test-HiveDistribution -Root $validUpgradeTarget -ExpectedOS "windows" -ExpectedArchitecture "amd64"
     if (Test-Path -LiteralPath "$validUpgradeTarget.previous") { throw "Successful valid upgrade left its recognized backup behind." }
 
+    # The immediately preceding integrated release did not inventory a root
+    # Visual Hive launcher. It must remain a recognized upgrade source while
+    # every new candidate is required to contain the launcher.
+    $legacyUpgradeTarget = Join-Path $resolvedWorkRoot "install-legacy-launcher-upgrade"
+    Copy-ValidHiveDistribution -Destination $legacyUpgradeTarget
+    $legacyLauncher = Join-Path $legacyUpgradeTarget "visual-hive.cmd"
+    Remove-Item -LiteralPath $legacyLauncher -Force
+    $legacyManifestPath = Join-Path $legacyUpgradeTarget "distribution-manifest.json"
+    $legacyManifest = Get-Content -LiteralPath $legacyManifestPath -Raw | ConvertFrom-Json
+    $legacyManifest.files = @($legacyManifest.files | Where-Object { $_.path -ne "visual-hive.cmd" })
+    [IO.File]::WriteAllText($legacyManifestPath, (($legacyManifest | ConvertTo-Json -Depth 100) + "`n"), $utf8NoBom)
+    Test-HiveDistribution -Root $legacyUpgradeTarget -ExpectedOS "windows" -ExpectedArchitecture "amd64"
+    $legacyUpgrade = Invoke-InstallerProcess -Name "legacy-launcher-upgrade" -RequestedVersion $Version -LocalReleaseDir $resolvedReleaseDir -InstallDirOverride $legacyUpgradeTarget -SkipAttestation
+    if ($legacyUpgrade.ExitCode -ne 0) { throw "Launcher-less prior Hive upgrade failed.`n$($legacyUpgrade.Output)" }
+    Test-HiveDistribution -Root $legacyUpgradeTarget -ExpectedOS "windows" -ExpectedArchitecture "amd64"
+    if (-not (Test-Path -LiteralPath (Join-Path $legacyUpgradeTarget "visual-hive.cmd") -PathType Leaf)) { throw "Upgrade did not install the Visual Hive launcher." }
+
     $env:HIVE_FAKE_GH_MODE = "auth-fail"
     Assert-InstallerFailure (Invoke-InstallerProcess -Name "auth-fail") "GitHub CLI authentication check failed with exit code 40."
 

@@ -199,7 +199,10 @@ jobs:
             --node-license "$GITHUB_WORKSPACE/.release/node/node-v${NODE_VERSION}-win-x64/LICENSE" \
             --node-version "v${NODE_VERSION}" --skill "$GITHUB_WORKSPACE/v2/skills/hive" \
             --target-os windows --target-arch amd64 --output "$windows_root"
-          "$linux_root/runtime/node" "$linux_root/visual-hive/visual-hive.mjs" --version
+          launcher_path="$RUNNER_TEMP/hive-visual-launcher-path"
+          mkdir -p "$launcher_path"
+          ln -s "$(command -v dirname)" "$launcher_path/dirname"
+          PATH="$launcher_path" "$linux_root/bin/visual-hive" --version
       - name: Archive and checksum distributions
         shell: bash
         run: |
@@ -272,7 +275,7 @@ jobs:
           RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
         run: |
           $work = Join-Path $env:RUNNER_TEMP "hive-windows-release-smoke"
-          $install = Join-Path $work "installed"
+          $install = Join-Path $work "Hive-Clean Install"
           New-Item -ItemType Directory -Path $work -Force | Out-Null
           $originalPath = $env:PATH
           $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -285,7 +288,25 @@ jobs:
             if ([IO.Path]::GetFullPath($resolvedHive) -ne $expectedHive) { throw "Default installer PATH did not resolve the activated Hive." }
             if (-not (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "skills/hive/SKILL.md") -PathType Leaf)) { throw "Default installer did not install the Hive Codex skill." }
             if ($installOutput -notmatch [regex]::Escape("& `"$expectedHive`" setup")) { throw "Installer did not print its exact absolute setup command." }
-            & (Join-Path $install "runtime/node.exe") (Join-Path $install "visual-hive/visual-hive.mjs") --version
+            $manifest = Get-Content -LiteralPath (Join-Path $install "distribution-manifest.json") -Raw | ConvertFrom-Json
+            $savedPath = $env:PATH
+            $env:PATH = "$install;$(Join-Path $env:SystemRoot 'System32');$env:SystemRoot"
+            try {
+              if (Get-Command node -CommandType Application -ErrorAction SilentlyContinue) { throw "Clean Visual Hive smoke unexpectedly retained global Node." }
+              $expectedVisualHive = [IO.Path]::GetFullPath((Join-Path $install "visual-hive.cmd"))
+              $resolvedVisualHive = (@(Get-Command visual-hive -CommandType Application -ErrorAction Stop)[0]).Source
+              if ([IO.Path]::GetFullPath($resolvedVisualHive) -ne $expectedVisualHive) { throw "Visual Hive launcher escaped the installed distribution: $resolvedVisualHive" }
+              $arbitraryCwd = Join-Path $work "arbitrary working directory"
+              New-Item -ItemType Directory -Path $arbitraryCwd -Force | Out-Null
+              Push-Location $arbitraryCwd
+              try {
+                $visualHiveVersion = (& $resolvedVisualHive --version | Out-String).Trim()
+                $visualHiveExit = $LASTEXITCODE
+              } finally { Pop-Location }
+              if ($visualHiveExit -ne 0 -or $visualHiveVersion -ne [string]$manifest.visual_hive_version) { throw "Packaged Visual Hive identity mismatch without global Node: exit=$visualHiveExit output=$visualHiveVersion" }
+            } finally {
+              $env:PATH = $savedPath
+            }
             $hiveVersion = @(& (Join-Path $install "hive.exe") --version)
             if ($LASTEXITCODE -ne 0 -or $hiveVersion[0] -ne "Hive $env:RELEASE_VERSION" -or $hiveVersion[1] -ne "commit: $env:GITHUB_SHA") { throw "Packaged Hive release identity mismatch: $($hiveVersion -join '; ')" }
             $savedPath = $env:PATH

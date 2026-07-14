@@ -639,7 +639,9 @@ const expected = new Map(inventoried);
 expected.set("distribution-manifest.json", "distribution-manifest.json");
 for (const [identity, relative] of actual) if (!expected.has(identity)) throw new Error(`Uninventoried distribution file: ${relative}`);
 for (const [identity, relative] of expected) if (!actual.has(identity)) throw new Error(`missing distribution file: ${relative}`);
-for (const required of ["hive.exe", "runtime/node.exe", "visual-hive/visual-hive.mjs", "visual-hive/release-manifest.json", "skills/hive/SKILL.md", "skills/hive/agents/openai.yaml"]) {
+const requiredFiles = ["hive.exe", "runtime/node.exe", "visual-hive/visual-hive.mjs", "visual-hive/release-manifest.json", "skills/hive/SKILL.md", "skills/hive/agents/openai.yaml"];
+if (expectedVersion || inventoried.has("visual-hive.cmd")) requiredFiles.push("visual-hive.cmd");
+for (const required of requiredFiles) {
   const stat = fs.lstatSync(path.join(root, ...required.split("/")));
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`missing regular file ${required}`);
 }

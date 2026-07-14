@@ -18,6 +18,41 @@ import (
 
 const DistributionSchema = "hive.integrated-distribution.v1"
 
+const linuxVisualHiveLauncher = `#!/bin/sh
+root_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)" || {
+  echo "Hive Visual Hive launcher error: could not resolve the integrated installation root. Reinstall the immutable integrated Hive release." >&2
+  exit 126
+}
+node="$root_dir/runtime/node"
+entrypoint="$root_dir/visual-hive/visual-hive.mjs"
+if [ ! -x "$node" ]; then
+  echo "Hive Visual Hive launcher error: bundled Node runtime is missing or not executable: $node. Reinstall the immutable integrated Hive release." >&2
+  exit 127
+fi
+if [ ! -f "$entrypoint" ]; then
+  echo "Hive Visual Hive launcher error: Visual Hive entrypoint is missing: $entrypoint. Reinstall the immutable integrated Hive release." >&2
+  exit 127
+fi
+exec "$node" "$entrypoint" "$@"
+`
+
+const windowsVisualHiveLauncher = `@echo off
+setlocal
+set "HIVE_NODE=%~dp0runtime\node.exe"
+set "HIVE_VISUAL_ENTRYPOINT=%~dp0visual-hive\visual-hive.mjs"
+if not exist "%HIVE_NODE%" (
+  >&2 echo Hive Visual Hive launcher error: bundled Node runtime is missing: "%HIVE_NODE%". Reinstall the immutable integrated Hive release.
+  exit /b 127
+)
+if not exist "%HIVE_VISUAL_ENTRYPOINT%" (
+  >&2 echo Hive Visual Hive launcher error: Visual Hive entrypoint is missing: "%HIVE_VISUAL_ENTRYPOINT%". Reinstall the immutable integrated Hive release.
+  exit /b 127
+)
+"%HIVE_NODE%" "%HIVE_VISUAL_ENTRYPOINT%" %*
+set "HIVE_VISUAL_EXIT=%ERRORLEVEL%"
+endlocal & exit /b %HIVE_VISUAL_EXIT%
+`
+
 var immutableCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
 
 type DistributionOptions struct {
@@ -160,6 +195,9 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	if err := copyRegularTree(options.VisualHiveDir, filepath.Join(staging, "visual-hive")); err != nil {
 		return DistributionManifest{}, err
 	}
+	if err := writeVisualHiveLauncher(staging, targetOS); err != nil {
+		return DistributionManifest{}, err
+	}
 	if err := copyRegularTree(options.SkillDir, filepath.Join(staging, "skills", "hive")); err != nil {
 		return DistributionManifest{}, err
 	}
@@ -188,6 +226,31 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	}
 	committed = true
 	return manifest, nil
+}
+
+func visualHiveLauncherPath(targetOS string) string {
+	if targetOS == "windows" {
+		return "visual-hive.cmd"
+	}
+	return "bin/visual-hive"
+}
+
+func writeVisualHiveLauncher(root, targetOS string) error {
+	relative := visualHiveLauncherPath(targetOS)
+	contents := linuxVisualHiveLauncher
+	mode := os.FileMode(0o755)
+	if targetOS == "windows" {
+		contents = strings.ReplaceAll(windowsVisualHiveLauncher, "\n", "\r\n")
+		mode = 0o644
+	}
+	target := filepath.Join(root, filepath.FromSlash(relative))
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create Visual Hive launcher directory: %w", err)
+	}
+	if err := os.WriteFile(target, []byte(contents), mode); err != nil {
+		return fmt.Errorf("write integrated Visual Hive launcher: %w", err)
+	}
+	return nil
 }
 
 func requiredNodeRuntimeFiles(targetOS string) []string {
