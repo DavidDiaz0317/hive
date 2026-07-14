@@ -266,7 +266,10 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 			`sudo du -sb "$target_browser_staging"`,
 			`sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/`,
 			`sudo chown -R root:root "$trusted_browser_path"`,
-			`sudo chmod -R a-w "$trusted_browser_path"`,
+			`sudo find "$trusted_browser_path" -type d -exec chmod a+rx,a-w {} +`,
+			`sudo find "$trusted_browser_path" -type f -exec chmod a+r,a-w {} +`,
+			`Sealed Playwright browser root is not readable and traversable by the isolated target account`,
+			`Sealed Playwright browser root remains writable by the isolated target account`,
 			`trusted_tooling="/opt/hive-target/trusted/visual-hive-tooling"`,
 			`HIVE_TRUSTED_BROWSER_MANIFEST=$trusted_browser_manifest`,
 			`Target Playwright runtime lacks a sealed executable binding`,
@@ -296,7 +299,7 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 		}
 		install := strings.Index(value, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
 		targetInstall := strings.Index(value, `PLAYWRIGHT_BROWSERS_PATH="$target_browser_staging"`)
-		seal := strings.Index(value, `sudo chmod -R a-w "$trusted_browser_path"`)
+		seal := strings.Index(value, `sudo find "$trusted_browser_path" -type d -exec chmod a+rx,a-w {} +`)
 		preflight := strings.Index(value, "name: Verify sealed Playwright browser handoff")
 		collection := strings.Index(value, "name: Run target-facing Visual Hive collection")
 		cleanup := strings.LastIndex(value, `sudo rm -rf -- "$expected_browser_path"`)

@@ -1019,8 +1019,16 @@ sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/
 sudo rm -rf -- "$target_browser_staging"
 test ! -e "$target_browser_staging"
 sudo chown -R root:root "$trusted_browser_path"
-sudo chmod -R a-w "$trusted_browser_path"
-sudo -u ` + isolatedTargetAccount + ` -- test ! -w "$trusted_browser_path"
+sudo find "$trusted_browser_path" -type d -exec chmod a+rx,a-w {} +
+sudo find "$trusted_browser_path" -type f -exec chmod a+r,a-w {} +
+if ! sudo -u ` + isolatedTargetAccount + ` -- test -r "$trusted_browser_path" -a -x "$trusted_browser_path"; then
+  echo "Sealed Playwright browser root is not readable and traversable by the isolated target account: $trusted_browser_path" >&2
+  exit 1
+fi
+if sudo -u ` + isolatedTargetAccount + ` -- test -w "$trusted_browser_path"; then
+  echo "Sealed Playwright browser root remains writable by the isolated target account: $trusted_browser_path" >&2
+  exit 1
+fi
 HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path"
 
 trusted_browser_manifest="$RUNNER_TEMP/hive-trusted-playwright-${GITHUB_RUN_ID}.tsv"
