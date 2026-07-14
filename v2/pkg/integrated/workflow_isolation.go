@@ -1005,16 +1005,16 @@ fi
 		targetEnvironment = strings.Replace(targetEnvironment, "PLAYWRIGHT_BROWSERS_PATH=/home/"+isolatedTargetAccount+"/.cache/ms-playwright", `PLAYWRIGHT_BROWSERS_PATH="$target_browser_staging"`, 1)
 		trustedBrowserAfter = `sudo pkill -KILL -u ` + isolatedTargetAccount + ` 2>/dev/null || true
 test -d "$target_browser_staging"
-if find "$target_browser_staging" -type l -print -quit | grep -q .; then
+if sudo find "$target_browser_staging" -type l -print -quit | grep -q .; then
   echo "Target Playwright browser staging contains a symbolic link" >&2
   exit 1
 fi
-if find "$target_browser_staging" ! -type d ! -type f -print -quit | grep -q .; then
+if sudo find "$target_browser_staging" ! -type d ! -type f -print -quit | grep -q .; then
   echo "Target Playwright browser staging contains a non-regular entry" >&2
   exit 1
 fi
-test "$(find "$target_browser_staging" -type f | wc -l)" -le 10000
-test "$(du -sb "$target_browser_staging" | cut -f 1)" -le 2147483648
+test "$(sudo find "$target_browser_staging" -type f | wc -l)" -le 10000
+test "$(sudo du -sb "$target_browser_staging" | cut -f 1)" -le 2147483648
 sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/
 sudo rm -rf -- "$target_browser_staging"
 test ! -e "$target_browser_staging"
