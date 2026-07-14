@@ -1,5 +1,17 @@
 # Current acceptance blockers
 
+## VH-WIN-SIGN-001
+
+- Acceptance stage: clean Windows production activation / persistent scheduler start
+- Observed error: Microsoft Defender quarantined the installed immutable `v0.4.1-integrated.16` `hive.exe` as `Behavior:Win32/Execution.A!ml` (`ThreatID 2147735815`) after the scheduler launched it. Doctor and repeated-setup acceptance could not execute afterward.
+- Exact released executable SHA-256: `33be0e25073dfa379a60b3d890d8b75e797b27b3c41def01d11f910aeeeb6f4b`
+- Root cause: the release had GitHub build provenance and an internally verified manifest, but its Windows executable had no publicly trusted Authenticode publisher identity; the behavioral false positive also requires Microsoft review of the exact file/hash.
+- Subsystem: integrated Windows release distribution trust.
+- Implemented fix: a dedicated GitHub-hosted Windows job builds the exact release binary, authenticates to Azure Artifact Signing through an environment-bound OIDC identity, applies a Public Trust Authenticode signature with RFC3161 timestamping, verifies the signature and embedded release identity, and transfers only those signed bytes to `hive-dist` before manifest generation.
+- Focused and full validation: workflow ordering/invariant test passed; integrated release tests passed; `go build ./...`, `go test ./... -count=1`, and `go vet ./...` passed serially.
+- External prerequisite: provision the verified Azure Artifact Signing account/Public Trust certificate profile and the `artifact-signing` GitHub environment variables documented in `v2/docs/integrated-windows-signing.md`. Submit the exact v.16 hash/file to Microsoft's Security Intelligence portal and retain the submission ID.
+- State: repository fix verified; signed publication and final Windows acceptance blocked on the external signing identity and Microsoft submission.
+
 ## VH-SETUP-008
 
 - Acceptance stage: final clean-room setup / pre-setup baseline inventory

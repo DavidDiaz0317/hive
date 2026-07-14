@@ -47,6 +47,62 @@ func TestIntegratedReleaseIsForkOnlyAndExecutionBounded(t *testing.T) {
 	}
 }
 
+func TestIntegratedReleaseAuthenticodeSignsWindowsBeforeManifestAssembly(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, invariant := range []string{
+		"windows-sign:",
+		"environment: artifact-signing",
+		"id-token: write",
+		"AZURE_ARTIFACT_SIGNING_CLIENT_ID",
+		"AZURE_ARTIFACT_SIGNING_TENANT_ID",
+		"AZURE_ARTIFACT_SIGNING_SUBSCRIPTION_ID",
+		"AZURE_ARTIFACT_SIGNING_ENDPOINT",
+		"AZURE_ARTIFACT_SIGNING_ACCOUNT",
+		"AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE",
+		"azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43",
+		"azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82",
+		"timestamp-rfc3161: http://timestamp.acs.microsoft.com",
+		"Get-AuthenticodeSignature -LiteralPath $binary",
+		"TimeStamperCertificate",
+		"1.3.6.1.5.5.7.3.3",
+		"name: hive-windows-signed-${{ github.sha }}",
+		"needs: windows-sign",
+		"Download exact signed Windows binary",
+	} {
+		if !strings.Contains(workflow, invariant) {
+			t.Fatalf("integrated release lost Windows Authenticode invariant %q", invariant)
+		}
+	}
+	if strings.Contains(workflow, "New-SelfSignedCertificate") {
+		t.Fatal("public Windows release must not use a self-signed certificate")
+	}
+	if strings.Contains(workflow, "CGO_ENABLED=0 GOOS=windows") {
+		t.Fatal("Ubuntu build must not replace the signed Windows binary")
+	}
+
+	build := strings.Index(workflow, "Validate signing identity and build exact Windows binary")
+	sign := strings.Index(workflow, "Authenticode-sign Windows Hive with Azure Artifact Signing")
+	verify := strings.Index(workflow, "Verify signed Windows release identity")
+	upload := strings.Index(workflow, "Retain signed Windows binary")
+	download := strings.Index(workflow, "Download exact signed Windows binary")
+	assemble := strings.Index(workflow, `--hive "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe"`)
+	if build < 0 || sign <= build || verify <= sign || upload <= verify || download <= upload || assemble <= download {
+		t.Fatal("Windows binary must be built, signed, verified, transferred, then inventoried in that order")
+	}
+	windowsJobEnd := strings.Index(workflow, "\n  build:")
+	if windowsJobEnd < 0 {
+		t.Fatal("integrated release is missing its build job")
+	}
+	windowsJob := workflow[:windowsJobEnd]
+	if strings.Contains(windowsJob, "secrets.AZURE_") {
+		t.Fatal("GitHub OIDC signing identity must not depend on a long-lived Azure client secret")
+	}
+}
+
 func TestIntegratedReleaseSmokesPublicInstallerDefaultsAndPersistentSchedulerHarness(t *testing.T) {
 	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
 	if err != nil {
