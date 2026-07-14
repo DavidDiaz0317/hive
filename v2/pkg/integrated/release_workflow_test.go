@@ -55,6 +55,7 @@ func TestIntegratedReleaseAuthenticodeSignsWindowsBeforeManifestAssembly(t *test
 	workflow := string(data)
 	for _, invariant := range []string{
 		"windows-sign:",
+		"if: github.event_name == 'push' && github.ref_type == 'tag'",
 		"environment: artifact-signing",
 		"id-token: write",
 		"AZURE_ARTIFACT_SIGNING_CLIENT_ID",
@@ -71,7 +72,10 @@ func TestIntegratedReleaseAuthenticodeSignsWindowsBeforeManifestAssembly(t *test
 		"1.3.6.1.5.5.7.3.3",
 		"name: hive-windows-signed-${{ github.sha }}",
 		"needs: windows-sign",
+		"if: ${{ always() && (needs.windows-sign.result == 'success' || github.event_name == 'workflow_dispatch') }}",
 		"Download exact signed Windows binary",
+		`if [[ -z "$RELEASE_TAG" ]]; then`,
+		"CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build",
 	} {
 		if !strings.Contains(workflow, invariant) {
 			t.Fatalf("integrated release lost Windows Authenticode invariant %q", invariant)
@@ -80,8 +84,10 @@ func TestIntegratedReleaseAuthenticodeSignsWindowsBeforeManifestAssembly(t *test
 	if strings.Contains(workflow, "New-SelfSignedCertificate") {
 		t.Fatal("public Windows release must not use a self-signed certificate")
 	}
-	if strings.Contains(workflow, "CGO_ENABLED=0 GOOS=windows") {
-		t.Fatal("Ubuntu build must not replace the signed Windows binary")
+	branchBuild := strings.Index(workflow, `if [[ -z "$RELEASE_TAG" ]]; then`)
+	releaseSignedBinary := strings.Index(workflow, `test -s "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe"`)
+	if branchBuild < 0 || releaseSignedBinary <= branchBuild {
+		t.Fatal("only a non-publishable branch rehearsal may cross-build an unsigned Windows binary")
 	}
 
 	build := strings.Index(workflow, "Validate signing identity and build exact Windows binary")

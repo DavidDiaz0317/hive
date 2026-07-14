@@ -14,7 +14,7 @@ This is release-maintainer configuration. It does not add a setup step for Hive 
    ```
 
 3. Grant that principal `Artifact Signing Certificate Profile Signer` on the Artifact Signing account or the narrower certificate-profile scope.
-4. Create the `artifact-signing` environment in `DavidDiaz0317/hive`. Store these non-secret environment variables there:
+4. Create the `artifact-signing` environment in `DavidDiaz0317/hive`. Configure **Selected branches and tags** with one tag rule, `v*-integrated.*`, and no branch rule. This prevents a manual branch workflow or modified branch from obtaining the production signing identity. Store these non-secret environment variables there:
 
    | Variable | Value |
    | --- | --- |
@@ -25,7 +25,7 @@ This is release-maintainer configuration. It does not add a setup step for Hive 
    | `AZURE_ARTIFACT_SIGNING_ACCOUNT` | Artifact Signing account name |
    | `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE` | Public Trust certificate profile name |
 
-Do not add a client secret, PFX file, or certificate password. The workflow has `id-token: write` only in the Windows signing job and exchanges GitHub's short-lived environment-bound identity for Azure access.
+Do not add a client secret, PFX file, or certificate password. The workflow has `id-token: write` only in the Windows signing job and exchanges GitHub's short-lived environment-bound identity for Azure access. The signing job itself also runs only for a tag push. Manual workflow-dispatch rehearsals build an unsigned Windows fixture for smoke testing, cannot enter the signing environment, and cannot publish a release.
 
 ## Release invariant
 

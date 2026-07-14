@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   windows-sign:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     permissions:
       contents: read
       id-token: write
@@ -127,6 +128,7 @@ jobs:
     permissions:
       contents: read
     needs: windows-sign
+    if: ${{ always() && (needs.windows-sign.result == 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
@@ -189,6 +191,7 @@ jobs:
           go-version: 1.25.6
           cache-dependency-path: v2/go.sum
       - name: Download exact signed Windows binary
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hive-windows-signed-${{ github.sha }}
@@ -285,7 +288,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/.release/bin"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12} -X main.integratedVersion=$RELEASE_VERSION" -o "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" ./cmd/hive
-          test -s "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe"
+          if [[ -z "$RELEASE_TAG" ]]; then
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.gitHash=$GITHUB_SHA -X main.gitShort=${GITHUB_SHA::12} -X main.integratedVersion=$RELEASE_VERSION" -o "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe" ./cmd/hive
+          else
+            test -s "$GITHUB_WORKSPACE/.release/bin/hive-windows-amd64.exe"
+          fi
 
           "$GITHUB_WORKSPACE/.release/bin/hive-linux-amd64" --version | tee "$GITHUB_WORKSPACE/.release/hive-version.txt"
           grep -Fx "Hive $RELEASE_VERSION" "$GITHUB_WORKSPACE/.release/hive-version.txt"
