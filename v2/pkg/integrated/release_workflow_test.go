@@ -186,6 +186,14 @@ func TestIntegratedReleasePinsFinalVisualHiveDependency(t *testing.T) {
 			t.Fatalf("integrated release retained superseded Visual Hive pin %s", supersededRef)
 		}
 	}
+	releaseIdentity := strings.Index(workflow, `GITHUB_SHA="$VISUAL_HIVE_REF" node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"`)
+	sourceDemo := strings.Index(workflow, "GITHUB_ACTIONS=false GITHUB_EVENT_NAME=local GITHUB_RUN_ID= GITHUB_RUN_ATTEMPT= VISUAL_HIVE_WORKFLOW_ARTIFACT_ID= npm run demo:all")
+	if releaseIdentity < 0 || sourceDemo < 0 || releaseIdentity > sourceDemo {
+		t.Fatal("integrated release must generate clean Visual Hive release identity before running local source demos")
+	}
+	if strings.Contains(workflow, "\n          npm run demo:all\n") {
+		t.Fatal("integrated release must not let source demos claim hosted release authority")
+	}
 }
 
 func TestIntegratedReleaseShipsCompletePackageManagerRuntime(t *testing.T) {

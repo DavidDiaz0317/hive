@@ -90,8 +90,8 @@ jobs:
           npm run typecheck
           npm test
           npm run lint
-          npm run demo:all
-          node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
+          GITHUB_SHA="$VISUAL_HIVE_REF" node scripts/build-release-bundle.mjs --output "$GITHUB_WORKSPACE/.release/visual-hive-bundle"
+          GITHUB_ACTIONS=false GITHUB_EVENT_NAME=local GITHUB_RUN_ID= GITHUB_RUN_ATTEMPT= VISUAL_HIVE_WORKFLOW_ARTIFACT_ID= npm run demo:all
 
       - name: Verify Hive source gates
         working-directory: v2
