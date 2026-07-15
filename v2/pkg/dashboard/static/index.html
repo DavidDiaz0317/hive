@@ -1200,6 +1200,7 @@
     /* .config-field inputs — shared input recipe (end of style block) */
     .config-field input[type="text"],
     .config-field input[type="number"],
+    .config-field input[type="password"],
     .config-field textarea,
     .config-field select { width: 100%; }
     .config-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -1806,6 +1807,7 @@
        DOM untouched, z-indexes retained at each pattern's rule (they
        encode stacking intent). The acmm JS-built overlay keeps its inline
        styles until the Phase 4 template sweep. */
+    body.modal-open { overflow: hidden; }
     .gh-auth-overlay, .config-overlay, .hive-dialog-overlay, .nous-config-overlay, .acmm-dialog-overlay {
       position: fixed; inset: 0;
       background: rgba(0, 0, 0, 0.55);
@@ -1833,7 +1835,7 @@
        .config-field input): --bg-soft field on --line border (the token
        remap makes this white-on-gray in light mode), var(--radius), and a
        subtle 2px amber focus ring. Grouped selectors — no renames. */
-    .config-field input[type="text"], .config-field input[type="number"], .config-field select,
+    .config-field input[type="text"], .config-field input[type="number"], .config-field input[type="password"], .config-field select,
     .config-field textarea,
     .nous-config-section textarea, .nous-config-section input[type="text"], .nous-config-section input[type="number"],
     .config-list-add input,
@@ -1847,7 +1849,7 @@
       padding: 8px 10px;
       outline: none;
     }
-    .config-field input[type="text"]:focus, .config-field input[type="number"]:focus, .config-field select:focus,
+    .config-field input[type="text"]:focus, .config-field input[type="number"]:focus, .config-field input[type="password"]:focus, .config-field select:focus,
     .config-field textarea:focus,
     .nous-config-section textarea:focus, .nous-config-section input[type="text"]:focus, .nous-config-section input[type="number"]:focus,
     .config-list-add input:focus,
@@ -1932,6 +1934,98 @@
     .row-card { cursor: pointer; padding: 8px; margin-bottom: 4px; background: var(--bg); border: 1px solid var(--line-strong); border-radius: 6px; transition: border-color .15s; }
     .error-note { color: var(--red); font-size: 0.82rem; }
     .repo-chip-btn { padding: 2px 8px; border-radius: 4px; border: 1px solid var(--line-strong); background: var(--bg); cursor: pointer; font-size: 0.72rem; color: var(--text); }
+    /* ACMM level badges — interactive controls that open the level selector,
+       not status labels. Ghost-button affordance: amber outline at rest,
+       brighter tint + solid border + underline on hover. Amber remaps per
+       theme, so this reads correctly in both light and dark modes. */
+    #acmm-badge, #acmm-sidebar-badge { transition: background 0.15s, border-color 0.15s; }
+    #acmm-badge:hover, #acmm-sidebar-badge:hover {
+      background: color-mix(in srgb, var(--amber) 26%, transparent);
+      border-color: var(--amber);
+      text-decoration: underline;
+    }
+    /* Enlarged dropdown caret on the ACMM badges. The badge label sits at a
+       small font-size; a slightly larger caret makes the "this opens a
+       picker" affordance read clearly without inflating the label text. */
+    .acmm-caret { font-size: 1.15em; line-height: 1; vertical-align: -1px; }
+
+    /* ══ One-shot attention shimmy ══
+       A gentle single-run wiggle applied on page load to draw the eye to an
+       interactive affordance (the ACMM badge, the topbar ? button). The class
+       is added shortly after load and removed on animationend, so it plays
+       exactly once per page load. Honors prefers-reduced-motion. */
+    @keyframes attn-shimmy {
+      0%   { transform: translateX(0)    rotate(0deg); }
+      15%  { transform: translateX(-2px) rotate(-1.5deg); }
+      30%  { transform: translateX(2px)  rotate(1.5deg); }
+      45%  { transform: translateX(-2px) rotate(-1deg); }
+      60%  { transform: translateX(2px)  rotate(1deg); }
+      75%  { transform: translateX(-1px) rotate(-0.5deg); }
+      100% { transform: translateX(0)    rotate(0deg); }
+    }
+    .attn-shimmy { animation: attn-shimmy 0.7s ease-in-out 1; transform-origin: center; }
+    @media (prefers-reduced-motion: reduce) {
+      .attn-shimmy { animation: none; }
+    }
+
+    /* ══ Welcome / Getting Started dialog ══
+       Panel, overlay, and footer buttons come from the Phase-2 modal and
+       button recipes (.config-overlay/.config-modal/.hive-dialog-btn);
+       only the checklist internals are defined here. Tokens only. */
+    .welcome-modal { max-width: 680px; width: 92%; max-height: 86vh; display: flex; flex-direction: column; }
+    .welcome-body { padding: 4px 24px 16px; overflow-y: auto; }
+    .welcome-progress { font-size: 0.72em; font-weight: 400; color: var(--muted); margin-left: 8px; white-space: nowrap; }
+    .welcome-intro { font-size: var(--fs-base); color: var(--text); margin: 12px 0 16px; line-height: 1.55; }
+    .welcome-step { border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; background: color-mix(in srgb, var(--panel-strong) 40%, transparent); }
+    .welcome-step-header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; user-select: none; }
+    .welcome-step-title { flex: 1; font-size: var(--fs-base); font-weight: 600; color: var(--text); }
+    .welcome-step.done .welcome-step-title { color: var(--muted); }
+    .welcome-check { width: 20px; height: 20px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line-strong); border-radius: 5px; font-size: 0.8rem; color: var(--bg); background: transparent; transition: background 0.15s, border-color 0.15s; }
+    .welcome-step.done .welcome-check { background: var(--green); border-color: var(--green); }
+    .welcome-check.manual { cursor: pointer; }
+    .welcome-check.manual:hover { border-color: var(--green); }
+    .welcome-step-chevron { color: var(--muted); font-size: 0.7rem; transition: transform 0.15s; }
+    .welcome-step.open .welcome-step-chevron { transform: rotate(90deg); }
+    .welcome-step-body { display: none; padding: 0 12px 12px 42px; font-size: var(--fs-sm); color: var(--muted); line-height: 1.55; }
+    .welcome-step.open .welcome-step-body { display: block; }
+    .welcome-step-body strong { color: var(--text); }
+    .welcome-step-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .welcome-auto-note { display: block; margin-top: 8px; font-size: var(--fs-xs); color: var(--muted); font-style: italic; }
+    .welcome-more-title { font-size: var(--fs-sm); font-weight: 600; color: var(--muted); margin: 14px 0 6px; letter-spacing: 0.5px; text-transform: uppercase; }
+    .welcome-more-item { font-size: var(--fs-sm); color: var(--muted); padding: 3px 0 3px 8px; line-height: 1.5; }
+    .welcome-more-link { color: var(--blue); cursor: pointer; font-weight: 600; }
+    .welcome-more-link:hover { text-decoration: underline; }
+    .welcome-footer { justify-content: space-between; }
+    @media (max-width: 480px) {
+      .welcome-step-body { padding-left: 12px; }
+    }
+    /* ── Genie minimize ──
+       On dismiss the panel scales down and flies toward the top-bar ? button
+       so the user sees where the checklist went (and how to reopen it). The
+       transform target is computed at runtime; only the timing/easing live
+       here as tokens. GENIE_MS below must match --welcome-genie-ms. */
+    :root { --welcome-genie-ms: 400ms; --welcome-genie-ease: cubic-bezier(0.4, 0.0, 1, 1); }
+    .welcome-modal.welcome-genie {
+      transition: transform var(--welcome-genie-ms) var(--welcome-genie-ease),
+                  opacity var(--welcome-genie-ms) var(--welcome-genie-ease);
+      pointer-events: none;
+    }
+    #welcome-overlay.welcome-genie-overlay {
+      transition: background var(--welcome-genie-ms) var(--welcome-genie-ease);
+      background: transparent;
+    }
+    /* One-shot pulse on the ? button when the panel lands on it. */
+    @keyframes welcome-target-pulse {
+      0% { transform: scale(1); box-shadow: 0 0 0 0 color-mix(in srgb, var(--blue) 55%, transparent); }
+      50% { transform: scale(1.18); box-shadow: 0 0 0 6px color-mix(in srgb, var(--blue) 0%, transparent); }
+      100% { transform: scale(1); box-shadow: 0 0 0 0 transparent; }
+    }
+    #welcome-topbar-btn.welcome-target-pulse { animation: welcome-target-pulse 0.4s ease-out; }
+    @media (prefers-reduced-motion: reduce) {
+      .welcome-check, .welcome-step-chevron { transition: none; }
+      .welcome-modal.welcome-genie, #welcome-overlay.welcome-genie-overlay { transition: none; }
+      #welcome-topbar-btn.welcome-target-pulse { animation: none; }
+    }
   </style>
 </head>
 <body>
@@ -2077,7 +2171,7 @@
 <div id="acmm-overlay" class="config-overlay hidden">
   <div class="config-modal" style="max-width:800px;max-height:85vh">
     <div class="config-header">
-      <h2 class="config-title">ACMM Maturity Level</h2>
+      <h2 class="config-title">ACMM Maturity Level <span id="acmm-dialog-current" style="font-size:0.72em;font-weight:400;color:var(--muted)"></span></h2>
       <button class="config-close" onclick="closeACMMDialog()">&times;</button>
     </div>
     <div class="config-body" style="padding:16px 24px;overflow-y:auto;max-height:calc(85vh - 120px)">
@@ -2087,6 +2181,19 @@
       </p>
       <div id="acmm-packs-list" style="display:flex;flex-direction:column;gap:12px"></div>
       <div id="acmm-apply-error" style="color:var(--red);font-size:0.8rem;margin-top:12px;display:none"></div>
+    </div>
+  </div>
+</div>
+<div id="welcome-overlay" class="config-overlay hidden">
+  <div class="config-modal welcome-modal">
+    <div class="config-header">
+      <h2 class="config-title">🐝 Getting Started<span id="welcome-progress" class="welcome-progress"></span></h2>
+      <button class="config-close" onclick="closeWelcomeDialog()">&times;</button>
+    </div>
+    <div class="config-body welcome-body" id="welcome-body"></div>
+    <div class="config-footer welcome-footer">
+      <button class="hive-dialog-btn" onclick="closeWelcomeDialog()" title="Close for now — the checklist opens again on the next dashboard load">Remind me next time</button>
+      <button class="hive-dialog-btn primary" onclick="dismissWelcomeDialog()" title="Stop opening this checklist on load — reopen it any time from Getting Started in the sidebar or the ? button in the top bar">Don't show on load</button>
     </div>
   </div>
 </div>
@@ -2104,7 +2211,7 @@
       </div>
     </div>
     <div style="padding:4px 16px 8px;text-align:center">
-      <span id="acmm-sidebar-badge" title="ACMM Maturity Level — click to change" style="cursor:pointer;display:inline-block;padding:3px 12px;border-radius:999px;font-size:0.7rem;font-weight:700;background:color-mix(in srgb, var(--amber) 14%, transparent);border:1px solid color-mix(in srgb, var(--amber) 45%, transparent);color:var(--amber);letter-spacing:0.5px" onclick="openACMMDialog()"></span>
+      <span id="acmm-sidebar-badge" title="Click to change maturity level" style="cursor:pointer;display:inline-block;padding:3px 12px;border-radius:999px;font-size:0.7rem;font-weight:700;background:color-mix(in srgb, var(--amber) 14%, transparent);border:1px solid color-mix(in srgb, var(--amber) 45%, transparent);color:var(--amber);letter-spacing:0.5px" onclick="openACMMDialog()"></span>
     </div>
     <div class="oc-nav-group">
       <div class="oc-nav-label">Control</div>
@@ -2138,6 +2245,7 @@
       <a class="oc-nav-item" data-section="contributors-section" onclick="ocNavigate('contributors-section')"><span class="oc-nav-emoji">👥</span><span class="oc-nav-text">Contributors</span><span id="contributors-sidebar-badge" class="oc-nav-count" style="display:none"></span></a>
       <a class="oc-nav-item" data-section="audit-section" onclick="ocNavigate('audit-section')"><span class="oc-nav-emoji">📋</span><span class="oc-nav-text">Audit Log</span></a>
       <a class="oc-nav-item" data-section="nous-section" onclick="ocNavigate('nous-section')"><span class="oc-nav-emoji">🧪</span><span class="oc-nav-text">Strategy Lab</span></a>
+      <a class="oc-nav-item" id="welcome-nav-item" style="display:none" onclick="openWelcomeDialog()" title="Open the Getting Started checklist — one-time setup steps for a new hive"><span class="oc-nav-emoji">🚀</span><span class="oc-nav-text">Getting Started</span></a>
       <a class="oc-nav-item" href="/api/docs" target="_blank"><span class="oc-nav-emoji">📘</span><span class="oc-nav-text">API Spec (Redoc)</span></a>
     </div>
     <div class="system-gauges" id="system-gauges">
@@ -2180,6 +2288,7 @@
       <span class="oc-health-badge" id="oc-health">● Health OK</span>
       <span id="oc-hive-id" class="git-version" title="Hive Instance ID" style="cursor:pointer;border:1px solid var(--border);padding:2px 8px;border-radius:4px" onclick="openConfigDialog('governor')"></span>
       <span class="oc-topbar-ts" id="oc-ts"></span>
+      <button class="btn" id="welcome-topbar-btn" style="display:none" onclick="openWelcomeDialog()" title="Open the Getting Started checklist">?</button>
       <a href="/api/widget" class="widget-dl" title="Download Übersicht widget">⬇ Widget</a>
       <div id="oc-gh-avatar-wrap" style="display:none;position:relative">
         <img id="oc-gh-avatar" src="" alt="" style="width:28px;height:28px;border-radius:50%;cursor:pointer;border:2px solid var(--green);vertical-align:middle" onclick="toggleGHUserMenu()">
@@ -2202,7 +2311,7 @@
   <h1><span class="bee">🐝</span> KubeStellar Hive Dashboard&nbsp;<span id="project-name">for KubeStellar/Console</span> <span class="timestamp" id="ts"></span>
     <span class="git-version" id="git-version"></span>
     <span class="git-version" id="hive-id-badge" title="Hive Instance ID" style="cursor:pointer;border:1px solid var(--border);padding:2px 8px;border-radius:4px" onclick="openConfigDialog('governor')"></span>
-    <span class="git-version" id="acmm-badge" title="ACMM Maturity Level — click to change" style="cursor:pointer;border:1px solid color-mix(in srgb, var(--amber) 45%, transparent);padding:2px 8px;border-radius:999px;background:color-mix(in srgb, var(--amber) 14%, transparent);color:var(--amber);font-weight:600" onclick="openACMMDialog()"></span>
+    <span class="git-version" id="acmm-badge" title="Click to change maturity level" style="cursor:pointer;border:1px solid color-mix(in srgb, var(--amber) 45%, transparent);padding:2px 8px;border-radius:999px;background:color-mix(in srgb, var(--amber) 14%, transparent);color:var(--amber);font-weight:600" onclick="openACMMDialog()"></span>
     <button class="layout-toggle" id="layout-toggle" onclick="toggleLayout()" title="Switch between Light mode (sidebar + detail panel) and Dark mode (dark theme grid). Your preference is saved in the browser.">☾ Switch to Dark Mode</button>
     <a href="/api/widget" class="widget-dl" title="Download Übersicht widget">⬇ Widget</a>
   </h1>
@@ -2246,7 +2355,7 @@
   </div>
 
   <div id="acmm-eval-section" style="margin-top: 16px; margin-bottom: 24px;">
-    <h2 style="margin-bottom: 8px;" class="section-label section-header-toggle" onclick="toggleSection('acmm-eval-section')"><span class="section-chevron">▼</span> 🎯 ACMM Evaluation</h2>
+    <h2 style="margin-bottom: 8px;" class="section-label section-header-toggle" onclick="toggleSection('acmm-eval-section')"><span class="section-chevron">▼</span> 🎯 ACMM Evaluation <button class="btn" onclick="event.stopPropagation();openACMMDialog()" title="Click to change maturity level" style="vertical-align:middle;margin-left:8px;font-weight:400">Change level ▾</button></h2>
     <div class="section-body">
       <div id="acmm-eval-card" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:16px">
         <div class="kb-stat-grid" id="acmm-eval-stats">
@@ -2545,6 +2654,38 @@
       setLayout(next);
       applyLayout(next);
     }
+    // Body scroll-lock while ANY modal overlay is open — otherwise wheel
+    // scrolling leaks through the backdrop to the dashboard behind it. A
+    // single observer covers every overlay (config, acmm, welcome, gh-auth,
+    // hive-dialog, nous) and any added later; per-modal open/close handlers
+    // no longer need to touch body.style.overflow.
+    (function installModalScrollLock() {
+      var OVERLAY_SELECTOR = '.config-overlay, .gh-auth-overlay, .hive-dialog-overlay, .nous-config-overlay, .acmm-dialog-overlay';
+      function anyOverlayOpen() {
+        var overlays = document.querySelectorAll(OVERLAY_SELECTOR);
+        for (var i = 0; i < overlays.length; i++) {
+          var el = overlays[i];
+          if (el.classList.contains('hidden')) continue;
+          var disp = el.style.display || getComputedStyle(el).display;
+          if (disp !== 'none') return true;
+        }
+        return false;
+      }
+      function sync() { document.body.classList.toggle('modal-open', anyOverlayOpen()); }
+      var obs = new MutationObserver(sync);
+      function start() {
+        document.querySelectorAll(OVERLAY_SELECTOR).forEach(function(el) {
+          obs.observe(el, { attributes: true, attributeFilter: ['class', 'style'] });
+        });
+        // Catch overlays created later (e.g. acmm dialog appended on first open).
+        obs.observe(document.body, { childList: true, subtree: false });
+        sync();
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+      } else { start(); }
+    })();
+
     const OC_TOPBAR_HEIGHT = 64;
     function _ocAgentFromHash() {
       const h = location.hash.replace('#', '');
@@ -2865,8 +3006,8 @@
             ${KNOWN_BACKENDS.map(b => `<option value="${b}" ${a.cli === b ? 'disabled' : ''}>${backendLabel(b)}</option>`).join('')}
           </select>
           <select class="btn backend-select" data-change-action="switchModel" data-agent="${esc(a.name)}" title="Switch this agent to a different LLM model">
-            <option value="" disabled selected>model ▾</option>
-            ${modelsForBackend(a.cli).map(m => `<option value="${m.value}">${m.label}</option>`).join('')}
+            <option value="" disabled${a.model ? '' : ' selected'}>model ▾</option>
+            ${modelOptionsHtml(a.cli, a.model)}
           </select>
         </div>
         <div class="oc-detail-fields">
@@ -3813,8 +3954,8 @@
               ${KNOWN_BACKENDS.map(b => `<option value="${b}" ${a.cli === b ? 'disabled' : ''}>${backendLabel(b)}</option>`).join('')}
             </select>
             <select class="btn backend-select" data-change-action="switchModel" data-agent="${esc(a.name)}" title="Switch this agent to a different LLM model. Higher-tier models (Opus) cost more tokens; lower-tier (Haiku) are cheaper but less capable.">
-              <option value="" disabled selected>model ▾</option>
-              ${modelsForBackend(a.cli).map(m => `<option value="${m.value}">${m.label}</option>`).join('')}
+              <option value="" disabled${a.model ? '' : ' selected'}>model ▾</option>
+              ${modelOptionsHtml(a.cli, a.model)}
             </select>
           </div>
           </div>
@@ -4391,24 +4532,110 @@
       if (backend === 'claude') return CLAUDE_CLI_MODELS;
       return COPILOT_CLI_MODELS;
     }
-    async function fetchInferenceModels(backend) {
+    // _modelIdMatches: an agent's stored model may lack (or carry) the
+    // gateway provider prefix that discovery reports (e.g. stored "gpt-4o"
+    // vs discovered "Azure/gpt-4o", or vice-versa). Match on the full id,
+    // the suffix after the last slash, or the normalized dotted/hyphenated
+    // version so the current model preselects regardless of prefix.
+    function _modelIdMatches(optionValue, current) {
+      if (!current) return false;
+      if (optionValue === current) return true;
+      const optTail = optionValue.split('/').pop();
+      const curTail = current.split('/').pop();
+      if (optTail === curTail) return true;
+      return _modelsEqual(optTail, curTail);
+    }
+    // modelOptionsHtml builds the <option> list for a model dropdown:
+    // discovered/known models first (already discovered-first from the API),
+    // the current model preselected (prefix-insensitive), and — if the
+    // current model is not in the list — a preselected fallback option so
+    // the dropdown never silently drops an agent's active selection.
+    function modelOptionsHtml(backend, currentModel) {
+      const models = modelsForBackend(backend);
+      const cur = currentModel || '';
+      let matched = false;
+      const opts = models.map(m => {
+        const sel = !matched && _modelIdMatches(m.value, cur);
+        if (sel) matched = true;
+        return `<option value="${esc(m.value)}"${sel ? ' selected' : ''}>${esc(m.label)}</option>`;
+      });
+      if (cur && !matched) {
+        opts.unshift(`<option value="${esc(cur)}" selected>${esc(cur.split('/').pop())} (current)</option>`);
+      }
+      return opts.join('');
+    }
+    async function fetchInferenceModels(backend, force) {
       const now = Date.now();
       const cached = _inferenceModelCache[backend];
-      if (cached && (now - cached.ts) < INFERENCE_MODEL_CACHE_TTL_MS) {
+      if (!force && cached && (now - cached.ts) < INFERENCE_MODEL_CACHE_TTL_MS) {
         return cached.models;
       }
       try {
         const resp = await fetch(`/api/inference/models/${encodeURIComponent(backend)}`);
         const data = await resp.json();
-        const models = (data.models || []).map(m => ({ value: m, label: m.split('/').pop() }));
+        // data.fallback: endpoint discovery failed and the server returned
+        // static common aliases — mark them as unverified against the key.
+        const labelSuffix = data.fallback ? ' (common alias, unverified)' : '';
+        const models = (data.models || []).map(m => ({ value: m, label: m.split('/').pop() + labelSuffix }));
         INFERENCE_MODELS[backend] = models;
-        _inferenceModelCache[backend] = { models, ts: now };
+        _inferenceModelCache[backend] = { models, ts: now, fallback: !!data.fallback };
+        // A real (non-fallback) discovery may have changed the entitlement-
+        // filtered model set — reconcile agents/defaults whose selected model
+        // is no longer available. No-op when the list is a static fallback or
+        // when every current selection is still present (idempotent).
+        reconcileModelsAfterDiscovery(backend, models, !!data.fallback);
         return models;
       } catch (e) {
         return INFERENCE_MODELS[backend] || [];
       }
     }
     INFERENCE_BACKENDS.forEach(b => fetchInferenceModels(b));
+
+    // reconcileModelsAfterDiscovery auto-heals selections that a key swap
+    // (or endpoint change) stripped out: when a REAL discovery (not the
+    // static fallback) returns a non-empty model set, any agent on this
+    // backend whose selected model is no longer in the set is switched to
+    // the first available model, via the same switchModel() path the
+    // dropdown uses (so it persists + relaunches, not a cosmetic change).
+    // Strictly: keep the current model when it is still present — no
+    // re-select, no toast, no relaunch. Idempotent: repeated refreshes with
+    // a compatible list never mutate a valid selection.
+    function reconcileModelsAfterDiscovery(backend, models, fallback) {
+      // Guard: only act on a genuinely successful discovery. Never switch
+      // based on unverified static aliases or an empty list.
+      if (fallback || !models || !models.length) return;
+      const available = models.map(m => m.value);
+      const first = available[0];
+      const isAvailable = (m) => available.some(v => _modelIdMatches(v, m));
+
+      // 1) Agents whose effective method is this backend.
+      (window._lastAgents || []).forEach(a => {
+        if (a.cli !== backend) return;
+        if (!a.model) return;                 // no explicit model — nothing to heal
+        if (isAvailable(a.model)) return;     // still valid — leave untouched (idempotent)
+        const label = a.displayName || a.name;
+        showToast(`${label}: model ${a.model.split('/').pop()} unavailable on ${backend} — switched to ${first.split('/').pop()}`, 'info');
+        switchModel(a.name, first);           // persists + relaunches via /api/model
+      });
+
+      // 2) LiteLLM Default Model — only when the config dialog holds governor
+      // data (that is where the saved default is available to the UI). If the
+      // saved default is gone from the new set, persist the first available.
+      if (backend === 'litellm' && _configState.type === 'governor') {
+        const saved = (_configState.data.litellm || {}).defaultModel;
+        if (saved && !isAvailable(saved)) {
+          _configState.data.litellm.defaultModel = first;
+          fetch('/api/config/governor/litellm', {
+            method: 'PUT',
+            headers: _inceptionAuthHeaders(),
+            body: JSON.stringify({ defaultModel: first })
+          }).then(() => {
+            showToast(`Default LiteLLM model ${saved.split('/').pop()} unavailable on new key — set to ${first.split('/').pop()}`, 'info');
+            refreshLitellmDefaultModelField();
+          }).catch(() => {});
+        }
+      }
+    }
 
     const _lastKnownModels = {};
     const _dismissedModelBanners = new Set();
@@ -4446,6 +4673,10 @@
         const models = currentIds.map(m => ({ value: m, label: m.split('/').pop() }));
         INFERENCE_MODELS[b.id] = models;
         _inferenceModelCache[b.id] = { models, ts: Date.now() };
+        // If the Governor→LiteLLM tab is open when a live "models pulled"
+        // push arrives, re-render the Default Model dropdown against the
+        // same freshly-discovered data (no separate fetch).
+        if (b.id === 'litellm') refreshLitellmDefaultModelField();
       }
     }
 
@@ -8223,6 +8454,7 @@ function burnAreaChart() {
       }
       renderGhRateLimits(data.ghRateLimits || {});
       renderGitHubAppBanner(data);
+      refreshWelcomeAutoChecks(data);
       renderHubBanner(data.hubBanner);
       renderSystemAlerts(data.systemAlerts || []);
       if (!_dropdownOpen && !_configModalOpen) {
@@ -9460,9 +9692,12 @@ function burnAreaChart() {
       dismissToast(toast, `${agent} restart counter reset`, 'success');
     }
 
-    // Prompts for the LiteLLM endpoint the first time the backend is
-    // selected anywhere in the UI. Resolves true when litellm is (or has
-    // just been) configured; false when the user cancels.
+    // Prompts for the LiteLLM endpoint + API key the first time the
+    // backend is selected anywhere in the UI. Resolves true when litellm
+    // is (or has just been) configured; false when the user cancels. The
+    // key VALUE goes to the server's private key store — never hive.yaml —
+    // and the save runs a live /v1/models test whose result is shown
+    // inline (endpoint/key mistakes fail here, not as agent 401s later).
     async function ensureLiteLLMConfigured() {
       try {
         const resp = await fetch('/api/config/governor');
@@ -9477,17 +9712,31 @@ function burnAreaChart() {
         overlay.className = 'gh-auth-overlay';
         overlay.innerHTML = `<div class="gh-auth-modal" style="max-width:480px;text-align:left">
           <h3 style="color:var(--amber);text-align:center">Configure LiteLLM</h3>
-          <p style="margin:0 0 14px;line-height:1.5">No LiteLLM endpoint is configured yet. Enter the proxy base URL (editable later under Governor Config → LiteLLM).</p>
+          <p style="margin:0 0 14px;line-height:1.5">No LiteLLM gateway is configured yet. Enter the gateway URL and your API key (editable later under Governor Config → LiteLLM).</p>
           <div class="config-field">
             <label>Endpoint URL</label>
             <input type="text" id="litellm-setup-endpoint" placeholder="https://litellm.example.com" style="width:100%;box-sizing:border-box">
           </div>
           <div class="config-field">
-            <label>API Key Env Name <span style="font-weight:400;text-transform:none">(optional — the key value is never stored)</span></label>
-            <input type="text" id="litellm-setup-keyenv" placeholder="HIVE_LITELLM_API_KEY" style="width:100%;box-sizing:border-box">
+            <label>API Key <span style="font-weight:400;text-transform:none">(stored privately on this hive — never in hive.yaml or logs)</span></label>
+            <input type="password" id="litellm-setup-key" placeholder="sk-..." autocomplete="new-password" style="width:100%;box-sizing:border-box">
           </div>
+          <details style="margin:0 0 12px">
+            <summary style="cursor:pointer;font-size:0.75rem;color:var(--muted)">Advanced — self-hosted key sources</summary>
+            <div class="config-field" style="margin-top:8px">
+              <label>Read Key From Environment Variable</label>
+              <input type="text" id="litellm-setup-keyenv" placeholder="HIVE_LITELLM_API_KEY" style="width:100%;box-sizing:border-box">
+              <div style="font-size:0.7rem;color:var(--muted);margin-top:2px">Enter the NAME of an environment variable on the hive container that contains your key (self-hosted installs). Hosted users: paste your key in the API Key field above instead.</div>
+            </div>
+            <div class="config-field">
+              <label>Read Key From File Path</label>
+              <input type="text" id="litellm-setup-keyfile" placeholder="/secrets/litellm_api_key" style="width:100%;box-sizing:border-box">
+              <div style="font-size:0.7rem;color:var(--muted);margin-top:2px">Path to a file that contains your key, such as a Kubernetes Secret mount (self-hosted installs).</div>
+            </div>
+          </details>
+          <div id="litellm-setup-result" style="display:none;font-size:0.75rem;margin:0 0 10px;white-space:pre-wrap;line-height:1.4"></div>
           <div style="display:flex;gap:8px;justify-content:center">
-            <button class="hive-dialog-btn primary">Save</button>
+            <button class="hive-dialog-btn primary">Save &amp; Test</button>
             <button class="hive-dialog-btn cancel">Cancel</button>
           </div></div>`;
         document.body.appendChild(overlay);
@@ -9495,27 +9744,56 @@ function burnAreaChart() {
         const close = (val) => { overlay.remove(); resolve(val); };
         overlay.querySelector('.cancel').onclick = () => close(false);
         overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+        const resultEl = overlay.querySelector('#litellm-setup-result');
+        const showResult = (msg, ok) => {
+          resultEl.textContent = msg;
+          resultEl.style.display = 'block';
+          resultEl.style.color = ok ? 'var(--green)' : 'var(--red)';
+        };
         overlay.querySelector('.primary').onclick = async () => {
           const endpoint = overlay.querySelector('#litellm-setup-endpoint').value.trim();
-          if (!endpoint) { showToast('Endpoint URL is required', 'error'); return; }
+          if (!endpoint) { showResult('Endpoint URL is required', false); return; }
+          const key = overlay.querySelector('#litellm-setup-key').value.trim();
           const keyEnv = overlay.querySelector('#litellm-setup-keyenv').value.trim();
+          const keyFile = overlay.querySelector('#litellm-setup-keyfile').value.trim();
+          // Same guardrails as the server: a key VALUE pasted into the
+          // NAME/PATH fields would leak into hive.yaml and resolve to an
+          // empty key at runtime.
+          if (keyEnv && looksLikeApiKeyValue(keyEnv)) {
+            showResult('This looks like an API key — paste it in the API Key field above; the advanced field takes an environment variable NAME (e.g. HIVE_LITELLM_API_KEY).', false);
+            return;
+          }
+          if (keyFile && !keyFile.startsWith('/') && looksLikeApiKeyValue(keyFile)) {
+            showResult('This looks like an API key — paste it in the API Key field above; the advanced field takes a file PATH (e.g. /secrets/litellm_api_key).', false);
+            return;
+          }
           const body = { endpoint };
+          if (key) body.apiKey = key;
           if (keyEnv) body.apiKeyEnv = keyEnv;
+          if (keyFile) body.apiKeyFile = keyFile;
           try {
             const res = await fetch('/api/config/governor/litellm', {
               method: 'PUT',
               headers: _inceptionAuthHeaders(),
               body: JSON.stringify(body)
             });
+            const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-              const err = await res.json().catch(() => ({}));
-              showToast(err.error || 'Failed to save LiteLLM config', 'error');
+              showResult(data.error || 'Failed to save LiteLLM config', false);
               return;
             }
-            showToast('LiteLLM endpoint saved', 'success');
+            if (data.probe && !data.probe.ok) {
+              // Saved, but the live /v1/models test failed — keep the
+              // dialog open with the gateway's actual error so the user
+              // can fix the key/endpoint and try again immediately.
+              showResult('Saved, but the connection test failed: ' + data.probe.error + '\nFix the endpoint or key and Save & Test again.', false);
+              return;
+            }
+            const n = data.probe && data.probe.ok ? data.probe.models : null;
+            showToast(n === null ? 'LiteLLM endpoint saved' : `LiteLLM configured — ${n} model${n === 1 ? '' : 's'} available`, 'success');
             close(true);
           } catch (e) {
-            showToast('Network error: ' + e.message, 'error');
+            showResult('Network error: ' + e.message, false);
           }
         };
         overlay.querySelector('#litellm-setup-endpoint').focus();
@@ -9565,6 +9843,27 @@ function burnAreaChart() {
         });
       }
     }
+
+    // Refresh an inference backend's model list whenever its dropdown is
+    // opened, so options reflect runtime state (endpoint/key changes, new
+    // models). fetchInferenceModels rate-limits via its
+    // INFERENCE_MODEL_CACHE_TTL_MS cache, so this cannot hammer the API.
+    document.addEventListener('focusin', async (e) => {
+      const sel = e.target;
+      if (!sel || !sel.matches || !sel.matches('select[data-change-action="switchModel"]')) return;
+      const agentName = sel.dataset.agent;
+      const a = (window._lastAgents || []).find(x => x.name === agentName);
+      const backend = a && a.cli;
+      if (!backend || !INFERENCE_BACKENDS.includes(backend)) return;
+      const prev = JSON.stringify(INFERENCE_MODELS[backend] || []);
+      const models = await fetchInferenceModels(backend);
+      if (JSON.stringify(models) !== prev) {
+        const current = sel.value;
+        sel.innerHTML = '<option value="">model ▾</option>' +
+          models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+        sel.value = current;
+      }
+    });
 
     async function switchModel(agent, model) {
       if (!model) return;
@@ -10499,6 +10798,8 @@ function burnAreaChart() {
       if (e.key !== 'Escape') return;
       const acmmOverlay = document.getElementById('acmm-dialog-overlay');
       if (acmmOverlay && acmmOverlay.style.display === 'flex') { acmmCloseDialog(); return; }
+      const welcomeOverlay = document.getElementById('welcome-overlay');
+      if (welcomeOverlay && !welcomeOverlay.classList.contains('hidden')) { closeWelcomeDialog(); return; }
       if (_configModalOpen) { closeConfigDialog(); return; }
       if (_acmmOpen) { closeACMMDialog(); return; }
       const nousOverlay = document.getElementById('nous-config-overlay');
@@ -10521,6 +10822,14 @@ function burnAreaChart() {
       _acmmOpen = true;
       document.getElementById('acmm-overlay').classList.remove('hidden');
       document.getElementById('acmm-apply-error').style.display = 'none';
+
+      // Restate the current level in the title so users arriving from any
+      // entry point (badge, config dialog, eval section) see where they are.
+      const currentEl = document.getElementById('acmm-dialog-current');
+      if (currentEl) {
+        const lvl = window._lastStatus ? (window._lastStatus.acmmLevel || 0) : 0;
+        currentEl.textContent = '(current: ' + (lvl > 0 ? acmmLevelLabel(lvl) : 'not set') + ')';
+      }
 
       if (!_acmmPacks) {
         try {
@@ -10685,13 +10994,23 @@ function burnAreaChart() {
       }
     }
 
-    function updateACMMBadge(level, packAgents) {
+    // Short "L3 Measured"-style label for an ACMM pack level. Shared by the
+    // badges, the level dialog subtitle, and the Governor config General tab.
+    function acmmLevelLabel(level) {
       const levelNames = ['', 'L1 Assisted', 'L2 Instructed', 'L3 Measured', 'L4 Adaptive', 'L5 Semi-Automated', 'L6 Autonomous'];
-      const text = levelNames[level] || 'L' + level;
+      return levelNames[level] || 'L' + level;
+    }
+
+    function updateACMMBadge(level, packAgents) {
+      // Trailing ▾ signals the badge is a dropdown-style control, not a label.
+      // The caret is wrapped in .acmm-caret so it renders slightly larger than
+      // the small badge label, strengthening the "opens a picker" affordance.
+      const label = 'ACMM ' + acmmLevelLabel(level) + ' ';
+      const html = escapeHtml(label) + '<span class="acmm-caret">▾</span>';
       const badge = document.getElementById('acmm-badge');
-      if (badge) badge.textContent = 'ACMM ' + text;
+      if (badge) badge.innerHTML = html;
       const sbBadge = document.getElementById('acmm-sidebar-badge');
-      if (sbBadge) sbBadge.textContent = 'ACMM ' + text;
+      if (sbBadge) sbBadge.innerHTML = html;
       applyACMMVisibility(level, packAgents);
     }
 
@@ -10809,6 +11128,12 @@ function burnAreaChart() {
       } else {
         body.innerHTML = renderGovernorTab(tabId);
         if (tabId === 'Hub') fetchQueueCount();
+        // Opening the LiteLLM tab triggers a fresh model discovery (bypassing
+        // the TTL cache) so a just-added key's models populate the Default
+        // Model dropdown without a full reload.
+        if (tabId === 'LiteLLM') {
+          fetchInferenceModels('litellm', true).then(refreshLitellmDefaultModelField).catch(() => {});
+        }
       }
     }
 
@@ -10935,51 +11260,212 @@ function burnAreaChart() {
       }
     }
 
+    // looksLikeApiKeyValue mirrors the server-side guardrail: env var
+    // NAMES are short with underscores; key values start with sk- or run
+    // long without any underscore. Catches keys pasted into the NAME/PATH
+    // fields (which would bake the key into hive.yaml and resolve to an
+    // empty key at runtime — a real leak that hit a hosted user).
+    function looksLikeApiKeyValue(v) {
+      const API_KEY_LIKE_LENGTH = 40; // matches apiKeyLikeLength server-side
+      return v.startsWith('sk-') || (v.length > API_KEY_LIKE_LENGTH && !v.includes('_'));
+    }
+
+    // litellmKeySourceLabel turns the API's keySource ("file:<path>" /
+    // "env:<NAME>") into human copy. Never contains the key value.
+    function litellmKeySourceLabel(src) {
+      if (!src) return '';
+      if (src.startsWith('env:')) return `environment variable ${src.slice(4)}`;
+      const path = src.startsWith('file:') ? src.slice(5) : src;
+      if (path.startsWith('/data/')) return `dashboard-saved key (${path})`;
+      if (path.startsWith('/secrets/')) return `Kubernetes Secret mount (${path})`;
+      return `key file ${path}`;
+    }
+
+    // litellmProbeMessage formats a probe result ({ok, models} or
+    // {ok:false, error}) from the save/test endpoints. Live results only —
+    // the server never counts static fallback aliases here.
+    function litellmProbeMessage(probe) {
+      if (probe.ok) {
+        return { ok: true, msg: `LiteLLM OK — ${probe.models} model${probe.models === 1 ? '' : 's'} available` };
+      }
+      return { ok: false, msg: `LiteLLM connection failed: ${probe.error}` };
+    }
+
+    // showLiteLLMTestResult writes a probe result to the tab's inline
+    // result line (when the LiteLLM tab is open) and returns the
+    // formatted message for toasts.
+    function showLiteLLMTestResult(probe) {
+      const r = litellmProbeMessage(probe);
+      const el = document.getElementById('litellm-test-result');
+      if (el) {
+        el.textContent = r.msg;
+        el.style.display = 'block';
+        el.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+      }
+      return r;
+    }
+
+    function onLitellmKeyEnvChange(input) {
+      const v = input.value.trim();
+      if (v && looksLikeApiKeyValue(v)) {
+        showToast('This looks like an API key — paste it in the API Key field above; this field takes an environment variable NAME (e.g. HIVE_LITELLM_API_KEY)', 'error');
+        input.value = '';
+        return;
+      }
+      markDirty('litellm', 'apiKeyEnv', v);
+    }
+
+    function onLitellmKeyFileChange(input) {
+      const v = input.value.trim();
+      if (v && !v.startsWith('/') && looksLikeApiKeyValue(v)) {
+        showToast('This looks like an API key — paste it in the API Key field above; this field takes a file PATH (e.g. /secrets/litellm_api_key)', 'error');
+        input.value = '';
+        return;
+      }
+      markDirty('litellm', 'apiKeyFile', v);
+    }
+
+    // Sentinel value for the "type a custom id" option in the Default Model
+    // select — chosen so it can never collide with a real model id.
+    const LITELLM_CUSTOM_MODEL_SENTINEL = '__custom__';
+
+    // litellmDefaultModelFieldHtml renders the Governor→LiteLLM "Default
+    // Model" control. When discovery has returned models for the litellm
+    // backend it renders a <select> of the discovered ids (verbatim,
+    // prefixes intact) with the current value preselected, plus a
+    // "Custom…" escape hatch that reveals a free-text input. When
+    // discovery is empty/unconfigured it falls back to a plain text input
+    // so the field is never a dead end.
+    function litellmDefaultModelFieldHtml(current) {
+      const models = modelsForBackend('litellm');
+      const cur = current || '';
+      if (!models.length) {
+        return `<input type="text" value="${esc(cur)}" placeholder="e.g. gpt-4o" onchange="markDirty('litellm','defaultModel',this.value)">`;
+      }
+      const inList = cur && models.some(m => m.value === cur);
+      const options = models.map(m =>
+        `<option value="${esc(m.value)}"${m.value === cur ? ' selected' : ''}>${esc(m.value)}</option>`).join('');
+      // Current value is set but not among discovered ids → preselect a
+      // "(custom)" option carrying it so the selection is never lost.
+      const customOptLabel = inList ? 'Custom…' : `${esc(cur)} (custom)`;
+      const customSelected = cur && !inList;
+      const emptyOpt = cur ? '' : '<option value="" selected disabled>Select a discovered model…</option>';
+      return `
+        <select onchange="onLitellmDefaultModelSelect(this)">
+          ${emptyOpt}${options}
+          <option value="${LITELLM_CUSTOM_MODEL_SENTINEL}"${customSelected ? ' selected' : ''}>${customOptLabel}</option>
+        </select>
+        <input type="text" value="${customSelected ? esc(cur) : ''}" placeholder="e.g. Azure/gpt-4o" style="margin-top:6px;display:${customSelected ? 'block' : 'none'}" data-litellm-custom-model onchange="markDirty('litellm','defaultModel',this.value)">`;
+    }
+
+    // onLitellmDefaultModelSelect handles the discovered-model <select>:
+    // picking a real id records it; picking "Custom…" reveals the free-text
+    // input and defers the value to its onchange.
+    function onLitellmDefaultModelSelect(sel) {
+      const custom = sel.parentElement.querySelector('[data-litellm-custom-model]');
+      if (sel.value === LITELLM_CUSTOM_MODEL_SENTINEL) {
+        if (custom) { custom.style.display = 'block'; custom.focus(); }
+        return;
+      }
+      if (custom) custom.style.display = 'none';
+      markDirty('litellm', 'defaultModel', sel.value);
+    }
+
+    // refreshLitellmDefaultModelField re-renders the Default Model control
+    // in place after a fresh discovery lands (tab open / key save), so a
+    // just-added key's models appear without a full reload. Preserves any
+    // unsaved dirty value the user has already typed/picked.
+    function refreshLitellmDefaultModelField() {
+      const host = document.getElementById('litellm-default-model-field');
+      if (!host) return;
+      const dirtyVal = (_configState.dirty.litellm || {}).defaultModel;
+      const saved = (_configState.data.litellm || {}).defaultModel;
+      const current = dirtyVal !== undefined ? dirtyVal : (saved || '');
+      host.innerHTML = litellmDefaultModelFieldHtml(current);
+    }
+
     function renderGovLiteLLM(litellm) {
-      const keyEnvName = litellm.apiKeyEnv || 'HIVE_LITELLM_API_KEY';
-      const keyFilePath = litellm.apiKeyFile || '/secrets/litellm_api_key';
+      // The server never returns the key VALUE — only hasKey, a masked
+      // tail hint ("••••WMg"), and the store it resolved from. The API
+      // Key input always starts EMPTY (never pre-filled): typing a value
+      // replaces the stored key, leaving it blank keeps it.
+      const keyHint = litellm.keyHint ? ` (${esc(litellm.keyHint)})` : '';
+      const keyLine = litellm.hasKey
+        ? `Key detected: yes${keyHint} — from ${esc(litellmKeySourceLabel(litellm.keySource))}`
+        : 'Key detected: no — paste your gateway key above';
+      // Pre-guardrail leak remediation: a key VALUE previously pasted into
+      // the env-name/file fields comes back MASKED from the server with a
+      // LooksLikeKey flag. Render the input empty (never echo even the
+      // masked form as an editable value) plus a warning to move the key.
+      const keyEnvWarning = litellm.apiKeyEnvLooksLikeKey
+        ? `<div style="font-size:0.72rem;margin-top:3px;color:var(--red)">The saved value here (${esc(litellm.apiKeyEnv || '')}) looks like a key VALUE, not an environment variable name — move it to the API Key field above and Save; storing a key clears this field automatically.</div>`
+        : '';
+      const keyFileWarning = litellm.apiKeyFileLooksLikeKey
+        ? `<div style="font-size:0.72rem;margin-top:3px;color:var(--red)">The saved value here (${esc(litellm.apiKeyFile || '')}) looks like a key VALUE, not a file path — move it to the API Key field above and Save.</div>`
+        : '';
+      const keyEnvValue = litellm.apiKeyEnvLooksLikeKey ? '' : (litellm.apiKeyEnv || '');
+      const keyFileValue = litellm.apiKeyFileLooksLikeKey ? '' : (litellm.apiKeyFile || '');
       return `
         <div class="config-field">
           <label>Endpoint URL <span class="config-info">i<span class="config-tooltip">Base URL of the LiteLLM proxy (e.g. https://litellm.example.com). Agents reach it through the hive's inference translator — the MITM proxy stays in the path. The HIVE_LITELLM_ENDPOINT env var overrides this at runtime.</span></span></label>
           <input type="text" value="${esc(litellm.endpoint || '')}" placeholder="https://litellm.example.com" onchange="markDirty('litellm','endpoint',this.value)">
         </div>
         <div class="config-field">
-          <label>API Key Env Name <span class="config-info">i<span class="config-tooltip">Name of the environment variable holding the LiteLLM API key. The key VALUE is never stored in hive.yaml or shown here. A key file at ${esc(keyFilePath)} takes precedence when present.</span></span></label>
-          <input type="text" value="${esc(litellm.apiKeyEnv || '')}" placeholder="HIVE_LITELLM_API_KEY" onchange="markDirty('litellm','apiKeyEnv',this.value)">
-          <div style="font-size:0.72rem;margin-top:4px;color:${litellm.hasKey ? 'var(--green)' : 'var(--red)'}">Key detected: ${litellm.hasKey ? 'yes' : `no — set ${esc(keyEnvName)} or mount ${esc(keyFilePath)}`}</div>
+          <label>API Key <span class="config-info">i<span class="config-tooltip">Paste the key from your gateway/provider. It is stored privately on this hive (owner-only file on the persistent volume, plus the hive's Kubernetes Secret when available) — never in hive.yaml, logs, or config downloads. Saving runs a live connection test.</span></span></label>
+          <input type="password" value="" placeholder="${litellm.hasKey ? '(key is set — enter a new key to replace it)' : 'sk-...'}" autocomplete="new-password" onchange="markDirty('litellm','apiKey',this.value.trim())">
+          <div style="font-size:0.72rem;margin-top:4px;color:${litellm.hasKey ? 'var(--green)' : 'var(--red)'}">${keyLine}</div>
         </div>
         <div class="config-field">
-          <label>Default Model <span class="config-info">i<span class="config-tooltip">Model used when an agent on the litellm backend has no model selected. Use Test Connection to list available models.</span></span></label>
-          <input type="text" value="${esc(litellm.defaultModel || '')}" placeholder="e.g. gpt-4o" onchange="markDirty('litellm','defaultModel',this.value)">
+          <label>Default Model <span class="config-info">i<span class="config-tooltip">Model used when an agent on the litellm backend has no model selected. Populated from the models discovered on the configured endpoint — choose "Custom…" to type an id the gateway does not list yet.</span></span></label>
+          <div id="litellm-default-model-field">${litellmDefaultModelFieldHtml(litellm.defaultModel || '')}</div>
         </div>
-        <div class="config-field">
-          <label>CA Bundle Path <span class="config-info">i<span class="config-tooltip">Optional PEM file for a private CA (e.g. an internal VPC endpoint). Certificate verification is never disabled — the CA is added to the trust pool.</span></span></label>
-          <input type="text" value="${esc(litellm.caBundle || '')}" placeholder="/secrets/litellm-ca.pem" onchange="markDirty('litellm','caBundle',this.value)">
-        </div>
-        <div class="config-toggle">
-          <div class="config-toggle-switch ${litellm.localProxy ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="litellm" data-key="localProxy"></div>
-          <span class="config-toggle-label">Local Proxy Fallback <span class="config-info">i<span class="config-tooltip">Run the bundled litellm binary as a local translator (config at /data/litellm/config.yaml). Off by default — the hive's Go translator forwards directly to the remote endpoint.</span></span></span>
-        </div>
+        <details style="margin:4px 0 8px">
+          <summary style="cursor:pointer;font-size:0.75rem;color:var(--muted)">Advanced — self-hosted key sources &amp; proxy options</summary>
+          <div class="config-field" style="margin-top:10px">
+            <label>Read Key From Environment Variable <span class="config-info">i<span class="config-tooltip">For self-hosted operators who manage the key outside the dashboard. Takes the NAME of an environment variable — never the key itself.</span></span></label>
+            <input type="text" value="${esc(keyEnvValue)}" placeholder="HIVE_LITELLM_API_KEY" onchange="onLitellmKeyEnvChange(this)">
+            <div style="font-size:0.7rem;margin-top:3px;color:var(--muted)">Enter the NAME of an environment variable on the hive container that contains your key (self-hosted installs). Hosted users: paste your key in the API Key field above instead.</div>
+            ${keyEnvWarning}
+          </div>
+          <div class="config-field">
+            <label>Read Key From File Path <span class="config-info">i<span class="config-tooltip">For self-hosted operators. Path to a mounted file containing the key (e.g. a Kubernetes Secret mount).</span></span></label>
+            <input type="text" value="${esc(keyFileValue)}" placeholder="/secrets/litellm_api_key" onchange="onLitellmKeyFileChange(this)">
+            <div style="font-size:0.7rem;margin-top:3px;color:var(--muted)">Path to a file that contains your key, such as a Kubernetes Secret mount (self-hosted installs). Hosted users: paste your key in the API Key field above instead.</div>
+            ${keyFileWarning}
+          </div>
+          <div class="config-field">
+            <label>CA Bundle Path <span class="config-info">i<span class="config-tooltip">Optional PEM file for a private CA (e.g. an internal VPC endpoint). Certificate verification is never disabled — the CA is added to the trust pool.</span></span></label>
+            <input type="text" value="${esc(litellm.caBundle || '')}" placeholder="/secrets/litellm-ca.pem" onchange="markDirty('litellm','caBundle',this.value)">
+          </div>
+          <div class="config-toggle">
+            <div class="config-toggle-switch ${litellm.localProxy ? 'on' : ''}" data-action="toggleConfigSwitch" data-section="litellm" data-key="localProxy"></div>
+            <span class="config-toggle-label">Local Proxy Fallback <span class="config-info">i<span class="config-tooltip">Run the bundled litellm binary as a local translator (config at /data/litellm/config.yaml). Off by default — the hive's Go translator forwards directly to the remote endpoint.</span></span></span>
+          </div>
+        </details>
         <div style="margin-top:12px">
           <button onclick="testLiteLLMConnection()" style="padding:6px 14px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);cursor:pointer;font-size:0.78rem">Test Connection</button>
+          <div id="litellm-test-result" style="display:none;font-size:0.75rem;margin-top:8px;white-space:pre-wrap"></div>
         </div>`;
     }
 
     async function testLiteLLMConnection() {
       const toast = showToast('Testing LiteLLM connection…', 'info', true);
       try {
-        const resp = await fetch('/api/inference/models/litellm');
-        const data = await resp.json();
+        // Live probe only (/v1/models with the same key resolution the
+        // translator uses). The old /api/inference/models path silently
+        // substituted the static fallback aliases, reporting "OK — 7
+        // models" against gateways that 401'd everything.
+        const resp = await fetch('/api/config/governor/litellm/test', {
+          method: 'POST',
+          headers: _inceptionAuthHeaders()
+        });
+        const data = await resp.json().catch(() => ({}));
         if (!resp.ok) {
           dismissToast(toast, data.error || 'LiteLLM endpoint not configured — save the endpoint first', 'error');
           return;
         }
-        const count = (data.models || []).length;
-        if (count > 0) {
-          dismissToast(toast, `LiteLLM OK — ${count} model${count === 1 ? '' : 's'} available`, 'success');
-        } else {
-          dismissToast(toast, 'Connected, but no models returned (check the API key)', 'error');
-        }
+        const r = showLiteLLMTestResult(data.probe || { ok: false, error: 'no probe result returned' });
+        dismissToast(toast, r.msg, r.ok ? 'success' : 'error');
       } catch (e) {
         dismissToast(toast, 'LiteLLM test failed: ' + e.message, 'error');
       }
@@ -12039,6 +12525,7 @@ function burnAreaChart() {
     // ── Governor Tab Renderers ──
     function renderGovGeneral() {
       const currentId = (window._lastStatus || {}).hiveId || '';
+      const currentACMMLevel = (window._lastStatus || {}).acmmLevel || 0;
       return `
         <p style="font-size:0.75rem;color:var(--muted);margin-bottom:14px">General hive instance settings.</p>
         <div class="config-field">
@@ -12048,6 +12535,14 @@ function burnAreaChart() {
             <button onclick="saveHiveId()" style="font-size:0.75rem;padding:6px 14px;background:var(--green);color:var(--bg);border:none;border-radius:6px;cursor:pointer;font-weight:600">Save</button>
           </div>
           <span style="font-size:0.65rem;color:var(--muted);margin-top:4px;display:block">Format: hive-adjective-noun (e.g. hive-bold-hawk). Changes take effect immediately.</span>
+        </div>
+        <div class="config-field">
+          <label>Maturity Level <span class="config-info">i<span class="config-tooltip">ACMM (AI-native Continuous Maturity Model) level — controls which agents run and how autonomous they are, from advisory-only (L1) to fully autonomous (L6).</span></span></label>
+          <div style="display:flex;gap:10px;align-items:center">
+            <span style="display:inline-block;padding:3px 12px;border-radius:999px;font-size:0.75rem;font-weight:700;background:color-mix(in srgb, var(--amber) 14%, transparent);border:1px solid color-mix(in srgb, var(--amber) 45%, transparent);color:var(--amber)">${currentACMMLevel > 0 ? acmmLevelLabel(currentACMMLevel) : 'Not set'}</span>
+            <button class="btn" onclick="closeConfigDialog();openACMMDialog()" title="Open the ACMM maturity level selector">Change&hellip;</button>
+          </div>
+          <span style="font-size:0.65rem;color:var(--muted);margin-top:4px;display:block">Each level applies a curated agent pack. Change&hellip; opens the level selector.</span>
         </div>`;
     }
 
@@ -12826,6 +13321,20 @@ function burnAreaChart() {
               body: JSON.stringify(values)
             });
             if (!res.ok) throw new Error(await saveErrorMessage(res));
+            if (_configState.type === 'governor' && section === 'litellm') {
+              // Saving the LiteLLM tab auto-runs the live connection test
+              // server-side; surface its result exactly like the Test
+              // Connection button would (inline line + toast).
+              const data = await res.json().catch(() => null);
+              if (data && data.probe) {
+                const r = showLiteLLMTestResult(data.probe);
+                showToast(r.msg, r.ok ? 'success' : 'error');
+              }
+              // A saved key can unlock (or change) the entitlement-filtered
+              // model set — force a fresh discovery and re-render the
+              // Default Model dropdown so the new models appear immediately.
+              fetchInferenceModels('litellm', true).then(refreshLitellmDefaultModelField).catch(() => {});
+            }
           }
         } catch (err) {
           showToast(`Failed to save ${section}: ${err.message}`, 'error');
@@ -13486,8 +13995,453 @@ function burnAreaChart() {
       }
     }
 
+    // ── Welcome / Getting Started dialog ──────────────────────────────
+    // A living checklist for new hive owners: opens on every dashboard
+    // load (write-access users only) until dismissed, and stays reachable
+    // from the sidebar Resources list and the topbar ? button.
+
+    // Per-browser persistence blob: {dismissed: bool, checks: {stepId: bool}}
+    // (same localStorage pattern as hive-layout-mode / hive-section-collapsed-*).
+    const WELCOME_LS_KEY = 'hive-welcome-state-v1';
+    // X-Hive-Role value the hub proxies read-only preview users in with —
+    // the same /api/role signal the avatar menu uses to gate owner actions.
+    const HIVE_ROLE_READ = 'read';
+    // Role assumed when the header is absent (standalone spoke = owner);
+    // mirrors the /api/role server-side default.
+    const HIVE_ROLE_DEFAULT = 'owner';
+
+    function loadWelcomeState() {
+      try {
+        const raw = localStorage.getItem(WELCOME_LS_KEY);
+        if (raw) {
+          const s = JSON.parse(raw);
+          return { dismissed: s.dismissed === true, checks: (s && typeof s.checks === 'object' && s.checks) || {} };
+        }
+      } catch (e) { /* corrupted blob — start fresh */ }
+      return { dismissed: false, checks: {} };
+    }
+    function saveWelcomeState() {
+      try { localStorage.setItem(WELCOME_LS_KEY, JSON.stringify(_welcomeState)); } catch (e) { /* storage blocked — non-fatal */ }
+    }
+    let _welcomeState = loadWelcomeState();
+    let _welcomeWriteAccess = false;
+
+    async function initWelcomeDialog() {
+      // Write-access gating: read-only previews never see the checklist or
+      // its entry points. On fetch failure (e.g. static snapshot) stay hidden.
+      let role = HIVE_ROLE_READ;
+      try {
+        const resp = await fetch('/api/role');
+        const data = await resp.json();
+        role = data.role || HIVE_ROLE_DEFAULT;
+      } catch (e) { /* API unreachable — treat as read-only */ }
+      if (role === HIVE_ROLE_READ) return;
+      _welcomeWriteAccess = true;
+      const navItem = document.getElementById('welcome-nav-item');
+      if (navItem) navItem.style.display = '';
+      const topBtn = document.getElementById('welcome-topbar-btn');
+      if (topBtn) topBtn.style.display = '';
+      if (!_welcomeState.dismissed) openWelcomeDialog();
+    }
+
+    function openWelcomeDialog() {
+      // Refresh the primary-repo signal: window._primaryRepo is set by the
+      // /api/config fetch at boot, so a repo saved through the config dialog
+      // would otherwise stay stale until a full page reload.
+      fetch('/api/config').then(r => r.json()).then(cfg => {
+        const repoDisplay = cfg.org && cfg.primaryRepo && !cfg.primaryRepo.includes('/')
+          ? cfg.org + '/' + cfg.primaryRepo
+          : (cfg.primaryRepo || '');
+        if (repoDisplay) window._primaryRepo = repoDisplay;
+        refreshWelcomeAutoChecks(window._lastStatus || null);
+      }).catch(() => {});
+      renderWelcomeDialog();
+      const overlay = document.getElementById('welcome-overlay');
+      // Clear any in-flight genie state so the panel opens at full size.
+      overlay.classList.remove('welcome-genie-overlay');
+      const panel = overlay.querySelector('.welcome-modal');
+      if (panel) {
+        panel.classList.remove('welcome-genie');
+        panel.style.transform = '';
+        panel.style.transformOrigin = '';
+        panel.style.opacity = '';
+      }
+      overlay.classList.remove('hidden');
+    }
+    // Genie-minimize timing. GENIE_MS must match --welcome-genie-ms in CSS;
+    // it is the fallback deadline in case transitionend never fires (the
+    // panel can be display:none'd mid-flight if the tab is backgrounded).
+    const WELCOME_GENIE_MS = 400;
+    const WELCOME_GENIE_FALLBACK_MS = WELCOME_GENIE_MS + 80;
+    // Scale the panel down to roughly the ? button's footprint as it flies in.
+    const WELCOME_GENIE_MIN_SCALE = 0.06;
+
+    function _prefersReducedMotion() {
+      return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+
+    // Finalize a genie animation: hide the overlay and reset the animation
+    // state so the next open starts clean. Idempotent.
+    function _finishWelcomeGenie(overlay, panel) {
+      if (!overlay || overlay.classList.contains('hidden')) return;
+      overlay.classList.add('hidden');
+      overlay.classList.remove('welcome-genie-overlay');
+      if (panel) {
+        panel.classList.remove('welcome-genie');
+        panel.style.transform = '';
+        panel.style.transformOrigin = '';
+        panel.style.opacity = '';
+      }
+    }
+
+    function closeWelcomeDialog() {
+      const overlay = document.getElementById('welcome-overlay');
+      if (!overlay || overlay.classList.contains('hidden')) return;
+      const panel = overlay.querySelector('.welcome-modal');
+      const target = document.getElementById('welcome-topbar-btn');
+      // Instant hide when motion is reduced, the panel/target are missing, or
+      // the reopen affordance is not visible (nothing to fly toward).
+      if (_prefersReducedMotion() || !panel || !target ||
+          target.offsetParent === null) {
+        _finishWelcomeGenie(overlay, panel);
+        return;
+      }
+      const panelRect = panel.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      if (!panelRect.width || !panelRect.height) { _finishWelcomeGenie(overlay, panel); return; }
+      // Translate the panel's centre to the ? button's centre, then shrink it.
+      const panelCX = panelRect.left + panelRect.width / 2;
+      const panelCY = panelRect.top + panelRect.height / 2;
+      const targetCX = targetRect.left + targetRect.width / 2;
+      const targetCY = targetRect.top + targetRect.height / 2;
+      const dx = targetCX - panelCX;
+      const dy = targetCY - panelCY;
+      panel.style.transformOrigin = 'center center';
+      panel.classList.add('welcome-genie');
+      // Kick the transform on the next frame so the transition actually runs.
+      requestAnimationFrame(function () {
+        panel.style.transform = 'translate(' + dx + 'px,' + dy + 'px) scale(' + WELCOME_GENIE_MIN_SCALE + ')';
+        panel.style.opacity = '0.2';
+        overlay.classList.add('welcome-genie-overlay');
+      });
+      let done = false;
+      const finish = function () {
+        if (done) return;
+        done = true;
+        _finishWelcomeGenie(overlay, panel);
+        // Pulse the ? button once so the eye lands on where it went.
+        target.classList.remove('welcome-target-pulse');
+        void target.offsetWidth; // restart the animation
+        target.classList.add('welcome-target-pulse');
+        setTimeout(function () { target.classList.remove('welcome-target-pulse'); }, WELCOME_GENIE_FALLBACK_MS);
+      };
+      panel.addEventListener('transitionend', function te(e) {
+        if (e.target === panel && e.propertyName === 'transform') {
+          panel.removeEventListener('transitionend', te);
+          finish();
+        }
+      });
+      setTimeout(finish, WELCOME_GENIE_FALLBACK_MS);
+    }
+    function dismissWelcomeDialog() {
+      _welcomeState.dismissed = true;
+      saveWelcomeState();
+      closeWelcomeDialog();
+    }
+
+    /** Same needs-login formula as the agent-card Auth badge. */
+    function _welcomeAgentNeedsLogin(a) {
+      return a.needsLogin === true || (a.authKnown === true && a.authAvailable !== true);
+    }
+
+    // Checklist steps. `auto(data)` derives done-state live from the latest
+    // status payload (re-evaluated on every render pass, so checks flip as
+    // the hive changes); steps without `auto` are manual click-to-check
+    // boxes persisted in hive-welcome-state-v1. Content is static markup —
+    // the dialog renders once on open, never in the hot render path.
+    const WELCOME_STEPS = [
+      {
+        id: 'welcome',
+        title: 'Welcome to your hive',
+        // Reading this step is step one — opening the dialog completes it.
+        auto: () => true,
+        body: 'Your hive is a fleet of AI <strong>agents</strong> that work your repositories — triaging issues, writing fixes, opening PRs. The <strong>governor</strong> paces them automatically as the workload changes (idle → quiet → busy → surge). This checklist covers the one-time choices that make the hive productive, and it updates itself as you complete them.'
+      },
+      {
+        id: 'github-app',
+        title: 'Install the GitHub App',
+        auto: (data) => data ? data.githubAppRequired !== true : null,
+        body: 'The GitHub App unlocks issues, advisory reports, and PRs on your primary repo — without it the hive can only observe.',
+        autoNote: 'Checks itself once the app is detected on your repository.',
+        actions: [
+          { label: 'Install GitHub App', onclick: 'welcomeInstallGitHubApp()' },
+          { label: 'Re-check', onclick: 'welcomeRecheckGitHubApp(event)' }
+        ]
+      },
+      {
+        id: 'methods',
+        title: 'Pick a method for each agent',
+        auto: null,
+        body: 'Each agent card has a <strong>method dropdown</strong>: <strong>claude / copilot / gemini</strong> run on subscription CLIs, while <strong>vllm / llm-d / litellm</strong> use a self-hosted inference endpoint (litellm takes an endpoint + API key under Governor Config → LiteLLM). Mix and match per agent.',
+        actions: [{ label: 'Show me', onclick: 'welcomeShowAgentCard()' }]
+      },
+      {
+        id: 'logins',
+        title: 'Log in once per method',
+        auto: (data) => {
+          if (!data || !Array.isArray(data.agents) || data.agents.length === 0) return null;
+          return data.agents.every(a => !_welcomeAgentNeedsLogin(a));
+        },
+        body: 'Credentials are shared <strong>per method, not per agent</strong> — one copilot device-code login covers every copilot agent, and claude uses a paste-the-code flow. Inference methods (vllm / llm-d / litellm) never log in; they use the endpoint + key instead.',
+        autoNote: 'Checks itself once every agent’s method is authenticated.',
+        actions: [{ label: 'Show me', onclick: 'welcomeShowLogin()' }]
+      },
+      {
+        id: 'terminal',
+        title: 'Watch an agent in its terminal',
+        auto: null,
+        body: 'The cyan <strong>▶ terminal</strong> button on each agent card opens the agent’s live tmux session: watch it work in real time, scroll its history, or type <strong>/login</strong> in the CLI when a login needs interaction. Etiquette: it is the agent’s working session — observe, don’t drive, except for logins.',
+        actions: [{ label: '▶ Open a terminal', onclick: 'welcomeOpenTerminal()' }]
+      },
+      {
+        id: 'models',
+        title: 'Choose models',
+        auto: null,
+        body: 'The <strong>model dropdown</strong> on each agent card lists models auto-discovered for its method. 📌 pinning a model stops the governor from auto-selecting a different one — it never blocks your own changes.',
+        actions: [{ label: 'Show me', onclick: 'welcomeShowAgentCard()' }]
+      },
+      {
+        id: 'repos',
+        title: 'Add repos &amp; mark the primary',
+        auto: () => window._primaryRepo ? true : false,
+        body: 'Governor Config → <strong>Repos</strong>: add every repository the agents should watch, and set the <strong>primary</strong> repo — it hosts the advisory issue and default markings.',
+        autoNote: 'Checks itself once a primary repo is set.',
+        actions: [{ label: 'Show me', onclick: "welcomeShowConfigTab('Repos')" }]
+      },
+      {
+        id: 'cadences',
+        title: 'Tune cadences',
+        auto: null,
+        body: 'Governor Config → <strong>Agents</strong>: per-mode kick intervals (idle / quiet / busy / surge), on-demand vs scheduled agents, and pausing. The intensity bar on the Governor panel shows the current mode.',
+        actions: [{ label: 'Show me', onclick: "welcomeShowConfigTab('Agents')" }]
+      },
+      {
+        id: 'acmm',
+        title: 'Set your ACMM level',
+        auto: null,
+        body: 'The amber badge in the sidebar opens the <strong>maturity-level dialog</strong>: L1 (advisory-only) → L6 (fully autonomous), each level additive. A default is preset — confirm it matches how much autonomy you want.',
+        actions: [{ label: 'Show me', onclick: 'welcomeShowACMM()' }]
+      }
+    ];
+
+    // Collapsed "More to explore" one-liners under the core steps.
+    const WELCOME_MORE_ITEMS = [
+      { id: 'budget', label: 'Budget', desc: 'set a weekly token budget and watch the burn rate (Governor Config → Budget).', onclick: "welcomeShowConfigTab('Budget')" },
+      { id: 'notifications', label: 'Notifications', desc: 'route alerts to your channels (Governor Config → Notifications).', onclick: "welcomeShowConfigTab('Notifications')" },
+      { id: 'knowledge', label: 'Knowledge Base', desc: 'seed facts and patterns the agents reuse across passes.', onclick: "welcomeShowSection('knowledge-section')" },
+      { id: 'contributors', label: 'Contributor Relay', desc: 'let outside contributors drive agents, with a leaderboard.', onclick: "welcomeShowSection('contributors-section')" },
+      { id: 'hub', label: 'Hub visibility', desc: 'make this hive public or private on the hub (Governor Config → Hub).', onclick: "welcomeShowConfigTab('Hub')" },
+      { id: 'theme', label: 'Light / Dark mode', desc: 'switch layouts any time from the toggle in the top bar.', onclick: 'toggleLayout()' }
+    ];
+
+    /** Done-state for one step: auto steps compute from the payload, manual
+        steps read the persisted checkbox. */
+    function welcomeStepDone(step, data) {
+      if (step.auto) return step.auto(data) === true;
+      return _welcomeState.checks[step.id] === true;
+    }
+
+    // Steps the user expanded this session (first undone step opens by default).
+    const _welcomeOpenSteps = new Set();
+
+    function renderWelcomeDialog() {
+      const body = document.getElementById('welcome-body');
+      if (!body) return;
+      const data = window._lastStatus || null;
+      if (_welcomeOpenSteps.size === 0) {
+        const firstUndone = WELCOME_STEPS.find(s => !welcomeStepDone(s, data));
+        _welcomeOpenSteps.add(firstUndone ? firstUndone.id : WELCOME_STEPS[0].id);
+      }
+      let html = '';
+      let n = 0;
+      for (const step of WELCOME_STEPS) {
+        n++;
+        const done = welcomeStepDone(step, data);
+        const open = _welcomeOpenSteps.has(step.id);
+        const checkCls = step.auto ? 'welcome-check' : 'welcome-check manual';
+        const checkTitle = step.auto
+          ? 'Checked automatically from the hive’s live status'
+          : 'Click to mark this step done (saved in this browser)';
+        const checkAttrs = step.auto ? '' : ` onclick="toggleWelcomeCheck(event,'${step.id}')" role="checkbox" aria-checked="${done}" tabindex="0" onkeydown="if(event.key===' '||event.key==='Enter')toggleWelcomeCheck(event,'${step.id}')"`;
+        html += `<div class="welcome-step${done ? ' done' : ''}${open ? ' open' : ''}" id="welcome-step-${step.id}">`
+          + `<div class="welcome-step-header" onclick="toggleWelcomeStep('${step.id}')">`
+          + `<span class="${checkCls}" title="${checkTitle}"${checkAttrs}>${done ? '✓' : ''}</span>`
+          + `<span class="welcome-step-title">${n}. ${step.title}</span>`
+          + `<span class="welcome-step-chevron">▶</span>`
+          + `</div>`
+          + `<div class="welcome-step-body">${step.body}`
+          + (step.autoNote ? `<span class="welcome-auto-note">${step.autoNote}</span>` : '')
+          + (step.actions ? `<div class="welcome-step-actions">` + step.actions.map(a => `<button class="btn" onclick="${a.onclick}">${a.label}</button>`).join('') + `</div>` : '')
+          + `</div></div>`;
+      }
+      html += '<div class="welcome-more-title">More to explore</div>';
+      for (const item of WELCOME_MORE_ITEMS) {
+        html += `<div class="welcome-more-item"><span class="welcome-more-link" id="welcome-more-${item.id}" onclick="${item.onclick}">${item.label}</span> — ${item.desc}</div>`;
+      }
+      body.innerHTML = html;
+      updateWelcomeProgress();
+    }
+
+    function toggleWelcomeStep(id) {
+      if (_welcomeOpenSteps.has(id)) _welcomeOpenSteps.delete(id); else _welcomeOpenSteps.add(id);
+      const el = document.getElementById('welcome-step-' + id);
+      if (el) el.classList.toggle('open', _welcomeOpenSteps.has(id));
+    }
+
+    function toggleWelcomeCheck(ev, id) {
+      ev.stopPropagation();
+      const step = WELCOME_STEPS.find(s => s.id === id);
+      if (!step || step.auto) return;
+      _welcomeState.checks[id] = _welcomeState.checks[id] !== true;
+      saveWelcomeState();
+      _syncWelcomeStepEl(step, window._lastStatus || null);
+      updateWelcomeProgress();
+    }
+
+    /** Update one rendered step's check/done visuals in place. */
+    function _syncWelcomeStepEl(step, data) {
+      const el = document.getElementById('welcome-step-' + step.id);
+      if (!el) return;
+      const done = welcomeStepDone(step, data);
+      el.classList.toggle('done', done);
+      const check = el.querySelector('.welcome-check');
+      if (check) {
+        check.textContent = done ? '✓' : '';
+        if (!step.auto) check.setAttribute('aria-checked', String(done));
+      }
+    }
+
+    function updateWelcomeProgress() {
+      const el = document.getElementById('welcome-progress');
+      if (!el) return;
+      const data = window._lastStatus || null;
+      const done = WELCOME_STEPS.filter(s => welcomeStepDone(s, data)).length;
+      el.textContent = done + ' of ' + WELCOME_STEPS.length + ' done';
+    }
+
+    // ── Welcome deep links ("Show me" wiring) ─────────────────────────
+    // Every action reuses an existing entry point: openConfigDialog(tab),
+    // openACMMDialog(), ocSelectAgent() agent focus, terminalUrl(), and the
+    // GitHub App banner's install URL + recheckGitHubApp().
+
+    /** First agent matching pred (else first agent) from the last payload. */
+    function _welcomeFirstAgentName(pred) {
+      const agents = (window._lastStatus && window._lastStatus.agents) || [];
+      const match = pred ? agents.find(pred) : null;
+      return (match || agents[0] || {}).name || null;
+    }
+    /** Focus the first agent card (method/model dropdowns live there). */
+    function welcomeShowAgentCard() {
+      closeWelcomeDialog();
+      const name = _welcomeFirstAgentName();
+      if (name) ocSelectAgent(name);
+    }
+    /** Focus the first agent whose method still needs a login. */
+    function welcomeShowLogin() {
+      closeWelcomeDialog();
+      const name = _welcomeFirstAgentName(_welcomeAgentNeedsLogin);
+      if (name) ocSelectAgent(name);
+    }
+    /** Open the first agent's live tmux session in a new tab. */
+    function welcomeOpenTerminal() {
+      const name = _welcomeFirstAgentName();
+      if (!name) { showToast('No agents yet — terminals open from each agent card', 'info'); return; }
+      window.open(terminalUrl(name), '_blank', 'noopener');
+    }
+    /** Open the GitHub App install page (same URL the banner links to). */
+    function welcomeInstallGitHubApp() {
+      const url = (window._lastStatus && window._lastStatus.githubAppInstallURL) || '';
+      if (url) { window.open(url, '_blank', 'noopener'); return; }
+      const installed = !!(window._lastStatus) && window._lastStatus.githubAppRequired !== true;
+      showToast(installed ? 'GitHub App already installed ✓' : 'Install URL not available yet — waiting for the next status refresh', 'info');
+    }
+    /** Re-check installation via the banner action, then flip the
+        auto-check immediately instead of waiting for the next SSE tick. */
+    async function welcomeRecheckGitHubApp(ev) {
+      const btn = ev ? ev.target : null;
+      if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+      await recheckGitHubApp();
+      // recheckGitHubApp() hides the banner when the app is detected —
+      // mirror that outcome onto the cached payload.
+      const banner = document.getElementById('gh-app-install-banner');
+      const installed = !!(banner && banner.hasAttribute('hidden'));
+      if (installed && window._lastStatus) window._lastStatus.githubAppRequired = false;
+      if (btn) { btn.disabled = false; btn.textContent = installed ? 'Installed ✓' : 'Re-check'; }
+      refreshWelcomeAutoChecks(window._lastStatus || null);
+    }
+    /** Jump to a Governor Config tab (Repos, Agents, Budget, …). */
+    function welcomeShowConfigTab(tab) {
+      closeWelcomeDialog();
+      openConfigDialog('governor', null, tab);
+    }
+    /** Open the ACMM maturity-level dialog. */
+    function welcomeShowACMM() {
+      closeWelcomeDialog();
+      openACMMDialog();
+    }
+    /** Navigate to a dashboard section (knowledge, contributors, …). */
+    function welcomeShowSection(section) {
+      closeWelcomeDialog();
+      ocNavigate(section);
+    }
+
+    /** Called from render() on every status refresh so auto-checks flip
+        live. No-op unless the dialog is actually open. */
+    function refreshWelcomeAutoChecks(data) {
+      if (!_welcomeWriteAccess) return;
+      const overlay = document.getElementById('welcome-overlay');
+      if (!overlay || overlay.classList.contains('hidden')) return;
+      for (const step of WELCOME_STEPS) {
+        if (step.auto) _syncWelcomeStepEl(step, data);
+      }
+      updateWelcomeProgress();
+    }
+
     checkGHAuth();
     setInterval(checkGHAuth, GH_AUTH_CHECK_INTERVAL_MS);
+    initWelcomeDialog();
+
+    // ── One-shot attention shimmy ──────────────────────────────────────
+    // Draw the eye, once per page load, to two interactive affordances users
+    // often miss: the ACMM level badge and the topbar ? (Getting Started
+    // reopen) button. Fires after the page has settled, staggered so the two
+    // wiggles read as one intentional gesture rather than a glitch. The class
+    // is removed on animationend so it can re-trigger on the next page load.
+    // Skipped entirely under prefers-reduced-motion.
+    const SHIMMY_INITIAL_DELAY_MS = 1500; // let first paint + layout settle
+    const SHIMMY_STAGGER_MS = 250;        // gap between badge and ? button
+    function _prefersReducedMotionShimmy() {
+      return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+    function _shimmyOnce(el) {
+      if (!el) return;
+      el.classList.add('attn-shimmy');
+      el.addEventListener('animationend', function handler() {
+        el.classList.remove('attn-shimmy');
+        el.removeEventListener('animationend', handler);
+      });
+    }
+    function triggerAttentionShimmy() {
+      if (_prefersReducedMotionShimmy()) return;
+      setTimeout(function () {
+        _shimmyOnce(document.getElementById('acmm-badge'));
+        setTimeout(function () {
+          _shimmyOnce(document.getElementById('welcome-topbar-btn'));
+        }, SHIMMY_STAGGER_MS);
+      }, SHIMMY_INITIAL_DELAY_MS);
+    }
+    triggerAttentionShimmy();
+
     checkClaudeAuth();
     var CLAUDE_AUTH_CHECK_INTERVAL_MS = 60000;
     setInterval(checkClaudeAuth, CLAUDE_AUTH_CHECK_INTERVAL_MS);

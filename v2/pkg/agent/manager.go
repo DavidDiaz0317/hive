@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/claude"
@@ -24,11 +24,11 @@ import (
 type ProcessState string
 
 const (
-	StateIdle     ProcessState = "idle"
-	StateRunning  ProcessState = "running"
-	StateStopped  ProcessState = "stopped"
-	StateFailed   ProcessState = "failed"
-	StatePaused   ProcessState = "paused"
+	StateIdle    ProcessState = "idle"
+	StateRunning ProcessState = "running"
+	StateStopped ProcessState = "stopped"
+	StateFailed  ProcessState = "failed"
+	StatePaused  ProcessState = "paused"
 )
 
 type KickRecord struct {
@@ -47,40 +47,58 @@ const (
 )
 
 type AgentProcess struct {
-	Name            string
-	ID              string
-	Config          config.AgentConfig
-	State           ProcessState
-	PID             int
-	UID             int
-	StartedAt       *time.Time
-	LastKick        *time.Time
-	Paused          bool
-	PausedAt        time.Time
-	PausedReason    string
-	PausedTrigger   string
-	PinnedCLI       string
-	PinnedModel     string
-	ModelOverride   string
-	BackendOverride string
-	RestartCount    int
-	OutputBuffer    *RingBuffer
-	lastPaneCapture []string
-	paneMu          sync.RWMutex
-	KickHistory     []KickRecord
+	Name               string
+	ID                 string
+	Config             config.AgentConfig
+	State              ProcessState
+	PID                int
+	UID                int
+	StartedAt          *time.Time
+	LastKick           *time.Time
+	Paused             bool
+	PausedAt           time.Time
+	PausedReason       string
+	PausedTrigger      string
+	PinnedCLI          string
+	PinnedModel        string
+	ModelOverride      string
+	BackendOverride    string
+	RestartCount       int
+	OutputBuffer       *RingBuffer
+	lastPaneCapture    []string
+	paneMu             sync.RWMutex
+	KickHistory        []KickRecord
 	LastKickMessage    string
 	KickRefused        bool
 	KickRefusalReason  string
 	LaunchedMode       AgentMode
-	HasLaunched     bool
-	tmuxSession     string
-	tmuxSocket      string
-	cancel context.CancelFunc
-	forceRelaunch       bool
-	BootstrapOverride   string // when set, replaces buildBootstrapPrompt output
-	LastError           string // captured from bare copilot diagnostic launch
-	lastTokenRestart    time.Time // cooldown for auto-restart after token detection
-	NeedsLogin          bool   // true when pane shows a login prompt
+	HasLaunched        bool
+	tmuxSession        string
+	tmuxSocket         string
+	cancel             context.CancelFunc
+	forceRelaunch      bool
+	BootstrapOverride  string    // when set, replaces buildBootstrapPrompt output
+	LastError          string    // captured from bare copilot diagnostic launch
+	lastTokenRestart   time.Time // cooldown for auto-restart after token detection
+	NeedsLogin         bool      // true when pane shows a login prompt
+	consentSeenAt      time.Time // watcher: when a consent screen was first seen in the pane
+	lastConsentDismiss time.Time // watcher: cooldown for re-running dismissInferencePrompts
+	lastInferKickAt    time.Time // stall watchdog: when the last kick was delivered to an inference agent
+	lastInferKickPane  string    // stall watchdog: hash of the visible pane just after kick delivery
+	stallNudgeSent     bool      // stall watchdog: at most one nudge per kick
+	StallNudges        int       // total post-kick stall nudges sent (surfaced to the dashboard)
+	launchGen          int       // increments per launch; stale deliverStartupKick goroutines check it and drop
+	lastInferKickMarks int       // no-action watchdog: tool-marker count in pane+scrollback just after kick delivery
+	actionNudgeSent    bool      // no-action watchdog: at most one action nudge per kick
+	ActionNudges       int       // total prose-only-response action nudges sent (surfaced to the dashboard)
+}
+
+// effectiveBackend returns the agent's backend accounting for any override.
+func effectiveBackend(agent *AgentProcess) string {
+	if agent.BackendOverride != "" {
+		return agent.BackendOverride
+	}
+	return agent.Config.Backend
 }
 
 // ProjectContext holds project-level config injected into agent boot prompts.
@@ -479,10 +497,9 @@ var cliPaneMarkers = []string{
 	"goose",
 }
 
-// tmuxPaneHasCLI reports whether a CLI is running in the pane by inspecting
-// the visible pane content for known CLI UI markers.
-func (m *Manager) tmuxPaneHasCLI(session string) bool {
-	output := m.captureTmuxPane(session)
+// paneHasCLIMarker reports whether the given pane content contains any known
+// CLI UI marker.
+func paneHasCLIMarker(output string) bool {
 	if output == "" {
 		return false
 	}
@@ -492,24 +509,73 @@ func (m *Manager) tmuxPaneHasCLI(session string) bool {
 		}
 	}
 	return false
+}
+
+// tmuxPaneHasCLI reports whether a CLI is running in the pane by inspecting
+// the visible pane content for known CLI UI markers.
+func (m *Manager) tmuxPaneHasCLI(session string) bool {
+	return paneHasCLIMarker(m.captureTmuxPane(session))
 }
 
 // tmuxPaneHasCLIForAgent checks for CLI markers using the agent's tmux socket.
 // Uses visible pane only (no scrollback) to avoid false positives from stale
 // markers left in scroll history after a CLI exits.
 func (m *Manager) tmuxPaneHasCLIForAgent(agent *AgentProcess) bool {
-	output := m.captureVisiblePaneForAgent(agent)
-	if output == "" {
+	return paneHasCLIMarker(m.captureVisiblePaneForAgent(agent))
+}
+
+const (
+	// consentConfirmFooter appears at the bottom of Claude Code interactive
+	// selection screens (consent dialogs, settings-error menus).
+	consentConfirmFooter = "Enter to confirm"
+	// bypassConsentTitle is the heading of the --dangerously-skip-permissions
+	// consent screen. Its default selection is "No, exit" — confirming it
+	// terminates the CLI and leaves a bare bash pane.
+	bypassConsentTitle = "Bypass Permissions mode"
+	// bypassConsentDefaultOption is the default (negative) option on the
+	// bypass-permissions consent screen.
+	bypassConsentDefaultOption = "No, exit"
+	// bypassConsentAcceptOption is the affirmative option on the
+	// bypass-permissions consent screen. Its position varies between CLI
+	// versions, so acceptance navigates by matching the selected-line text.
+	bypassConsentAcceptOption = "Yes, I accept"
+	// apiKeyPromptTitle is the heading of the custom-API-key approval prompt,
+	// shown when ANTHROPIC_API_KEY is not in customApiKeyResponses.approved.
+	// Its default selection is "No (recommended)" with the affirmative option
+	// above it.
+	apiKeyPromptTitle = "Detected a custom API key"
+	// apiKeyPromptAcceptOption is the affirmative option on the
+	// custom-API-key approval prompt.
+	apiKeyPromptAcceptOption = "Yes"
+	// cliWorkingMarker is shown while Claude Code is actively processing a
+	// request; a pane in this state is never a consent screen.
+	cliWorkingMarker = "esc to interrupt"
+)
+
+// paneShowsConsentScreen reports whether the pane is showing an interactive
+// consent/selection screen rather than a ready CLI input prompt. Such screens
+// contain a "❯"-selected menu option (e.g. "❯ 1. No, exit"), so they satisfy
+// marker-based CLI presence checks ("❯" is also a cliPaneMarkers entry) — a
+// kick typed into one is consumed by the menu, or by bash once the default
+// "No, exit" selection terminates the CLI. Callers should pass the visible
+// pane only (no scrollback): dismissed consent screens linger in history.
+func paneShowsConsentScreen(pane string) bool {
+	if pane == "" || strings.Contains(pane, cliWorkingMarker) {
 		return false
 	}
-	for _, marker := range cliPaneMarkers {
-		if strings.Contains(output, marker) {
+	if strings.Contains(pane, bypassConsentTitle) && strings.Contains(pane, bypassConsentDefaultOption) {
+		return true
+	}
+	if !strings.Contains(pane, consentConfirmFooter) {
+		return false
+	}
+	for _, line := range strings.Split(pane, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "❯") {
 			return true
 		}
 	}
 	return false
 }
-
 
 func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 	backend := agent.Config.Backend
@@ -529,6 +595,7 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 	if agent.ModelOverride != "" {
 		model = agent.ModelOverride
 	}
+	modelIn := model
 	model = normalizeModelName(model, backend)
 
 	bootstrapPrompt := agent.BootstrapOverride
@@ -550,6 +617,13 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 		binary = "claude"
 		m.ensureClaudeSettings(agent.Name, agent.UID)
 		if m.inferenceRouteCallback != nil {
+			// inference-model-passthrough: the model set here becomes the
+			// outbound OpenAI "model" field that the gateway checks for
+			// entitlement, so it must equal the configured model verbatim.
+			// Log in->out (never keys) so a mismatch is greppable.
+			m.logger.Info("inference route model passthrough",
+				"agent", agent.Name, "backend", backend,
+				"model_in", modelIn, "model_out", model)
 			m.inferenceRouteCallback(agent.Name, backend, model)
 		}
 		backend = "claude"
@@ -628,6 +702,25 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 		bootstrapPrompt = "You are an AI agent. Await further instructions."
 	}
 
+	// Interactive backends get the bootstrap prompt delivered AFTER the CLI
+	// is ready (deliverStartupKick, spawned below) instead of embedding it in
+	// the launch command. Embedding raced the CLI boot: the prompt-bearing
+	// launch line was typed into the pane in the same second as the (re)start
+	// (observed live: `audit: agent kicked trigger=startup` 60ms after
+	// `audit: agent restarting`), before the CLI — or even bash — was ready
+	// to consume it, so the kick text landed in bash and an unbalanced quote
+	// left the shell in PS2 continuation. Goose keeps the embedded --text
+	// prompt: goose run needs it to stay interactive and exits on the ^C that
+	// readiness-gated delivery sends.
+	deferredStartupKick := ""
+	if bootstrapPrompt != "" {
+		switch backend {
+		case "claude", "copilot", "gemini":
+			deferredStartupKick = bootstrapPrompt
+			bootstrapPrompt = ""
+		}
+	}
+
 	if bootstrapPrompt != "" {
 		now := time.Now()
 		agent.LastKick = &now
@@ -643,31 +736,14 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 			"trigger", "startup",
 		)
 
+		// Only goose (and unknown backends, which never embed) reach this
+		// block — claude/copilot/gemini bootstrap prompts were deferred to
+		// deliverStartupKick above.
 		promptFile := fmt.Sprintf("/tmp/.hive-bootstrap-%s.txt", agent.Name)
 		if err := os.WriteFile(promptFile, []byte(bootstrapPrompt), 0o644); err != nil {
 			m.logger.Warn("failed to write bootstrap prompt", "name", agent.Name, "error", err)
-		} else {
-			switch backend {
-			case "copilot":
-				launchCmd += fmt.Sprintf(" -i \"$(cat %s)\"", promptFile)
-			case "claude":
-				// Write a launcher script instead of using $(cat) in send-keys.
-				// $(cat file) fails when the tmux shell hasn't fully initialized.
-				// Use -- to separate options from the positional prompt argument,
-				// otherwise --disallowed-tools consumes the prompt as tool names.
-				launcherFile := fmt.Sprintf("/tmp/.hive-launch-%s.sh", agent.Name)
-				launcherContent := fmt.Sprintf("#!/bin/sh\nexec %s -- \"$(cat %s)\"\n", launchCmd, promptFile)
-				if err := os.WriteFile(launcherFile, []byte(launcherContent), 0o755); err != nil {
-					m.logger.Warn("failed to write launcher script", "error", err)
-					launchCmd += fmt.Sprintf(" \"$(cat %s)\"", promptFile)
-				} else {
-					launchCmd = launcherFile
-				}
-			case "gemini":
-				launchCmd += fmt.Sprintf(" -i \"$(cat %s)\"", promptFile)
-			case "goose":
-				launchCmd += fmt.Sprintf(" --text \"$(cat %s)\"", promptFile)
-			}
+		} else if backend == "goose" {
+			launchCmd += fmt.Sprintf(" --text \"$(cat %s)\"", promptFile)
 		}
 	}
 
@@ -693,14 +769,47 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 		if backend == "copilot" {
 			go m.watchForTrustPromptForAgent(agent, agentCtx)
 		}
+		if isInference {
+			// The surviving pane may be parked on a consent screen (e.g.
+			// the hub restarted while the CLI awaited consent). The marker
+			// check above cannot tell the difference, so re-arm dismissal;
+			// it exits quickly once the main prompt is visible.
+			go m.dismissInferencePrompts(agent)
+		}
 		return nil
 	}
 	agent.forceRelaunch = false
+
+	// Single-CLI guarantee: reap any pre-existing or leaked CLI for this agent
+	// before launching a new one. Without this a relaunch (model/backend switch,
+	// crash-restart) spawns a second claude alongside the old one — the old
+	// process keeps hitting the gateway on a stale model and 403-floods the
+	// pane. The reaper matches by HIVE_AGENT env, so it also catches a process
+	// that survived tmux kill-session by detaching from the pane. Runs on every
+	// real launch (the CLI-already-running early return above skips it, keeping
+	// the healthy single CLI).
+	if reaped := m.reapAgentCLI(agent); reaped > 0 {
+		m.logger.Info("reaped stale CLI before launch",
+			"name", agent.Name, "reaped", reaped, "session", agent.tmuxSession)
+		// Give the kernel a moment to tear down the killed process so the new
+		// launch starts from a clean slate (no lingering socket on the gateway).
+		time.Sleep(preLaunchShellClearDelay)
+	}
 
 	m.fixSharedConfigPerms(agent)
 
 	envCmd := m.buildEnvPrefix(agent)
 	fullCmd := envCmd + launchCmd
+
+	// A previously spilled kick can leave bash in PS2 quote-continuation
+	// (an unbalanced quote): anything typed next is appended to the open
+	// string literal instead of executing, so the launch command would be
+	// silently eaten. Abort any pending continuation or partially typed
+	// line before typing the launch command. The pane holds only bash at
+	// this point (the CLI-already-running check above returned early), so
+	// C-c cannot kill a live CLI.
+	m.tmuxSendKeysForAgent(agent, "C-c")
+	time.Sleep(preLaunchShellClearDelay)
 
 	m.tmuxSendLiteralForAgent(agent, fullCmd)
 	time.Sleep(textToEnterDelay)
@@ -713,6 +822,7 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 	now := time.Now()
 	agent.State = StateRunning
 	agent.StartedAt = &now
+	agent.launchGen++
 	m.logger.Info("audit: agent started",
 		"name", agent.Name,
 		"backend", backend,
@@ -729,11 +839,23 @@ func (m *Manager) launchInTmux(ctx context.Context, agent *AgentProcess) error {
 		go m.watchForTrustPromptForAgent(agent, agentCtx)
 	}
 
+	// Deliver the bootstrap prompt once the CLI is ready — fire-and-forget,
+	// same semantics as the old embedded delivery but gated on readiness.
+	if deferredStartupKick != "" {
+		go m.deliverStartupKick(agent, deferredStartupKick, agent.launchGen)
+	}
+
 	if agent.Config.CavemanMode != "" {
 		switch backend {
 		case "goose", "codex", "aider":
 			go func(a *AgentProcess, cavemanMode string) {
-				time.Sleep(cavemanActivationDelay)
+				// Same readiness gate as kicks: a fixed post-launch delay
+				// raced the CLI boot and could type /caveman into bash.
+				if !m.waitForInputPromptForAgent(a) {
+					m.logger.Warn("caveman activation skipped: CLI never reached input prompt",
+						"agent", a.Name, "mode", cavemanMode)
+					return
+				}
 				m.tmuxSendLiteralForAgent(a, "/caveman "+cavemanMode)
 				time.Sleep(textToEnterDelay)
 				m.tmuxSendEntersForAgent(a)
@@ -1071,7 +1193,6 @@ func (m *Manager) findACMMFragments() []string {
 	return files
 }
 
-
 func (m *Manager) buildProjectPreamble(agent *AgentProcess) string {
 	p := m.project
 	if p.Org == "" || len(p.Repos) == 0 {
@@ -1327,7 +1448,6 @@ func findOverlap(prev, curr []string) int {
 	return -1
 }
 
-
 // waitForCLIReady polls the tmux pane until the CLI shows its ready prompt
 // or the timeout expires. Returns true if the CLI became ready.
 func (m *Manager) waitForCLIReady(session string) bool {
@@ -1406,6 +1526,13 @@ func (m *Manager) waitForInputPromptForAgent(agent *AgentProcess) bool {
 				"head_500", truncateHead(output, 500), "tail_500", truncateTail(output, 500))
 			return false
 		case <-ticker.C:
+			// A consent/selection screen also contains "❯" but is NOT a
+			// ready input prompt — sending a kick there feeds the menu.
+			// Check the visible pane only: a dismissed consent screen
+			// lingers in the scrollback that captureTmuxPaneForAgent sees.
+			if paneShowsConsentScreen(m.captureVisiblePaneForAgent(agent)) {
+				continue
+			}
 			output := m.captureTmuxPaneForAgent(agent)
 			if strings.Contains(output, "❯") || strings.Contains(output, "goose is ready") || strings.Contains(output, "> Enter to send") || strings.Contains(output, "\n>\n") {
 				return true
@@ -1561,6 +1688,13 @@ func (m *Manager) RemoveAgent(name string) {
 	m.logger.Info("audit: agent removed", "name", name, "id", agent.ID)
 }
 
+// inferencePaneCheck pairs an inference agent name with its captured visible
+// pane for post-kick stall inspection outside the manager read lock.
+type inferencePaneCheck struct {
+	name string
+	pane string
+}
+
 // CheckAndRestartCrashedAgents checks all running agents for crashed CLI
 // processes (bare shell prompt with no child process) and restarts them.
 // Returns the names of agents that were successfully restarted so the
@@ -1568,6 +1702,8 @@ func (m *Manager) RemoveAgent(name string) {
 func (m *Manager) CheckAndRestartCrashedAgents(ctx context.Context) []string {
 	m.mu.RLock()
 	var crashed []string
+	var consentStuck, consentCleared []string
+	var stallChecks []inferencePaneCheck
 	for name, agent := range m.agents {
 		if agent.State != StateRunning {
 			continue
@@ -1592,10 +1728,26 @@ func (m *Manager) CheckAndRestartCrashedAgents(ctx context.Context) []string {
 			crashed = append(crashed, name)
 			continue
 		}
-		if !m.tmuxPaneHasCLIForAgent(agent) {
+		pane := m.captureVisiblePaneForAgent(agent)
+		if !paneHasCLIMarker(pane) {
 			var uptimeSeconds float64
 			if agent.StartedAt != nil {
 				uptimeSeconds = time.Since(*agent.StartedAt).Seconds()
+			}
+			// Don't declare a freshly-launched agent crashed: the CLI needs a
+			// few seconds to render its UI marker (longer for inference, which
+			// may sit on a consent screen or first-token latency). Restarting
+			// inside this window spawns a second CLI before the first has even
+			// finished booting — the exact race that let three claude processes
+			// on three models coexist after a fresh pod boot. Wait past the
+			// grace period before treating a bare pane as a crash.
+			if agent.StartedAt != nil && uptimeSeconds < cliBootGraceSeconds {
+				m.logger.Debug("agent pane bare but within boot grace; not restarting",
+					"name", name,
+					"uptime_seconds", int(uptimeSeconds),
+					"grace_seconds", cliBootGraceSeconds,
+				)
+				continue
 			}
 			m.logger.Warn("agent CLI crashed (bare shell detected)",
 				"name", name,
@@ -1604,9 +1756,33 @@ func (m *Manager) CheckAndRestartCrashedAgents(ctx context.Context) []string {
 				"uptime_seconds", int(uptimeSeconds),
 			)
 			crashed = append(crashed, name)
+			continue
+		}
+		// An inference agent parked on a consent screen has a live CLI, so
+		// it is not "crashed" — but it is stuck. Restarting would loop back
+		// to the same screen; re-running prompt dismissal recovers it.
+		if IsInferenceBackend(effectiveBackend(agent)) {
+			if paneShowsConsentScreen(pane) {
+				consentStuck = append(consentStuck, name)
+			} else {
+				if !agent.consentSeenAt.IsZero() {
+					consentCleared = append(consentCleared, name)
+				}
+				stallChecks = append(stallChecks, inferencePaneCheck{name: name, pane: pane})
+			}
 		}
 	}
 	m.mu.RUnlock()
+
+	for _, name := range consentCleared {
+		m.clearConsentTracking(name)
+	}
+	for _, name := range consentStuck {
+		m.dismissConsentIfStuck(name)
+	}
+	for _, check := range stallChecks {
+		m.nudgeIfKickStalled(check.name, check.pane)
+	}
 
 	var restarted []string
 	for _, name := range crashed {
@@ -1645,9 +1821,15 @@ func (m *Manager) SendKick(name string, message string) error {
 		return fmt.Errorf("tmux session %s not found", agent.tmuxSession)
 	}
 
-	// Detect crashed CLI and restart before sending kick
-	if !m.tmuxPaneHasCLIForAgent(agent) {
-		m.logger.Warn("agent CLI crashed, restarting before kick", "name", name)
+	// Detect a crashed CLI (bare shell) or a CLI stuck on a consent screen
+	// and restart before sending the kick. A consent pane contains "❯" so it
+	// passes the marker check, but a kick typed into it is consumed by the
+	// menu — or by bash once the default "No, exit" selection exits the CLI
+	// (observed live: "-bash: NEVER: command not found").
+	pane := m.captureVisiblePaneForAgent(agent)
+	if !paneHasCLIMarker(pane) || paneShowsConsentScreen(pane) {
+		m.logger.Warn("agent CLI crashed or stuck on consent screen, restarting before kick",
+			"name", name, "consent_screen", paneShowsConsentScreen(pane))
 		m.mu.Unlock()
 		if err := m.Restart(context.Background(), name); err != nil {
 			m.mu.Lock()
@@ -1678,6 +1860,17 @@ func (m *Manager) SendKick(name string, message string) error {
 		return fmt.Errorf("agent %s disappeared while waiting for input prompt", name)
 	}
 
+	m.deliverKickLocked(agent, message, "send-kick")
+
+	return nil
+}
+
+// deliverKickLocked types a message into the agent's CLI and records the
+// kick bookkeeping (LastKick, history, stall watchdog, audit log). Callers
+// must hold m.mu and must already have verified the CLI is ready for input
+// (crash detect + waitForCLIReadyForAgent + waitForInputPromptForAgent) —
+// this function does no readiness checking of its own.
+func (m *Manager) deliverKickLocked(agent *AgentProcess, message, trigger string) {
 	// Clear stale input before kick (Ctrl+C then Ctrl+U).
 	// Goose 1.37 exits on ^C — skip clear for goose backend.
 	if agent.Config.Backend != "goose" && agent.BackendOverride != "goose" {
@@ -1692,6 +1885,17 @@ func (m *Manager) SendKick(name string, message string) error {
 		time.Sleep(textToEnterDelay)
 		m.tmuxSendEntersForAgent(agent)
 		time.Sleep(clearBeforeKickDelay)
+	}
+
+	// Weak OSS models served over inference backends often answer a kick
+	// with a prose plan addressed to a reader and execute zero tool calls
+	// (observed live: litellm/vllm + deepseek-r1-14b produced a coherent
+	// PLAN and returned to the idle prompt without running anything).
+	// Append an action-forcing block here — where the effective backend is
+	// knowable — instead of editing the kick templates, which are shared
+	// with commercial CLI backends that do not need it.
+	if IsInferenceBackend(effectiveBackend(agent)) {
+		message += "\n\n" + inferenceKickActionSuffix
 	}
 
 	// Send message in chunks (400 rune max per chunk, rune-safe)
@@ -1719,10 +1923,17 @@ func (m *Manager) SendKick(name string, message string) error {
 	agent.KickRefused = false
 	agent.KickRefusalReason = ""
 
+	// Arm the post-kick watchdog for inference agents: the watcher loop
+	// sends a "continue" nudge if the pane freezes at an idle prompt, and
+	// an action nudge if the model responds with prose but runs no tools.
+	if IsInferenceBackend(effectiveBackend(agent)) {
+		m.recordInferenceKick(agent, now)
+	}
+
 	snippet := message
 	const maxSnippetLen = 120
 	snippet = truncateStr(snippet, maxSnippetLen)
-	record := KickRecord{Timestamp: now, Agent: name, Snippet: snippet}
+	record := KickRecord{Timestamp: now, Agent: agent.Name, Snippet: snippet}
 	if len(agent.KickHistory) >= kickHistoryCapacity {
 		agent.KickHistory = agent.KickHistory[1:]
 	}
@@ -1734,12 +1945,45 @@ func (m *Manager) SendKick(name string, message string) error {
 		kickPreview = truncateStr(kickPreview, maxKickPreviewLen)
 	}
 	m.logger.Info("audit: agent kicked",
-		"name", name,
+		"name", agent.Name,
 		"message_len", len(message),
 		"preview", kickPreview,
+		"trigger", trigger,
 	)
+}
 
-	return nil
+// deliverStartupKick delivers a bootstrap prompt to a freshly launched agent
+// once its CLI is actually ready for input, mirroring SendKick's readiness
+// chain (CLI marker visible, input prompt shown, not parked on a consent
+// screen — the consent check lives inside waitForInputPromptForAgent). It
+// runs fire-and-forget in a goroutine, bounded by cliReadyTimeout +
+// inputPromptTimeout. If the CLI never becomes ready the prompt is dropped
+// with a warning rather than typed into a bare bash pane — the crash
+// detector restarts the agent and the next launch builds a fresh bootstrap.
+// gen is the agent's launch generation at spawn time; a mismatch at delivery
+// time means the agent was relaunched while we waited (the new launch owns
+// its own startup kick, so this one is stale and dropped).
+func (m *Manager) deliverStartupKick(agent *AgentProcess, prompt string, gen int) {
+	if !m.waitForCLIReadyForAgent(agent) {
+		m.logger.Warn("startup kick dropped: CLI never became ready",
+			"name", agent.Name, "session", agent.tmuxSession, "trigger", "startup")
+		return
+	}
+	if !m.waitForInputPromptForAgent(agent) {
+		m.logger.Warn("startup kick dropped: CLI never reached input prompt",
+			"name", agent.Name, "session", agent.tmuxSession, "trigger", "startup")
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.agents[agent.Name]
+	if !ok || current != agent || agent.State != StateRunning || agent.launchGen != gen {
+		m.logger.Warn("startup kick dropped: agent restarted or stopped while waiting",
+			"name", agent.Name, "trigger", "startup")
+		return
+	}
+	m.deliverKickLocked(agent, prompt, "startup")
 }
 
 // tmuxSendLiteralForAgent sends text using the agent's tmux socket.
@@ -1748,30 +1992,73 @@ func (m *Manager) tmuxSendLiteralForAgent(agent *AgentProcess, text string) {
 }
 
 // dismissInferencePrompts polls the tmux pane for Claude Code interactive
-// prompts and auto-dismisses them. Works dynamically regardless of prompt
-// text changes between Claude Code versions by:
+// prompts and auto-dismisses them. The "Bypass Permissions mode" consent
+// screen and the custom-API-key approval prompt are handled first and
+// explicitly (see confirmMenuOption): their default selections are negative
+// ("No, exit" / "No (recommended)"), so confirming blind terminates the CLI
+// or declines the seeded key.
+// Other prompts are handled dynamically regardless of prompt text changes
+// between Claude Code versions by:
 //  1. Detecting "Enter to confirm" (universal prompt footer)
 //  2. Finding the selected option (line with "❯" marker)
 //  3. If selected option looks negative (contains "No" or "exit"), navigate
 //     away from it before confirming
 //  4. For "Press Enter to continue" screens, just press Enter
 //
+// The pane is polled fast for the first 10s — the consent screen appears
+// within ~5-8s of launch and every second it lingers is a window for a kick
+// to be swallowed by the menu — then at a relaxed interval.
+//
 // Stops when the main Claude Code input prompt appears ("esc to interrupt").
 func (m *Manager) dismissInferencePrompts(agent *AgentProcess) {
 	const (
-		promptPollInterval   = 1 * time.Second
-		promptDismissTimeout = 60 * time.Second
-		postKeystrokeDelay   = 500 * time.Millisecond
+		// promptFastPollWindow covers the launch window in which the consent
+		// screen normally appears (~5-8s after CLI start).
+		promptFastPollWindow   = 10 * time.Second
+		promptFastPollInterval = 250 * time.Millisecond
+		promptPollInterval     = 1 * time.Second
+		promptDismissTimeout   = 60 * time.Second
+		postKeystrokeDelay     = 500 * time.Millisecond
 	)
 
-	deadline := time.Now().Add(promptDismissTimeout)
+	start := time.Now()
+	deadline := start.Add(promptDismissTimeout)
 	lastPane := ""
 
 	for time.Now().Before(deadline) {
-		time.Sleep(promptPollInterval)
+		interval := promptPollInterval
+		if time.Since(start) < promptFastPollWindow {
+			interval = promptFastPollInterval
+		}
+		time.Sleep(interval)
 
 		pane := m.captureVisiblePaneForAgent(agent)
-		if pane == "" || pane == lastPane {
+		if pane == "" {
+			continue
+		}
+
+		// Bypass-permissions consent screen: handle first and explicitly,
+		// even if the pane is unchanged since the last poll (a mistimed
+		// keystroke must be retried, not skipped). The affirmative option
+		// sits below the default "No, exit".
+		if strings.Contains(pane, bypassConsentTitle) && !strings.Contains(pane, cliWorkingMarker) {
+			m.logger.Info("accepting bypass-permissions consent", "agent", agent.Name)
+			m.confirmMenuOption(agent, bypassConsentTitle, bypassConsentAcceptOption, "Down")
+			lastPane = "" // re-capture fresh on the next pass
+			continue
+		}
+
+		// Custom-API-key approval prompt: the affirmative "Yes" sits ABOVE
+		// the default "No (recommended)" selection, so the generic
+		// Down-then-Enter fallback below would decline it.
+		if strings.Contains(pane, apiKeyPromptTitle) && !strings.Contains(pane, cliWorkingMarker) {
+			m.logger.Info("approving seeded inference API key", "agent", agent.Name)
+			m.confirmMenuOption(agent, apiKeyPromptTitle, apiKeyPromptAcceptOption, "Up")
+			lastPane = ""
+			continue
+		}
+
+		if pane == lastPane {
 			continue
 		}
 		lastPane = pane
@@ -1795,14 +2082,7 @@ func (m *Manager) dismissInferencePrompts(agent *AgentProcess) {
 		}
 
 		// Find the currently selected option (marked with ❯)
-		selected := ""
-		for _, line := range strings.Split(pane, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "❯") {
-				selected = trimmed
-				break
-			}
-		}
+		selected := selectedMenuOption(pane)
 
 		m.logger.Info("inference prompt detected",
 			"agent", agent.Name,
@@ -1830,6 +2110,297 @@ func (m *Manager) dismissInferencePrompts(agent *AgentProcess) {
 	m.logger.Warn("inference prompt dismissal timed out", "agent", agent.Name)
 }
 
+// selectedMenuOption returns the trimmed text of the "❯"-selected line of an
+// interactive CLI menu, or "" if no line is selected.
+func selectedMenuOption(pane string) string {
+	for _, line := range strings.Split(pane, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "❯") {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// confirmMenuOption drives an interactive CLI menu identified by title to the
+// option whose text contains want, then confirms it with Enter. Navigation
+// matches the "❯"-selected line text rather than pressing a fixed number of
+// keys, so it lands on the right option whichever position it occupies (menu
+// option order differs between Claude CLI versions). navKey is the arrow key
+// to step with ("Down" or "Up"). Returns true once the option was confirmed
+// or the screen is gone.
+func (m *Manager) confirmMenuOption(agent *AgentProcess, title, want, navKey string) bool {
+	const (
+		// menuMaxNavigateSteps bounds arrow-key navigation; the handled menus
+		// have 2 options, extra headroom covers future variants.
+		menuMaxNavigateSteps = 4
+		postKeystrokeDelay   = 500 * time.Millisecond
+	)
+	for step := 0; step < menuMaxNavigateSteps; step++ {
+		pane := m.captureVisiblePaneForAgent(agent)
+		if !strings.Contains(pane, title) || strings.Contains(pane, cliWorkingMarker) {
+			return true // screen already dismissed
+		}
+		if strings.Contains(selectedMenuOption(pane), want) {
+			m.tmuxSendKeysForAgent(agent, "Enter")
+			time.Sleep(postKeystrokeDelay)
+			return true
+		}
+		m.tmuxSendKeysForAgent(agent, navKey)
+		time.Sleep(postKeystrokeDelay)
+	}
+	m.logger.Warn("inference menu: wanted option not reached",
+		"agent", agent.Name, "title", title, "want", want)
+	return false
+}
+
+const (
+	// consentStuckGracePeriod is how long a consent screen must stay visible
+	// across watcher passes before the agent counts as stuck. The launch-time
+	// dismissal goroutine runs for 60s, so a screen still visible this long
+	// after first being seen by the watcher means dismissal lost the race.
+	consentStuckGracePeriod = 30 * time.Second
+	// consentDismissCooldown is the minimum interval between watcher-triggered
+	// dismissal passes for one agent, so a stubborn screen can't spam
+	// keystroke goroutines (each dismissal pass itself polls for 60s).
+	consentDismissCooldown = 2 * time.Minute
+)
+
+// clearConsentTracking resets the consent-stuck timer for an agent whose pane
+// no longer shows a consent screen.
+func (m *Manager) clearConsentTracking(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if agent, ok := m.agents[name]; ok {
+		agent.consentSeenAt = time.Time{}
+	}
+}
+
+// dismissConsentIfStuck re-runs dismissInferencePrompts for an inference agent
+// whose pane has shown a consent screen for longer than the grace period,
+// subject to a per-agent cooldown. Called from the watcher loop
+// (CheckAndRestartCrashedAgents) so an agent that lands on a consent screen
+// after launch — e.g. a crash-recovery restart whose launch-time dismissal
+// timed out — recovers instead of sitting stuck while kicks appear to succeed.
+func (m *Manager) dismissConsentIfStuck(name string) {
+	now := time.Now()
+	m.mu.Lock()
+	agent, ok := m.agents[name]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if agent.consentSeenAt.IsZero() {
+		agent.consentSeenAt = now
+		m.mu.Unlock()
+		return
+	}
+	stuckFor := now.Sub(agent.consentSeenAt)
+	if stuckFor < consentStuckGracePeriod || now.Sub(agent.lastConsentDismiss) < consentDismissCooldown {
+		m.mu.Unlock()
+		return
+	}
+	agent.lastConsentDismiss = now
+	m.mu.Unlock()
+
+	m.logger.Warn("inference agent stuck on consent screen, re-running prompt dismissal",
+		"name", name, "stuck_seconds", int(stuckFor.Seconds()))
+	go m.dismissInferencePrompts(agent)
+}
+
+// inferenceKickActionSuffix is appended to every kick sent to an agent whose
+// effective backend is a self-hosted inference backend (vllm/llm-d/litellm).
+// Weak OSS models tend to answer a kick conversationally — describing steps
+// for someone else to follow — instead of acting; this block demands
+// immediate tool execution. Commercial CLI backends don't receive it.
+const inferenceKickActionSuffix = "IMPORTANT — EXECUTE, DO NOT NARRATE: " +
+	"You have real tools (Bash, file edit, gh). Perform the work NOW in " +
+	"this session. Do not describe steps for someone else, do not summarize " +
+	"a plan and stop. Begin immediately by running your first command. " +
+	"Every response that contains no tool execution is a failure."
+
+const (
+	// inferenceKickStallTimeout is how long after a kick an unchanged, idle
+	// pane counts as a stalled kick (message swallowed without a response).
+	inferenceKickStallTimeout = 5 * time.Minute
+	// inferenceStallNudgeMessage is the literal message typed into the CLI to
+	// unstick a stalled kick.
+	inferenceStallNudgeMessage = "continue"
+	// cliInputPromptMarker is the CLI's idle input prompt indicator.
+	cliInputPromptMarker = "❯"
+	// inferenceActionNudgeGrace is the minimum time after a kick before the
+	// no-action check may fire, so the watcher never misreads the brief
+	// post-Enter window (kick echoed, spinner not yet rendered) as a
+	// completed prose-only response.
+	inferenceActionNudgeGrace = 2 * time.Minute
+	// inferenceActionNudgeMessage is typed into the CLI when the model
+	// answered a kick with prose only — a plan addressed to a reader with
+	// zero tool executions (observed live with weak OSS models on
+	// inference backends, e.g. deepseek-r1-14b via litellm/vllm).
+	inferenceActionNudgeMessage = "You produced a plan but executed nothing. Execute it yourself NOW using your tools, starting with step 1. Do not reply with prose only."
+	// inferenceMaxOutputTokensDefault caps CLAUDE_CODE_MAX_OUTPUT_TOKENS for
+	// inference-backend agents. 16384 is a safe universal floor across the
+	// commercial models operators point litellm at: Azure GPT-4o allows at
+	// most 16384 completion tokens and 400s ("max_tokens is too large:
+	// 128000. This model supports at most 16384 completion tokens") on
+	// anything higher; GPT-4.1/GPT-5 and most vLLM/Claude backends meet or
+	// exceed 16384. A previous 128000 value (chosen so verbose OSS models
+	// would not truncate) made every request to a capped commercial model
+	// fail. 16384 output tokens is still generous for agent work, so we
+	// trade "never truncate huge OSS outputs" for "works on capped
+	// commercial models" — the correct default.
+	inferenceMaxOutputTokensDefault = 16384
+	// cliActiveCounterMarker appears inside Claude Code's live activity
+	// spinner, e.g. "✶ Infusing… (18s · ↓ 94 tokens)" (verified against
+	// Claude Code v2.1.204). The completed form ("✻ Worked for 26s") has no
+	// counter, so this distinguishes an in-flight response from a finished
+	// one on versions whose footer no longer shows cliWorkingMarker.
+	cliActiveCounterMarker = "s · ↓"
+)
+
+// toolSummaryRe matches Claude Code's collapsed tool-activity summary lines,
+// rendered only when tools actually executed (verified against Claude Code
+// v2.1.204): "Running 1 shell command…" while a Bash call is in flight, and
+// "Ran 1 shell command" / "Read 1 file, ran 2 shell commands" once done.
+// Edit/write variants are included for completeness across versions.
+var toolSummaryRe = regexp.MustCompile(`(?i)\b(?:ran|running) \d+ shell command|\bread \d+ file|\bedited \d+ file|\bwrote \d+ file|\bupdated \d+ file`)
+
+// expandedToolCallMarkers are literal fragments of Claude Code's expanded
+// per-tool rendering. "⎿" is the result elbow drawn under a tool call
+// (verified live on v2.1.204: "⎿  $ sleep 15 && echo probe3"); the
+// "⏺ Name(" forms are the expanded tool-call headers older CLI versions
+// render. A bare "⏺" is NOT a tool marker — v2.1.204 uses it as the bullet
+// for every assistant response block, including pure prose.
+var expandedToolCallMarkers = []string{
+	"⎿",
+	"⏺ Bash(",
+	"⏺ Read(",
+	"⏺ Write(",
+	"⏺ Edit(",
+	"⏺ Update(",
+	"⏺ Search(",
+	"⏺ Fetch(",
+	"⏺ Task(",
+}
+
+// countToolMarkers counts tool-execution markers in captured pane content.
+// The no-action watchdog compares the count after a kick against the count
+// recorded at kick delivery: scrollback keeps markers from work done before
+// the kick, so only an increase proves the model executed tools since.
+func countToolMarkers(pane string) int {
+	n := len(toolSummaryRe.FindAllStringIndex(pane, -1))
+	for _, marker := range expandedToolCallMarkers {
+		n += strings.Count(pane, marker)
+	}
+	return n
+}
+
+// paneShowsActiveWork reports whether the CLI is mid-response: either the
+// legacy "esc to interrupt" footer hint or the live spinner counter is
+// visible. The idle input prompt "❯" alone proves nothing on v2.1.204 —
+// the input box stays rendered while a response streams.
+func paneShowsActiveWork(pane string) bool {
+	return strings.Contains(pane, cliWorkingMarker) || strings.Contains(pane, cliActiveCounterMarker)
+}
+
+// paneContentHash returns a short stable hash of pane content, used to detect
+// whether a pane has changed since a kick was delivered.
+func paneContentHash(pane string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(pane))
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// recordInferenceKick arms the post-kick stall watchdog for an inference
+// agent: remembers when the kick was delivered and what the pane looked like
+// right after delivery. Caller must hold m.mu.
+func (m *Manager) recordInferenceKick(agent *AgentProcess, at time.Time) {
+	agent.lastInferKickAt = at
+	agent.lastInferKickPane = paneContentHash(m.captureVisiblePaneForAgent(agent))
+	agent.stallNudgeSent = false
+	// Baseline for the no-action check: markers already in scrollback from
+	// work done before this kick must not count as post-kick tool activity.
+	agent.lastInferKickMarks = countToolMarkers(m.captureTmuxPaneForAgent(agent))
+	agent.actionNudgeSent = false
+}
+
+// nudgeIfKickStalled watches an inference agent after a kick and corrects
+// two distinct failure modes, sending at most one nudge each (so at most two
+// combined nudges per kick):
+//
+//   - Frozen pane: the pane has not changed since the kick was delivered and
+//     the stall timeout elapsed — the CLI swallowed the message. Sends the
+//     "continue" nudge (counted in StallNudges).
+//   - Prose-only response: the pane changed (the CLI consumed the kick), the
+//     response completed back at the idle input prompt, but the tool-marker
+//     count has not risen above the baseline recorded at kick delivery — the
+//     model narrated a plan instead of acting. Sends the action nudge
+//     (counted in ActionNudges).
+//
+// A CLI that is mid-response (paneShowsActiveWork) is always left alone, and
+// post-kick tool activity disarms the watchdog entirely.
+func (m *Manager) nudgeIfKickStalled(name, pane string) {
+	now := time.Now()
+	m.mu.Lock()
+	agent, ok := m.agents[name]
+	if !ok || agent.lastInferKickAt.IsZero() || agent.lastInferKickPane == "" {
+		m.mu.Unlock()
+		return
+	}
+	if paneShowsActiveWork(pane) || !strings.Contains(pane, cliInputPromptMarker) {
+		m.mu.Unlock()
+		return
+	}
+	sinceKick := now.Sub(agent.lastInferKickAt)
+
+	if paneContentHash(pane) == agent.lastInferKickPane {
+		// Frozen pane: the CLI never consumed the kick.
+		if agent.stallNudgeSent || sinceKick < inferenceKickStallTimeout {
+			m.mu.Unlock()
+			return
+		}
+		agent.stallNudgeSent = true
+		agent.StallNudges++
+		totalNudges := agent.StallNudges
+		m.mu.Unlock()
+
+		m.logger.Warn("inference agent stalled after kick, sending continue nudge",
+			"name", name,
+			"minutes_since_kick", int(sinceKick.Minutes()),
+			"total_nudges", totalNudges)
+		m.tmuxSendLiteralForAgent(agent, inferenceStallNudgeMessage)
+		time.Sleep(textToEnterDelay)
+		m.tmuxSendEntersForAgent(agent)
+		return
+	}
+
+	// The pane moved since the kick — the CLI consumed it and the response
+	// completed (idle prompt, no active-work indicator). Check whether any
+	// tools ran since the kick before declaring the response prose-only.
+	if agent.actionNudgeSent || sinceKick < inferenceActionNudgeGrace {
+		m.mu.Unlock()
+		return
+	}
+	if countToolMarkers(m.captureTmuxPaneForAgent(agent)) > agent.lastInferKickMarks {
+		// Real tool activity since the kick — the agent is acting. Disarm.
+		agent.lastInferKickPane = ""
+		m.mu.Unlock()
+		return
+	}
+	agent.actionNudgeSent = true
+	agent.ActionNudges++
+	totalActionNudges := agent.ActionNudges
+	m.mu.Unlock()
+
+	m.logger.Warn("inference agent answered kick with prose only, sending action nudge",
+		"name", name,
+		"minutes_since_kick", int(sinceKick.Minutes()),
+		"total_action_nudges", totalActionNudges)
+	m.tmuxSendLiteralForAgent(agent, inferenceActionNudgeMessage)
+	time.Sleep(textToEnterDelay)
+	m.tmuxSendEntersForAgent(agent)
+}
+
 // tmuxSendEntersForAgent sends Enter presses using the agent's tmux socket.
 func (m *Manager) tmuxSendEntersForAgent(agent *AgentProcess) {
 	for i := 0; i < enterCount; i++ {
@@ -1847,18 +2418,26 @@ func (m *Manager) tmuxSendKeysForAgent(agent *AgentProcess, keys ...string) {
 }
 
 const (
-	clearBeforeKickDelay  = 2 * time.Second
-	enterCount            = 3
-	enterDelay            = 300 * time.Millisecond
-	textToEnterDelay      = 1 * time.Second
-	chunkSize             = 400
-	chunkDelay            = 1 * time.Second
-	staleCheckDelay       = 1 * time.Second
+	clearBeforeKickDelay    = 2 * time.Second
+	enterCount              = 3
+	enterDelay              = 300 * time.Millisecond
+	textToEnterDelay        = 1 * time.Second
+	chunkSize               = 400
+	chunkDelay              = 1 * time.Second
+	staleCheckDelay         = 1 * time.Second
 	cliReadyPollInterval    = 2 * time.Second
 	cliReadyTimeout         = 60 * time.Second
 	inputPromptPollInterval = 2 * time.Second
 	inputPromptTimeout      = 120 * time.Second
-	cavemanActivationDelay  = 5 * time.Second
+	// preLaunchShellClearDelay gives bash time to process the C-c that
+	// clears stale PS2 quote-continuation state before the launch command
+	// is typed into the pane.
+	preLaunchShellClearDelay = 500 * time.Millisecond
+	// cliBootGraceSeconds is how long after StartedAt a bare pane (no CLI
+	// marker) is tolerated before CheckAndRestartCrashedAgents treats it as a
+	// crash. It matches cliReadyTimeout (60s) so a still-booting CLI is never
+	// restarted underneath itself, which would spawn a second concurrent CLI.
+	cliBootGraceSeconds = 60
 )
 
 func (m *Manager) SeedLastKick(name string, t time.Time) {
@@ -1935,6 +2514,8 @@ func (a *AgentProcess) snapshot() AgentProcess {
 		KickHistory:     history,
 		LastKickMessage: a.LastKickMessage,
 		NeedsLogin:      needsLogin,
+		StallNudges:     a.StallNudges,
+		ActionNudges:    a.ActionNudges,
 		HasLaunched:     a.HasLaunched,
 		LaunchedMode:    a.LaunchedMode,
 		tmuxSession:     a.tmuxSession,
@@ -2423,8 +3004,8 @@ func (m *Manager) fixSharedConfigPerms(agent *AgentProcess) {
 }
 
 const (
-	claudeInferenceSettingsPath  = "/tmp/.claude-inference-settings.json"
-	claudeInferenceHomePrefix = "/tmp/.claude-inference-home-"
+	claudeInferenceSettingsPath = "/tmp/.claude-inference-settings.json"
+	claudeInferenceHomePrefix   = "/tmp/.claude-inference-home-"
 )
 
 // inferenceHomePath returns the per-agent inference HOME directory.
@@ -2432,39 +3013,198 @@ func inferenceHomePath(agentName string) string {
 	return claudeInferenceHomePrefix + agentName
 }
 
+// inferenceConfigMigrationVersion matches the Claude CLI internal config
+// migration version so the CLI skips first-run migration prompts.
+const inferenceConfigMigrationVersion = 13
+
+// inferenceUserConfigSeed returns the required top-level keys for an inference
+// agent's ~/.claude.json. These skip the first-run setup (onboarding,
+// migrations) and pre-approve the per-agent inference API key.
+//
+// NOTE: "bypassPermissionsModeAccepted" does NOT suppress the interactive
+// "Bypass Permissions mode" consent dialog — verified live against Claude CLI
+// v2.1.190 and v2.1.204, the dialog is gated only on the settings key
+// "skipDangerousModePermissionPrompt" (see inferenceSettingsSeed). The
+// .claude.json key is still read by non-interactive CLI paths (e.g. the --bg
+// bypass check), so it stays in the seed for those.
+// apiKeyApprovalSuffixLen is how many trailing characters of an API key the
+// Claude CLI compares against customApiKeyResponses.approved entries
+// (key.slice(-20), verified in CLI v2.1.190). Seeding only the full key
+// leaves keys longer than this unapproved — "sk-hive-" plus an agent name
+// over 12 chars — so the CLI shows the "Detected a custom API key" prompt,
+// whose default selection is "No (recommended)".
+const apiKeyApprovalSuffixLen = 20
+
+func inferenceUserConfigSeed(agentName string) map[string]any {
+	apiKey := "sk-hive-" + agentName
+	approved := []string{apiKey}
+	if len(apiKey) > apiKeyApprovalSuffixLen {
+		approved = append(approved, apiKey[len(apiKey)-apiKeyApprovalSuffixLen:])
+	}
+	return map[string]any{
+		"hasCompletedOnboarding":        true,
+		"opusProMigrationComplete":      true,
+		"sonnet1m45MigrationComplete":   true,
+		"migrationVersion":              inferenceConfigMigrationVersion,
+		"bypassPermissionsModeAccepted": true,
+		"customApiKeyResponses": map[string]any{
+			"approved": approved,
+			"rejected": []string{},
+		},
+	}
+}
+
+// inferenceSettingsSeed returns the required keys for an inference agent's
+// Claude settings.json — both ~/.claude/settings.json (userSettings) and the
+// standalone file passed via --settings (flagSettings).
+//
+// "skipDangerousModePermissionPrompt" is the key that actually suppresses the
+// "Bypass Permissions mode" consent dialog. Verified live against Claude CLI
+// v2.1.190 and v2.1.204 with a scratch HOME: the interactive dialog is gated
+// only on this settings key (honored from userSettings, localSettings,
+// flagSettings, or policySettings), and accepting the dialog interactively
+// persists this same key into ~/.claude/settings.json. Seeding
+// bypassPermissionsModeAccepted in .claude.json does NOT suppress the dialog
+// on either version, and IS_SANDBOX=1 does not suppress it either. Without
+// this key every --dangerously-skip-permissions launch shows a consent menu
+// whose default selection is "No, exit" — if dismissal loses the race, the
+// CLI exits and the pane degrades to bare bash.
+func inferenceSettingsSeed() map[string]any {
+	return map[string]any{
+		"permissions":                       map[string]any{"allow": []any{}, "deny": []any{}},
+		"hasCompletedOnboarding":            true,
+		"bypassPermissions":                 true,
+		"hasAcknowledgedDisclaimer":         true,
+		"skipDangerousModePermissionPrompt": true,
+	}
+}
+
+// seedClaudeUserConfig writes or repairs the inference agent's .claude.json.
+// Unlike a plain exists-check, this merges required keys into an existing
+// file that is missing some of them (e.g. seeded by an older hive version
+// without bypassPermissionsModeAccepted) and rewrites a file that fails to
+// parse. A complete, parseable file is left untouched.
+func (m *Manager) seedClaudeUserConfig(agentName, path string) {
+	m.seedJSONFile(agentName, path, inferenceUserConfigSeed(agentName))
+	m.mergeApprovedAPIKeys(agentName, path)
+}
+
+// mergeApprovedAPIKeys ensures every seeded approved API key form is present
+// in an existing customApiKeyResponses.approved list. The top-level merge in
+// seedJSONFile skips a key that already exists, which would leave configs
+// seeded by older hive versions without the truncated key form the CLI
+// actually matches against (see apiKeyApprovalSuffixLen).
+func (m *Manager) mergeApprovedAPIKeys(agentName, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	existing := map[string]any{}
+	if err := json.Unmarshal(data, &existing); err != nil {
+		return
+	}
+	responses, ok := existing["customApiKeyResponses"].(map[string]any)
+	if !ok {
+		return
+	}
+	approved, _ := responses["approved"].([]any)
+	present := make(map[string]bool, len(approved))
+	for _, v := range approved {
+		if s, ok := v.(string); ok {
+			present[s] = true
+		}
+	}
+	seedResponses, _ := inferenceUserConfigSeed(agentName)["customApiKeyResponses"].(map[string]any)
+	seedApproved, _ := seedResponses["approved"].([]string)
+	changed := false
+	for _, key := range seedApproved {
+		if !present[key] {
+			approved = append(approved, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	responses["approved"] = approved
+	out, err := json.Marshal(existing)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(path, out, 0o666); err != nil {
+		m.logger.Warn("failed to write inference config", "agent", agentName, "path", path, "error", err)
+	}
+}
+
+// seedClaudeSettingsFile writes or repairs a Claude settings.json, merging in
+// the keys from inferenceSettingsSeed (e.g. a file seeded by an older hive
+// version without skipDangerousModePermissionPrompt gains the key instead of
+// being skipped by an exists-check).
+func (m *Manager) seedClaudeSettingsFile(agentName, path string) {
+	m.seedJSONFile(agentName, path, inferenceSettingsSeed())
+}
+
+// seedJSONFile merges required top-level keys into the JSON object stored at
+// path. Missing keys are added, existing keys are never overwritten, and a
+// file that fails to parse is rewritten from the seed alone. A complete,
+// parseable file is left untouched.
+func (m *Manager) seedJSONFile(agentName, path string, seed map[string]any) {
+	existing := map[string]any{}
+	if data, err := os.ReadFile(path); err == nil {
+		if jsonErr := json.Unmarshal(data, &existing); jsonErr != nil {
+			m.logger.Warn("inference config unparseable, rewriting",
+				"agent", agentName, "path", path, "error", jsonErr)
+			existing = map[string]any{}
+		}
+	}
+
+	needsWrite := false
+	for key, value := range seed {
+		if _, ok := existing[key]; !ok {
+			existing[key] = value
+			needsWrite = true
+		}
+	}
+	if !needsWrite {
+		return
+	}
+
+	data, err := json.Marshal(existing)
+	if err != nil {
+		m.logger.Warn("failed to marshal inference config", "agent", agentName, "path", path, "error", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0o666); err != nil {
+		m.logger.Warn("failed to write inference config", "agent", agentName, "path", path, "error", err)
+	}
+}
+
 // ensureClaudeSettings creates a per-agent writable HOME directory for inference
 // agents with pre-populated .claude/settings.json. Each agent gets its own dir
 // to avoid cross-agent permission conflicts when Claude Code creates session
 // files. Directories use 0o777 so the agent UID can create subdirs freely
 // (hive runs as dev, not root, so chown is not available).
+//
+// The .claude.json and settings.json seeds are repaired on every call
+// (missing keys merged in, corrupt files rewritten) so agents launched by
+// older hive versions pick up newly required keys instead of being skipped
+// by an exists-check.
 func (m *Manager) ensureClaudeSettings(agentName string, uid int) {
 	homePath := inferenceHomePath(agentName)
 	settingsDir := filepath.Join(homePath, ".claude")
 	settingsFile := filepath.Join(settingsDir, "settings.json")
 
-	settings := `{"permissions":{"allow":[],"deny":[]},"hasCompletedOnboarding":true,"bypassPermissions":true,"hasAcknowledgedDisclaimer":true}`
-
-	if _, err := os.Stat(settingsFile); err == nil {
-		m.ensureWorldWritable(homePath)
-		return
-	}
 	if err := os.MkdirAll(settingsDir, 0o777); err != nil {
 		m.logger.Warn("failed to create claude inference home", "agent", agentName, "error", err)
 		return
 	}
-	if err := os.WriteFile(settingsFile, []byte(settings), 0o666); err != nil {
-		m.logger.Warn("failed to write claude settings", "agent", agentName, "error", err)
-	}
-	// Also write the standalone settings file for --settings flag
-	_ = os.WriteFile(claudeInferenceSettingsPath, []byte(settings), 0o666)
-	// Pre-populate .claude.json to skip first-run setup (GrowthBook, migrations)
-	// and pre-approve the inference API key so the CLI sends tools immediately.
-	userConfig := filepath.Join(homePath, ".claude.json")
-	if _, err := os.Stat(userConfig); err != nil {
-		apiKey := "sk-hive-" + agentName
-		cfg := fmt.Sprintf(`{"hasCompletedOnboarding":true,"opusProMigrationComplete":true,"sonnet1m45MigrationComplete":true,"migrationVersion":13,"customApiKeyResponses":{"approved":[%q],"rejected":[]}}`, apiKey)
-		_ = os.WriteFile(userConfig, []byte(cfg), 0o666)
-	}
+	// Write (or repair) both settings files: the HOME userSettings file and
+	// the standalone file passed via --settings. The CLI honors
+	// skipDangerousModePermissionPrompt from either source.
+	m.seedClaudeSettingsFile(agentName, settingsFile)
+	m.seedClaudeSettingsFile(agentName, claudeInferenceSettingsPath)
+	// Pre-populate (or repair) .claude.json so the CLI skips first-run setup.
+	m.seedClaudeUserConfig(agentName, filepath.Join(homePath, ".claude.json"))
 	m.ensureWorldWritable(homePath)
 }
 
@@ -2490,8 +3230,16 @@ func (m *Manager) ensureWorldWritable(root string) {
 // normalizeModelName converts YAML-friendly model names to the format each
 // CLI backend expects. Claude CLI uses hyphens (claude-opus-4-7), while
 // Copilot and other backends use dots (claude-opus-4.7).
+//
+// Self-hosted inference backends (vllm, llm-d, litellm) are the outbound
+// gateway model id verbatim — the string must match an entitled model on the
+// gateway EXACTLY (prefixes like "Azure/", dots vs hyphens, case). Rewriting
+// it (e.g. "Azure/gpt-4" -> "Azure/gpt.4", "gpt-4o-2024-08-06" ->
+// "gpt-4o-2024-08.06") produces a model the team is not entitled to and the
+// gateway 403s ("team not allowed to access model") even for entitled models.
+// So never normalize inference model names — pass them through untouched.
 func normalizeModelName(model, backend string) string {
-	if backend == "claude" {
+	if backend == "claude" || IsInferenceBackend(backend) {
 		return model
 	}
 	idx := strings.LastIndex(model, "-")
@@ -2727,9 +3475,16 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 		baseURL := fmt.Sprintf("http://127.0.0.1:%d", inferenceTranslatePort)
 		vars = append(vars, agentEnvPair{"ANTHROPIC_BASE_URL", baseURL, false})
 		vars = append(vars, agentEnvPair{"NO_PROXY", "127.0.0.1,localhost", false})
-		// Open-source models may generate verbose output; raise the CLI
-		// output-token cap to avoid "exceeded maximum" errors.
-		vars = append(vars, agentEnvPair{"CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000", false})
+		// Cap the CLI output-token budget at a value every commercial model
+		// litellm may front will accept. A prior 128000 (chosen so verbose
+		// OSS models would not truncate) exceeds Azure GPT-4o's 16384
+		// completion-token cap, so every request 400s with
+		// "max_tokens is too large: 128000. This model supports at most
+		// 16384 completion tokens". See inferenceMaxOutputTokensDefault.
+		// TODO: the gateway 400 body names the model's real cap ("supports
+		// at most N completion tokens"); a future enhancement could parse it
+		// to auto-adjust per-model instead of using a universal floor.
+		vars = append(vars, agentEnvPair{"CLAUDE_CODE_MAX_OUTPUT_TOKENS", strconv.Itoa(inferenceMaxOutputTokensDefault), false})
 	}
 	if m.copilotAuthToken != "" {
 		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", m.copilotAuthToken, true})
@@ -2831,6 +3586,9 @@ func (m *Manager) SeedPauseState(name string, pausedAt time.Time, trigger, reaso
 }
 
 func (m *Manager) Resume(ctx context.Context, name, trigger, reason string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.Lock()
 	agent, ok := m.agents[name]
 	if !ok {
@@ -2908,10 +3666,20 @@ func (m *Manager) RestartWithBootstrap(ctx context.Context, name, prompt string)
 		}
 	}
 
+	// Terminate the agent's CLI process(es) before recreating the session.
+	// reapAgentCLI matches by the HIVE_AGENT env marker, so it works whether or
+	// not UID isolation is enabled — killAgentProcesses (UID-based) is a no-op
+	// when agents share the dev UID, which let stale claude processes on old
+	// models survive a model/backend switch and keep hitting the gateway.
+	reaped := m.reapAgentCLI(agent)
 	if agent.UID > 0 {
+		// UID isolation on: also sweep any non-CLI helper processes (MCP
+		// servers, hung copilot binaries) owned exclusively by this agent.
 		killed := killAgentProcesses(agent.UID, m.logger)
 		m.logger.Info("killed orphaned agent processes",
-			"name", name, "uid", agent.UID, "killed", killed)
+			"name", name, "uid", agent.UID, "killed", killed, "reaped_cli", reaped)
+	} else if reaped > 0 {
+		m.logger.Info("reaped agent CLI on restart", "name", name, "reaped_cli", reaped)
 	}
 
 	_ = m.tmuxCmd(agent, "kill-session", "-t", agent.tmuxSession).Run()
@@ -2963,6 +3731,108 @@ func (m *Manager) RestartThenSendKick(ctx context.Context, name, message string)
 	return m.SendKick(name, message)
 }
 
+// cliProcessMarkers are substrings that identify a CLI process in its
+// /proc/<pid>/cmdline. The Claude CLI (and inference backends, which also use
+// it) runs as `claude` (often re-exec'd via node); copilot/gemini/goose/bob run
+// under their own names. Matching cmdline substrings catches the CLI regardless
+// of the interpreter the process reports as its comm name.
+var cliProcessMarkers = []string{
+	"claude",
+	"copilot",
+	"gemini",
+	"goose",
+	"bob",
+}
+
+// reapAgentCLI finds and SIGKILLs every CLI process belonging to the given
+// agent, matched by the HIVE_AGENT=<name> marker in /proc/<pid>/environ. This
+// marker is inlined into every launch command (buildEnvPrefix) and set on the
+// tmux session (ensureTmuxSession), so it uniquely identifies an agent's CLI
+// processes — unlike UID matching, which cannot distinguish agents that share
+// the dev UID (UID isolation disabled). Returns the number of processes killed.
+//
+// This is the single-CLI guarantee: before every (re)launch, any pre-existing
+// or leaked CLI for the agent is terminated, so an agent can never accumulate
+// concurrent claude processes on different models. tmux kill-session alone is
+// insufficient — a detached node/claude child can survive the session's SIGHUP
+// and keep hitting the gateway (403-flooding the pane on a stale model).
+func (m *Manager) reapAgentCLI(agent *AgentProcess) int {
+	const procPath = "/proc"
+	marker := "HIVE_AGENT=" + agent.Name
+
+	entries, err := os.ReadDir(procPath)
+	if err != nil {
+		m.logger.Warn("reapAgentCLI: failed to read /proc", "agent", agent.Name, "error", err)
+		return 0
+	}
+
+	killed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if pid == os.Getpid() {
+			continue
+		}
+
+		// cmdline is NUL-separated; read it raw and check for a CLI binary.
+		cmdlineRaw, err := os.ReadFile(filepath.Join(procPath, entry.Name(), "cmdline"))
+		if err != nil || len(cmdlineRaw) == 0 {
+			continue
+		}
+		cmdline := strings.ReplaceAll(string(cmdlineRaw), "\x00", " ")
+		if !containsCLIMarker(cmdline) {
+			continue
+		}
+
+		// environ is NUL-separated KEY=VALUE pairs. Match the exact agent so we
+		// never kill another agent's CLI when UIDs are shared.
+		environRaw, err := os.ReadFile(filepath.Join(procPath, entry.Name(), "environ"))
+		if err != nil {
+			continue
+		}
+		if !environHasMarker(string(environRaw), marker) {
+			continue
+		}
+
+		if err := killProcessPID(pid); err == nil {
+			killed++
+			m.logger.Info("reaped agent CLI process",
+				"agent", agent.Name, "pid", pid, "cmdline", truncateStr(cmdline, 120))
+		}
+	}
+	if killed > 0 {
+		m.logger.Info("reapAgentCLI complete", "agent", agent.Name, "killed", killed)
+	}
+	return killed
+}
+
+// containsCLIMarker reports whether a /proc cmdline names a known CLI binary.
+func containsCLIMarker(cmdline string) bool {
+	for _, marker := range cliProcessMarkers {
+		if strings.Contains(cmdline, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// environHasMarker reports whether a raw NUL-separated /proc environ blob
+// contains the exact HIVE_AGENT=<name> pair. Splitting on NUL and comparing
+// whole entries avoids a prefix collision between "scanner" and "scanner-2".
+func environHasMarker(environ, marker string) bool {
+	for _, pair := range strings.Split(environ, "\x00") {
+		if pair == marker {
+			return true
+		}
+	}
+	return false
+}
+
 // killAgentProcesses finds all processes owned by the given UID via /proc and
 // sends SIGKILL to each. Hung copilot binaries ignore SIGINT, so brute-force
 // cleanup is needed to prevent orphan accumulation on the shared SQLite store.
@@ -3010,7 +3880,7 @@ func killAgentProcesses(uid int, logger *slog.Logger) int {
 			continue
 		}
 
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+		if err := killProcessPID(pid); err == nil {
 			killed++
 		}
 	}
@@ -3033,10 +3903,20 @@ func (m *Manager) Restart(ctx context.Context, name string) error {
 		}
 	}
 
+	// Terminate the agent's CLI process(es) before recreating the session.
+	// reapAgentCLI matches by the HIVE_AGENT env marker, so it works whether or
+	// not UID isolation is enabled — killAgentProcesses (UID-based) is a no-op
+	// when agents share the dev UID, which let stale claude processes on old
+	// models survive a model/backend switch and keep hitting the gateway.
+	reaped := m.reapAgentCLI(agent)
 	if agent.UID > 0 {
+		// UID isolation on: also sweep any non-CLI helper processes (MCP
+		// servers, hung copilot binaries) owned exclusively by this agent.
 		killed := killAgentProcesses(agent.UID, m.logger)
 		m.logger.Info("killed orphaned agent processes",
-			"name", name, "uid", agent.UID, "killed", killed)
+			"name", name, "uid", agent.UID, "killed", killed, "reaped_cli", reaped)
+	} else if reaped > 0 {
+		m.logger.Info("reaped agent CLI on restart", "name", name, "reaped_cli", reaped)
 	}
 
 	_ = m.tmuxCmd(agent, "kill-session", "-t", agent.tmuxSession).Run()

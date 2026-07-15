@@ -49,6 +49,11 @@ const (
 	// dashboardTokenBytes is the number of random bytes for dashboard auth tokens.
 	dashboardTokenBytes = 32
 
+	// saasRoleOwner / saasRoleRead are the role strings stored in each
+	// SaaSUser.Hives map and injected into the spoke's authorized-users list.
+	saasRoleOwner = "owner"
+	saasRoleRead  = "read"
+
 	// ingressTypeOpenShiftRoute selects OpenShift Route generation.
 	ingressTypeOpenShiftRoute = "openshift-route"
 
@@ -368,6 +373,40 @@ func countUserHives(username string) int {
 	return count
 }
 
+// authorizedUsersForHive builds the comma-separated authorized-users list a
+// spoke needs to enforce per-user device-flow authorization on its direct
+// (non-hub-proxied) route. Format: "owner:owner,viewer1:read,viewer2:read".
+//
+// The owner always comes first with role "owner" (read-write). Every OTHER
+// SaaS user the hub granted this hive (any of "owner"/"read-write"/"read") is
+// appended as "read" — a read-only viewer on the direct route. Granting a
+// non-owner write access on the direct route is deliberately deferred (only the
+// single provisioned owner is write-capable there); see the PR notes for the
+// multi-user-grant follow-up. This fails safe: a grant can never widen access
+// beyond read on the direct route. Usernames are sanitized to guard the env
+// value, and the owner is de-duplicated so they appear exactly once.
+func authorizedUsersForHive(h *SaaSHive) string {
+	entries := make([]string, 0, 4)
+	seen := map[string]bool{}
+	owner := sanitize(h.Owner)
+	if owner != "" {
+		entries = append(entries, owner+":"+saasRoleOwner)
+		seen[strings.ToLower(owner)] = true
+	}
+	for _, u := range listAllSaaSUsers() {
+		if _, ok := u.Hives[h.ID]; !ok {
+			continue
+		}
+		name := sanitize(u.GitHubUsername)
+		if name == "" || seen[strings.ToLower(name)] {
+			continue
+		}
+		entries = append(entries, name+":"+saasRoleRead)
+		seen[strings.ToLower(name)] = true
+	}
+	return strings.Join(entries, ",")
+}
+
 func provisionHive(h *SaaSHive, req *CreateHiveRequest, cluster *ClusterConfig, logger *slog.Logger) error {
 	dir := filepath.Join(saasHivesDir, h.ID, "manifests")
 	os.MkdirAll(dir, 0o755)
@@ -408,17 +447,18 @@ func provisionHive(h *SaaSHive, req *CreateHiveRequest, cluster *ClusterConfig, 
 	}
 
 	data := map[string]any{
-		"ID":             h.ID,
-		"Namespace":      "hive-hosted-" + h.ID,
-		"Org":            sanitize(h.Org),
-		"Repos":          reposYAML,
-		"PrimaryRepo":    sanitize(h.PrimaryRepo),
-		"ACMMLevel":      h.ACMMLevel,
-		"Token":          req.GitHubToken,
-		"UseApp":         useApp,
-		"UseAppFull":     useAppFull,
-		"AppID":          sanitize(req.AppID),
-		"InstallationID": sanitize(req.InstallationID),
+		"ID":              h.ID,
+		"Namespace":       "hive-hosted-" + h.ID,
+		"Org":             sanitize(h.Org),
+		"Repos":           reposYAML,
+		"PrimaryRepo":     sanitize(h.PrimaryRepo),
+		"AuthorizedUsers": authorizedUsersForHive(h),
+		"ACMMLevel":       h.ACMMLevel,
+		"Token":           req.GitHubToken,
+		"UseApp":          useApp,
+		"UseAppFull":      useAppFull,
+		"AppID":           sanitize(req.AppID),
+		"InstallationID":  sanitize(req.InstallationID),
 		"AppPrivateKey": func() string {
 			lines := strings.Split(strings.TrimSpace(req.AppPrivateKey), "\n")
 			for i := range lines {
@@ -859,6 +899,38 @@ subjects:
   namespace: {{.Namespace}}
 ---
 {{- end}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-secrets-writer
+  namespace: {{.Namespace}}
+rules:
+# Least privilege: the hive pod may read and patch ONLY its own
+# hive-secrets Secret, so dashboard-entered API keys (e.g. the LiteLLM
+# key) are stored in the Secret instead of on the PVC.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["hive-secrets"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-secrets-writer
+  namespace: {{.Namespace}}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-secrets-writer
+subjects:
+- kind: ServiceAccount
+{{- if .RequiresSCC}}
+  name: hive-sa
+{{- else}}
+  name: default
+{{- end}}
+  namespace: {{.Namespace}}
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1000,6 +1072,13 @@ metadata:
   namespace: {{.Namespace}}
 spec:
   replicas: 1
+  # Zero-downtime rollout: maxUnavailable=0 keeps the old pod serving until the
+  # surge pod passes its readinessProbe, so the OpenShift router never sees zero
+  # Ready endpoints (which renders as "Application is not available"). This
+  # REQUIRES the hive-data PVC to be ReadWriteMany so both pods can mount /data
+  # during the surge — see the PVC definitions above (NFS and dynamic storage
+  # both request ReadWriteMany). A ReadWriteOnce PVC would deadlock the surge
+  # pod on volume attach across nodes; do not set maxSurge>0 with an RWO volume.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -1035,9 +1114,19 @@ spec:
       - name: init-permissions
         image: ghcr.io/kubestellar/hive:{{.ImageTag}}
         imagePullPolicy: {{.ImagePullPolicy}}
-        command: ["sh", "-c", "chown -R {{.InitContainerUID}}:{{.InitContainerGID}} /data 2>/dev/null; echo permissions-set"]
-        securityContext:
-          runAsUser: 0
+        # Best-effort ownership normalization. /data is already 1001:1000 on
+        # these hives, so this recursive chown is belt-and-suspenders and must
+        # never be fatal: on OpenShift the restricted SCC rejects runAsUser:0
+        # and assigns an arbitrary non-root UID, so the chown runs as a
+        # non-owner and fails on any file it doesn't own (e.g. a stale
+        # root-owned /data/*.tmp). Suppress errors AND force exit 0 so a
+        # non-ownable file can't crash-loop init and wedge the rolling update
+        # (maxUnavailable=0/maxSurge=1 means a never-Ready surge pod hangs the
+        # rollout indefinitely). We deliberately do NOT request runAsUser:0:
+        # it is invalid under the restricted SCC and pointless here since the
+        # files that matter are already correctly owned — letting the SCC
+        # assign the UID makes the chown a no-op success.
+        command: ["sh", "-c", "chown -R {{.InitContainerUID}}:{{.InitContainerGID}} /data 2>/dev/null || true; echo permissions-set"]
         volumeMounts:
         - name: data
           mountPath: /data
@@ -1091,6 +1180,10 @@ spec:
           value: https://hive.kubestellar.io
         - name: HIVE_HUB_SECRET
           value: "{{.HubSecret}}"
+{{- if .AuthorizedUsers}}
+        - name: HIVE_AUTHORIZED_USERS
+          value: "{{.AuthorizedUsers}}"
+{{- end}}
 {{- if .HasInference}}
         - name: HIVE_VLLM_ENDPOINT
           value: "{{.InferenceEndpoint}}"
@@ -1112,11 +1205,12 @@ spec:
           mountPath: /etc/hive
         - name: data
           mountPath: /data
-{{- if .UseApp}}
+        # hive-secrets is always whole-volume-mounted (no subPath) so keys
+        # the pod patches into the Secret (e.g. litellm_api_key entered in
+        # the dashboard) propagate to /secrets/<key> without a restart.
         - name: secrets
           mountPath: /secrets
           readOnly: true
-{{- end}}
       volumes:
       - name: config
         configMap:
@@ -1126,11 +1220,9 @@ spec:
       - name: data
         persistentVolumeClaim:
           claimName: hive-data
-{{- if .UseApp}}
       - name: secrets
         secret:
           secretName: hive-secrets
-{{- end}}
 ---
 apiVersion: v1
 kind: Service

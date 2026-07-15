@@ -99,6 +99,7 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("PUT /api/config/governor/logging", s.handleGovernorLogging)
 	s.mux.HandleFunc("PUT /api/config/governor/hub", s.handleGovernorHub)
 	s.mux.HandleFunc("PUT /api/config/governor/litellm", s.handleGovernorLiteLLM)
+	s.mux.HandleFunc("POST /api/config/governor/litellm/test", s.handleGovernorLiteLLMTest)
 	s.mux.HandleFunc("POST /api/config/governor/agents", s.handleGovernorAddAgent)
 	s.mux.HandleFunc("DELETE /api/config/governor/agents/{name}", s.handleGovernorRemoveAgent)
 	s.mux.HandleFunc("PUT /api/config/governor/repos", s.handleGovernorRepos)
@@ -529,15 +530,15 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		githubBaseURL = "https://github.com"
 	}
 	jsonResponse(w, map[string]interface{}{
-		"org":              cfg.Project.Org,
-		"repos":            cfg.Project.Repos,
-		"ai_author":        cfg.Project.AIAuthor,
-		"agents":           len(cfg.EnabledAgents()),
-		"eval_interval_s":  cfg.Governor.EvalIntervalS,
-		"primaryRepo":      primaryRepo,
-		"hub_url":          cfg.Hub.URL,
-		"hive_id":          cfg.HiveID,
-		"github_base_url":  githubBaseURL,
+		"org":             cfg.Project.Org,
+		"repos":           cfg.Project.Repos,
+		"ai_author":       cfg.Project.AIAuthor,
+		"agents":          len(cfg.EnabledAgents()),
+		"eval_interval_s": cfg.Governor.EvalIntervalS,
+		"primaryRepo":     primaryRepo,
+		"hub_url":         cfg.Hub.URL,
+		"hive_id":         cfg.HiveID,
+		"github_base_url": githubBaseURL,
 	})
 }
 
@@ -884,11 +885,11 @@ func (s *Server) handleWidget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, map[string]interface{}{
-		"mode":     state.Mode,
-		"issues":   state.QueueIssues,
-		"prs":      state.QueuePRs,
-		"running":  running,
-		"paused":   paused,
+		"mode":      state.Mode,
+		"issues":    state.QueueIssues,
+		"prs":       state.QueuePRs,
+		"running":   running,
+		"paused":    paused,
 		"last_eval": state.LastEval,
 	})
 }
@@ -922,9 +923,9 @@ func (s *Server) handlePane(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, map[string]interface{}{
-		"agent":  name,
-		"lines":  output,
-		"count":  len(output),
+		"agent": name,
+		"lines": output,
+		"count": len(output),
 	})
 }
 
@@ -1200,7 +1201,7 @@ func (s *Server) handleIssueCosts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleModelAdvisor(w http.ResponseWriter, r *http.Request) {
 	budget := s.deps.Governor.GetBudget()
 	jsonResponse(w, map[string]interface{}{
-		"budget":        budget,
+		"budget":         budget,
 		"recommendation": "Use haiku for simple tasks, sonnet for default, opus for complex refactors",
 	})
 }
@@ -1266,6 +1267,27 @@ func (s *Server) handleGHAuth(w http.ResponseWriter, r *http.Request) {
 const userTokenPath = "/data/gh-user-token"
 
 func (s *Server) handleGHUserAuthStatus(w http.ResponseWriter, r *http.Request) {
+	// The login status must reflect THIS request's user, not the single
+	// persisted token. On a direct-route spoke, resolving from the per-user
+	// session is the only correct answer — otherwise every visitor would see
+	// the last-authenticated user's identity (the reported vulnerability).
+	if sess := s.sessionFromRequest(r); sess != nil {
+		jsonResponse(w, map[string]interface{}{"logged_in": true, "username": sess.Username, "role": sess.Role})
+		return
+	}
+	// Hub-proxied path: nginx injects the per-user X-Hive-User/X-Hive-Role, so
+	// report THAT user rather than the single shared persisted token (which
+	// would show every proxied visitor the owner's identity).
+	if hubUser := r.Header.Get("X-Hive-User"); hubUser != "" {
+		jsonResponse(w, map[string]interface{}{"logged_in": true, "username": hubUser, "role": r.Header.Get("X-Hive-Role")})
+		return
+	}
+	if s.directRouteAuthzEnabled() {
+		// No valid session on a direct-route spoke → not logged in for this
+		// request, regardless of any persisted owner token on disk.
+		jsonResponse(w, map[string]interface{}{"logged_in": false})
+		return
+	}
 	tokenData, err := os.ReadFile(userTokenPath)
 	if err != nil || len(strings.TrimSpace(string(tokenData))) == 0 {
 		jsonResponse(w, map[string]interface{}{"logged_in": false})
@@ -1330,40 +1352,69 @@ func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpTokenPath := userTokenPath + ".tmp"
-	if err := os.WriteFile(tmpTokenPath, []byte(token), 0o600); err != nil {
-		jsonError(w, "failed to save token: "+err.Error(), http.StatusInternalServerError)
+	// Resolve the GitHub identity BEFORE persisting anything. An unauthorized
+	// user's token must never be written to disk or wired in as the hive's user
+	// client — otherwise a rejected login would still leak its token into the
+	// shared client and become the hive's identity.
+	user, err := github.ValidateToken(token, s.deps.Config.GitHub.ResolvedAPIURL())
+	if err != nil || user == nil || user.Login == "" {
+		s.deviceFlowState = nil
+		jsonResponse(w, map[string]interface{}{"status": "error", "error": "could not verify GitHub identity"})
 		return
 	}
-	if err := os.Rename(tmpTokenPath, userTokenPath); err != nil {
-		jsonError(w, "failed to persist token: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	user, _ := github.ValidateToken(token, s.deps.Config.GitHub.ResolvedAPIURL())
 	s.deviceFlowState = nil
-	username := ""
-	avatarURL := ""
-	if user != nil {
-		username = user.Login
-		avatarURL = user.AvatarURL
-	}
-	s.deps.Logger.Info("GitHub user authenticated via device flow", "username", username)
+	username := user.Login
+	avatarURL := user.AvatarURL
 
-	if s.deps.SetUserClient != nil {
-		s.deps.SetUserClient(token)
+	// Per-hive authorization: on a direct-route spoke, only GitHub users on the
+	// configured allowlist may obtain a session. The hub-proxied path is gated
+	// upstream by nginx and leaves the allowlist empty, so it is unaffected.
+	role := config.RoleOwner
+	if s.directRouteAuthzEnabled() {
+		resolvedRole, ok := s.deps.Config.Dashboard.AuthorizedRole(username)
+		if !ok {
+			// Do NOT persist the token, do NOT set a session, do NOT log the
+			// user in. Reject before any state is written.
+			s.deps.Logger.Warn("device-flow login rejected: user not authorized for this hive", "username", username)
+			s.auditFromRequest(r, "gh_auth_denied", auditDetail("username", username), "")
+			jsonError(w, "your GitHub account is not authorized to access this hive. Contact the hive owner to request access.", http.StatusForbidden)
+			return
+		}
+		role = resolvedRole
 	}
 
+	// The persisted token and the hive's shared user GitHub client represent the
+	// hive's WRITE identity (advisory posting, autonomous actions). Only the
+	// owner (read-write) may set them; a read-only viewer logging in must never
+	// clobber the owner's token/client with their own identity. Viewers still
+	// get a per-user session below, they just don't become the hive's actor.
+	if role == config.RoleOwner {
+		tmpTokenPath := userTokenPath + ".tmp"
+		if err := os.WriteFile(tmpTokenPath, []byte(token), 0o600); err != nil {
+			jsonError(w, "failed to save token: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(tmpTokenPath, userTokenPath); err != nil {
+			jsonError(w, "failed to persist token: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if s.deps.SetUserClient != nil {
+			s.deps.SetUserClient(token)
+		}
+	}
+
+	s.deps.Logger.Info("GitHub user authenticated via device flow", "username", username, "role", role)
+
+	// Issue a per-user session (opaque random id → username+role) instead of a
+	// single shared cookie. Each authenticated user gets their own session so
+	// requests resolve to the user that owns their cookie — never a shared one.
 	if s.authToken != "" {
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    s.authToken,
-			Path:     "/",
-			MaxAge:   sessionCookieMaxAge,
-			HttpOnly: true,
-			Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-			SameSite: http.SameSiteLaxMode,
-		})
+		sid := s.createUserSession(username, role)
+		if sid == "" {
+			jsonError(w, "failed to create session", http.StatusInternalServerError)
+			return
+		}
+		setSessionCookie(w, r, sid)
 	}
 
 	s.auditFromRequest(r, "gh_auth_complete", auditDetail("username", username), "")
@@ -1371,39 +1422,38 @@ func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGHUserAuthLogout(w http.ResponseWriter, r *http.Request) {
-	os.Remove(userTokenPath)
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	// Clear only THIS request's session so logging out affects one user, not
+	// everyone. Removing the disk token only makes sense when the logging-out
+	// user is the one whose token is persisted (the owner/last-authenticated
+	// user); on a direct-route spoke a read-only viewer logging out must not
+	// wipe the owner's persisted token.
+	var loggedOut, loggedOutRole string
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		if sess := s.lookupSession(c.Value); sess != nil {
+			loggedOut = sess.Username
+			loggedOutRole = sess.Role
+		}
+		s.deleteSession(c.Value)
+	}
+	// Only clear the persisted GitHub token when the logging-out user is the
+	// owner (read-write). Use the role bound to the session at login time — not
+	// a fresh config lookup — so a later allowlist change can't leave a
+	// logging-out owner's own token stranded on disk. Viewer logouts leave the
+	// hive's user client intact.
+	if !s.directRouteAuthzEnabled() || loggedOutRole == config.RoleOwner {
+		os.Remove(userTokenPath)
+	}
+	clearSessionCookie(w)
 	s.auditFromRequest(r, "gh_auth_logout", "", "")
-	s.deps.Logger.Info("GitHub user logged out")
+	s.deps.Logger.Info("GitHub user logged out", "username", loggedOut)
 	jsonResponse(w, map[string]interface{}{"status": "logged_out"})
 }
 
 func (s *Server) handleGHUserAuthSession(w http.ResponseWriter, r *http.Request) {
-	if s.authToken == "" {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	tokenData, err := os.ReadFile(userTokenPath)
-	if err != nil || strings.TrimSpace(string(tokenData)) == "" {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    s.authToken,
-		Path:     "/",
-		MaxAge:   sessionCookieMaxAge,
-		HttpOnly: true,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-		SameSite: http.SameSiteLaxMode,
-	})
+	// This endpoint only lands the user on the dashboard after the device flow
+	// completed. The per-user session cookie was already set by the poll
+	// handler; we never mint a session here (doing so from a shared secret or a
+	// disk token file would grant any caller a valid session).
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -1591,10 +1641,10 @@ func (s *Server) handleAgentConfigGet(w http.ResponseWriter, r *http.Request) {
 			"aliases":         agentCfg.Aliases,
 			"cavemanMode":     agentCfg.CavemanMode,
 		},
-		"cadences": cadences,
-		"models":   models,
-		"pipeline": pipeline,
-		"hooks":    hooks,
+		"cadences":       cadences,
+		"models":         models,
+		"pipeline":       pipeline,
+		"hooks":          hooks,
 		"restrictions":   restrictions,
 		"stats":          stats,
 		"prompt":         lastPrompt,
@@ -2707,26 +2757,16 @@ func (s *Server) handleGovernorConfigGet(w http.ResponseWriter, r *http.Request)
 			"compress":   cfg.Governor.Logging.Compress,
 			"level":      cfg.Governor.Logging.Level,
 		},
-		"litellm": map[string]interface{}{
-			"endpoint":     cfg.Governor.LiteLLM.Endpoint,
-			"apiKeyEnv":    cfg.Governor.LiteLLM.APIKeyEnv,
-			"apiKeyFile":   cfg.Governor.LiteLLM.APIKeyFile,
-			"defaultModel": cfg.Governor.LiteLLM.DefaultModel,
-			"caBundle":     cfg.Governor.LiteLLM.CABundle,
-			"localProxy":   cfg.Governor.LiteLLM.LocalProxy,
-			// The key VALUE is never returned — only whether one resolves
-			// from the configured file/env var.
-			"hasKey": cfg.Governor.LiteLLM.ResolveAPIKey() != "",
-		},
+		"litellm": litellmSectionResponse(&cfg.Governor.LiteLLM),
 		"hub": map[string]interface{}{
-			"enabled":                  cfg.Hub.Enabled,
-			"url":                      cfg.Hub.URL,
-			"dashboard_url":            cfg.Hub.DashboardURL,
-			"snapshot_url":             cfg.Hub.SnapshotURL,
-			"is_public":               cfg.Hub.IsPublic,
-			"auto_snapshot":           cfg.Hub.AutoSnapshot,
-			"auto_upgrade":            cfg.Hub.AutoUpgrade,
-			"snapshot_interval_min":   cfg.Hub.SnapshotIntervalMin,
+			"enabled":                          cfg.Hub.Enabled,
+			"url":                              cfg.Hub.URL,
+			"dashboard_url":                    cfg.Hub.DashboardURL,
+			"snapshot_url":                     cfg.Hub.SnapshotURL,
+			"is_public":                        cfg.Hub.IsPublic,
+			"auto_snapshot":                    cfg.Hub.AutoSnapshot,
+			"auto_upgrade":                     cfg.Hub.AutoUpgrade,
+			"snapshot_interval_min":            cfg.Hub.SnapshotIntervalMin,
 			"contribute_suspended":             cfg.Hub.ContributeSuspended,
 			"contribute_allow_labels":          cfg.Hub.ContributeAllowLabels,
 			"contribute_deny_labels":           cfg.Hub.ContributeDenyLabels,
@@ -2814,7 +2854,9 @@ func (s *Server) handleGovernorSensing(w http.ResponseWriter, r *http.Request) {
 		s.deps.Config.Governor.Sensing.PullbackSeconds = body.PullbackSeconds
 	}
 
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config", "error", err)
+	}
 	s.auditFromRequest(r, "config_governor_sensing", auditDetail("section", "sensing"), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
@@ -2925,7 +2967,9 @@ func (s *Server) handleGovernorBudget(w http.ResponseWriter, r *http.Request) {
 		s.deps.Config.Governor.Budget.CriticalPct = body.CriticalPct
 	}
 
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config after budget update", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config after budget update", "error", err)
+	}
 	s.auditFromRequest(r, "config_governor_budget", auditDetail("section", "budget"), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
@@ -2968,7 +3012,9 @@ func (s *Server) handleGovernorNotifications(w http.ResponseWriter, r *http.Requ
 		}
 		s.deps.Config.Notifications.Discord.Webhook = body.DiscordWebhook
 	}
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config after notification update", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config after notification update", "error", err)
+	}
 	s.auditFromRequest(r, "config_governor_notifications", auditDetail("section", "notifications"), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
@@ -2998,7 +3044,9 @@ func (s *Server) handleGovernorHealth(w http.ResponseWriter, r *http.Request) {
 	if body.ModelLock != nil {
 		s.deps.Config.Governor.Health.ModelLock = *body.ModelLock
 	}
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config after health update", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config after health update", "error", err)
+	}
 	s.auditFromRequest(r, "config_governor_health", auditDetail("section", "health"), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
@@ -3042,7 +3090,9 @@ func (s *Server) handleGovernorLogging(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config after logging update", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config after logging update", "error", err)
+	}
 	s.auditFromRequest(r, "config_governor_logging", auditDetail("section", "logging"), "")
 	s.refreshAndPersist()
 	okResponse(w, map[string]string{"status": "updated"})
@@ -3050,22 +3100,22 @@ func (s *Server) handleGovernorLogging(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGovernorHub(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled                       *bool               `json:"enabled"`
-		URL                           string              `json:"url"`
-		DashboardURL                  string              `json:"dashboard_url"`
-		SnapshotURL                   string              `json:"snapshot_url"`
-		IsPublic                      *bool               `json:"is_public"`
-		AutoSnapshot                  *bool               `json:"auto_snapshot"`
-		AutoUpgrade                   *bool               `json:"auto_upgrade"`
-		ContributeSuspended           *bool               `json:"contribute_suspended"`
-		ContributeAllowLabels         []string            `json:"contribute_allow_labels"`
-		ContributeDenyLabels          []string            `json:"contribute_deny_labels"`
-		ContributeDenyTitles          []string            `json:"contribute_deny_titles"`
-		ContributeDenyAuthors         []string            `json:"contribute_deny_authors"`
-		ContributeAllowModels         []string            `json:"contribute_allow_models"`
-		ContributeRejectUnknownModels *bool               `json:"contribute_reject_unknown_models"`
-		DisabledRepos                 []string            `json:"disabled_repos"`
-		DisabledTiers                 []string            `json:"disabled_tiers"`
+		Enabled                       *bool                      `json:"enabled"`
+		URL                           string                     `json:"url"`
+		DashboardURL                  string                     `json:"dashboard_url"`
+		SnapshotURL                   string                     `json:"snapshot_url"`
+		IsPublic                      *bool                      `json:"is_public"`
+		AutoSnapshot                  *bool                      `json:"auto_snapshot"`
+		AutoUpgrade                   *bool                      `json:"auto_upgrade"`
+		ContributeSuspended           *bool                      `json:"contribute_suspended"`
+		ContributeAllowLabels         []string                   `json:"contribute_allow_labels"`
+		ContributeDenyLabels          []string                   `json:"contribute_deny_labels"`
+		ContributeDenyTitles          []string                   `json:"contribute_deny_titles"`
+		ContributeDenyAuthors         []string                   `json:"contribute_deny_authors"`
+		ContributeAllowModels         []string                   `json:"contribute_allow_models"`
+		ContributeRejectUnknownModels *bool                      `json:"contribute_reject_unknown_models"`
+		DisabledRepos                 []string                   `json:"disabled_repos"`
+		DisabledTiers                 []string                   `json:"disabled_tiers"`
 		TierLimits                    map[string]config.TierRate `json:"tier_limits"`
 	}
 	if err := decodeBody(r, &body); err != nil {
@@ -3127,12 +3177,196 @@ func (s *Server) handleGovernorHub(w http.ResponseWriter, r *http.Request) {
 	okResponse(w, map[string]string{"status": "updated"})
 }
 
+// apiKeyLikeLength: env var NAMES are short and conventionally use
+// underscores, while bearer keys are typically 40+ chars without any.
+const apiKeyLikeLength = 40
+
+// looksLikeAPIKeyValue guards the env-name field against users pasting an
+// actual API key VALUE into it (which would bake "sk-..." into hive.yaml
+// as an env var name and silently resolve to an empty key at runtime).
+func looksLikeAPIKeyValue(s string) bool {
+	return strings.HasPrefix(s, "sk-") ||
+		(len(s) > apiKeyLikeLength && !strings.Contains(s, "_"))
+}
+
+const (
+	// litellmProbeTimeout bounds the save-time /v1/models check.
+	litellmProbeTimeout = 8 * time.Second
+	// litellmProbeMaxErrBody caps how much of a gateway error body is
+	// surfaced back to the dialog.
+	litellmProbeMaxErrBody = 512
+)
+
+// probeLiteLLMModels queries {endpoint}/v1/models with the given key and
+// returns the number of models the gateway offers. This is a LIVE probe
+// only — it never falls back to the static model aliases, so a failing
+// gateway can never masquerade as "N models available" (the bug where
+// Test Connection reported the 7 static fallback aliases as success).
+// On failure the error carries the gateway's actual message (truncated)
+// so the UI can show e.g. LiteLLM's "token not found" instead of a bare
+// status code.
+func probeLiteLLMModels(endpoint, apiKey string) (int, error) {
+	modelsURL := strings.TrimRight(endpoint, "/") + "/v1/models"
+	req, err := http.NewRequest("GET", modelsURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("building request: %w", err)
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	client := &http.Client{Timeout: litellmProbeTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("cannot reach gateway: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// Error path: only a truncated slice of the body is surfaced to the
+		// dialog (error bodies can be huge and may echo the key).
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, litellmProbeMaxErrBody))
+		gatewayMsg := strings.TrimSpace(string(body))
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			// The two auth failures lead users to different fixes.
+			if apiKey == "" {
+				return 0, fmt.Errorf("gateway requires an API key and none is configured (HTTP %d): %s",
+					resp.StatusCode, gatewayMsg)
+			}
+			return 0, fmt.Errorf("gateway rejected the configured key (HTTP %d): %s",
+				resp.StatusCode, gatewayMsg)
+		default:
+			return 0, fmt.Errorf("gateway returned HTTP %d: %s", resp.StatusCode, gatewayMsg)
+		}
+	}
+
+	// Success path: parse the FULL body with the exact same lenient decoder
+	// the model-discovery dropdown uses (fetchModelsFromEndpoint) — a JSON
+	// object with a "data" array of items each carrying an "id" string is
+	// sufficient. We do NOT require top-level object=="list" (some gateways
+	// omit or reorder it) and tolerate extra/unknown fields. Reading only a
+	// truncated prefix here (the old bug) corrupted large valid lists into
+	// invalid JSON and produced a false "non-OpenAI response" negative.
+	models, err := parseModelsResponse(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("gateway returned a non-OpenAI /v1/models response")
+	}
+	return len(models), nil
+}
+
+// redactSecret removes any occurrence of a secret value from a message so
+// gateway error bodies can never echo the key back to the client or logs.
+func redactSecret(msg, secret string) string {
+	if secret == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, secret, "[redacted]")
+}
+
+// maskHintVisibleChars is how many trailing characters of a secret survive
+// masking in UI hints ("••••WMg" style) — enough to recognize a key,
+// useless to reconstruct one.
+const maskHintVisibleChars = 4
+
+// maskSecretHint returns a display-safe hint for a secret value: bullets
+// plus the last few characters. Values too short to safely reveal a tail
+// are fully masked.
+func maskSecretHint(v string) string {
+	if len(v) <= maskHintVisibleChars*2 {
+		return "••••"
+	}
+	return "••••" + v[len(v)-maskHintVisibleChars:]
+}
+
+// litellmSectionResponse builds the governor-config GET payload for the
+// LiteLLM tab. The resolved key VALUE is never serialized — only hasKey,
+// the store it came from, and a masked tail hint. The apiKeyEnv/apiKeyFile
+// CONFIG fields normally hold a var NAME / file PATH (not secrets), but a
+// user who pasted an actual key into them before the guardrails existed
+// would otherwise get it echoed straight back into the tab — in one live
+// case the raw key rendered in plaintext during screen shares. Key-like
+// values in those fields are therefore masked too, with LooksLikeKey
+// flags so the UI can tell the user to move the value.
+func litellmSectionResponse(lc *config.LiteLLMConfig) map[string]interface{} {
+	apiKeyEnv := lc.APIKeyEnv
+	apiKeyEnvLooksLikeKey := looksLikeAPIKeyValue(apiKeyEnv)
+	if apiKeyEnvLooksLikeKey {
+		apiKeyEnv = maskSecretHint(apiKeyEnv)
+	}
+	apiKeyFile := lc.APIKeyFile
+	apiKeyFileLooksLikeKey := !strings.HasPrefix(apiKeyFile, "/") && looksLikeAPIKeyValue(apiKeyFile)
+	if apiKeyFileLooksLikeKey {
+		apiKeyFile = maskSecretHint(apiKeyFile)
+	}
+	key := lc.ResolveAPIKey()
+	keyHint := ""
+	if key != "" {
+		keyHint = maskSecretHint(key)
+	}
+	return map[string]interface{}{
+		"endpoint":               lc.Endpoint,
+		"apiKeyEnv":              apiKeyEnv,
+		"apiKeyEnvLooksLikeKey":  apiKeyEnvLooksLikeKey,
+		"apiKeyFile":             apiKeyFile,
+		"apiKeyFileLooksLikeKey": apiKeyFileLooksLikeKey,
+		"defaultModel":           lc.DefaultModel,
+		"caBundle":               lc.CABundle,
+		"localProxy":             lc.LocalProxy,
+		"hasKey":                 key != "",
+		"keyHint":                keyHint,
+		// redactSecret guards the pathological case of a key-like env var
+		// NAME appearing in the source string.
+		"keySource": redactSecret(lc.ResolveAPIKeySource(), key),
+	}
+}
+
+// liteLLMProbeResult runs the live probe against the effective endpoint
+// using the SAME key resolution the inference translator uses
+// (ResolveAPIKey: api_key_file → Secret mount → PVC file → env), unless
+// overrideKey is set (a key just submitted in the same request, which the
+// key files may not reflect yet). Returns nil when no endpoint is
+// configured.
+func (s *Server) liteLLMProbeResult(lc *config.LiteLLMConfig, overrideKey string) map[string]interface{} {
+	ep := lc.ResolveEndpoint()
+	if ep == "" {
+		return nil
+	}
+	probeKey := overrideKey
+	if probeKey == "" {
+		probeKey = lc.ResolveAPIKey()
+	}
+	n, err := probeLiteLLMModels(ep, probeKey)
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": redactSecret(err.Error(), probeKey)}
+	}
+	return map[string]interface{}{"ok": true, "models": n}
+}
+
+// handleGovernorLiteLLMTest is the Test Connection endpoint: a live
+// /v1/models probe with the currently effective endpoint + key. Unlike
+// /api/inference/models/{backend} it NEVER substitutes the static
+// fallback aliases, so the result reflects only what the gateway said.
+func (s *Server) handleGovernorLiteLLMTest(w http.ResponseWriter, r *http.Request) {
+	lc := s.deps.Config.Governor.LiteLLM
+	probe := s.liteLLMProbeResult(&lc, "")
+	if probe == nil {
+		jsonError(w, "no litellm endpoint configured", http.StatusBadRequest)
+		return
+	}
+	jsonResponse(w, map[string]interface{}{"ok": true, "probe": probe})
+}
+
 // handleGovernorLiteLLM updates governor.litellm from the dashboard's
-// LiteLLM config tab. The API key VALUE is never accepted or stored —
-// only the env var name / key file path used to resolve it at runtime.
+// LiteLLM config tab / first-use dialog. An API key VALUE (apiKey) is
+// stored via storeLiteLLMAPIKey (PVC file + best-effort hive-secrets
+// Secret) — never in hive.yaml, logs, or responses; hive.yaml records
+// only the file path. After saving, the gateway is probed at /v1/models
+// and the result returned so a bad endpoint/key fails visibly at save
+// time instead of as agent 401s later.
 func (s *Server) handleGovernorLiteLLM(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Endpoint     *string `json:"endpoint"`
+		APIKey       *string `json:"apiKey"`
 		APIKeyEnv    *string `json:"apiKeyEnv"`
 		APIKeyFile   *string `json:"apiKeyFile"`
 		DefaultModel *string `json:"defaultModel"`
@@ -3150,10 +3384,26 @@ func (s *Server) handleGovernorLiteLLM(w http.ResponseWriter, r *http.Request) {
 		lc.Endpoint = strings.TrimSpace(*body.Endpoint)
 	}
 	if body.APIKeyEnv != nil {
-		lc.APIKeyEnv = strings.TrimSpace(*body.APIKeyEnv)
+		keyEnv := strings.TrimSpace(*body.APIKeyEnv)
+		if looksLikeAPIKeyValue(keyEnv) {
+			jsonError(w, "this looks like an API key — paste it in the API Key field instead; "+
+				"this field takes an environment variable NAME (e.g. HIVE_LITELLM_API_KEY)",
+				http.StatusBadRequest)
+			return
+		}
+		lc.APIKeyEnv = keyEnv
 	}
 	if body.APIKeyFile != nil {
-		lc.APIKeyFile = strings.TrimSpace(*body.APIKeyFile)
+		keyFile := strings.TrimSpace(*body.APIKeyFile)
+		// Same paste-the-key-value guardrail as the env-name field; real
+		// key file paths are absolute, keys never are.
+		if !strings.HasPrefix(keyFile, "/") && looksLikeAPIKeyValue(keyFile) {
+			jsonError(w, "this looks like an API key — paste it in the API Key field instead; "+
+				"this field takes a file PATH (e.g. /secrets/litellm_api_key)",
+				http.StatusBadRequest)
+			return
+		}
+		lc.APIKeyFile = keyFile
 	}
 	if body.DefaultModel != nil {
 		lc.DefaultModel = strings.TrimSpace(*body.DefaultModel)
@@ -3168,6 +3418,30 @@ func (s *Server) handleGovernorLiteLLM(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Store a submitted key VALUE outside hive.yaml and point api_key_file
+	// at it. Empty apiKey means "no change" so the tab can be re-saved
+	// without re-entering the key.
+	submittedKey := ""
+	if body.APIKey != nil {
+		submittedKey = strings.TrimSpace(*body.APIKey)
+	}
+	if submittedKey != "" {
+		keyFile, err := s.storeLiteLLMAPIKey(submittedKey)
+		if err != nil {
+			jsonError(w, "failed to store API key: "+redactSecret(err.Error(), submittedKey),
+				http.StatusInternalServerError)
+			return
+		}
+		lc.APIKeyFile = keyFile
+		// Remediation for the pre-guardrail leak: a key VALUE pasted into
+		// the env-name field never worked as a name (os.Getenv("sk-...")
+		// is empty) and is a plaintext secret in hive.yaml. Now that a
+		// real key is stored properly, scrub it.
+		if looksLikeAPIKeyValue(lc.APIKeyEnv) {
+			lc.APIKeyEnv = ""
+			s.logger.Info("cleared key-like value from litellm api_key_env (replaced by stored API key)")
+		}
+	}
 	cfg.Governor.LiteLLM = lc
 
 	if err := s.saveConfig(); err != nil {
@@ -3177,6 +3451,9 @@ func (s *Server) handleGovernorLiteLLM(w http.ResponseWriter, r *http.Request) {
 
 	// Register the endpoint for model discovery (empty list unregisters)
 	// and re-apply routes for live agents already running on litellm.
+	// This must come after the key store above: SetInferenceRoute
+	// snapshots the key into each route, so the refresh is what makes a
+	// rotated key take effect without an agent restart.
 	var endpoints []string
 	if ep := lc.ResolveEndpoint(); ep != "" {
 		endpoints = []string{ep}
@@ -3187,7 +3464,15 @@ func (s *Server) handleGovernorLiteLLM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.refreshAndPersist()
-	okResponse(w, map[string]string{"status": "updated"})
+
+	// Save-time validation probe (live /v1/models — never the static
+	// fallback list) so the dialog can immediately show "N models
+	// available" or the gateway's real error.
+	resp := map[string]interface{}{"ok": true, "status": "updated"}
+	if probe := s.liteLLMProbeResult(&lc, submittedKey); probe != nil {
+		resp["probe"] = probe
+	}
+	jsonResponse(w, resp)
 }
 
 func (s *Server) handleGovernorAddAgent(w http.ResponseWriter, r *http.Request) {
@@ -3235,7 +3520,9 @@ func (s *Server) handleGovernorAddAgent(w http.ResponseWriter, r *http.Request) 
 	}
 	s.deps.Config.Agents[body.Name] = agentCfg
 	s.deps.AgentMgr.AddAgent(body.Name, agentCfg)
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config", "error", err)
+	}
 
 	s.auditFromRequest(r, "add_agent", auditDetail("backend", body.Backend, "model", body.Model), body.Name)
 	s.refreshAndPersist()
@@ -3330,7 +3617,9 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.saveConfig(); err != nil { s.logger.Error("failed to persist config", "error", err) }
+	if err := s.saveConfig(); err != nil {
+		s.logger.Error("failed to persist config", "error", err)
+	}
 	if s.deps.EnumerateFunc != nil {
 		go s.deps.EnumerateFunc()
 	}
@@ -3349,10 +3638,10 @@ func (s *Server) handleGitHubAppInstallClicked(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleConfigGitHub(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		AppID          *int64  `json:"app_id"`
-		InstallationID *int64  `json:"installation_id"`
-		KeyFile        string  `json:"key_file"`
-		PrivateKey     string  `json:"private_key"`
+		AppID          *int64 `json:"app_id"`
+		InstallationID *int64 `json:"installation_id"`
+		KeyFile        string `json:"key_file"`
+		PrivateKey     string `json:"private_key"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
@@ -3510,23 +3799,73 @@ func (s *Server) handleInferenceModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	models := fetchModelsFromEndpoints(endpoints, s.inferenceAPIKey(backend))
+	fallback := false
 	if len(models) == 0 {
 		s.logger.Warn("no models found from any endpoint", "backend", backend, "endpoints", len(endpoints))
+		// Discovery is authoritative (a LiteLLM gateway entitlement-filters
+		// /v1/models per API key); only when it fails do we fall back to
+		// the common static aliases, flagged so the UI can mark them as
+		// unverified against the configured endpoint/key.
+		models = inferenceStaticModelAliases
+		fallback = true
 	}
 	jsonResponse(w, map[string]interface{}{
-		"backend": backend,
-		"models":  models,
+		"backend":  backend,
+		"models":   models,
+		"fallback": fallback,
 	})
 }
 
 // inferenceAPIKey returns the bearer key used for a backend's model
-// discovery requests. Only litellm requires auth on /v1/models;
-// vllm/llm-d endpoints are unauthenticated.
+// discovery requests. litellm requires auth on /v1/models. vllm/llm-d are
+// usually unauthenticated, but the configured endpoint may in fact be a
+// LiteLLM gateway, which entitlement-filters /v1/models and hides
+// key-gated models from anonymous callers — so resolve a backend-specific
+// key first (governor.vllm / governor.llm-d api_key_env|api_key_file, or
+// the HIVE_VLLM_API_KEY / HIVE_LLMD_API_KEY defaults), then fall back to
+// the litellm key. A plain vLLM/llm-d server without --api-key ignores the
+// Authorization header, so sending a key is harmless there.
 func (s *Server) inferenceAPIKey(backend string) string {
-	if backend != "litellm" || s.deps == nil || s.deps.Config == nil {
+	if s.deps == nil || s.deps.Config == nil {
 		return ""
 	}
-	return s.deps.Config.Governor.LiteLLM.ResolveAPIKey()
+	gov := &s.deps.Config.Governor
+	switch backend {
+	case "vllm":
+		if key := gov.VLLM.ResolveAPIKey(config.DefaultVLLMAPIKeyEnv); key != "" {
+			return key
+		}
+	case "llm-d":
+		if key := gov.LLMD.ResolveAPIKey(config.DefaultLLMDAPIKeyEnv); key != "" {
+			return key
+		}
+	}
+	return gov.LiteLLM.ResolveAPIKey()
+}
+
+// inferenceStaticModelAliases is the FALLBACK model list for the inference
+// model dropdowns (vllm, llm-d, litellm), offered only when runtime
+// /v1/models discovery against the backend's configured endpoint fails
+// (and no HIVE_*_MODELS env override is set), so a dropdown is never
+// empty. Discovery is authoritative: a LiteLLM gateway entitlement-filters
+// /v1/models per API key, so when discovery succeeds we show ONLY the
+// discovered set — appending these aliases on top would offer unlicensed
+// models that just 403 at runtime. The entries use the LiteLLM gateway
+// naming convention observed live: UNDERSCORES between words and a DOT in
+// the version (claude_opus_4.8) — unlike the Claude CLI (all hyphens,
+// claude-opus-4-8) and the Copilot/Gemini backends (hyphenated words with
+// a dotted version, claude-opus-4.8 / gemini-2.5-pro). Model set derived
+// from the CLAUDE_CLI_MODELS/COPILOT_CLI_MODELS lists in static/index.html
+// and the gemini backend list in handleBackends; keep in sync when those
+// change.
+var inferenceStaticModelAliases = []string{
+	"claude_opus_4.8",
+	"claude_opus_4.7",
+	"claude_opus_4.6",
+	"claude_sonnet_4.6",
+	"claude_haiku_4.5",
+	"gemini_2.5_pro",
+	"gemini_2.5_flash",
 }
 
 func (s *Server) queryInferenceModels(backend string) []string {
@@ -3546,7 +3885,9 @@ func (s *Server) queryInferenceModels(backend string) []string {
 	if val := os.Getenv(envVar); val != "" {
 		return inferenceModelsFromEnv(envVar, "")
 	}
-	return nil
+	// Discovery failed or the backend is unconfigured — fall back to the
+	// common static aliases (unverified against any endpoint/key).
+	return inferenceStaticModelAliases
 }
 
 const inferenceModelQueryTimeout = 5 * time.Second
@@ -3592,20 +3933,33 @@ func fetchModelsFromEndpoint(baseURL, apiKey string) ([]string, error) {
 		return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	models, err := parseModelsResponse(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("parse response: %w", err)
 	}
+	return models, nil
+}
 
+// parseModelsResponse decodes an OpenAI-style GET /v1/models body into the
+// list of model IDs. It is the single source of truth shared by the
+// model-discovery dropdown (fetchModelsFromEndpoint) and the Test Connection
+// probe (probeLiteLLMModels), so both agree on what "N models" means.
+//
+// It is deliberately lenient: any JSON object with a "data" array whose items
+// carry a non-empty "id" string is accepted. It does NOT require top-level
+// object=="list" (gateways may omit or reorder it), imposes no field order,
+// and tolerates extra/unknown per-item fields (object, created, owned_by, …).
+// IDs are returned verbatim, so provider-prefixed / hyphenated ids like
+// "Azure/gpt-5.1-codex-2025-11-13" or "claude-opus-4-7" survive intact.
+func parseModelsResponse(r io.Reader) ([]string, error) {
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	if err := json.NewDecoder(r).Decode(&result); err != nil {
+		return nil, err
 	}
-
 	models := make([]string, 0, len(result.Data))
 	for _, m := range result.Data {
 		if m.ID != "" {
@@ -3758,20 +4112,20 @@ func (s *Server) handleKnowledgeExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	typeLabels := map[string]string{
-		"pattern":        "Patterns",
-		"gotcha":         "Gotchas",
-		"decision":       "Decisions",
-		"regression":     "Regressions",
-		"test_scaffold":  "Test Scaffolds",
-		"integration":    "Integration",
-		"coverage_rule":  "Coverage Rules",
-		"idea":           "Ideas",
-		"vision":         "Vision",
-		"constitution":   "Constitution",
-		"requirement":    "Requirements",
-		"constraint":     "Constraints",
-		"stakeholder":    "Stakeholders",
-		"general":        "General",
+		"pattern":       "Patterns",
+		"gotcha":        "Gotchas",
+		"decision":      "Decisions",
+		"regression":    "Regressions",
+		"test_scaffold": "Test Scaffolds",
+		"integration":   "Integration",
+		"coverage_rule": "Coverage Rules",
+		"idea":          "Ideas",
+		"vision":        "Vision",
+		"constitution":  "Constitution",
+		"requirement":   "Requirements",
+		"constraint":    "Constraints",
+		"stakeholder":   "Stakeholders",
+		"general":       "General",
 	}
 
 	var sb strings.Builder
@@ -5030,6 +5384,15 @@ func maskSecret(s string) string {
 }
 
 func (s *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
+	// On a direct-route spoke the shared token must never be handed to a
+	// browser: identity there is per-user (device-flow sessions), and the
+	// shared token no longer grants API access on that path (see authenticate).
+	// Exposing it publicly here would leak the internal server-to-server secret
+	// (used as X-Hive-Internal by the local proxy) to any visitor.
+	if s.directRouteAuthzEnabled() {
+		jsonError(w, "not available on this hive", http.StatusNotFound)
+		return
+	}
 	token := s.authToken
 	if token == "" {
 		token = os.Getenv("HIVE_DASHBOARD_TOKEN")
@@ -5216,4 +5579,3 @@ func (s *Server) handleBeadsCreate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	jsonResponse(w, b)
 }
-

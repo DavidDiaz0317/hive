@@ -14,18 +14,18 @@ import (
 )
 
 type Config struct {
-	Project       ProjectConfig                `yaml:"project"`
-	Policies      PoliciesConfig               `yaml:"policies"`
-	Agents        map[string]AgentConfig        `yaml:"agents"`
-	Governor      GovernorConfig               `yaml:"governor"`
-	GitHub        GitHubConfig                 `yaml:"github"`
-	Notifications NotificationsConfig          `yaml:"notifications"`
-	Dashboard     DashboardConfig              `yaml:"dashboard"`
-	Data          DataConfig                   `yaml:"data"`
-	Knowledge     KnowledgeConfig              `yaml:"knowledge"`
-	Hub           HubConfig                    `yaml:"hub"`
-	HiveID        string                       `yaml:"hive_id"`
-	ACMMLevel     *int                         `yaml:"acmm_level,omitempty" json:"acmm_level"`
+	Project       ProjectConfig          `yaml:"project"`
+	Policies      PoliciesConfig         `yaml:"policies"`
+	Agents        map[string]AgentConfig `yaml:"agents"`
+	Governor      GovernorConfig         `yaml:"governor"`
+	GitHub        GitHubConfig           `yaml:"github"`
+	Notifications NotificationsConfig    `yaml:"notifications"`
+	Dashboard     DashboardConfig        `yaml:"dashboard"`
+	Data          DataConfig             `yaml:"data"`
+	Knowledge     KnowledgeConfig        `yaml:"knowledge"`
+	Hub           HubConfig              `yaml:"hub"`
+	HiveID        string                 `yaml:"hive_id"`
+	ACMMLevel     *int                   `yaml:"acmm_level,omitempty" json:"acmm_level"`
 
 	SourcePath string `yaml:"-" json:"-"`
 }
@@ -39,15 +39,15 @@ type DocSourceConfigYAML struct {
 }
 
 type KnowledgeConfig struct {
-	Enabled    bool                  `yaml:"enabled"`
-	Engine     string                `yaml:"engine"`
-	Layers     []KnowledgeLayer      `yaml:"layers"`
-	Vaults     []VaultConfig         `yaml:"vaults"`
-	GitSources []GitSourceConfigYAML `yaml:"git_sources"`
-	Documents  []DocSourceConfigYAML `yaml:"documents"`
-	Curator         KnowledgeCurator         `yaml:"curator"`
-	Primer          KnowledgePrimer          `yaml:"primer"`
-	BeadSynthesizer BeadSynthesizerConfig    `yaml:"bead_synthesizer"`
+	Enabled         bool                  `yaml:"enabled"`
+	Engine          string                `yaml:"engine"`
+	Layers          []KnowledgeLayer      `yaml:"layers"`
+	Vaults          []VaultConfig         `yaml:"vaults"`
+	GitSources      []GitSourceConfigYAML `yaml:"git_sources"`
+	Documents       []DocSourceConfigYAML `yaml:"documents"`
+	Curator         KnowledgeCurator      `yaml:"curator"`
+	Primer          KnowledgePrimer       `yaml:"primer"`
+	BeadSynthesizer BeadSynthesizerConfig `yaml:"bead_synthesizer"`
 }
 
 // BeadSynthesizerConfig controls automatic synthesis of completed beads into wiki facts.
@@ -218,22 +218,22 @@ type AgentConfig struct {
 	Description     string `yaml:"description" json:"description,omitempty"`
 
 	// Phase 2: config-driven agent behavior fields
-	Role             string            `yaml:"role" json:"role,omitempty"`
-	SortOrder        int               `yaml:"sort_order" json:"sort_order,omitempty"`
-	Emoji            string            `yaml:"emoji" json:"emoji,omitempty"`
-	Color            string            `yaml:"color" json:"color,omitempty"`
-	Aliases          []string          `yaml:"aliases" json:"aliases,omitempty"`
-	LaneKeywords     []string          `yaml:"lane_keywords" json:"lane_keywords,omitempty"`
-	DetectKeywords   []string          `yaml:"detect_keywords" json:"detect_keywords,omitempty"`
-	KickTemplate     string            `yaml:"kick_template" json:"kick_template,omitempty"`
-	IncludeRepos     *bool             `yaml:"include_repos" json:"include_repos,omitempty"`
-	MetricsCollector string            `yaml:"metrics_collector" json:"metrics_collector,omitempty"`
-	BeadRole         string            `yaml:"bead_role" json:"bead_role,omitempty"`
+	Role             string              `yaml:"role" json:"role,omitempty"`
+	SortOrder        int                 `yaml:"sort_order" json:"sort_order,omitempty"`
+	Emoji            string              `yaml:"emoji" json:"emoji,omitempty"`
+	Color            string              `yaml:"color" json:"color,omitempty"`
+	Aliases          []string            `yaml:"aliases" json:"aliases,omitempty"`
+	LaneKeywords     []string            `yaml:"lane_keywords" json:"lane_keywords,omitempty"`
+	DetectKeywords   []string            `yaml:"detect_keywords" json:"detect_keywords,omitempty"`
+	KickTemplate     string              `yaml:"kick_template" json:"kick_template,omitempty"`
+	IncludeRepos     *bool               `yaml:"include_repos" json:"include_repos,omitempty"`
+	MetricsCollector string              `yaml:"metrics_collector" json:"metrics_collector,omitempty"`
+	BeadRole         string              `yaml:"bead_role" json:"bead_role,omitempty"`
 	StatsDisplay     []StatsDisplayEntry `yaml:"stats_display" json:"stats_display,omitempty"`
-	ACMMLevels       []int             `yaml:"acmm_levels" json:"acmm_levels,omitempty"`
-	Mode             string            `yaml:"mode" json:"mode,omitempty"`
-	OnDemand         bool              `yaml:"on_demand" json:"on_demand,omitempty"`
-	CavemanMode      string            `yaml:"caveman_mode" json:"caveman_mode,omitempty"`
+	ACMMLevels       []int               `yaml:"acmm_levels" json:"acmm_levels,omitempty"`
+	Mode             string              `yaml:"mode" json:"mode,omitempty"`
+	OnDemand         bool                `yaml:"on_demand" json:"on_demand,omitempty"`
+	CavemanMode      string              `yaml:"caveman_mode" json:"caveman_mode,omitempty"`
 
 	// Channels declares how this agent gets triggered (kick, webhook, discord, schedule, bead).
 	// When nil/empty, the agent uses governor timer kicks by default (implicit kick channel).
@@ -353,6 +353,54 @@ type GovernorConfig struct {
 	Budget        BudgetConfig          `yaml:"budget"`
 	Logging       LoggingConfig         `yaml:"logging"`
 	LiteLLM       LiteLLMConfig         `yaml:"litellm"`
+	VLLM          InferenceAuthConfig   `yaml:"vllm"`
+	LLMD          InferenceAuthConfig   `yaml:"llm-d"`
+}
+
+// Discovery-auth defaults for the self-hosted inference backends. Like
+// LiteLLM, hive.yaml stores only the env var NAME and/or key FILE PATH —
+// never the key value itself (Config.Save() writes the expanded config
+// back to disk, so a key value in YAML would be persisted in plaintext).
+const (
+	// DefaultVLLMAPIKeyEnv is the env var consulted for the vLLM model
+	// discovery API key when governor.vllm.api_key_env is not set.
+	DefaultVLLMAPIKeyEnv = "HIVE_VLLM_API_KEY"
+	// DefaultLLMDAPIKeyEnv is the env var consulted for the llm-d model
+	// discovery API key when governor.llm-d.api_key_env is not set.
+	DefaultLLMDAPIKeyEnv = "HIVE_LLMD_API_KEY"
+)
+
+// InferenceAuthConfig holds optional /v1/models discovery auth for a
+// self-hosted inference backend (vllm, llm-d). Plain vLLM/llm-d servers
+// need no key, but the configured endpoint may actually be a LiteLLM
+// gateway, which entitlement-filters /v1/models per API key and hides
+// key-gated models from anonymous callers.
+type InferenceAuthConfig struct {
+	APIKeyEnv  string `yaml:"api_key_env"`  // env var NAME holding the key; never the key value
+	APIKeyFile string `yaml:"api_key_file"` // path to a file holding the key
+}
+
+// ResolveAPIKey returns the backend's discovery API key using the
+// resolution order: key file (api_key_file) → env var named by
+// api_key_env → defaultEnv. Returns "" when no key is configured. The key
+// value itself is never stored in hive.yaml.
+func (c *InferenceAuthConfig) ResolveAPIKey(defaultEnv string) string {
+	if c.APIKeyFile != "" {
+		if data, err := os.ReadFile(c.APIKeyFile); err == nil {
+			if key := strings.TrimSpace(string(data)); key != "" {
+				return key
+			}
+		}
+	}
+	if c.APIKeyEnv != "" {
+		if key := os.Getenv(c.APIKeyEnv); key != "" {
+			return key
+		}
+	}
+	if defaultEnv != "" {
+		return os.Getenv(defaultEnv)
+	}
+	return ""
 }
 
 type LoggingConfig struct {
@@ -375,6 +423,16 @@ const (
 	// DefaultLiteLLMAPIKeyFile is the key file consulted when api_key_file
 	// is not set. Matches the /secrets volume used for k8s Secret mounts.
 	DefaultLiteLLMAPIKeyFile = "/secrets/litellm_api_key"
+	// WritableSecretsDir is the PVC-backed directory where the dashboard
+	// persists secret VALUES entered in the UI. Unlike /secrets (a
+	// read-only Kubernetes Secret mount), /data is the hive's writable
+	// persistent volume, so files written here survive pod restarts and
+	// hosted users can set keys without cluster access.
+	WritableSecretsDir = "/data/secrets"
+	// WritableLiteLLMAPIKeyFile is where the dashboard stores an API key
+	// value entered in the LiteLLM config UI. hive.yaml references it via
+	// api_key_file; the key value itself never enters hive.yaml or logs.
+	WritableLiteLLMAPIKeyFile = WritableSecretsDir + "/litellm_api_key"
 	// LiteLLMEndpointEnv overrides governor.litellm.endpoint at runtime
 	// (mirrors HIVE_VLLM_ENDPOINT / HIVE_LLMD_ENDPOINT).
 	LiteLLMEndpointEnv = "HIVE_LITELLM_ENDPOINT"
@@ -392,26 +450,54 @@ type LiteLLMConfig struct {
 	LocalProxy   bool   `yaml:"local_proxy"`   // run the bundled litellm binary as a local translator fallback
 }
 
-// ResolveAPIKey returns the LiteLLM API key using the resolution order:
-// key file (api_key_file, falling back to DefaultLiteLLMAPIKeyFile) →
-// env var named by api_key_env → DefaultLiteLLMAPIKeyEnv. Returns "" when
-// no key is configured. The key value itself is never stored in hive.yaml.
+// ResolveAPIKey returns the LiteLLM API key. Key FILES are consulted in
+// priority order — the configured api_key_file, then the k8s Secret mount
+// (DefaultLiteLLMAPIKeyFile), then the dashboard-written PVC file
+// (WritableLiteLLMAPIKeyFile) — followed by the env var named by
+// api_key_env and finally DefaultLiteLLMAPIKeyEnv. Returns "" when no key
+// is configured. The key value itself is never stored in hive.yaml.
+//
+// Consulting all three file locations means a key saved via the dashboard
+// keeps working even if hive.yaml is reset (e.g. re-seeded from a
+// ConfigMap) and the api_key_file pointer is lost, and an admin-managed
+// Secret key keeps working if the PVC copy is wiped.
 func (c *LiteLLMConfig) ResolveAPIKey() string {
-	keyFile := c.APIKeyFile
-	if keyFile == "" {
-		keyFile = DefaultLiteLLMAPIKeyFile
-	}
-	if data, err := os.ReadFile(keyFile); err == nil {
-		if key := strings.TrimSpace(string(data)); key != "" {
-			return key
+	key, _ := c.resolveAPIKeyWithSource()
+	return key
+}
+
+// ResolveAPIKeySource reports where ResolveAPIKey found the key without
+// exposing the value: "file:<path>", "env:<NAME>", or "" when no key is
+// configured. Safe to return from APIs (the dashboard shows it as the
+// "Key detected" store).
+func (c *LiteLLMConfig) ResolveAPIKeySource() string {
+	_, source := c.resolveAPIKeyWithSource()
+	return source
+}
+
+func (c *LiteLLMConfig) resolveAPIKeyWithSource() (string, string) {
+	files := []string{c.APIKeyFile, DefaultLiteLLMAPIKeyFile, WritableLiteLLMAPIKeyFile}
+	seen := map[string]bool{"": true}
+	for _, f := range files {
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		if data, err := os.ReadFile(f); err == nil {
+			if key := strings.TrimSpace(string(data)); key != "" {
+				return key, "file:" + f
+			}
 		}
 	}
 	if c.APIKeyEnv != "" {
 		if key := os.Getenv(c.APIKeyEnv); key != "" {
-			return key
+			return key, "env:" + c.APIKeyEnv
 		}
 	}
-	return os.Getenv(DefaultLiteLLMAPIKeyEnv)
+	if key := os.Getenv(DefaultLiteLLMAPIKeyEnv); key != "" {
+		return key, "env:" + DefaultLiteLLMAPIKeyEnv
+	}
+	return "", ""
 }
 
 // ResolveEndpoint returns the effective LiteLLM base URL: the
@@ -517,12 +603,12 @@ func (m ModeConfig) MarshalYAML() (interface{}, error) {
 }
 
 type GitHubConfig struct {
-	AppID                int64  `yaml:"app_id"`
-	InstallationID       int64  `yaml:"installation_id"`
-	DocsInstallationID   int64  `yaml:"docs_installation_id"`
-	KeyFile              string `yaml:"key_file"`
-	Token                string `yaml:"token"`
-	OAuthClientID        string `yaml:"oauth_client_id"`
+	AppID              int64  `yaml:"app_id"`
+	InstallationID     int64  `yaml:"installation_id"`
+	DocsInstallationID int64  `yaml:"docs_installation_id"`
+	KeyFile            string `yaml:"key_file"`
+	Token              string `yaml:"token"`
+	OAuthClientID      string `yaml:"oauth_client_id"`
 	// AppSlug is the GitHub App URL slug for the install link.
 	// For public GitHub: "kubestellar-hive". For GHE: your app's slug.
 	AppSlug string `yaml:"app_slug"`
@@ -606,26 +692,26 @@ type DiscordConfig struct {
 }
 
 type HubConfig struct {
-	Enabled                bool     `yaml:"enabled"`
-	URL                    string   `yaml:"url"`
-	IsPublic               bool     `yaml:"is_public"`
-	SnapshotURL            string   `yaml:"snapshot_url"`
-	DashboardURL           string   `yaml:"dashboard_url"`
-	HiveType               string   `yaml:"hive_type"`
-	ClusterID              string   `yaml:"cluster_id"`
-	AutoSnapshot           bool     `yaml:"auto_snapshot"`
-	AutoUpgrade            bool     `yaml:"auto_upgrade"`
-	ContributeSuspended    bool     `yaml:"contribute_suspended"`
-	ContributeAllowLabels  []string `yaml:"contribute_allow_labels"`
-	ContributeDenyLabels   []string `yaml:"contribute_deny_labels"`
-	ContributeDenyTitles   []string `yaml:"contribute_deny_titles"`
-	ContributeDenyAuthors         []string `yaml:"contribute_deny_authors"`
-	ContributeAllowModels         []string `yaml:"contribute_allow_models"`
-	ContributeRejectUnknownModels bool     `yaml:"contribute_reject_unknown_models"`
+	Enabled                       bool                `yaml:"enabled"`
+	URL                           string              `yaml:"url"`
+	IsPublic                      bool                `yaml:"is_public"`
+	SnapshotURL                   string              `yaml:"snapshot_url"`
+	DashboardURL                  string              `yaml:"dashboard_url"`
+	HiveType                      string              `yaml:"hive_type"`
+	ClusterID                     string              `yaml:"cluster_id"`
+	AutoSnapshot                  bool                `yaml:"auto_snapshot"`
+	AutoUpgrade                   bool                `yaml:"auto_upgrade"`
+	ContributeSuspended           bool                `yaml:"contribute_suspended"`
+	ContributeAllowLabels         []string            `yaml:"contribute_allow_labels"`
+	ContributeDenyLabels          []string            `yaml:"contribute_deny_labels"`
+	ContributeDenyTitles          []string            `yaml:"contribute_deny_titles"`
+	ContributeDenyAuthors         []string            `yaml:"contribute_deny_authors"`
+	ContributeAllowModels         []string            `yaml:"contribute_allow_models"`
+	ContributeRejectUnknownModels bool                `yaml:"contribute_reject_unknown_models"`
 	DisabledRepos                 []string            `yaml:"disabled_repos"`
-	DisabledTiers          []string            `yaml:"disabled_tiers"`
-	TierLimits             map[string]TierRate `yaml:"tier_limits"`
-	SnapshotIntervalMin    int                 `yaml:"snapshot_interval_min"`
+	DisabledTiers                 []string            `yaml:"disabled_tiers"`
+	TierLimits                    map[string]TierRate `yaml:"tier_limits"`
+	SnapshotIntervalMin           int                 `yaml:"snapshot_interval_min"`
 }
 
 type TierRate struct {
@@ -639,14 +725,89 @@ type DashboardConfig struct {
 	SnapshotDir        string `yaml:"snapshot_dir"`
 	AuthToken          string `yaml:"auth_token"`
 	AgentPollIntervalS int    `yaml:"agent_poll_interval_s"`
+	// AuthorizedUsers is the allowlist of GitHub usernames permitted to log in
+	// to a direct-route (non-hub-proxied) spoke via the device flow. The first
+	// entry is treated as the owner (read-write); the rest are granted viewers
+	// (read-only) unless an explicit "username:role" suffix is given. On the
+	// hub-proxied path, nginx injects X-Hive-User/X-Hive-Role and this list is
+	// not consulted. Empty on hub-proxied hives; populated by provisioning for
+	// hosted hives so direct-route device-flow logins are per-user authorized.
+	AuthorizedUsers []string `yaml:"authorized_users"`
+}
+
+// Role strings used for direct-route spoke authorization. These mirror the
+// roles the hub injects via X-Hive-Role on the proxied path so the read-only
+// gating in the dashboard behaves identically on both paths.
+const (
+	RoleOwner = "owner"
+	RoleRead  = "read"
+)
+
+// AuthorizedRole resolves a GitHub username against the spoke's authorized-users
+// allowlist and returns the user's role and whether they are authorized.
+//
+// Each entry is either "username" or "username:role" (role = "owner" or "read").
+// An entry without an explicit role defaults to "owner" for the first entry
+// (the hive owner) and "read" for the rest (granted viewers). Matching is
+// case-insensitive because GitHub usernames are case-insensitive.
+//
+// A spoke with an empty AuthorizedUsers list is NOT a direct-route spoke that
+// enforces device-flow authz (it is either hub-proxied or misconfigured); the
+// caller decides how to treat that case — see IsDirectRouteAuthzEnabled.
+func (d DashboardConfig) AuthorizedRole(username string) (string, bool) {
+	if username == "" {
+		return "", false
+	}
+	want := strings.ToLower(username)
+	for i, entry := range d.AuthorizedUsers {
+		name, role := splitAuthorizedEntry(entry)
+		if name == "" {
+			continue
+		}
+		if strings.ToLower(name) != want {
+			continue
+		}
+		if role == "" {
+			if i == 0 {
+				role = RoleOwner
+			} else {
+				role = RoleRead
+			}
+		}
+		return role, true
+	}
+	return "", false
+}
+
+// IsDirectRouteAuthzEnabled reports whether this spoke has a per-hive
+// authorized-users allowlist and must therefore enforce per-user authorization
+// on device-flow logins. Hub-proxied hives leave this empty and rely on nginx.
+func (d DashboardConfig) IsDirectRouteAuthzEnabled() bool {
+	return len(d.AuthorizedUsers) > 0
+}
+
+// splitAuthorizedEntry parses a "username" or "username:role" allowlist entry.
+func splitAuthorizedEntry(entry string) (name, role string) {
+	entry = strings.TrimSpace(entry)
+	if idx := strings.LastIndex(entry, ":"); idx >= 0 {
+		name = strings.TrimSpace(entry[:idx])
+		role = strings.ToLower(strings.TrimSpace(entry[idx+1:]))
+		if role != RoleOwner && role != RoleRead {
+			// Unknown role suffix — treat the whole thing as a bare username so
+			// a stray colon can never silently downgrade or escalate access.
+			return strings.TrimSpace(entry), ""
+		}
+		return name, role
+	}
+	return entry, ""
 }
 
 type DataConfig struct {
-	MetricsDir          string `yaml:"metrics_dir"`
-	LogsDir             string `yaml:"logs_dir"`
-	ClaudeSessionsDir   string `yaml:"claude_sessions_dir"`
-	CopilotSessionsDir  string `yaml:"copilot_sessions_dir"`
-	AgentsDir           string `yaml:"agents_dir"`
+	MetricsDir         string `yaml:"metrics_dir"`
+	LogsDir            string `yaml:"logs_dir"`
+	ClaudeSessionsDir  string `yaml:"claude_sessions_dir"`
+	CopilotSessionsDir string `yaml:"copilot_sessions_dir"`
+	AgentsDir          string `yaml:"agents_dir"`
 }
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -826,6 +987,28 @@ func (c *Config) applyBootstrapEnv() {
 			c.Dashboard.AuthToken = v
 		}
 	}
+	// K8s-provisioned spokes receive their per-hive authorized GitHub users as a
+	// comma-separated env var (owner first). This is what lets a direct-route
+	// spoke reject unauthorized device-flow logins without the hub proxy.
+	if len(c.Dashboard.AuthorizedUsers) == 0 {
+		if v := os.Getenv("HIVE_AUTHORIZED_USERS"); v != "" {
+			c.Dashboard.AuthorizedUsers = parseAuthorizedUsers(v)
+		}
+	}
+}
+
+// parseAuthorizedUsers splits a comma-separated authorized-users list, trimming
+// whitespace and dropping empty entries. Order is preserved so the first entry
+// remains the owner.
+func parseAuthorizedUsers(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if u := strings.TrimSpace(p); u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 func expandEnvVars(s string) string {
@@ -1077,52 +1260,52 @@ func applyKnownAgentDefaults(name string, agent *AgentConfig) {
 			Emoji: "🔍", Color: "#3498db", Aliases: []string{"sc"},
 			LaneKeywords:   []string{"bug", "triage", "typo", "fix"},
 			DetectKeywords: []string{"scanner", "triage", "issue", "bug"},
-			BeadRole: "worker", SortOrder: 20, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 20, IncludeRepos: true,
 		},
 		"ci-maintainer": {
 			Emoji: "🔧", Color: "#2ecc71", Aliases: []string{"ci"},
 			LaneKeywords:   []string{"workflow-failure", "ci-failure", "nightly", "coverage", "regression", "ga4", "analytics"},
 			DetectKeywords: []string{"ci-maintainer", "review", "ci", "coverage", "ga4"},
-			BeadRole: "worker", SortOrder: 30, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 30, IncludeRepos: true,
 		},
 		"architect": {
 			Emoji: "🏗", Color: "#9b59b6", Aliases: []string{"ar"},
 			LaneKeywords:   []string{"rfc", "architecture", "refactor", "redesign", "migration", "breaking change", "protocol", "api design"},
 			DetectKeywords: []string{"architect", "rfc", "refactor"},
-			BeadRole: "worker", SortOrder: 40, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 40, IncludeRepos: true,
 		},
 		"outreach": {
 			Emoji: "🌐", Color: "#e67e22", Aliases: []string{"ou"},
 			LaneKeywords:   []string{"adopters", "outreach", "community", "engagement"},
 			DetectKeywords: []string{"outreach", "adopters", "community"},
-			BeadRole: "worker", SortOrder: 50, IncludeRepos: false,
+			BeadRole:       "worker", SortOrder: 50, IncludeRepos: false,
 		},
 		"supervisor": {
 			Emoji: "👑", Color: "#e74c3c", Aliases: []string{"su"},
 			DetectKeywords: []string{"supervisor", "sweep", "monitor"},
-			BeadRole: "supervisor", SortOrder: 10, IncludeRepos: true,
+			BeadRole:       "supervisor", SortOrder: 10, IncludeRepos: true,
 		},
 		"sec-check": {
 			Emoji: "🛡", Color: "#1abc9c", Aliases: []string{"se"},
 			DetectKeywords: []string{"security", "sec-check", "vulnerability"},
-			BeadRole: "worker", SortOrder: 60, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 60, IncludeRepos: true,
 		},
 		"quality": {
 			Emoji: "🧪", Color: "#3498db", Aliases: []string{"te", "qa"},
 			LaneKeywords:   []string{"test-gap", "test-strategy", "test-coverage", "test-scaffold", "untested", "missing-tests"},
 			DetectKeywords: []string{"quality", "test", "coverage"},
-			BeadRole: "worker", SortOrder: 35, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 35, IncludeRepos: true,
 		},
 		"strategist": {
 			Emoji: "🧠", Color: "#f39c12", Aliases: []string{"sg"},
 			DetectKeywords: []string{"strategist", "strategy"},
-			BeadRole: "worker", SortOrder: 70, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 70, IncludeRepos: true,
 		},
 		"guide": {
 			Emoji: "📖", Color: "#8e44ad", Aliases: []string{"gu"},
 			LaneKeywords:   []string{"docs", "documentation", "readme", "guide", "tutorial", "onboarding"},
 			DetectKeywords: []string{"guide", "docs", "documentation"},
-			BeadRole: "worker", SortOrder: 45, IncludeRepos: true,
+			BeadRole:       "worker", SortOrder: 45, IncludeRepos: true,
 		},
 	}
 
@@ -1376,23 +1559,23 @@ func (c *Config) Save() error {
 	// and other runtime changes are lost on container restart.
 	f, err := os.OpenFile(c.SourcePath, os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		// File may not exist yet — fall back to create.
+		// File may not exist yet — fall back to create. Continue below so
+		// the PVC backup and dashboard overlay are still written.
 		if writeErr := os.WriteFile(c.SourcePath, data, 0o644); writeErr != nil {
 			return fmt.Errorf("writing config (create fallback): %w", writeErr)
 		}
-		return nil
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("writing config: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("syncing config: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing config: %w", err)
+	} else {
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return fmt.Errorf("writing config: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("syncing config: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("closing config: %w", err)
+		}
 	}
 
 	// Write a rolling backup to the PVC. This is NOT the primary config —
@@ -1412,7 +1595,75 @@ func (c *Config) Save() error {
 	} else {
 		log.Printf("[config] PVC backup written to %s (recovery copy, not primary config)", backupPath)
 	}
+
+	c.saveDashboardOverlay()
 	return nil
+}
+
+// DashboardOverlayFile is where Save() persists a secret-free copy of the
+// dashboard-edited config on the PVC in Kubernetes mode. The copy-config
+// init container re-seeds /etc/hive/hive.yaml FROM THE CONFIGMAP on every
+// pod boot, so without this overlay every dashboard save (LiteLLM
+// endpoint, notifications, agent tweaks, ...) silently vanished on the
+// next restart or upgrade. The entrypoint merges this file over the
+// ConfigMap seed at boot; the ConfigMap stays authoritative for the
+// hub/admin-managed keys (acmm_level, hub.is_public).
+//
+// A package var (not const) only so tests can point it at a temp dir; it
+// never changes at runtime in production.
+var DashboardOverlayFile = "/data/hive.yaml.dashboard"
+
+// IsKubernetesPod reports whether the process is running inside a
+// Kubernetes pod (mirrors the entrypoint's IS_KUBERNETES detection).
+func IsKubernetesPod() bool {
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return true
+	}
+	_, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	return err == nil
+}
+
+// saveDashboardOverlay writes the secret-free PVC overlay in Kubernetes
+// mode. Failures are logged, never fatal: the primary save already
+// succeeded, the overlay only affects persistence across pod restarts.
+func (c *Config) saveDashboardOverlay() {
+	if !IsKubernetesPod() {
+		// Docker/LXC mode: /data/hive.yaml.bak is already the boot-time
+		// source of truth there, so dashboard saves persist without an
+		// overlay.
+		return
+	}
+	data, err := c.dashboardOverlayBytes()
+	if err != nil {
+		log.Printf("[config] warning: failed to marshal dashboard overlay: %v", err)
+		return
+	}
+	if err := os.WriteFile(DashboardOverlayFile, data, 0o644); err != nil {
+		log.Printf("[config] warning: failed to write dashboard overlay %s (dashboard saves will not survive pod restarts): %v", DashboardOverlayFile, err)
+		return
+	}
+	log.Printf("[config] dashboard overlay written to %s (merged over the ConfigMap seed at next boot)", DashboardOverlayFile)
+}
+
+// dashboardOverlayBytes marshals the config with env-derived secret VALUES
+// collapsed back to their env-var forms, so the PVC overlay stays
+// secret-free. Load() re-expands ${VAR} references and applyBootstrapEnv
+// re-fills the dashboard auth token from the pod env, so nothing is lost.
+func (c *Config) dashboardOverlayBytes() ([]byte, error) {
+	// Shallow copy: top-level fields are struct values, so mutating the
+	// copy's GitHub/Dashboard sections leaves the live config untouched
+	// (the shared Agents map is not modified).
+	cp := *c
+	if tok := os.Getenv("HIVE_GITHUB_TOKEN"); tok != "" && cp.GitHub.Token == tok {
+		cp.GitHub.Token = "${HIVE_GITHUB_TOKEN}"
+	}
+	for _, env := range []string{"DASHBOARD_AUTH_TOKEN", "HIVE_DASHBOARD_TOKEN"} {
+		if v := os.Getenv(env); v != "" && cp.Dashboard.AuthToken == v {
+			cp.Dashboard.AuthToken = ""
+			break
+		}
+	}
+	return yaml.Marshal(&cp)
 }
 
 // WildcardMatch checks if text matches a pattern supporting:

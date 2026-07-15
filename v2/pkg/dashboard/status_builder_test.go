@@ -926,3 +926,28 @@ func TestCollectSystemResources_DoesNotPanic(t *testing.T) {
 		t.Errorf("CpuPct = %.1f, want [0, 100]", res.CpuPct)
 	}
 }
+
+func TestCPUUsagePercent(t *testing.T) {
+	tests := []struct {
+		name      string
+		deltaUsec int64
+		elapsed   time.Duration
+		cpuCount  int
+		want      float64
+	}{
+		{name: "half of one CPU", deltaUsec: 100_000, elapsed: 200 * time.Millisecond, cpuCount: 1, want: 50},
+		{name: "half of two CPUs", deltaUsec: 200_000, elapsed: 200 * time.Millisecond, cpuCount: 2, want: 50},
+		{name: "uses measured elapsed time", deltaUsec: 201_200, elapsed: 202 * time.Millisecond, cpuCount: 1, want: 99.6},
+		{name: "bounds accounting overshoot", deltaUsec: 201_200, elapsed: 200 * time.Millisecond, cpuCount: 1, want: 100},
+		{name: "invalid CPU count", deltaUsec: 100_000, elapsed: 200 * time.Millisecond, cpuCount: 0, want: 0},
+		{name: "invalid interval", deltaUsec: 100_000, elapsed: 0, cpuCount: 1, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cpuUsagePercent(tt.deltaUsec, tt.elapsed, tt.cpuCount); got != tt.want {
+				t.Fatalf("cpuUsagePercent(%d, %s, %d) = %.1f, want %.1f", tt.deltaUsec, tt.elapsed, tt.cpuCount, got, tt.want)
+			}
+		})
+	}
+}

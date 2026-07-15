@@ -31,6 +31,21 @@ func (c *Client) GoGitHub() *gh.Client {
 	return c.client
 }
 
+func (c *Client) AuthenticatedLogin(ctx context.Context) (string, error) {
+	if c == nil || c.client == nil {
+		return "", fmt.Errorf("GitHub client is required")
+	}
+	user, _, err := c.client.Users.Get(ctx, "")
+	if err != nil {
+		return "", fmt.Errorf("read authenticated GitHub identity: %w", err)
+	}
+	login := strings.TrimSpace(user.GetLogin())
+	if login == "" {
+		return "", fmt.Errorf("authenticated GitHub identity has no login")
+	}
+	return login, nil
+}
+
 type Issue struct {
 	Repo           string    `json:"repo"`
 	Number         int       `json:"number"`
@@ -62,12 +77,12 @@ type PullRequest struct {
 }
 
 type ActionableResult struct {
-	GeneratedAt   time.Time          `json:"generated_at"`
-	Issues        IssueResult        `json:"issues"`
-	PRs           PRResult           `json:"prs"`
-	Hold          HoldResult         `json:"hold"`
-	Clusters      []IssueCluster     `json:"clusters,omitempty"`
-	TotalByRepo   map[string]RepoCounts `json:"total_by_repo,omitempty"`
+	GeneratedAt time.Time             `json:"generated_at"`
+	Issues      IssueResult           `json:"issues"`
+	PRs         PRResult              `json:"prs"`
+	Hold        HoldResult            `json:"hold"`
+	Clusters    []IssueCluster        `json:"clusters,omitempty"`
+	TotalByRepo map[string]RepoCounts `json:"total_by_repo,omitempty"`
 }
 
 type RepoCounts struct {
@@ -87,10 +102,10 @@ type PRResult struct {
 }
 
 type HoldResult struct {
-	Issues int         `json:"issues"`
-	PRs    int         `json:"prs"`
-	Total  int         `json:"total"`
-	Items  []HoldItem  `json:"items"`
+	Issues int        `json:"issues"`
+	PRs    int        `json:"prs"`
+	Total  int        `json:"total"`
+	Items  []HoldItem `json:"items"`
 }
 
 type HoldItem struct {
@@ -214,7 +229,7 @@ func (c *Client) EnumerateActionable(ctx context.Context) (*ActionableResult, er
 	// zero-count result would tell the governor the queue is empty and
 	// idle the agents. Surface the failure so callers keep prior state.
 	if len(repos) > 0 && failedRepos >= len(repos) {
-		return nil, fmt.Errorf("all %d repos failed to enumerate (last error: %w)", len(repos), lastFetchErr)
+		return result, fmt.Errorf("all %d repos failed to enumerate (last error: %w)", len(repos), lastFetchErr)
 	}
 
 	sort.Slice(allIssues, func(i, j int) bool {

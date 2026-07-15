@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/config"
 )
@@ -15,6 +17,9 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestSave_InvalidPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix /proc error-path fixture")
+	}
 	u := NewUIDMap()
 	u.AllocateUIDs([]string{"scanner"})
 
@@ -718,16 +723,41 @@ func TestEnsureClaudeSettings_CreatesFiles(t *testing.T) {
 	if parsed["bypassPermissions"] != true {
 		t.Error("bypassPermissions should be true")
 	}
+	if parsed["skipDangerousModePermissionPrompt"] != true {
+		t.Error("skipDangerousModePermissionPrompt should be true — it is the only key that suppresses the bypass-permissions consent dialog")
+	}
 
 	// Check standalone settings file
-	if _, err := os.Stat(claudeInferenceSettingsPath); err != nil {
-		t.Errorf("standalone settings file not created: %v", err)
+	flagData, err := os.ReadFile(claudeInferenceSettingsPath)
+	if err != nil {
+		t.Fatalf("standalone settings file not created: %v", err)
+	}
+	var flagParsed map[string]interface{}
+	if err := json.Unmarshal(flagData, &flagParsed); err != nil {
+		t.Fatalf("standalone settings invalid JSON: %v", err)
+	}
+	if flagParsed["skipDangerousModePermissionPrompt"] != true {
+		t.Error("standalone settings skipDangerousModePermissionPrompt should be true")
 	}
 
 	// Check .claude.json user config
 	userConfig := filepath.Join(testHomePath, ".claude.json")
-	if _, err := os.Stat(userConfig); err != nil {
-		t.Errorf("user config not created: %v", err)
+	userData, err := os.ReadFile(userConfig)
+	if err != nil {
+		t.Fatalf("user config not created: %v", err)
+	}
+	var userParsed map[string]interface{}
+	if err := json.Unmarshal(userData, &userParsed); err != nil {
+		t.Fatalf("user config invalid JSON: %v", err)
+	}
+	if userParsed["hasCompletedOnboarding"] != true {
+		t.Error("user config hasCompletedOnboarding should be true")
+	}
+	if userParsed["bypassPermissionsModeAccepted"] != true {
+		t.Error("user config bypassPermissionsModeAccepted should be true")
+	}
+	if _, ok := userParsed["customApiKeyResponses"]; !ok {
+		t.Error("user config should include customApiKeyResponses")
 	}
 }
 
@@ -742,6 +772,233 @@ func TestEnsureClaudeSettings_Idempotent(t *testing.T) {
 	settingsFile := filepath.Join(idempotentHomePath, ".claude", "settings.json")
 	if _, err := os.Stat(settingsFile); err != nil {
 		t.Errorf("settings should still exist: %v", err)
+	}
+}
+
+func TestSeedClaudeSettingsFile_RepairsMissingKey(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	// Simulate a settings file seeded by an older hive version: no
+	// skipDangerousModePermissionPrompt, plus keys that must be preserved.
+	old := `{"permissions":{"allow":["Bash"],"deny":[]},"hasCompletedOnboarding":true,"bypassPermissions":true,"hasAcknowledgedDisclaimer":true}`
+	if err := os.WriteFile(path, []byte(old), 0o666); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m.seedClaudeSettingsFile("repair-agent", path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("invalid JSON after repair: %v", err)
+	}
+	if parsed["skipDangerousModePermissionPrompt"] != true {
+		t.Error("skipDangerousModePermissionPrompt should be merged in")
+	}
+	perms, ok := parsed["permissions"].(map[string]interface{})
+	if !ok {
+		t.Fatal("permissions should remain an object")
+	}
+	allow, ok := perms["allow"].([]interface{})
+	if !ok || len(allow) != 1 || allow[0] != "Bash" {
+		t.Error("existing permissions must not be overwritten on repair")
+	}
+}
+
+func TestSeedClaudeSettingsFile_CompleteFileUntouched(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+
+	m.seedClaudeSettingsFile("complete-agent", path)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after seed: %v", err)
+	}
+
+	m.seedClaudeSettingsFile("complete-agent", path)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after reseed: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Error("complete settings should not be rewritten")
+	}
+}
+
+func TestInferenceUserConfigSeed_ApprovedKeyForms(t *testing.T) {
+	// Short name: full key is within the CLI's 20-char comparison suffix,
+	// so only the full form is needed.
+	seed := inferenceUserConfigSeed("kellyaa")
+	responses := seed["customApiKeyResponses"].(map[string]any)
+	approved := responses["approved"].([]string)
+	if len(approved) != 1 || approved[0] != "sk-hive-kellyaa" {
+		t.Errorf("short-name approved = %v, want [sk-hive-kellyaa]", approved)
+	}
+
+	// Long name: the CLI matches key.slice(-20), so the truncated form must
+	// be seeded alongside the full key.
+	seed = inferenceUserConfigSeed("test-settings")
+	responses = seed["customApiKeyResponses"].(map[string]any)
+	approved = responses["approved"].([]string)
+	fullKey := "sk-hive-test-settings"
+	wantSuffix := fullKey[len(fullKey)-apiKeyApprovalSuffixLen:]
+	if len(approved) != 2 || approved[0] != fullKey || approved[1] != wantSuffix {
+		t.Errorf("long-name approved = %v, want [%s %s]", approved, fullKey, wantSuffix)
+	}
+}
+
+func TestSeedClaudeUserConfig_MergesTruncatedAPIKey(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+
+	// Config seeded by an older hive version: full key only, no truncated
+	// form. The top-level merge alone would skip customApiKeyResponses.
+	old := `{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"customApiKeyResponses":{"approved":["sk-hive-long-agent-name"],"rejected":["other"]}}`
+	if err := os.WriteFile(path, []byte(old), 0o666); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m.seedClaudeUserConfig("long-agent-name", path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("invalid JSON after repair: %v", err)
+	}
+	responses := parsed["customApiKeyResponses"].(map[string]interface{})
+	approved := responses["approved"].([]interface{})
+	fullKey := "sk-hive-long-agent-name"
+	wantSuffix := fullKey[len(fullKey)-apiKeyApprovalSuffixLen:]
+	found := false
+	for _, v := range approved {
+		if v == wantSuffix {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("approved = %v, should include truncated form %q", approved, wantSuffix)
+	}
+	rejected := responses["rejected"].([]interface{})
+	if len(rejected) != 1 || rejected[0] != "other" {
+		t.Errorf("rejected = %v, existing entries must be preserved", rejected)
+	}
+}
+
+func TestSelectedMenuOption(t *testing.T) {
+	tests := []struct {
+		name string
+		pane string
+		want string
+	}{
+		{
+			name: "no-first consent variant",
+			pane: "WARNING: Claude Code running in Bypass Permissions mode\n ❯ 1. No, exit\n   2. Yes, I accept\nEnter to confirm · Esc to cancel",
+			want: "❯ 1. No, exit",
+		},
+		{
+			name: "yes-first consent variant",
+			pane: "WARNING: Claude Code running in Bypass Permissions mode\n ❯ 1. Yes, I accept\n   2. No, exit\nEnter to confirm · Esc to cancel",
+			want: "❯ 1. Yes, I accept",
+		},
+		{
+			name: "no selection",
+			pane: "plain shell output\n$ ",
+			want: "",
+		},
+		{
+			name: "empty pane",
+			pane: "",
+			want: "",
+		},
+	}
+	for _, tc := range tests {
+		if got := selectedMenuOption(tc.pane); got != tc.want {
+			t.Errorf("selectedMenuOption(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSeedClaudeUserConfig_RepairsMissingKeys(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+
+	// Simulate a seed from an older hive version: no bypassPermissionsModeAccepted,
+	// plus a CLI-written key that must be preserved.
+	old := `{"hasCompletedOnboarding":true,"someCliKey":"keep-me"}`
+	if err := os.WriteFile(path, []byte(old), 0o666); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m.seedClaudeUserConfig("repair-agent", path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("invalid JSON after repair: %v", err)
+	}
+	if parsed["bypassPermissionsModeAccepted"] != true {
+		t.Error("bypassPermissionsModeAccepted should be merged in")
+	}
+	if parsed["someCliKey"] != "keep-me" {
+		t.Error("existing keys should be preserved on repair")
+	}
+}
+
+func TestSeedClaudeUserConfig_RewritesCorruptFile(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o666); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m.seedClaudeUserConfig("corrupt-agent", path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("corrupt file should be rewritten as valid JSON: %v", err)
+	}
+	if parsed["bypassPermissionsModeAccepted"] != true {
+		t.Error("bypassPermissionsModeAccepted should be true after rewrite")
+	}
+}
+
+func TestSeedClaudeUserConfig_CompleteFileUntouched(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{}, discardLogger(), ProjectContext{})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".claude.json")
+
+	m.seedClaudeUserConfig("complete-agent", path)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after seed: %v", err)
+	}
+
+	m.seedClaudeUserConfig("complete-agent", path)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after reseed: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Error("complete config should not be rewritten")
 	}
 }
 
@@ -965,6 +1222,305 @@ func TestCliPaneMarkers_HasExpectedEntries(t *testing.T) {
 		if !found {
 			t.Errorf("missing CLI pane marker: %q", e)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// paneShowsConsentScreen
+// ---------------------------------------------------------------------------
+
+func TestPaneShowsConsentScreen(t *testing.T) {
+	bypassConsent := `WARNING: Claude Code running in Bypass Permissions mode
+
+In Bypass Permissions mode, Claude Code will not ask for your approval before running potentially dangerous commands.
+
+ ❯ 1. No, exit
+   2. Yes, I accept
+
+Enter to confirm · Esc to exit`
+
+	genericSelection := `Do you trust the files in this folder?
+
+ ❯ 1. Yes, proceed
+   2. No, exit
+
+Enter to confirm`
+
+	readyPane := `╭──────────────────────────╮
+│ ❯                        │
+╰──────────────────────────╯
+  ? for shortcuts`
+
+	workingPane := `Thinking...
+(esc to interrupt)
+❯ 1. No, exit
+Enter to confirm`
+
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"empty pane", "", false},
+		{"bypass permissions consent", bypassConsent, true},
+		{"generic selection with confirm footer", genericSelection, true},
+		{"ready input prompt", readyPane, false},
+		{"working state is never consent", workingPane, false},
+		{"bare bash", "dev@hive:~$ ", false},
+		{"confirm footer without selection", "Enter to confirm something in output", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := paneShowsConsentScreen(tc.pane); got != tc.want {
+				t.Errorf("paneShowsConsentScreen(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDismissConsentIfStuck_GraceAndCooldown(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{
+		"vinf": {Backend: "vllm"},
+	}, discardLogger(), ProjectContext{})
+	m.mu.RLock()
+	agent := m.agents["vinf"]
+	m.mu.RUnlock()
+
+	// First sighting only starts the grace timer.
+	m.dismissConsentIfStuck("vinf")
+	if agent.consentSeenAt.IsZero() {
+		t.Fatal("first sighting should start the grace timer")
+	}
+	if !agent.lastConsentDismiss.IsZero() {
+		t.Fatal("no dismissal should fire within the grace period")
+	}
+
+	// Simulate the screen having been visible past the grace period.
+	agent.consentSeenAt = time.Now().Add(-consentStuckGracePeriod - time.Second)
+	m.dismissConsentIfStuck("vinf")
+	if agent.lastConsentDismiss.IsZero() {
+		t.Fatal("dismissal should fire once past the grace period")
+	}
+	first := agent.lastConsentDismiss
+
+	// Cooldown: an immediate re-check must not re-fire.
+	m.dismissConsentIfStuck("vinf")
+	if !agent.lastConsentDismiss.Equal(first) {
+		t.Fatal("cooldown should prevent immediate re-dismissal")
+	}
+
+	// A pane without a consent screen resets the grace timer.
+	m.clearConsentTracking("vinf")
+	if !agent.consentSeenAt.IsZero() {
+		t.Fatal("clearConsentTracking should reset consentSeenAt")
+	}
+}
+
+func TestNudgeIfKickStalled(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{
+		"vinf": {Backend: "vllm"},
+	}, discardLogger(), ProjectContext{})
+	m.mu.RLock()
+	agent := m.agents["vinf"]
+	m.mu.RUnlock()
+
+	idlePane := "╭───╮\n│ ❯ │\n╰───╯\n? for shortcuts"
+
+	// No kick recorded — never nudges.
+	m.nudgeIfKickStalled("vinf", idlePane)
+	if agent.StallNudges != 0 {
+		t.Fatal("no nudge without a recorded kick")
+	}
+
+	// Kick recorded but timeout not elapsed — no nudge.
+	agent.lastInferKickAt = time.Now()
+	agent.lastInferKickPane = paneContentHash(idlePane)
+	agent.stallNudgeSent = false
+	m.nudgeIfKickStalled("vinf", idlePane)
+	if agent.StallNudges != 0 {
+		t.Fatal("no nudge before the stall timeout")
+	}
+
+	// Timeout elapsed, pane unchanged, idle prompt — exactly one nudge.
+	agent.lastInferKickAt = time.Now().Add(-inferenceKickStallTimeout - time.Minute)
+	m.nudgeIfKickStalled("vinf", idlePane)
+	if agent.StallNudges != 1 || !agent.stallNudgeSent {
+		t.Fatalf("expected one nudge, got %d (sent=%v)", agent.StallNudges, agent.stallNudgeSent)
+	}
+
+	// Second watcher pass: still max one nudge per kick.
+	m.nudgeIfKickStalled("vinf", idlePane)
+	if agent.StallNudges != 1 {
+		t.Fatalf("max one nudge per kick, got %d", agent.StallNudges)
+	}
+
+	// New kick re-arms, but a working pane is never nudged.
+	workingPane := idlePane + "\nesc to interrupt"
+	agent.lastInferKickAt = time.Now().Add(-inferenceKickStallTimeout - time.Minute)
+	agent.lastInferKickPane = paneContentHash(workingPane)
+	agent.stallNudgeSent = false
+	m.nudgeIfKickStalled("vinf", workingPane)
+	if agent.StallNudges != 1 {
+		t.Fatal("working pane must not be nudged")
+	}
+
+	// A pane change with post-kick tool activity disarms the watchdog.
+	// (No tmux session in tests → captureTmuxPaneForAgent returns "" →
+	// countToolMarkers is 0; a negative baseline simulates "count rose".)
+	agent.lastInferKickPane = paneContentHash("what the pane looked like at kick time")
+	agent.lastInferKickMarks = -1
+	m.nudgeIfKickStalled("vinf", idlePane)
+	if agent.StallNudges != 1 || agent.ActionNudges != 0 {
+		t.Fatal("changed pane with tool activity must not be nudged")
+	}
+	if agent.lastInferKickPane != "" {
+		t.Fatal("changed pane with tool activity should disarm the watchdog")
+	}
+}
+
+func TestNudgeIfKickStalled_ActionNudge(t *testing.T) {
+	m := NewManager(map[string]config.AgentConfig{
+		"vinf": {Backend: "vllm"},
+	}, discardLogger(), ProjectContext{})
+	m.mu.RLock()
+	agent := m.agents["vinf"]
+	m.mu.RUnlock()
+
+	// Prose-only response: the model answered the kick with a plan and
+	// returned to the idle prompt without a single tool marker.
+	prosePane := "❯ [agent:scanner] fix the failing issues\n" +
+		"⏺ To fix the failing issues, follow these steps. First you ensure the\n" +
+		"  branch is up to date, then you open a pull request with the fix.\n" +
+		"✻ Worked for 26s\n" +
+		"❯ \n" +
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+
+	// Within the grace period — never nudged.
+	agent.lastInferKickAt = time.Now().Add(-inferenceActionNudgeGrace + time.Minute)
+	agent.lastInferKickPane = paneContentHash("pane as captured at kick delivery")
+	agent.lastInferKickMarks = 0
+	m.nudgeIfKickStalled("vinf", prosePane)
+	if agent.ActionNudges != 0 {
+		t.Fatal("no action nudge within the grace period")
+	}
+
+	// Past the grace period with zero new tool markers — exactly one nudge.
+	// (No tmux session in tests → the scrollback capture is empty → the
+	// marker count stays at the baseline.)
+	agent.lastInferKickAt = time.Now().Add(-inferenceActionNudgeGrace - time.Minute)
+	m.nudgeIfKickStalled("vinf", prosePane)
+	if agent.ActionNudges != 1 || !agent.actionNudgeSent {
+		t.Fatalf("expected one action nudge, got %d (sent=%v)", agent.ActionNudges, agent.actionNudgeSent)
+	}
+	if agent.StallNudges != 0 {
+		t.Fatal("prose-only response must not count as a frozen-pane stall")
+	}
+
+	// Second watcher pass: max one action nudge per kick.
+	m.nudgeIfKickStalled("vinf", prosePane)
+	if agent.ActionNudges != 1 {
+		t.Fatalf("max one action nudge per kick, got %d", agent.ActionNudges)
+	}
+
+	// A CLI mid-response (live spinner counter) is left alone even though
+	// the footer no longer shows "esc to interrupt" on v2.1.204.
+	streamingPane := prosePane + "\n✶ Infusing… (18s · ↓ 94 tokens)"
+	agent.actionNudgeSent = false
+	m.nudgeIfKickStalled("vinf", streamingPane)
+	if agent.ActionNudges != 1 {
+		t.Fatal("streaming pane must not be nudged")
+	}
+
+	// A new kick re-arms both nudges.
+	now := time.Now()
+	m.mu.Lock()
+	m.recordInferenceKick(agent, now)
+	m.mu.Unlock()
+	if agent.actionNudgeSent || agent.stallNudgeSent {
+		t.Fatal("recordInferenceKick must reset both nudge flags")
+	}
+}
+
+func TestCountToolMarkers(t *testing.T) {
+	cases := []struct {
+		name string
+		pane string
+		want int
+	}{
+		{"empty", "", 0},
+		// A bare ⏺ is the bullet for every assistant block, prose included.
+		{"prose only", "⏺ To fix this, follow these steps and you ensure the tests pass.\n✻ Worked for 26s", 0},
+		{"mid-run bash (v2.1.204)", "⏺ Running 1 shell command…\n  ⎿  $ sleep 15 && echo probe3 (12s)", 2},
+		{"collapsed summary (v2.1.204)", "  Ran 1 shell command\n⏺ Done — it printed probe3.", 1},
+		{"collapsed read+bash (v2.1.204)", "  Read 1 file, ran 1 shell command\n⏺ Done.", 2},
+		{"expanded legacy tool call", "⏺ Bash(git status)\n  ⎿  On branch main", 2},
+		{"expanded legacy read", "⏺ Read(main.go)", 1},
+		{"plural summary", "  Ran 3 shell commands\n  Edited 2 files", 2},
+		{"idle prompt only", "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countToolMarkers(tc.pane); got != tc.want {
+				t.Errorf("countToolMarkers(%s) = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPaneShowsActiveWork(t *testing.T) {
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"legacy footer hint", "some output\nesc to interrupt", true},
+		{"live spinner counter (v2.1.204)", "✶ Infusing… (18s · ↓ 94 tokens)", true},
+		{"completed response", "⏺ Done.\n✻ Worked for 26s\n❯ ", false},
+		{"idle prompt", "❯ \n  ⏵⏵ bypass permissions on", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := paneShowsActiveWork(tc.pane); got != tc.want {
+				t.Errorf("paneShowsActiveWork(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPaneContentHash_StableAndDistinct(t *testing.T) {
+	a := paneContentHash("pane content")
+	if a != paneContentHash("pane content") {
+		t.Error("hash should be stable")
+	}
+	if a == paneContentHash("other content") {
+		t.Error("different content should hash differently")
+	}
+	if len(a) != 16 {
+		t.Errorf("hash should be 16 hex chars, got %d", len(a))
+	}
+}
+
+func TestEffectiveBackend(t *testing.T) {
+	agent := &AgentProcess{Config: config.AgentConfig{Backend: "copilot"}}
+	if got := effectiveBackend(agent); got != "copilot" {
+		t.Errorf("effectiveBackend = %q, want copilot", got)
+	}
+	agent.BackendOverride = "vllm"
+	if got := effectiveBackend(agent); got != "vllm" {
+		t.Errorf("effectiveBackend with override = %q, want vllm", got)
+	}
+}
+
+func TestPaneHasCLIMarker(t *testing.T) {
+	if paneHasCLIMarker("") {
+		t.Error("empty pane should have no CLI marker")
+	}
+	if paneHasCLIMarker("dev@hive:~$ ls\n-bash: NEVER: command not found") {
+		t.Error("bare bash pane should have no CLI marker")
+	}
+	if !paneHasCLIMarker("❯ ") {
+		t.Error("input prompt marker should match")
 	}
 }
 
@@ -1253,6 +1809,9 @@ func TestClearExpiredTokens_MissingFile(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFixSharedConfigPerms_FixesPerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix group mode bits")
+	}
 	cleanup := configTestHelper(t)
 	defer cleanup()
 

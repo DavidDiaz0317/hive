@@ -26,9 +26,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 
 	"github.com/kubestellar/hive/v2/pkg/advisory"
-	"github.com/kubestellar/hive/v2/pkg/hub"
 	"github.com/kubestellar/hive/v2/pkg/agent"
-	"github.com/kubestellar/hive/v2/pkg/logscrub"
 	"github.com/kubestellar/hive/v2/pkg/beads"
 	"github.com/kubestellar/hive/v2/pkg/classify"
 	"github.com/kubestellar/hive/v2/pkg/config"
@@ -36,22 +34,44 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/discord"
 	"github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/governor"
+	"github.com/kubestellar/hive/v2/pkg/hub"
 	"github.com/kubestellar/hive/v2/pkg/knowledge"
+	"github.com/kubestellar/hive/v2/pkg/logscrub"
 	"github.com/kubestellar/hive/v2/pkg/notify"
 	"github.com/kubestellar/hive/v2/pkg/policies"
 	"github.com/kubestellar/hive/v2/pkg/proxy"
+	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/scheduler"
 	"github.com/kubestellar/hive/v2/pkg/snapshot"
 	"github.com/kubestellar/hive/v2/pkg/tokens"
 )
 
 var (
-	gitHash   = "unknown"
-	gitShort  = "unknown"
-	gitBranch = "unknown"
+	gitHash           = "unknown"
+	gitShort          = "unknown"
+	gitBranch         = "unknown"
+	integratedVersion = "development"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		os.Exit(runVersionCommand(os.Args[1:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == repair.ContainmentProbeCommand {
+		os.Exit(repair.RunContainmentProbeChild())
+	}
+	if len(os.Args) > 1 && os.Args[1] == "visual" {
+		os.Exit(runVisualCommand(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "mcp-server" {
+		os.Exit(runMCPServer())
+	}
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
+			os.Exit(runIntegratedCommand(os.Args[1], os.Args[2:]))
+		}
+	}
 	startTime := time.Now()
 	defaultConfig := "/etc/hive/hive.yaml"
 	if envCfg := os.Getenv("HIVE_CONFIG"); envCfg != "" {
@@ -268,7 +288,12 @@ func main() {
 			num, err := ghClient.EnsureAdvisoryIssue(ctx, primaryRepo)
 			if err != nil {
 				logger.Error("failed to ensure advisory issue", "repo", primaryRepo, "error", err)
-				if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "401") {
+				// GitHub returns 403 for rate limiting too — a transient
+				// condition that must not raise the "App Not Installed"
+				// banner (matches the guard on the repo-change path).
+				if strings.Contains(err.Error(), "rate limit") {
+					logger.Warn("GitHub API rate limit hit during advisory issue ensure", "repo", primaryRepo)
+				} else if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "401") {
 					githubAppRequired = true
 					logger.Warn("GitHub App not installed or credentials invalid — setting githubAppRequired flag", "error", err)
 				}
@@ -553,7 +578,7 @@ func main() {
 	if badgeURL == "" {
 		badgeURL = "https://gist.githubusercontent.com/clubanderson/b9a9ae8469f1897a22d5a40629bc1e82/raw/coverage-badge.json"
 	}
-		primaryRepo := cfg.Project.PrimaryRepo
+	primaryRepo := cfg.Project.PrimaryRepo
 	if primaryRepo == "" && len(cfg.Project.Repos) > 0 {
 		primaryRepo = cfg.Project.Repos[0]
 	}
@@ -1344,7 +1369,7 @@ func main() {
 					out := make([]hub.LeaderboardEntry, len(lb))
 					for i, e := range lb {
 						out[i] = hub.LeaderboardEntry{
-							GitHubUsername:  e.GitHubUsername,
+							GitHubUsername: e.GitHubUsername,
 							AvatarURL:      e.AvatarURL,
 							TrustTier:      e.TrustTier,
 							TasksCompleted: e.TasksCompleted,
@@ -1366,7 +1391,7 @@ func main() {
 					}
 					return ""
 				}(),
-				Health:       dashSrv.HealthSummary(),
+				Health: dashSrv.HealthSummary(),
 				DashboardURL: func() string {
 					if cfg.Hub.DashboardURL != "" {
 						return cfg.Hub.DashboardURL
@@ -1378,13 +1403,13 @@ func main() {
 					}
 					return fmt.Sprintf("http://localhost:%d", cfg.Dashboard.Port)
 				}(),
-				SnapshotURL:  cfg.Hub.SnapshotURL,
-				HiveType:     cfg.Hub.HiveType,
-				ClusterID:    cfg.Hub.ClusterID,
-				IsPublic:     cfg.Hub.IsPublic,
-				Version:           "3.0.0",
-				GitHash:           gitShort,
-				GitBranch:         gitBranch,
+				SnapshotURL:             cfg.Hub.SnapshotURL,
+				HiveType:                cfg.Hub.HiveType,
+				ClusterID:               cfg.Hub.ClusterID,
+				IsPublic:                cfg.Hub.IsPublic,
+				Version:                 "3.0.0",
+				GitHash:                 gitShort,
+				GitBranch:               gitBranch,
 				GitHubAppRequired:       dashSrv.IsGitHubAppRequired(),
 				GitHubAppPermIssue:      dashSrv.GetGitHubAppPermIssue(),
 				PendingGitHubAppInstall: dashSrv.IsPendingGitHubAppInstall(),
@@ -1543,7 +1568,7 @@ func main() {
 			out := make([]hub.LeaderboardEntry, len(lb))
 			for i, e := range lb {
 				out[i] = hub.LeaderboardEntry{
-					GitHubUsername:  e.GitHubUsername,
+					GitHubUsername: e.GitHubUsername,
 					AvatarURL:      e.AvatarURL,
 					TrustTier:      e.TrustTier,
 					TasksCompleted: e.TasksCompleted,
@@ -1639,6 +1664,23 @@ func main() {
 			dashSrv.BroadcastAgentStatus(payload)
 		}
 	}
+}
+
+func runVersionCommand(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 || (args[0] != "--version" && args[0] != "version") {
+		fmt.Fprintln(stderr, "usage: hive --version")
+		return 2
+	}
+	version := strings.TrimSpace(integratedVersion)
+	commit := strings.ToLower(strings.TrimSpace(gitHash))
+	if version == "" {
+		version = "development"
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	fmt.Fprintf(stdout, "Hive %s\ncommit: %s\n", version, commit)
+	return 0
 }
 
 // Dashboard system-alert IDs for the budget thresholds.
@@ -2212,22 +2254,22 @@ func persistState(agentMgr *agent.Manager, gov *governor.Governor, cfg *config.C
 	}
 
 	state := &snapshot.PersistedState{
-		Agents:           agents,
-		GovernorMode:     string(govState.Mode),
-		BudgetLimit:      budget.WeeklyLimit,
-		BudgetIgnored:    budget.IgnoredAgents,
-		BudgetIgnoreAll:  budget.IgnoreAll,
-		CadenceOverrides: cadenceOverrides,
-		LastKicks:        govState.LastKick,
+		Agents:               agents,
+		GovernorMode:         string(govState.Mode),
+		BudgetLimit:          budget.WeeklyLimit,
+		BudgetIgnored:        budget.IgnoredAgents,
+		BudgetIgnoreAll:      budget.IgnoreAll,
+		CadenceOverrides:     cadenceOverrides,
+		LastKicks:            govState.LastKick,
 		BudgetSpend:          budget.CurrentSpend,
 		BudgetResetAt:        budget.ResetAt,
 		BudgetByAgent:        budget.ByAgent,
 		BudgetByModel:        budget.ByModel,
 		BudgetWindowBaseline: budget.WindowBaseline,
-		KickHistory:      kickEntries,
-		IssueCosts:       issueCosts,
-		LastEval:         govState.LastEval,
-		ACMMLevel:        cfg.ACMMLevel,
+		KickHistory:          kickEntries,
+		IssueCosts:           issueCosts,
+		LastEval:             govState.LastEval,
+		ACMMLevel:            cfg.ACMMLevel,
 	}
 
 	if err := snapshot.SaveState(path, state, logger); err != nil {

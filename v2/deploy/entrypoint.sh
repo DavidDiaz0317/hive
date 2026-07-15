@@ -26,11 +26,61 @@ if [ -n "${KUBERNETES_SERVICE_HOST:-}" ] || [ -f /var/run/secrets/kubernetes.io/
 fi
 
 if [ "$IS_KUBERNETES" = "true" ]; then
-  # ── Kubernetes mode: ConfigMap is the source of truth ──────────────
+  # ── Kubernetes mode: ConfigMap seed + dashboard overlay ────────────
   if [ -f "$HIVE_CONFIG_PATH" ] && [ -s "$HIVE_CONFIG_PATH" ]; then
-    # ConfigMap is present and non-empty — use it as-is, write a backup for recovery
+    # The copy-config init container re-seeded $HIVE_CONFIG_PATH from the
+    # ConfigMap on this boot. Config saved via the dashboard (Config.Save
+    # writes /etc/hive/hive.yaml, an emptyDir) would be silently lost —
+    # so the Go binary also persists a secret-free overlay to the PVC
+    # (/data/hive.yaml.dashboard) on every save, and we merge it over the
+    # seed here, BEFORE the backup copy and before the agent-UID
+    # enumeration below reads hive.yaml.
+    #
+    # Precedence: the overlay (last dashboard save) wins for everything
+    # EXCEPT the hub/admin-managed keys, which the ConfigMap owns:
+    #   - acmm_level     (set by the hub at provision / level change)
+    #   - hub.is_public  (hub-managed visibility)
+    # A missing, empty, unparsable, or implausible overlay (no
+    # project.org / agents) leaves the ConfigMap seed untouched.
+    HIVE_DASHBOARD_OVERLAY="/data/hive.yaml.dashboard"
+    if [ -f "$HIVE_DASHBOARD_OVERLAY" ] && [ -s "$HIVE_DASHBOARD_OVERLAY" ]; then
+      if python3 - "$HIVE_CONFIG_PATH" "$HIVE_DASHBOARD_OVERLAY" <<'PYEOF'
+import os, sys, yaml
+
+seed_path, overlay_path = sys.argv[1], sys.argv[2]
+with open(seed_path) as f:
+    seed = yaml.safe_load(f) or {}
+with open(overlay_path) as f:
+    overlay = yaml.safe_load(f) or {}
+
+# Sanity: the overlay must look like a full hive config. Save()'s
+# validateSaveGuard enforces this on write; re-check before trusting it.
+if not isinstance(overlay, dict):
+    sys.exit(1)
+if not (overlay.get('project') or {}).get('org') or not overlay.get('agents'):
+    sys.exit(1)
+
+# ConfigMap (hub/admin) wins for its managed keys when it sets them.
+if 'acmm_level' in seed:
+    overlay['acmm_level'] = seed['acmm_level']
+if isinstance(seed.get('hub'), dict) and 'is_public' in seed['hub']:
+    overlay.setdefault('hub', {})['is_public'] = seed['hub']['is_public']
+
+# Atomic replace so a failure mid-write can never corrupt the seed.
+tmp_path = seed_path + '.merged'
+with open(tmp_path, 'w') as f:
+    yaml.safe_dump(overlay, f, default_flow_style=False, sort_keys=False)
+os.replace(tmp_path, seed_path)
+PYEOF
+      then
+        echo "[entrypoint] K8s mode — dashboard overlay merged over ConfigMap seed (ConfigMap wins for acmm_level, hub.is_public)"
+      else
+        echo "[entrypoint] K8s mode — dashboard overlay invalid, using ConfigMap seed as-is"
+      fi
+    fi
+    # Write the (merged) config as the disaster-recovery backup.
     cp "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_BACKUP" 2>/dev/null || true
-    echo "[entrypoint] K8s mode — ConfigMap is source of truth, backup written to $HIVE_CONFIG_BACKUP"
+    echo "[entrypoint] K8s mode — ConfigMap is the seed, backup written to $HIVE_CONFIG_BACKUP"
   elif [ -f "$HIVE_CONFIG_BACKUP" ] && [ -s "$HIVE_CONFIG_BACKUP" ]; then
     # ConfigMap is missing or empty but a PVC backup exists — recover
     if cp "$HIVE_CONFIG_BACKUP" "$HIVE_CONFIG_PATH" 2>/dev/null; then
@@ -90,6 +140,18 @@ if [ "$(id -u)" = "0" ]; then
   fi
   chown dev:node /home/dev 2>/dev/null || true
   chown dev:node /etc/hive/hive.yaml 2>/dev/null || true
+
+  # Ensure the PVC secrets dir the dashboard writes API keys into
+  # (/data/secrets/litellm_api_key) exists and is owned by the dev user.
+  # The Go binary runs as non-root (uid 1001) and CANNOT chown, so if this
+  # dir ever ends up root-owned the key save fails with EACCES. We create
+  # and chown it here (as root, before dropping to dev) UNCONDITIONALLY —
+  # not gated on DATA_OWNER — because the recursive /data chown above is
+  # skipped when /data is already dev-owned, which would leave a
+  # root-owned /data/secrets uncorrected. Mode 700: owner-only secrets.
+  mkdir -p /data/secrets && chown dev:node /data/secrets 2>/dev/null || true
+  chmod 700 /data/secrets 2>/dev/null || true
+
   mkdir -p /var/run/hive-metrics && chown dev:node /var/run/hive-metrics 2>/dev/null || true
   mkdir -p /var/run/hive-metrics/agent-tokens && chown dev:node /var/run/hive-metrics/agent-tokens 2>/dev/null || true
 
