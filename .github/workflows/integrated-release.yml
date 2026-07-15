@@ -25,7 +25,7 @@ jobs:
       release_tag: ${{ steps.metadata.outputs.release_tag }}
     env:
       NODE_VERSION: 22.23.1
-      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '6891c7fcc831eac8d560ea933d2e72e21a39a475' }}
+      VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '03e229ad1efe8ab3e996c2ae94dbb683c73add66' }}
       RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || '' }}
       RELEASE_VERSION: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && github.ref_name) || github.sha }}
     steps:

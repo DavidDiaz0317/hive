@@ -168,7 +168,7 @@ func TestIntegratedReleasePinsFinalVisualHiveDependency(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(data)
-	const visualRef = "6891c7fcc831eac8d560ea933d2e72e21a39a475"
+	const visualRef = "03e229ad1efe8ab3e996c2ae94dbb683c73add66"
 	for _, invariant := range []string{
 		"repository: DavidDiaz0317/visual-hive",
 		"VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '" + visualRef + "' }}",
@@ -178,8 +178,13 @@ func TestIntegratedReleasePinsFinalVisualHiveDependency(t *testing.T) {
 			t.Fatalf("integrated release lost exact final dependency invariant %q", invariant)
 		}
 	}
-	if strings.Contains(workflow, "16edc8ab5737314123cbad5823e63cfff0bad386") {
-		t.Fatal("integrated release retained the superseded Visual Hive pin")
+	for _, supersededRef := range []string{
+		"16edc8ab5737314123cbad5823e63cfff0bad386",
+		"6891c7fcc831eac8d560ea933d2e72e21a39a475",
+	} {
+		if strings.Contains(workflow, supersededRef) {
+			t.Fatalf("integrated release retained superseded Visual Hive pin %s", supersededRef)
+		}
 	}
 }
 
