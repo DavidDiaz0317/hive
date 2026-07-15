@@ -199,5 +199,5 @@ func staleRaceBundle(id, head, state string) *visualhive.ValidatedBundle {
 		Source:       visualhive.Source{Repository: "owner/repo", RepositoryID: "123", Ref: "refs/heads/main", CommitSHA: head, WorkflowRunID: id},
 		Scan:         visualhive.Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"route:/"}},
 		Observations: []visualhive.Observation{observation}, ReplayProtection: visualhive.ReplayProtection{Key: id},
-	}}
+	}, Validation: visualhive.Validation{Status: "passed", Trusted: true, Authoritative: true}}
 }

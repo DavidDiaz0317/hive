@@ -62,24 +62,24 @@ func TestValidateBundleRejectsUntrustedByDefault(t *testing.T) {
 	}
 }
 
-func TestValidateBundleAcceptsIndependentProvenanceWithoutProducerTrustClaim(t *testing.T) {
+func TestValidateBundleKeepsVerifiedV2ForLocalCompatibilityButRejectsProductionAuthority(t *testing.T) {
 	root := t.TempDir()
 	manifestPath := writeTestBundle(t, root, false)
 	bindTestBundleToIndependentProvenance(t, manifestPath)
 
-	validated, err := ValidateBundle(manifestPath, ValidationOptions{
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{
 		Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3,
 		VerifiedProvenance: true, ExpectedRepository: "owner/repo", ExpectedWorkflowRunID: "42",
-	})
-	if err != nil {
-		t.Fatal(err)
+	}); err == nil || !strings.Contains(err.Error(), "requires a Visual Hive bundle v3") {
+		t.Fatalf("expected v2 production authority rejection, got %v", err)
 	}
-	if !validated.Validation.Trusted {
-		t.Fatal("independently verified bundle must be trusted")
+	validated, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true})
+	if err != nil || !validated.Validation.Trusted {
+		t.Fatalf("v2 local/backward compatibility was lost: bundle=%+v err=%v", validated, err)
 	}
 }
 
-func TestValidateBundleRejectsCrossRepositoryAndStaleRunProvenance(t *testing.T) {
+func TestValidateBundleRejectsV2BeforeProductionIdentityAuthority(t *testing.T) {
 	manifestPath := writeTestBundle(t, t.TempDir(), false)
 	bindTestBundleToIndependentProvenance(t, manifestPath)
 
@@ -89,13 +89,13 @@ func TestValidateBundleRejectsCrossRepositoryAndStaleRunProvenance(t *testing.T)
 	}
 	crossRepository := base
 	crossRepository.ExpectedRepository = "owner/other"
-	if _, err := ValidateBundle(manifestPath, crossRepository); err == nil || !strings.Contains(err.Error(), "repository") {
-		t.Fatalf("expected cross-repository evidence rejection, got %v", err)
+	if _, err := ValidateBundle(manifestPath, crossRepository); err == nil || !strings.Contains(err.Error(), "bundle v3") {
+		t.Fatalf("expected v2 production authority rejection, got %v", err)
 	}
 	staleRun := base
 	staleRun.ExpectedWorkflowRunID = "43"
-	if _, err := ValidateBundle(manifestPath, staleRun); err == nil || !strings.Contains(err.Error(), "workflow run") {
-		t.Fatalf("expected stale-run evidence rejection, got %v", err)
+	if _, err := ValidateBundle(manifestPath, staleRun); err == nil || !strings.Contains(err.Error(), "bundle v3") {
+		t.Fatalf("expected v2 production authority rejection, got %v", err)
 	}
 }
 
@@ -106,8 +106,18 @@ func TestValidateBundleRejectsAbsentObservationFromPartialScan(t *testing.T) {
 	manifest.Scan.AuthoritativeForResolution = false
 	manifest.Observations[0].State = "absent"
 	writeManifest(t, manifestPath, manifest)
-	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "authoritative") {
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "cannot claim finding absence") {
 		t.Fatalf("expected unsafe resolution rejection, got %v", err)
+	}
+}
+
+func TestValidateV2ArtifactBundleRejectsCraftedResolutionAuthority(t *testing.T) {
+	manifestPath := writeTestBundle(t, t.TempDir(), false)
+	manifest := readManifest(t, manifestPath)
+	manifest.Scan.AuthoritativeForResolution = true
+	sealTestManifest(t, manifestPath, &manifest)
+	if _, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true}); err == nil || !strings.Contains(err.Error(), "cannot claim authoritative resolution") {
+		t.Fatalf("crafted v2 resolution authority was accepted: %v", err)
 	}
 }
 
@@ -373,8 +383,14 @@ func TestValidateBundleProducedByVisualHive(t *testing.T) {
 	if manifestPath == "" {
 		t.Skip("VISUAL_HIVE_TEST_BUNDLE is not set")
 	}
-	if _, err := ValidateBundle(manifestPath, ValidationOptions{MaxACMM: 6, AllowLocal: true}); err != nil {
+	bundle, err := ValidateBundle(manifestPath, ValidationOptions{MaxACMM: 6, AllowLocal: true})
+	if err != nil {
 		t.Fatalf("Visual Hive producer and Hive consumer contract diverged: %v", err)
+	}
+	if sourceRoot := os.Getenv("VISUAL_HIVE_TEST_SOURCE"); sourceRoot != "" {
+		if err := bundle.VerifySourceArtifact(sourceRoot); err != nil {
+			t.Fatalf("Visual Hive producer source index and Hive consumer diverged: %v", err)
+		}
 	}
 }
 
@@ -396,7 +412,7 @@ func writeTestBundle(t *testing.T, root string, trusted bool) string {
 		SchemaVersion: ManifestSchema, BundleID: "test-bundle", GeneratedAt: time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 7, 10, 11, 0, 0, 0, time.UTC),
 		Producer: Producer{Name: "visual-hive", Version: "0.2.0", GitCommit: "abc123"}, Source: Source{Repository: "owner/repo", Ref: "refs/heads/main", CommitSHA: "abc123", Event: "local", Conclusion: "local", Trusted: trusted},
 		Project: "demo", Mode: "measured", Verdict: "ready", ACMMRequest: 3,
-		Scan:             Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"app-shell"}, EvaluatedFiles: []string{"src/App.tsx"}, TestPlanVersion: "plan-1", ToolRegistryVersion: "tools-1"},
+		Scan:             Scan{Scope: "full", AuthoritativeForResolution: false, EvaluatedContracts: []string{"app-shell"}, EvaluatedFiles: []string{"src/App.tsx"}, TestPlanVersion: "plan-1", ToolRegistryVersion: "tools-1"},
 		Observations:     []Observation{{Fingerprint: "visual-hive:test:app-shell", RepositoryFingerprint: digest([]byte("owner/repo\x00visual-hive:test:app-shell")), State: "present", IssueKind: "visual_regression", Severity: "high", OwningAgentHint: "hive/quality", Title: "App shell regression", Body: "Evidence-backed regression", Labels: []string{"visual-hive"}, SourceArtifacts: []string{".visual-hive/report.json"}, AffectedContracts: []string{"app-shell"}, ValidationCommand: "npm run vh:run:ci", ObservedAt: "2026-07-09T11:00:00.000Z", FirstSeenAt: "2026-07-09T11:00:00.000Z", SourceArtifact: ".visual-hive/issues.json"}},
 		Files:            []File{{Path: relative, SourcePath: ".visual-hive/hive/beads.json", SHA256: fileDigest, Size: int64(len(data)), MediaType: "application/json"}},
 		ReplayProtection: ReplayProtection{Nonce: "test-bundle"},

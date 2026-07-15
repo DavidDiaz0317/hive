@@ -31,6 +31,9 @@ const (
 	setupNodeActionSHA      = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" // actions/setup-node v6.4.0
 	setupPythonActionSHA    = "a309ff8b426b58ec0e2a45f0f869d46889d02405" // actions/setup-python v6.2.0
 	uploadArtifactActionSHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
+	managedPreimagesVersion = "hive.managed-path-preimages.v1"
+	maxManagedPreimageBytes = 4 << 20
+	maxManagedPreimageFile  = 1 << 20
 )
 
 var (
@@ -177,6 +180,10 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if err := validateOrdinarySetupCheckout(checkout); err != nil {
 		return result, err
 	}
+	preimagesVersion, managedPreimages, preimagesUpdated, err := resolveManagedPathPreimages(ctx, checkout, prior, hasPrior, options.VisualHive)
+	if err != nil {
+		return result, fmt.Errorf("capture repository-owned managed path preimages: %w", err)
+	}
 	if options.VisualHive {
 		if err := runVisualHiveSetup(ctx, options, checkout); err != nil {
 			return result, err
@@ -210,6 +217,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		MaxRepairAttempts:           options.MaxRepairAttempts,
 		VisualHiveRepo:              options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
 		VisualHiveCommand: options.VisualHiveCommand, VisualHiveArgs: append([]string(nil), options.VisualHiveArgs...),
+		ManagedPreimagesVersion: preimagesVersion, ManagedPathPreimages: managedPreimages,
 		TestCommands: testCommandsForCoverage(inspection, options.Coverage), AllowedRepairPaths: defaultAllowedRepairPaths(),
 		AllowedAutoMergePaths: append([]string(nil), options.AllowedAutoMergePaths...),
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
@@ -232,6 +240,14 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		config.AllowedRepairPaths = append([]string(nil), prior.AllowedRepairPaths...)
 		if prior.SetupAuthorizationActorID > 0 {
 			config.SetupAuthorizationActorID = prior.SetupAuthorizationActorID
+		}
+	}
+	// The exact repository preimages must outlive any branch push or setup PR.
+	// Persist them before the first remote mutation so an interrupted setup can
+	// resume without reclassifying already-managed bytes as repository-owned.
+	if preimagesUpdated {
+		if err := store.Save(config); err != nil {
+			return result, fmt.Errorf("persist managed path preimages before setup publication: %w", err)
 		}
 	}
 	if err := writeManagedFiles(checkout, config, inspection); err != nil {
@@ -307,7 +323,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		if err := completeSetupBaselineRebind(store, config); err != nil {
 			return result, err
 		}
-		result.Applied, result.Idempotent, result.Config = true, true, &config
+		result.Applied, result.Idempotent, result.Config = true, true, publicSetupConfig(config)
 		result.Branch, result.PRNumber, result.PRURL = prior.SetupBranch, prior.SetupPRNumber, prior.SetupPRURL
 		result.CommitSHA = strings.TrimSpace(sha)
 		if err := setSetupActivationStatus(&result, store, config, options.Start); err != nil {
@@ -372,7 +388,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if err := completeSetupBaselineRebind(store, config); err != nil {
 		return result, err
 	}
-	result.Applied, result.Idempotent, result.Config = true, idempotent, &config
+	result.Applied, result.Idempotent, result.Config = true, idempotent, publicSetupConfig(config)
 	result.Branch, result.CommitSHA, result.PRNumber, result.PRURL = branch, sha, pull.Number, pull.URL
 	result.SetupAuthorizationContext, result.SetupAuthorizationStatusID = authorization.Status.Context, authorization.Status.StatusID
 	result.SetupAuthorizationCreatorID, result.SetupAuthorizationReused = authorization.Status.CreatorID, authorization.Status.Reused
@@ -380,6 +396,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+func publicSetupConfig(config Config) *Config {
+	config.ManagedPathPreimages = redactManagedPathPreimages(config.ManagedPathPreimages)
+	return &config
 }
 
 func setSetupBaselineStatus(result *SetupResult, store *Store, config Config, setupHead string) error {
@@ -550,7 +571,7 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 		return fmt.Errorf("parse managed setup from target branch: %w", err)
 	}
 	expected := installedRepositoryConfig{
-		SchemaVersion: ConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
+		SchemaVersion: managedRepositoryConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
 		Coverage: config.Coverage, Automation: config.Automation, Provider: config.Provider, ACMMLevel: config.ACMMLevel,
 		MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
 		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, VisualHiveConfigDigest: config.VisualHiveConfigDigest, TestCommands: config.TestCommands,
@@ -589,7 +610,7 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 			return fmt.Errorf("managed Visual Hive configuration does not match the exact repository-specific coverage plan; rerun setup and merge its reviewed PR")
 		}
 	}
-	for _, forbidden := range []string{".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml"} {
+	for _, forbidden := range standaloneVisualHiveWriterWorkflowPaths() {
 		content, _, response, forbiddenErr := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, forbidden, &gh.RepositoryContentGetOptions{Ref: ref})
 		if forbiddenErr == nil || content != nil {
 			return fmt.Errorf("standalone Visual Hive lifecycle writer %s must be removed; Hive is the sole lifecycle writer", forbidden)
@@ -622,12 +643,20 @@ func verifyVisualHiveCoverageProfile(data []byte, expected string) error {
 		Project struct {
 			SetupProfile string `yaml:"setupProfile"`
 		} `yaml:"project"`
+		Integrations struct {
+			Hive struct {
+				Enabled bool `yaml:"enabled"`
+			} `yaml:"hive"`
+		} `yaml:"integrations"`
 	}
 	if err := yaml.Unmarshal(data, &value); err != nil {
 		return fmt.Errorf("parse managed Visual Hive config: %w", err)
 	}
 	if value.Project.SetupProfile != expected {
 		return fmt.Errorf("Visual Hive setup profile %q does not match coverage depth %q (expected %q); rerun setup and merge its exact reviewed PR", value.Project.SetupProfile, expected, expected)
+	}
+	if !value.Integrations.Hive.Enabled {
+		return fmt.Errorf("managed Visual Hive configuration must set integrations.hive.enabled=true so Hive is the sole lifecycle writer; rerun setup and merge its exact reviewed PR")
 	}
 	return nil
 }
@@ -800,9 +829,289 @@ func setupRequiredActions(automation Automation) []string {
 func managedSetupFiles(visualHive bool) []string {
 	files := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
 	if visualHive {
-		files = append(files, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml", ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
+		files = append(files, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml")
+		files = append(files, standaloneVisualHiveWriterWorkflowPaths()...)
 	}
 	return files
+}
+
+func standaloneVisualHiveWriterWorkflowPaths() []string {
+	return []string{
+		".github/workflows/visual-hive-lifecycle.yml",
+		".github/workflows/visual-hive-issue-lifecycle.yml",
+		".github/workflows/visual-hive-trusted-publisher.yml",
+		".github/workflows/visual-hive-failure-issue.yml",
+		".github/workflows/visual-hive-hive-handoff.yml",
+	}
+}
+
+func captureManagedPathPreimages(ctx context.Context, checkout string, managed []string) (map[string]ManagedPathPreimage, error) {
+	preimages := make(map[string]ManagedPathPreimage, len(managed))
+	total := 0
+	for _, relative := range managed {
+		candidate := filepath.Join(checkout, filepath.FromSlash(relative))
+		info, err := os.Lstat(candidate)
+		if os.IsNotExist(err) {
+			preimages[relative] = ManagedPathPreimage{Existed: false}
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", relative, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("managed path %s is not an ordinary file", relative)
+		}
+		stage, err := git(ctx, checkout, "ls-files", "--stage", "--", relative)
+		if err != nil {
+			return nil, fmt.Errorf("read Git mode for %s: %w", relative, err)
+		}
+		fields := strings.Fields(strings.TrimSpace(stage))
+		if len(fields) < 4 || (fields[0] != "100644" && fields[0] != "100755") {
+			return nil, fmt.Errorf("managed path %s must be one tracked ordinary Git blob before setup", relative)
+		}
+		blob, err := git(ctx, checkout, "cat-file", "blob", ":"+relative)
+		if err != nil {
+			return nil, fmt.Errorf("read repository blob for %s: %w", relative, err)
+		}
+		data := []byte(blob)
+		if len(data) > maxManagedPreimageFile || total+len(data) > maxManagedPreimageBytes {
+			return nil, fmt.Errorf("managed path preimage exceeds the bounded %d-byte per-file or %d-byte total ledger", maxManagedPreimageFile, maxManagedPreimageBytes)
+		}
+		digest := sha256.Sum256(data)
+		preimages[relative] = ManagedPathPreimage{Existed: true, GitMode: fields[0], Content: append([]byte(nil), data...), ContentSHA256: hex.EncodeToString(digest[:])}
+		total += len(data)
+	}
+	if err := validateManagedPathPreimages(managedPreimagesVersion, preimages, managed); err != nil {
+		return nil, err
+	}
+	return preimages, nil
+}
+
+// resolveManagedPathPreimages never treats bytes already written by an older
+// Hive installation as repository-owned. New installations capture every
+// managed path before the first write. A legacy core-only installation that is
+// enabling Visual Hive captures only the newly entering Visual Hive paths; its
+// already-managed core paths retain legacy deletion ownership. If an older
+// Visual Hive installation has no ledger, provenance cannot be reconstructed,
+// so its legacy deletion policy is retained instead of manufacturing one.
+func resolveManagedPathPreimages(ctx context.Context, checkout string, prior Config, hasPrior, visualHive bool) (string, map[string]ManagedPathPreimage, bool, error) {
+	managed := managedSetupFiles(visualHive)
+	if !hasPrior {
+		preimages, err := captureManagedPathPreimages(ctx, checkout, managed)
+		return managedPreimagesVersion, preimages, err == nil, err
+	}
+
+	if managedPathPreimagesConfigured(prior) {
+		priorManaged := managedSetupFiles(prior.VisualHive)
+		if err := validateManagedPathPreimages(prior.ManagedPreimagesVersion, prior.ManagedPathPreimages, priorManaged); err != nil {
+			return "", nil, false, fmt.Errorf("existing managed-path preimage ledger is invalid: %w", err)
+		}
+		preimages := cloneManagedPathPreimages(prior.ManagedPathPreimages)
+		if prior.VisualHive == visualHive {
+			return prior.ManagedPreimagesVersion, preimages, false, nil
+		}
+		entering := managedPathDifference(managed, priorManaged)
+		captured, err := captureManagedPathPreimages(ctx, checkout, entering)
+		if err != nil {
+			return "", nil, false, err
+		}
+		for relative, preimage := range captured {
+			preimages[relative] = preimage
+		}
+		if err := validateManagedPathPreimages(managedPreimagesVersion, preimages, managed); err != nil {
+			return "", nil, false, err
+		}
+		return managedPreimagesVersion, preimages, true, nil
+	}
+
+	if prior.VisualHive || !visualHive {
+		return "", nil, false, nil
+	}
+
+	// Legacy Hive owned the core paths, but the Visual Hive paths are entering
+	// management for the first time and may belong to a standalone installation.
+	preimages := make(map[string]ManagedPathPreimage, len(managed))
+	for _, relative := range managedSetupFiles(false) {
+		preimages[relative] = ManagedPathPreimage{Existed: false}
+	}
+	entering := managedPathDifference(managed, managedSetupFiles(false))
+	captured, err := captureManagedPathPreimages(ctx, checkout, entering)
+	if err != nil {
+		return "", nil, false, err
+	}
+	for relative, preimage := range captured {
+		preimages[relative] = preimage
+	}
+	if err := validateManagedPathPreimages(managedPreimagesVersion, preimages, managed); err != nil {
+		return "", nil, false, err
+	}
+	return managedPreimagesVersion, preimages, true, nil
+}
+
+func managedPathDifference(all, alreadyManaged []string) []string {
+	seen := make(map[string]struct{}, len(alreadyManaged))
+	for _, relative := range alreadyManaged {
+		seen[relative] = struct{}{}
+	}
+	result := make([]string, 0, len(all))
+	for _, relative := range all {
+		if _, exists := seen[relative]; !exists {
+			result = append(result, relative)
+		}
+	}
+	return result
+}
+
+func validateManagedPathPreimages(version string, preimages map[string]ManagedPathPreimage, managed []string) error {
+	if err := validateManagedPathOwnership(version, preimages, managed); err != nil {
+		return err
+	}
+	total := 0
+	for _, relative := range managed {
+		preimage := preimages[relative]
+		if !preimage.Existed {
+			if len(preimage.Content) != 0 {
+				return fmt.Errorf("absent managed path preimage %s carries file data", relative)
+			}
+			continue
+		}
+		if len(preimage.Content) > maxManagedPreimageFile || total+len(preimage.Content) > maxManagedPreimageBytes {
+			return fmt.Errorf("managed path preimage ledger exceeds its bounded size")
+		}
+		digest := sha256.Sum256(preimage.Content)
+		if !strings.EqualFold(preimage.ContentSHA256, hex.EncodeToString(digest[:])) {
+			return fmt.Errorf("managed path preimage %s content digest does not match", relative)
+		}
+		total += len(preimage.Content)
+	}
+	return nil
+}
+
+func validateManagedPathOwnership(version string, preimages map[string]ManagedPathPreimage, managed []string) error {
+	if version != managedPreimagesVersion || len(preimages) != len(managed) {
+		return fmt.Errorf("managed path preimage ledger is incomplete")
+	}
+	for _, relative := range managed {
+		preimage, exists := preimages[relative]
+		if !exists {
+			return fmt.Errorf("managed path preimage ledger omits %s", relative)
+		}
+		if !preimage.Existed {
+			if preimage.GitMode != "" || preimage.ContentSHA256 != "" {
+				return fmt.Errorf("absent managed path preimage %s carries file metadata", relative)
+			}
+			continue
+		}
+		if preimage.GitMode != "100644" && preimage.GitMode != "100755" {
+			return fmt.Errorf("managed path preimage %s has unsupported Git mode", relative)
+		}
+		decoded, err := hex.DecodeString(preimage.ContentSHA256)
+		if err != nil || len(decoded) != sha256.Size || preimage.ContentSHA256 != strings.ToLower(preimage.ContentSHA256) {
+			return fmt.Errorf("managed path preimage %s has an invalid content digest", relative)
+		}
+	}
+	return nil
+}
+
+func cloneManagedPathPreimages(source map[string]ManagedPathPreimage) map[string]ManagedPathPreimage {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]ManagedPathPreimage, len(source))
+	for relative, preimage := range source {
+		preimage.Content = append([]byte(nil), preimage.Content...)
+		result[relative] = preimage
+	}
+	return result
+}
+
+func hasValidManagedPathPreimages(config Config) bool {
+	return validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)) == nil
+}
+
+func managedPathPreimagesConfigured(config Config) bool {
+	return config.ManagedPreimagesVersion != "" || config.ManagedPathPreimages != nil
+}
+
+func restoreManagedPathPreimages(root string, config Config) error {
+	managed := managedSetupFiles(config.VisualHive)
+	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managed); err != nil {
+		return err
+	}
+	for _, relative := range managed {
+		preimage := config.ManagedPathPreimages[relative]
+		if !preimage.Existed {
+			if err := removeSetupCheckoutFile(root, relative); err != nil {
+				return fmt.Errorf("remove Hive-owned managed path %s: %w", relative, err)
+			}
+			continue
+		}
+		if err := writeSetupCheckoutFile(root, relative, preimage.Content); err != nil {
+			return fmt.Errorf("restore repository-owned managed path %s: %w", relative, err)
+		}
+	}
+	return nil
+}
+
+func managedUninstallRequiredPaths(config Config) (present, absent []string) {
+	managed := managedSetupFiles(config.VisualHive)
+	if validateManagedPathOwnership(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managed) != nil {
+		if managedPathPreimagesConfigured(config) {
+			return nil, nil
+		}
+		return []string{}, append([]string(nil), managed...)
+	}
+	for _, relative := range managed {
+		if config.ManagedPathPreimages[relative].Existed {
+			present = append(present, relative)
+		} else {
+			absent = append(absent, relative)
+		}
+	}
+	return present, absent
+}
+
+func applyManagedPathPreimageModes(ctx context.Context, checkout string, config Config) error {
+	if !managedPathPreimagesConfigured(config) {
+		return nil
+	}
+	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+		return err
+	}
+	for _, relative := range managedSetupFiles(config.VisualHive) {
+		preimage := config.ManagedPathPreimages[relative]
+		if !preimage.Existed {
+			continue
+		}
+		flag := "--chmod=-x"
+		if preimage.GitMode == "100755" {
+			flag = "--chmod=+x"
+		}
+		if _, err := git(ctx, checkout, "update-index", flag, "--", relative); err != nil {
+			return fmt.Errorf("restore Git mode for repository-owned managed path %s: %w", relative, err)
+		}
+	}
+	return nil
+}
+
+func managedPathPolicyDigest(config Config) (string, error) {
+	if !managedPathPreimagesConfigured(config) {
+		return digestPaths(managedSetupFiles(config.VisualHive))
+	}
+	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+		return "", err
+	}
+	payload := struct {
+		Version   string                         `json:"version"`
+		Paths     []string                       `json:"paths"`
+		Preimages map[string]ManagedPathPreimage `json:"preimages"`
+	}{Version: config.ManagedPreimagesVersion, Paths: managedSetupFiles(config.VisualHive), Preimages: config.ManagedPathPreimages}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode managed path restoration policy: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func layersForCoverage(coverage Coverage) []string {
@@ -1023,17 +1332,23 @@ func mergeVisualHiveRecommendation(checkout, expectedProfile string) error {
 		return fmt.Errorf("parse existing config: %w", err)
 	}
 	project := ensureStringMap(current, "project")
+	enableVisualHiveIntegration(current)
 	origin := ""
 	if rawOrigin, exists := project["hiveConfigOrigin"]; exists && rawOrigin != nil {
 		origin = strings.ToLower(strings.TrimSpace(fmt.Sprint(rawOrigin)))
 	}
 	// Legacy repository-owned plans predate Hive's origin marker. When their
-	// effective coverage profile is unchanged, preserve the YAML byte-for-byte:
-	// an immutable runtime/workflow upgrade must not create a cosmetic config
-	// conflict with an in-flight repair. A later explicit profile change remains
-	// a reviewed repository diff and records the ownership marker then.
+	// effective coverage profile is unchanged, preserve all repository-owned
+	// semantics while adding only the explicit Hive integration ownership bit.
 	if origin == "" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(project["setupProfile"])), strings.TrimSpace(expectedProfile)) {
-		return nil
+		updated, err := yaml.Marshal(current)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(existingData, updated) {
+			return nil
+		}
+		return writeSetupCheckoutFile(checkout, "visual-hive.config.yaml", updated)
 	}
 	var report struct {
 		RecommendedConfig map[string]any `json:"recommendedConfig"`
@@ -1092,6 +1407,7 @@ func markVisualHiveConfigOrigin(checkout, origin, profile string) error {
 		return err
 	}
 	project := ensureStringMap(current, "project")
+	enableVisualHiveIntegration(current)
 	project["setupProfile"] = profile
 	project["hiveManagedBy"] = "hive-integrated"
 	project["hiveConfigOrigin"] = origin
@@ -1110,6 +1426,12 @@ func ensureStringMap(parent map[string]any, key string) map[string]any {
 	value := map[string]any{}
 	parent[key] = value
 	return value
+}
+
+func enableVisualHiveIntegration(config map[string]any) {
+	integrations := ensureStringMap(config, "integrations")
+	hive := ensureStringMap(integrations, "hive")
+	hive["enabled"] = true
 }
 
 func anyStringMap(value any) map[string]any {
@@ -1248,8 +1570,13 @@ func readSetupBaselineBlob(ctx context.Context, checkout, objectSHA string) ([]b
 }
 
 func writeManagedFiles(root string, config Config, inspection RepositoryInspection) error {
+	if managedPathPreimagesConfigured(config) {
+		if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+			return fmt.Errorf("refuse managed writes with an invalid managed-path preimage ledger: %w", err)
+		}
+	}
 	repositoryConfig := map[string]any{
-		"schema_version": ConfigSchema, "repository": config.Repository, "repository_id": config.RepositoryID,
+		"schema_version": managedRepositoryConfigSchema, "repository": config.Repository, "repository_id": config.RepositoryID,
 		"default_branch": config.DefaultBranch, "coverage": config.Coverage, "automation": config.Automation,
 		"provider": config.Provider, "acmm_level": config.ACMMLevel, "max_active_issues": config.MaxActiveIssues, "max_repair_attempts": config.MaxRepairAttempts, "visual_hive": config.VisualHive,
 		"visual_hive_repository": config.VisualHiveRepo, "visual_hive_ref": config.VisualHiveRef,
@@ -1279,7 +1606,7 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 		}
 	}
 	if config.VisualHive {
-		for _, relative := range []string{".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml"} {
+		for _, relative := range standaloneVisualHiveWriterWorkflowPaths() {
 			if err := removeSetupCheckoutFile(root, relative); err != nil {
 				return err
 			}

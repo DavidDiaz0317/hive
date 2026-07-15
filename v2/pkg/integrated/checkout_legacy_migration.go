@@ -61,7 +61,7 @@ func migrateLegacyManagedCheckout(checkout, repository string, proof legacyManag
 
 func validateLegacyManagedCheckoutProof(checkout, repository string, proof legacyManagedCheckoutProof) error {
 	config := proof.Config
-	if config.SchemaVersion != ConfigSchema || !strings.EqualFold(strings.TrimSpace(config.Repository), strings.TrimSpace(repository)) {
+	if !supportedDurableConfigSchema(config.SchemaVersion) || !strings.EqualFold(strings.TrimSpace(config.Repository), strings.TrimSpace(repository)) {
 		return fmt.Errorf("durable legacy config does not bind exact repository %s", repository)
 	}
 	repositoryID := strings.TrimSpace(config.RepositoryID)

@@ -146,11 +146,11 @@ func EncodeRepositoryTestEvidence(results []RepositoryTestResult, overall int) (
 // verdict. Failed commands become repairable findings; only a completely
 // green plan emits authoritative absent observations that may close a finding.
 func BuildRepositoryTestBundle(parent *ValidatedBundle, results []RepositoryTestResult, overall int, expectedEvidenceDigest string) (*ValidatedBundle, error) {
-	// Source.Trusted is an explicitly advisory producer claim. The validated
-	// bundle's Trusted bit is set only after Hive independently verifies the
-	// GitHub repository/run/artifact provenance, so it is the sole trust input.
-	if parent == nil || !parent.Validation.Trusted {
-		return nil, fmt.Errorf("trusted parent Visual Hive bundle is required for repository test evidence")
+	// Source.Trusted is an explicitly advisory producer claim. Repository-test
+	// authority additionally requires Hive's private provenance and complete
+	// source-verification state; the public Trusted field alone is insufficient.
+	if parent == nil || parent.Manifest.SchemaVersion != ManifestSchemaV3 || !parent.Validation.Trusted || !parent.provenanceVerified || !parent.sourceVerified {
+		return nil, fmt.Errorf("independently verified complete-source parent Visual Hive bundle is required for repository test evidence")
 	}
 	if parent.Manifest.Source.Event != "workflow_dispatch" || parent.Manifest.Source.WorkflowRunID == "" || parent.Manifest.Source.CommitSHA == "" || parent.Manifest.Source.Repository == "" || parent.Manifest.Source.RepositoryID == "" {
 		return nil, fmt.Errorf("parent Visual Hive bundle lacks exact production workflow provenance")

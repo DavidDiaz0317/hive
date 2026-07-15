@@ -13,7 +13,7 @@ import (
 
 func TestMergeVisualHiveRecommendationPreservesLegacyPlanAtSameProfile(t *testing.T) {
 	root := t.TempDir()
-	original := `# Repository-owned legacy plan; an immutable runtime upgrade must not rewrite it.
+	original := `# Repository-owned legacy plan.
 project:
   name: proof
   setupProfile: complex-app
@@ -28,6 +28,11 @@ mutation:
   enabled: true
   operators:
     - api-500
+integrations:
+  hive:
+    enabled: false
+    mode: guarded_repair
+    defaultActor: repository-quality
 `
 	writeFixture(t, root, "visual-hive.config.yaml", original)
 	if err := mergeVisualHiveRecommendation(root, "complex-app"); err != nil {
@@ -37,8 +42,60 @@ mutation:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(updated) != original {
-		t.Fatalf("same-profile runtime upgrade rewrote legacy repository-owned config:\n%s", updated)
+	var value map[string]any
+	if err := yaml.Unmarshal(updated, &value); err != nil {
+		t.Fatal(err)
+	}
+	project := anyStringMap(value["project"])
+	hive := anyStringMap(anyStringMap(value["integrations"])["hive"])
+	if project["name"] != "proof" || project["setupProfile"] != "complex-app" || len(anyStringMap(value["targets"])) != 1 ||
+		fmt.Sprint(anyStringMap(anySlice(value["contracts"])[0])["id"]) != "domain-contract" ||
+		!reflect.DeepEqual(anySlice(anyStringMap(value["mutation"])["operators"]), []any{"api-500"}) ||
+		hive["enabled"] != true || hive["mode"] != "guarded_repair" || hive["defaultActor"] != "repository-quality" {
+		t.Fatalf("same-profile integration enablement replaced repository-owned configuration: %+v", value)
+	}
+	if err := mergeVisualHiveRecommendation(root, "complex-app"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(filepath.Join(root, "visual-hive.config.yaml"))
+	if err != nil || !reflect.DeepEqual(updated, second) {
+		t.Fatalf("same-profile integration enablement is not idempotent: err=%v", err)
+	}
+}
+
+func TestMarkVisualHiveConfigOriginEnablesHiveIntegrationAdditively(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "visual-hive.config.yaml", `project:
+  name: generated-proof
+targets:
+  custom:
+    kind: command
+contracts:
+  - id: generated-contract
+    target: custom
+integrations:
+  hive:
+    enabled: false
+    mode: measured
+    acmmLevel: 5
+`)
+	if err := markVisualHiveConfigOrigin(root, "generated", "complex-app"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "visual-hive.config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := yaml.Unmarshal(data, &value); err != nil {
+		t.Fatal(err)
+	}
+	project := anyStringMap(value["project"])
+	hive := anyStringMap(anyStringMap(value["integrations"])["hive"])
+	if project["name"] != "generated-proof" || project["setupProfile"] != "complex-app" || project["hiveManagedBy"] != "hive-integrated" ||
+		project["hiveConfigOrigin"] != "generated" || hive["enabled"] != true || hive["mode"] != "measured" || hive["acmmLevel"] != 5 ||
+		fmt.Sprint(anyStringMap(anySlice(value["contracts"])[0])["id"]) != "generated-contract" {
+		t.Fatalf("generated Visual Hive config did not preserve repository fields while enabling Hive: %+v", value)
 	}
 }
 
@@ -83,6 +140,9 @@ mutation:
 	}
 	if anyStringMap(value["project"])["setupProfile"] != "complex-app" || len(anyStringMap(value["targets"])) != 1 || len(anySlice(value["contracts"])) != 1 {
 		t.Fatalf("coverage migration did not reconcile to the exact deterministic plan: %+v", value)
+	}
+	if anyStringMap(anyStringMap(value["integrations"])["hive"])["enabled"] != true {
+		t.Fatalf("coverage migration did not enable Hive integration: %+v", value["integrations"])
 	}
 	operators := anySlice(anyStringMap(value["mutation"])["operators"])
 	if !reflect.DeepEqual(operators, []any{"api-500", "broken-image"}) || anyStringMap(value["mutation"])["enabled"] != true {
@@ -150,7 +210,25 @@ mutation:
 	}
 	project := anyStringMap(value["project"])
 	if project["setupProfile"] != "complex-app" || project["hiveConfigOrigin"] != "existing" || len(anyStringMap(value["targets"])) != 1 ||
-		fmt.Sprint(anyStringMap(anySlice(value["contracts"])[0])["id"]) != "domain-contract" || !reflect.DeepEqual(anySlice(anyStringMap(value["mutation"])["operators"]), []any{"api-500"}) {
+		fmt.Sprint(anyStringMap(anySlice(value["contracts"])[0])["id"]) != "domain-contract" || !reflect.DeepEqual(anySlice(anyStringMap(value["mutation"])["operators"]), []any{"api-500"}) ||
+		anyStringMap(anyStringMap(value["integrations"])["hive"])["enabled"] != true {
 		t.Fatalf("pre-existing repository testing plan was replaced: %+v", value)
+	}
+}
+
+func TestVerifyVisualHiveCoverageProfileRequiresHiveLifecycleOwnership(t *testing.T) {
+	valid := []byte("project:\n  setupProfile: complex-app\nintegrations:\n  hive:\n    enabled: true\n")
+	if err := verifyVisualHiveCoverageProfile(valid, "complex-app"); err != nil {
+		t.Fatalf("valid integrated Visual Hive config was rejected: %v", err)
+	}
+	for name, config := range map[string][]byte{
+		"missing":  []byte("project:\n  setupProfile: complex-app\n"),
+		"disabled": []byte("project:\n  setupProfile: complex-app\nintegrations:\n  hive:\n    enabled: false\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := verifyVisualHiveCoverageProfile(config, "complex-app"); err == nil {
+				t.Fatal("non-integrated Visual Hive config was accepted as production-ready")
+			}
+		})
 	}
 }

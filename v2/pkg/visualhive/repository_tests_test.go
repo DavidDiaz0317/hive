@@ -112,6 +112,55 @@ func TestRepositoryTestBundleIdentityIsStableAcrossRuns(t *testing.T) {
 	}
 }
 
+func TestRepositoryTestBundleRequiresVerifiedCompleteSourceParent(t *testing.T) {
+	result, err := NewRepositoryTestResult("npm test", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := []RepositoryTestResult{result}
+	_, _, evidenceDigest, err := EncodeRepositoryTestEvidence(results, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localManifest, localSource := writeTestV3Bundle(t, nil)
+	local, err := ValidateBundle(localManifest, ValidationOptions{
+		Now: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC), MaxACMM: 3, AllowLocal: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.VerifySourceArtifact(localSource); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildRepositoryTestBundle(local, results, 0, evidenceDigest); err == nil || !strings.Contains(err.Error(), "independently verified complete-source") {
+		t.Fatalf("local v3 parent conferred derived repository-test authority: %v", err)
+	}
+
+	verifiedManifest, verifiedSource := writeTestV3Bundle(t, nil)
+	verified, err := ValidateBundle(verifiedManifest, ValidationOptions{
+		Now: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC), MaxACMM: 3,
+		VerifiedProvenance: true, ExpectedProducerGitCommit: testV3ProducerCommit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildRepositoryTestBundle(verified, results, 0, evidenceDigest); err == nil || !strings.Contains(err.Error(), "independently verified complete-source") {
+		t.Fatalf("pre-source v3 parent conferred derived repository-test authority: %v", err)
+	}
+	writeTestData(t, filepath.Join(verifiedSource, sourceArtifactExtractionMarker), []byte("99\n"))
+	if err := verified.VerifySourceArtifact(verifiedSource); err != nil {
+		t.Fatal(err)
+	}
+	derived, err := BuildRepositoryTestBundle(verified, results, 0, evidenceDigest)
+	if err != nil {
+		t.Fatalf("verified complete-source parent was rejected: %v", err)
+	}
+	if !derived.Validation.Trusted || !derived.Validation.Authoritative || len(derived.Manifest.Observations) != 1 || derived.Manifest.Observations[0].State != "absent" {
+		t.Fatalf("verified complete-source parent did not yield the expected derived authority: %+v", derived)
+	}
+}
+
 func TestRepositoryTestEvidenceRejectsMismatchDuplicatesAndUnsafeCommands(t *testing.T) {
 	cases := []struct {
 		name, ledger, summary, want string
@@ -119,7 +168,7 @@ func TestRepositoryTestEvidenceRejectsMismatchDuplicatesAndUnsafeCommands(t *tes
 		{name: "summary mismatch", ledger: "1\tnpm test\n", summary: "0\n", want: "does not match"},
 		{name: "duplicate", ledger: "1\tnpm test\n0\tnpm test\n", summary: "1\n", want: "repeats command"},
 		{name: "unsafe shell", ledger: "1\tnpm test && curl example.test\n", summary: "1\n", want: "unsafe command"},
-		{name: "credential", ledger: "1\tnpm test github_pat_abcdefghijklmnopqrstuvwxyz\n", summary: "1\n", want: "unsafe"},
+		{name: "credential", ledger: "1\\tnpm test " + "github_" + "pat_" + strings.Repeat("a", 24) + "\\n", summary: "1\\n", want: "unsafe"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -137,7 +186,7 @@ func repositoryTestParent(runID, artifactID, commit string, generatedAt time.Tim
 	replay := "visual-parent:" + runID + ":" + artifactID
 	return &ValidatedBundle{
 		Manifest: Manifest{
-			SchemaVersion: ManifestSchema, BundleID: "parent-" + runID, GeneratedAt: generatedAt, ExpiresAt: generatedAt.Add(24 * time.Hour),
+			SchemaVersion: ManifestSchemaV3, BundleID: "parent-" + runID, GeneratedAt: generatedAt, ExpiresAt: generatedAt.Add(24 * time.Hour),
 			Producer: Producer{Name: "visual-hive", Version: "0.2.4", GitCommit: strings.Repeat("d", 40)},
 			Source: Source{
 				Repository: "owner/repo", RepositoryID: "123", Ref: "main", CommitSHA: commit, Event: "workflow_dispatch",
@@ -147,7 +196,9 @@ func repositoryTestParent(runID, artifactID, commit string, generatedAt time.Tim
 			Scan:             Scan{Scope: "full", ToolRegistryVersion: "visual-hive.tools.v1"},
 			ReplayProtection: ReplayProtection{Nonce: "parent", Key: replay},
 		},
-		Validation: Validation{SchemaVersion: ManifestSchema, Status: "valid", Trusted: true},
+		Validation:         Validation{SchemaVersion: ManifestSchemaV3, Status: "valid", Trusted: true},
+		provenanceVerified: true,
+		sourceVerified:     true,
 	}
 }
 

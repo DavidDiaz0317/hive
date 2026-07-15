@@ -448,6 +448,69 @@ func TestLifecycleDoesNotResolveFromWrongTargetRef(t *testing.T) {
 	}
 }
 
+func TestLifecycleRejectsV3BeforeCompleteSourceVerification(t *testing.T) {
+	manifestPath, _ := writeTestV3Bundle(t, nil)
+	bundle, err := ValidateBundle(manifestPath, ValidationOptions{
+		Now: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC), MaxACMM: 3,
+		VerifiedProvenance: true, ExpectedProducerGitCommit: testV3ProducerCommit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	if _, err := lifecycle.ApplyBundle(bundle, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err == nil || !strings.Contains(err.Error(), "trusted Visual Hive bundle") {
+		t.Fatalf("lifecycle accepted a v3 bundle before source verification: %v", err)
+	}
+}
+
+func TestLifecycleRequiresValidatedAuthorityForV3Absence(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		omitFinding bool
+		wantIgnored int
+	}{
+		{name: "explicit absent", wantIgnored: 1},
+		{name: "omitted from exhaustive inventory", omitFinding: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+			lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			present := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "present"), "bundle-authority-present", "present", "refs/heads/main", true))
+			if _, err := lifecycle.ApplyBundle(present, beadStore, ApplyLifecycleOptions{TargetRef: "main"}); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint := present.Manifest.Observations[0].RepositoryFingerprint
+
+			crafted := validateLocalBundle(t, writeLifecycleBundle(t, filepath.Join(root, "crafted"), "bundle-authority-crafted", "absent", "refs/heads/main", true))
+			crafted.Manifest.SchemaVersion = ManifestSchemaV3
+			crafted.Validation.Authoritative = false
+			if test.omitFinding {
+				crafted.Manifest.Observations = nil
+			}
+			result, err := lifecycle.ApplyBundle(crafted, beadStore, ApplyLifecycleOptions{TargetRef: "main"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Resolved != 0 || result.IgnoredAbsent != test.wantIgnored {
+				t.Fatalf("unverified v3 authority claim changed lifecycle state: %+v", result)
+			}
+			finding, ok := lifecycle.Finding(fingerprint)
+			if !ok || finding.Status == StatusResolved || finding.Status == StatusIssueClosed {
+				t.Fatalf("unverified v3 absence resolved finding: %+v", finding)
+			}
+		})
+	}
+}
+
 func TestLifecycleInfersAbsenceOnlyForEvaluatedContracts(t *testing.T) {
 	root := t.TempDir()
 	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
@@ -515,11 +578,11 @@ func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *test
 		Source: Source{Ref: "refs/heads/main"},
 		Scan:   Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"testing-layer:2"}},
 	}
-	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
+	if allowed, reason := resolutionAllowed(finding, manifest, true, "main", ApplyLifecycleOptions{}); !allowed {
 		t.Fatalf("verified Unit layer should resolve a legacy test-adequacy finding: %s", reason)
 	}
 	manifest.Scan.EvaluatedContracts = []string{"testing-layer:3"}
-	if allowed, _ := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); allowed {
+	if allowed, _ := resolutionAllowed(finding, manifest, true, "main", ApplyLifecycleOptions{}); allowed {
 		t.Fatal("a different testing layer must not resolve the Unit adequacy finding")
 	}
 	manifest.Scan.EvaluatedContracts = []string{"testing-layer:2"}
@@ -529,11 +592,11 @@ func TestResolutionAllowsLegacyTestAdequacyOnlyWhenUnitLayerWasEvaluated(t *test
 	finding.MergeSHA = "repair-merge"
 	finding.ValidationRunID = "run-verified"
 	verified := ApplyLifecycleOptions{VerificationRunID: "run-verified", VerificationCommitSHA: "target-head", VerifiedMergeAncestorFingerprint: "finding", VerifiedMergeAncestorSHA: "repair-merge"}
-	if allowed, reason := resolutionAllowed(finding, manifest, "main", verified); !allowed {
+	if allowed, reason := resolutionAllowed(finding, manifest, true, "main", verified); !allowed {
 		t.Fatalf("verified non-conflicting descendant should be accepted: %s", reason)
 	}
 	verified.VerificationCommitSHA = "different-head"
-	if allowed, _ := resolutionAllowed(finding, manifest, "main", verified); allowed {
+	if allowed, _ := resolutionAllowed(finding, manifest, true, "main", verified); allowed {
 		t.Fatal("descendant authorization bound to a different verification SHA must be rejected")
 	}
 }
@@ -544,15 +607,15 @@ func TestResolutionAllowsRepositoryAuditFindingsOnlyForExactEvaluatedScope(t *te
 		Scan:   Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{"workflow-safety"}},
 	}
 	finding := &FindingLifecycle{IssueKind: "workflow_safety"}
-	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
+	if allowed, reason := resolutionAllowed(finding, manifest, true, "main", ApplyLifecycleOptions{}); !allowed {
 		t.Fatalf("verified workflow audit should resolve a repository workflow finding: %s", reason)
 	}
 	manifest.Scan.EvaluatedContracts = []string{"provider-governance"}
-	if allowed, _ := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); allowed {
+	if allowed, _ := resolutionAllowed(finding, manifest, true, "main", ApplyLifecycleOptions{}); allowed {
 		t.Fatal("provider evidence must not resolve a workflow finding")
 	}
 	finding.IssueKind = "provider_governance"
-	if allowed, reason := resolutionAllowed(finding, manifest, "main", ApplyLifecycleOptions{}); !allowed {
+	if allowed, reason := resolutionAllowed(finding, manifest, true, "main", ApplyLifecycleOptions{}); !allowed {
 		t.Fatalf("verified provider evidence should resolve a provider finding: %s", reason)
 	}
 }
@@ -1417,6 +1480,18 @@ func writePublicationLifecycleBundle(t *testing.T, root, bundleID string, observ
 
 func validateLocalBundle(t *testing.T, manifestPath string) *ValidatedBundle {
 	t.Helper()
+	manifest := readManifest(t, manifestPath)
+	legacyAuthorityFixture := manifest.SchemaVersion == ManifestSchema && manifest.Scan.AuthoritativeForResolution
+	for _, observation := range manifest.Observations {
+		legacyAuthorityFixture = legacyAuthorityFixture || (manifest.SchemaVersion == ManifestSchema && observation.State == "absent")
+	}
+	if legacyAuthorityFixture {
+		// These fixtures unit-test lifecycle state transitions that predate the
+		// v3 ingestion contract. Construct the already-validated test input
+		// directly so they do not imply that production v2 ingestion can confer
+		// authority; bundle_test.go covers that fail-closed boundary.
+		return &ValidatedBundle{Manifest: manifest, Validation: Validation{SchemaVersion: "test.lifecycle-input.v1", Status: "passed", Trusted: true, Authoritative: manifest.Scan.AuthoritativeForResolution}}
+	}
 	bundle, err := ValidateBundle(manifestPath, ValidationOptions{Now: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), MaxACMM: 6, AllowLocal: true})
 	if err != nil {
 		t.Fatal(err)

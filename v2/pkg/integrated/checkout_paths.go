@@ -164,7 +164,7 @@ func validateSetupStateRoot(stateDir, repository string) error {
 		return fmt.Errorf("nonempty state directory has no exact Hive ownership marker or legacy config")
 	}
 	var config Config
-	if json.Unmarshal(data, &config) != nil || config.SchemaVersion != ConfigSchema || !strings.EqualFold(config.Repository, strings.TrimSpace(repository)) || strings.TrimSpace(config.RepositoryID) == "" {
+	if json.Unmarshal(data, &config) != nil || !supportedDurableConfigSchema(config.SchemaVersion) || !strings.EqualFold(config.Repository, strings.TrimSpace(repository)) || strings.TrimSpace(config.RepositoryID) == "" {
 		return fmt.Errorf("legacy state directory does not bind exact repository %s", repository)
 	}
 	return nil

@@ -739,7 +739,7 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 			Repository: config.Repository, WorkflowRunID: workflow.RunID, ArtifactID: workflow.BundleArtifact, SourceArtifactID: workflow.EvidenceArtifact,
 			DestinationDir: filepath.Join(config.StateDir, "setup-baseline", "production-verification"), TargetRef: config.DefaultBranch,
 			MaxACMM: config.ACMMLevel, ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath,
-			ExpectedRunName: workflowDispatchDisplayTitle(workflow.CorrelationID), FetchSourceArtifact: true,
+			ExpectedRunName: workflowDispatchDisplayTitle(workflow.CorrelationID), ExpectedProducerGitCommit: config.VisualHiveRef, FetchSourceArtifact: true,
 		})
 		if err != nil {
 			return intent, true, fmt.Errorf("validate post-baseline production bundle without lifecycle writes: %w", err)

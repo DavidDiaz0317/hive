@@ -43,25 +43,42 @@ func (s *Store) Load() (Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return Config{}, err
 	}
-	if config.SchemaVersion != ConfigSchema {
+	legacy := config.SchemaVersion == legacyConfigSchema
+	if !supportedDurableConfigSchema(config.SchemaVersion) {
 		return Config{}, fmt.Errorf("unsupported integrated config schema %q", config.SchemaVersion)
 	}
 	if config.MaxRepairAttempts == 0 {
 		config.MaxRepairAttempts = 3
 	}
+	if legacy {
+		// Persist the v2 writer guard before returning legacy state to any caller.
+		// Older Hive binaries understand only v1 and will therefore refuse this
+		// state instead of silently dropping the managed-path preimage ledger on
+		// a later save.
+		if err := s.save(&config); err != nil {
+			return Config{}, fmt.Errorf("migrate integrated config schema: %w", err)
+		}
+	}
 	return config, nil
 }
 
 func (s *Store) Save(config Config) error {
+	return s.save(&config)
+}
+
+func (s *Store) save(config *Config) error {
 	config.SchemaVersion = ConfigSchema
 	config.UpdatedAt = time.Now().UTC()
 	if config.InstalledAt.IsZero() {
 		config.InstalledAt = config.UpdatedAt
 	}
-	if err := ensureStateOwnershipMarker(filepath.Dir(s.dir), config); err != nil {
+	if err := ensureStateOwnershipMarker(filepath.Dir(s.dir), *config); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(config, "", "  ")
+	// Bypass Config.MarshalJSON only for the permission-bounded durable state;
+	// normal command/status JSON intentionally redacts repository preimages.
+	type persistedConfig Config
+	data, err := json.MarshalIndent(persistedConfig(*config), "", "  ")
 	if err != nil {
 		return err
 	}

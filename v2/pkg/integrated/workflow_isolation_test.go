@@ -1,12 +1,15 @@
 package integrated
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"gopkg.in/yaml.v3"
@@ -14,6 +17,138 @@ import (
 
 type isolatedWorkflowDocument struct {
 	Jobs map[string]isolatedWorkflowJob `yaml:"jobs"`
+}
+
+func TestIntegratedArtifactRequestsBindPinnedVisualHiveProducer(t *testing.T) {
+	for _, source := range []string{"run.go", "setup_baseline.go"} {
+		data, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		if requests, bindings := strings.Count(text, "hivegithub.VisualHiveArtifactRequest{"), strings.Count(text, "ExpectedProducerGitCommit: config.VisualHiveRef"); requests != 1 || bindings != requests {
+			t.Fatalf("%s must bind every Visual Hive artifact request to config.VisualHiveRef: requests=%d bindings=%d", source, requests, bindings)
+		}
+	}
+}
+
+func TestRunnerOwnedResolutionScopesRequireFreshStrictReceipts(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node is required to execute the runner-owned resolution receipt verifier")
+	}
+	type receiptMutation func(map[string]any, map[string]any, map[string]any, map[string]any, map[string]any)
+	writeReceipts := func(t *testing.T, root string, mutate receiptMutation) {
+		t.Helper()
+		layerRows := make([]any, 0, 12)
+		for id := 0; id < 12; id++ {
+			layerRows = append(layerRows, map[string]any{"id": id, "status": "covered", "evidence": []any{"current-run"}, "gaps": []any{}, "skippedReasons": []any{}})
+		}
+		layers := map[string]any{"schemaVersion": 1, "layers": layerRows}
+		workflows := map[string]any{"schemaVersion": 1, "summary": map[string]any{"workflowCount": 1}, "workflows": []any{map[string]any{"path": ".github/workflows/hive-visual-hive.yml"}}, "findings": []any{}}
+		providers := map[string]any{"schemaVersion": 1, "providers": []any{map[string]any{"providerId": "playwright", "result": map[string]any{"providerId": "playwright", "status": "passed"}}}}
+		evidence := map[string]any{"providers": []any{map[string]any{"providerId": "playwright", "status": "passed"}, map[string]any{"providerId": "playwright", "status": "passed"}}}
+		report := map[string]any{"providerResults": []any{map[string]any{"providerId": "playwright", "status": "passed"}}}
+		if mutate != nil {
+			mutate(layers, workflows, providers, evidence, report)
+		}
+		for relative, value := range map[string]any{
+			".visual-hive/testing-layers.json":   layers,
+			".visual-hive/workflows.json":        workflows,
+			".visual-hive/provider-results.json": providers,
+			".visual-hive/evidence-packet.json":  evidence,
+			".visual-hive/report.json":           report,
+		} {
+			data, marshalErr := json.Marshal(value)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			writeFixture(t, root, relative, string(data))
+		}
+		writeFixture(t, root, ".visual-hive/evaluated-contracts.txt", "contract-a\n")
+	}
+	run := func(t *testing.T, mutate receiptMutation) ([]byte, error, string) {
+		t.Helper()
+		root := t.TempDir()
+		writeReceipts(t, root, mutate)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, node, "-e", runnerOwnedResolutionScopeReceiptScript())
+		command.Dir = root
+		output, runErr := command.CombinedOutput()
+		evaluated, _ := os.ReadFile(filepath.Join(root, ".visual-hive", "evaluated-contracts.txt"))
+		return output, runErr, string(evaluated)
+	}
+	if output, runErr, evaluated := run(t, nil); runErr != nil {
+		t.Fatalf("strict current receipts were rejected: %v\n%s", runErr, output)
+	} else {
+		for _, scope := range []string{"contract-a", "testing-layer:0", "testing-layer:11", "workflow-safety", "provider-governance"} {
+			if !strings.Contains(evaluated, scope+"\n") {
+				t.Fatalf("evaluated scope omitted %q: %q", scope, evaluated)
+			}
+		}
+	}
+	withheld := []struct {
+		name   string
+		mutate receiptMutation
+		scope  string
+	}{
+		{name: "partial layer", scope: "testing-layer:2", mutate: func(layers, _, _, _, _ map[string]any) {
+			layers["layers"].([]any)[2].(map[string]any)["status"] = "partial"
+		}},
+		{name: "covered layer with remaining gap", scope: "testing-layer:2", mutate: func(layers, _, _, _, _ map[string]any) {
+			layers["layers"].([]any)[2].(map[string]any)["gaps"] = []any{"current-run gap"}
+		}},
+		{name: "workflow findings beyond issue projection", scope: "workflow-safety", mutate: func(_, workflows, _, _, _ map[string]any) {
+			findings := make([]any, 11)
+			for index := range findings {
+				findings[index] = map[string]any{"id": fmt.Sprintf("workflow-finding-%02d", index)}
+			}
+			workflows["findings"] = findings
+		}},
+		{name: "provider failure", scope: "provider-governance", mutate: func(_, _, providers, evidence, report map[string]any) {
+			providers["providers"].([]any)[0].(map[string]any)["result"].(map[string]any)["status"] = "failed"
+			evidence["providers"] = []any{map[string]any{"providerId": "playwright", "status": "failed"}, map[string]any{"providerId": "playwright", "status": "failed"}}
+			report["providerResults"] = []any{map[string]any{"providerId": "playwright", "status": "failed"}}
+		}},
+		{name: "provider upload failure", scope: "provider-governance", mutate: func(_, _, providers, evidence, report map[string]any) {
+			upload := map[string]any{"status": "failed"}
+			providers["providers"].([]any)[0].(map[string]any)["result"].(map[string]any)["upload"] = upload
+			evidence["providers"] = []any{
+				map[string]any{"providerId": "playwright", "status": "passed", "upload": upload},
+				map[string]any{"providerId": "playwright", "status": "passed", "upload": upload},
+			}
+			report["providerResults"] = []any{map[string]any{"providerId": "playwright", "status": "passed", "upload": upload}}
+		}},
+	}
+	for _, test := range withheld {
+		t.Run(test.name, func(t *testing.T) {
+			output, runErr, evaluated := run(t, test.mutate)
+			if runErr != nil {
+				t.Fatalf("valid active receipt was rejected: %v\n%s", runErr, output)
+			}
+			if strings.Contains(evaluated, test.scope+"\n") {
+				t.Fatalf("active receipt authorized resolution scope %q: %q", test.scope, evaluated)
+			}
+		})
+	}
+	negative := []struct {
+		name   string
+		mutate receiptMutation
+	}{
+		{name: "incomplete layers", mutate: func(layers, _, _, _, _ map[string]any) { layers["layers"] = layers["layers"].([]any)[:11] }},
+		{name: "empty workflow audit", mutate: func(_, workflows, _, _, _ map[string]any) { workflows["workflows"] = []any{} }},
+		{name: "provider evidence mismatch", mutate: func(_, _, _, evidence, _ map[string]any) {
+			evidence["providers"] = []any{map[string]any{"providerId": "playwright", "status": "failed"}}
+		}},
+	}
+	for _, test := range negative {
+		t.Run(test.name, func(t *testing.T) {
+			if output, runErr, evaluated := run(t, test.mutate); runErr == nil {
+				t.Fatalf("malformed receipt was accepted; evaluated=%q output=%s", evaluated, output)
+			}
+		})
+	}
 }
 
 type isolatedWorkflowJob struct {
@@ -167,7 +302,7 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 		"sudo chown root:root visual-hive.config.yaml", "sudo chmod 0444 visual-hive.config.yaml",
 		"git diff --no-ext-diff --no-textconv --exit-code -- .", "HIVE_VISUAL_HIVE_CLI_SHA", "test ! -w \"$VISUAL_HIVE_CLI\"",
 		"HIVE_TRUSTED_NODE_SHA", `"$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`, `sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_NODE"`,
-		"visual-hive-raw-${{ github.run_id }}",
+		"hive.visual-runner-outcome.v1", ".visual-hive/hive-runner-outcome.json", "visual-hive-raw-${{ github.run_id }}",
 	} {
 		if !strings.Contains(executionText, required) {
 			t.Fatalf("isolated target execution is missing %q", required)
@@ -181,12 +316,22 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 	for _, required := range []string{
 		"actions/download-artifact@" + downloadArtifactActionSHA, "Rebuild exact immutable Visual Hive CLI on fresh runner",
 		"visual-hive-evidence-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "--authoritative-for-resolution",
+		"authoritative-resolution.txt", "authority_args=()", `pipeline.mode === "full"`, `report.mode === "full"`,
+		`runnerOutcome.outcome === "success"`, `plan --config visual-hive.config.yaml --mode full --output .visual-hive/plan.json`,
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN", "Raw evidence contains a symbolic link", "Verify isolated runner prerequisites before trusted publication",
 		"isolated Visual Hive execution did not complete successfully",
 	} {
 		if !strings.Contains(aggregatorText, required) {
 			t.Fatalf("runner-owned production aggregator is missing %q", required)
 		}
+	}
+	if strings.Contains(aggregatorText, `--scan-scope full --authoritative-for-resolution`) {
+		t.Fatal("production bundle still receives unconditional resolution authority")
+	}
+	receiptIndex := strings.Index(executionText, `sudo install -o root -g root -m 0444 "$runner_outcome" .visual-hive/hive-runner-outcome.json`)
+	uploadIndex := strings.Index(executionText, "Upload isolated raw Visual evidence")
+	if receiptIndex < 0 || uploadIndex < 0 || receiptIndex > uploadIndex {
+		t.Fatalf("runner-owned pipeline outcome receipt is not root-created after target termination and before raw upload: receipt=%d upload=%d", receiptIndex, uploadIndex)
 	}
 	for _, forbidden := range []string{"sudo -u hive-target", "npm --prefix \"$(dirname \"$lockfile\")\" ci", "target_visual_pipeline"} {
 		if strings.Contains(aggregatorText, forbidden) {
@@ -312,6 +457,9 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 		!strings.Contains(pullRequestExecution, `["failed", "blocked"].includes(report.status) && verdictSummary.visualHiveVerdict === "blocked"`) {
 		t.Fatal("pull-request verifier does not accept Visual Hive's blocked missing-baseline status")
 	}
+	if !strings.Contains(pullRequestExecution, `blocking.length === 0`) {
+		t.Fatal("pull-request verifier does not require every gating contribution to pass")
+	}
 	for _, stale := range []string{"pipeline.summary", "pipeline.verdictSummary", "pipeline.verdictContributions", "pipeline.results"} {
 		if strings.Contains(pullRequestExecution, stale) {
 			t.Fatalf("pull-request verifier still reads %s from the pipeline envelope", stale)
@@ -325,6 +473,216 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 	}
 	if strings.Contains(dependencyShell, isolatedVisualTargetEnvPrefix()+` bash`) {
 		t.Fatal("target dependency code was granted the final trusted browser directory")
+	}
+}
+
+func TestRunnerOwnedEvaluationScopeUsesCompletedReportRowsAndFailsClosed(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node is required to execute the runner-owned evidence scope verifier")
+	}
+	tests := []struct {
+		name              string
+		pipeline          string
+		plan              string
+		report            string
+		runnerOutcome     string
+		wantEvaluated     string
+		wantAuthoritative string
+		wantError         bool
+	}{
+		{
+			name:              "full green complete",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-b"},{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a","contract-b"],"excludedContracts":[],"results":[{"contractId":"contract-b","status":"passed"},{"contractId":"contract-a","status":"passed"}]}`,
+			wantEvaluated:     "contract-a\ncontract-b\n",
+			wantAuthoritative: "true\n",
+		},
+		{
+			name:              "crafted green artifacts cannot override runner failure",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"}]}`,
+			runnerOutcome:     `{"schemaVersion":"hive.visual-runner-outcome.v1","outcome":"failure","conclusion":"success"}`,
+			wantEvaluated:     "",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:              "planned contract skipped",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"},{"contractId":"contract-b"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a","contract-b"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"},{"contractId":"contract-b","status":"skipped"}]}`,
+			wantEvaluated:     "contract-a\n",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:              "configured contract excluded",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[{"contractId":"contract-b"}]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[{"contractId":"contract-b"}],"results":[{"contractId":"contract-a","status":"passed"}]}`,
+			wantEvaluated:     "contract-a\n",
+			wantAuthoritative: "true\n",
+		},
+		{
+			name:              "pipeline not green",
+			pipeline:          `{"mode":"full","status":"failed","exitCode":1}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"}]}`,
+			wantEvaluated:     "contract-a\n",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:              "report not green",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"failed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"failed"}]}`,
+			wantEvaluated:     "",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:              "created result is not an absence receipt",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"created"}]}`,
+			wantEvaluated:     "",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:              "non-full mode",
+			pipeline:          `{"mode":"pr","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"pr","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:            `{"mode":"pr","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"}]}`,
+			wantEvaluated:     "contract-a\n",
+			wantAuthoritative: "false\n",
+		},
+		{
+			name:      "extra unselected result is rejected",
+			pipeline:  `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:      `{"mode":"full","items":[{"contractId":"contract-a"}],"excluded":[]}`,
+			report:    `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"},{"contractId":"unselected","status":"skipped"}]}`,
+			wantError: true,
+		},
+		{
+			name:              "vacuous green plan is non-authoritative",
+			pipeline:          `{"mode":"full","status":"passed","exitCode":0}`,
+			plan:              `{"mode":"full","items":[],"excluded":[]}`,
+			report:            `{"mode":"full","status":"passed","selectedContracts":[],"excludedContracts":[],"results":[]}`,
+			wantEvaluated:     "",
+			wantAuthoritative: "false\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			runnerOutcome := test.runnerOutcome
+			if runnerOutcome == "" {
+				runnerOutcome = `{"schemaVersion":"hive.visual-runner-outcome.v1","outcome":"success","conclusion":"success"}`
+			}
+			writeFixture(t, root, ".visual-hive/hive-runner-outcome.json", runnerOutcome)
+			writeFixture(t, root, ".visual-hive/pipeline.json", test.pipeline)
+			writeFixture(t, root, ".visual-hive/plan.json", test.plan)
+			writeFixture(t, root, ".visual-hive/report.json", test.report)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, node, "-e", runnerOwnedEvaluationScopeScript())
+			command.Dir = root
+			if output, runErr := command.CombinedOutput(); test.wantError {
+				if runErr == nil || !strings.Contains(string(output), "exact one-to-one") {
+					t.Fatalf("runner-owned scope verifier error = %v, output=%s", runErr, output)
+				}
+				return
+			} else if runErr != nil {
+				t.Fatalf("runner-owned scope verifier failed: %v\n%s", runErr, output)
+			}
+			evaluated, readErr := os.ReadFile(filepath.Join(root, ".visual-hive", "evaluated-contracts.txt"))
+			if readErr != nil || string(evaluated) != test.wantEvaluated {
+				t.Fatalf("evaluated contracts = %q, err=%v; want %q", evaluated, readErr, test.wantEvaluated)
+			}
+			authority, readErr := os.ReadFile(filepath.Join(root, ".visual-hive", "authoritative-resolution.txt"))
+			if readErr != nil || string(authority) != test.wantAuthoritative {
+				t.Fatalf("resolution authority = %q, err=%v; want %q", authority, readErr, test.wantAuthoritative)
+			}
+		})
+	}
+}
+
+func TestRunnerOwnedPlanRegenerationReplacesHostileRawPlanAndBindsReport(t *testing.T) {
+	bash := workflowBash(t)
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("Node is required to execute the runner-owned plan regeneration verifier")
+	}
+	run := func(t *testing.T, report string) ([]byte, error, string, bool) {
+		t.Helper()
+		root := t.TempDir()
+		writeFixture(t, root, "visual-hive.config.yaml", "schemaVersion: 1\n")
+		writeFixture(t, root, ".visual-hive/hive-runner-outcome.json", `{"schemaVersion":"hive.visual-runner-outcome.v1","outcome":"success","conclusion":"success"}`)
+		writeFixture(t, root, ".visual-hive/pipeline.json", `{"mode":"full","status":"passed","exitCode":0}`)
+		writeFixture(t, root, ".visual-hive/report.json", report)
+		writeFixture(t, root, ".visual-hive/plan.json", `{"mode":"full","items":[{"contractId":"hostile-contract"}],"excluded":[]}`)
+		writeFixture(t, root, ".visual-hive/plan.full.json", `{"mode":"full","items":[{"contractId":"hostile-contract"}],"excluded":[]}`)
+		writeFixture(t, root, "fake-visual-hive.js", `const fs = require("fs");
+const args = process.argv.slice(2);
+if (args[0] !== "plan" || args[args.indexOf("--mode") + 1] !== "full") process.exit(2);
+const output = args[args.indexOf("--output") + 1];
+fs.writeFileSync(output, JSON.stringify({mode:"full",items:[{contractId:"contract-a"}],excluded:[]}) + "\n");`)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, bash, "-e", "-o", "pipefail", "-c", runnerOwnedPlanRegenerationAndEvaluationShell())
+		command.Dir = root
+		command.Env = append(os.Environ(), "VISUAL_HIVE_CLI=fake-visual-hive.js")
+		output, runErr := command.CombinedOutput()
+		evaluated, _ := os.ReadFile(filepath.Join(root, ".visual-hive", "evaluated-contracts.txt"))
+		_, staleErr := os.Stat(filepath.Join(root, ".visual-hive", "plan.full.json"))
+		return output, runErr, string(evaluated), os.IsNotExist(staleErr)
+	}
+	t.Run("fresh immutable plan replaces hostile raw plans", func(t *testing.T) {
+		output, runErr, evaluated, staleRemoved := run(t, `{"mode":"full","status":"passed","selectedContracts":["contract-a"],"excludedContracts":[],"results":[{"contractId":"contract-a","status":"passed"}]}`)
+		if runErr != nil || evaluated != "contract-a\n" || !staleRemoved {
+			t.Fatalf("fresh plan replacement failed: err=%v evaluated=%q stale_removed=%t\n%s", runErr, evaluated, staleRemoved, output)
+		}
+	})
+	t.Run("hostile report cannot retain deleted hostile plan scope", func(t *testing.T) {
+		output, runErr, evaluated, staleRemoved := run(t, `{"mode":"full","status":"passed","selectedContracts":["hostile-contract"],"excludedContracts":[],"results":[{"contractId":"hostile-contract","status":"passed"}]}`)
+		if runErr == nil || !strings.Contains(string(output), "exact one-to-one") || evaluated != "" || !staleRemoved {
+			t.Fatalf("hostile report was not rejected: err=%v evaluated=%q stale_removed=%t\n%s", runErr, evaluated, staleRemoved, output)
+		}
+	})
+}
+
+func TestRunnerOwnedRebuildRefreshesArtifactIndexLast(t *testing.T) {
+	shell := runnerOwnedEvidenceRebuildShell(false)
+	artifactCommand := `"${safe_env[@]}" node "$VISUAL_HIVE_CLI" artifacts --config visual-hive.config.yaml --complete`
+	generated := workflow(isolationWorkflowConfig())
+	if !strings.Contains(generated, artifactCommand) {
+		t.Fatal("generated production workflow does not request a complete artifact index")
+	}
+	artifactIndex := strings.LastIndex(shell, artifactCommand)
+	if artifactIndex < 0 {
+		t.Fatal("runner-owned rebuild does not refresh a complete artifact index")
+	}
+	capabilityCommand := `"${safe_env[@]}" node "$VISUAL_HIVE_CLI" capabilities --config visual-hive.config.yaml`
+	if !strings.Contains(generated, capabilityCommand) {
+		t.Fatal("generated production workflow does not regenerate capability parity with the pinned CLI")
+	}
+	capabilityIndex := strings.LastIndex(shell, capabilityCommand)
+	safeEnvironmentIndex := strings.Index(shell, `safe_env=(env `)
+	if safeEnvironmentIndex < 0 || capabilityIndex < safeEnvironmentIndex || capabilityIndex > artifactIndex {
+		t.Fatalf("runner-owned capability parity is not regenerated with the pinned safe CLI before the complete index: safe_env=%d capabilities=%d artifacts=%d", safeEnvironmentIndex, capabilityIndex, artifactIndex)
+	}
+	if !strings.Contains(shell, `rm -f `) || !strings.Contains(shell, `.visual-hive/capability-parity.json`) {
+		t.Fatal("runner-owned rebuild does not discard the target-produced capability parity receipt")
+	}
+	for _, command := range []string{" workflows --config", " providers list --config", " evidence --config", " layers --config", " verdict --config", " issues --config", " baselines list --config", " hive integration-smoke --config"} {
+		index := strings.Index(shell, command)
+		if index < 0 || index > artifactIndex {
+			t.Fatalf("artifact index is not refreshed after %q", command)
+		}
+	}
+	for _, required := range []string{`.visual-hive/workflows.json`, `.visual-hive/provider-results.json`, `.visual-hive/testing-layers.json`, `"testing-layer:" + layer.id`, `workflows.findings.length === 0`, `issueProducingProviderStatuses`, `scopes.push("workflow-safety")`, `scopes.push("provider-governance")`} {
+		if !strings.Contains(shell, required) {
+			t.Fatalf("runner-owned rebuild omitted current receipt invariant %q", required)
+		}
 	}
 }
 
@@ -418,6 +776,15 @@ func TestPullRequestEnforcementUsesOnlyRunnerOwnedJobTopology(t *testing.T) {
 	if err := run(baseEnv); err != nil {
 		t.Fatalf("valid runner topology was rejected: %v", err)
 	}
+	writeFixture(t, filepath.Join(root, ".visual-hive"), "verdict.json", `{"summary":{"visualHiveVerdict":"passed"},"gatingContributions":[{"kind":"future_required_capability","status":"blocked","gating":true}]}`)
+	if err := run(baseEnv); err == nil {
+		t.Fatal("nominally passed verdict accepted an unknown blocked gating contribution")
+	}
+	writeFixture(t, filepath.Join(root, ".visual-hive"), "verdict.json", `{"summary":{"visualHiveVerdict":"passed"}}`)
+	if err := run(baseEnv); err == nil {
+		t.Fatal("nominally passed verdict accepted a missing gating contribution inventory")
+	}
+	writeFixture(t, filepath.Join(root, ".visual-hive"), "verdict.json", `{"summary":{"visualHiveVerdict":"passed"},"gatingContributions":[]}`)
 	for _, invalid := range []string{
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"failure"},"repository-test-001":{"result":"success"}}`,
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"success"},"repository-test-002":{"result":"success"}}`,

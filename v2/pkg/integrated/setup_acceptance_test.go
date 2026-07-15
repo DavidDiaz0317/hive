@@ -47,6 +47,10 @@ func TestInstalledVisualHiveBundleSetupApplyAndMergedRerunIsIdempotent(t *testin
 	if err := os.WriteFile(filepath.Join(seed, "package.json"), []byte("{\"scripts\":{\"test\":\"node --test\"}}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	const repositoryGuide = "# Repository Visual Hive guide\n"
+	const standaloneLifecycle = "name: Visual Hive lifecycle\npermissions:\n  issues: write\n"
+	writeFixture(t, seed, "docs/visual-hive.md", repositoryGuide)
+	writeFixture(t, seed, ".github/workflows/visual-hive-lifecycle.yml", standaloneLifecycle)
 	runIntegratedGit(t, seed, "add", ".")
 	runIntegratedGit(t, seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed")
 	runIntegratedGit(t, seed, "remote", "add", "origin", remote)
@@ -95,6 +99,26 @@ func TestInstalledVisualHiveBundleSetupApplyAndMergedRerunIsIdempotent(t *testin
 	}
 	if first.Plan.VisualHiveRepository != options.VisualHiveRepo || first.Plan.VisualHiveRef != visualRef || first.Config.VisualHiveRef != visualRef {
 		t.Fatalf("first setup did not preserve disclosed bundle identity: plan=%s@%s config=%s", first.Plan.VisualHiveRepository, first.Plan.VisualHiveRef, first.Config.VisualHiveRef)
+	}
+	if err := validateManagedPathOwnership(first.Config.ManagedPreimagesVersion, first.Config.ManagedPathPreimages, managedSetupFiles(true)); err != nil {
+		t.Fatalf("setup result lost non-secret managed-path ownership metadata: %v", err)
+	}
+	if hasValidManagedPathPreimages(*first.Config) {
+		t.Fatal("setup result exposed private managed-path preimage bytes")
+	}
+	stored, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedConfig, err := stored.Load()
+	if err != nil || !hasValidManagedPathPreimages(storedConfig) {
+		t.Fatalf("setup did not durably bind managed-path ownership before publication: %v", err)
+	}
+	for relative, want := range map[string]string{"docs/visual-hive.md": repositoryGuide, ".github/workflows/visual-hive-lifecycle.yml": standaloneLifecycle} {
+		preimage := storedConfig.ManagedPathPreimages[relative]
+		if !preimage.Existed || string(preimage.Content) != want {
+			t.Fatalf("setup preimage for %s = %+v, want exact repository bytes", relative, preimage)
+		}
 	}
 	setupRef := "refs/heads/" + first.Branch
 	setupSHA := strings.TrimSpace(integratedGitOutput(t, remote, "rev-parse", setupRef))

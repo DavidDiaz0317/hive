@@ -245,9 +245,21 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 			return result, fmt.Errorf("managed uninstall requires the numeric setup authorizer recorded by a current Hive installation; rerun setup first")
 		}
 		candidate.Paused = true
-		for _, relative := range managed {
-			if err := os.Remove(filepath.Join(config.CheckoutDir, filepath.FromSlash(relative))); err != nil && !os.IsNotExist(err) {
-				return result, err
+		if managedPathPreimagesConfigured(config) && !hasValidManagedPathPreimages(config) {
+			return result, fmt.Errorf("managed uninstall refuses an invalid repository preimage ledger")
+		}
+		if hasValidManagedPathPreimages(config) {
+			if err := restoreManagedPathPreimages(config.CheckoutDir, config); err != nil {
+				return result, fmt.Errorf("restore repository-owned files during uninstall: %w", err)
+			}
+		} else {
+			// Legacy installations predate the preimage ledger. Preserve their
+			// historical behavior; every newly created installation records an
+			// exact restoration policy before the first managed write.
+			for _, relative := range managed {
+				if err := os.Remove(filepath.Join(config.CheckoutDir, filepath.FromSlash(relative))); err != nil && !os.IsNotExist(err) {
+					return result, err
+				}
 			}
 		}
 		title = uninstallTitle()
@@ -257,6 +269,11 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 	}
 	if err := stageManagedPaths(ctx, config.CheckoutDir, managed); err != nil {
 		return result, err
+	}
+	if options.Operation == OperationUninstall {
+		if err := applyManagedPathPreimageModes(ctx, config.CheckoutDir, config); err != nil {
+			return result, err
+		}
 	}
 	changed, err := git(ctx, config.CheckoutDir, "diff", "--cached", "--name-only")
 	if err != nil {
@@ -438,7 +455,7 @@ func deleteManagedState(stateDir string) error {
 		return err
 	}
 	var config Config
-	if json.Unmarshal(data, &config) != nil || config.SchemaVersion != ConfigSchema || strings.TrimSpace(config.Repository) == "" || strings.TrimSpace(config.RepositoryID) == "" {
+	if json.Unmarshal(data, &config) != nil || !supportedDurableConfigSchema(config.SchemaVersion) || strings.TrimSpace(config.Repository) == "" || strings.TrimSpace(config.RepositoryID) == "" {
 		return fmt.Errorf("refusing to delete %s because its managed config identity is invalid", absolute)
 	}
 	allowedDirectories := map[string]bool{"integrated": true, "visual-hive": true, "repair": true, "beads": true, "runtime": true}

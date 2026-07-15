@@ -357,7 +357,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}, {"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "name: Hive repository test 002", "name: Hive repository test 003", "visual-hive-execution", "visual-hive-production", "setup-baseline-capture", "setup-baseline-verify", "--bootstrap-baselines", "hive-setup-baselines-${{ inputs.hive_dispatch_id }}", "setup-baseline-manifest.json", `runner: "ubuntu-latest"`, "sudo -u hive-target -- env -i", "env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY", "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-raw-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", `"testing-layer:" + layer.id`, "workflow-safety", "provider-governance", "baselines list", "Raw evidence contains a symbolic link", "--authoritative-for-resolution"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "name: Hive repository test 002", "name: Hive repository test 003", "visual-hive-execution", "visual-hive-production", "setup-baseline-capture", "setup-baseline-verify", "--bootstrap-baselines", "hive-setup-baselines-${{ inputs.hive_dispatch_id }}", "setup-baseline-manifest.json", `runner: "ubuntu-latest"`, "sudo -u hive-target -- env -i", "env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY", "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-raw-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "hive-runner-outcome.json", "plan and report lack an exact one-to-one contract evaluation binding", "evaluated-contracts.txt", "authoritative-resolution.txt", "baselines list", "Raw evidence contains a symbolic link", "--authoritative-for-resolution"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}
@@ -745,14 +745,21 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 
 func TestManagedRepositoryConfigExcludesLocalPaths(t *testing.T) {
 	root := t.TempDir()
+	writeFixture(t, root, "visual-hive.config.yaml", "project:\n  name: proof\ntargets:\n  app:\n    kind: command\ncontracts:\n  - id: app\n    target: app\nintegrations:\n  hive:\n    enabled: false\n    mode: measured\n")
+	writeFixture(t, root, ".github/workflows/visual-hive-lifecycle.yml", "issues: write")
 	writeFixture(t, root, ".github/workflows/visual-hive-issue-lifecycle.yml", "issues: write")
 	writeFixture(t, root, ".github/workflows/visual-hive-trusted-publisher.yml", "issues: write")
+	writeFixture(t, root, ".github/workflows/visual-hive-failure-issue.yml", "issues: write")
+	writeFixture(t, root, ".github/workflows/visual-hive-hive-handoff.yml", "issues: write")
 	config := Config{
 		Repository: "owner/repo", DefaultBranch: "main", Coverage: CoverageStandard, Automation: AutomationIssues,
 		Provider: "codex", ACMMLevel: 4, VisualHive: true, VisualHiveRepo: "owner/visual-hive",
 		VisualHiveRef: "0123456789012345678901234567890123456789", CheckoutDir: `C:\private\checkout`, StateDir: `C:\private\state`,
 	}
 	if err := writeManagedFiles(root, config, RepositoryInspection{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := markVisualHiveConfigOrigin(root, "generated", profileForCoverage(config.Coverage)); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, ".hive", "integrated.json"))
@@ -763,14 +770,56 @@ func TestManagedRepositoryConfigExcludesLocalPaths(t *testing.T) {
 	if strings.Contains(value, "private") || strings.Contains(value, "checkout_dir") || strings.Contains(value, "state_dir") {
 		t.Fatalf("local paths leaked into repository config: %s", value)
 	}
-	for _, relative := range []string{".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml"} {
+	for _, relative := range standaloneVisualHiveWriterWorkflowPaths() {
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relative))); !os.IsNotExist(err) {
 			t.Fatalf("standalone writer %s must be removed in integrated mode", relative)
 		}
 	}
+	visualConfig, err := os.ReadFile(filepath.Join(root, "visual-hive.config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal(visualConfig, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	hiveIntegration := anyStringMap(anyStringMap(parsed["integrations"])["hive"])
+	if hiveIntegration["enabled"] != true || hiveIntegration["mode"] != "measured" {
+		t.Fatalf("integrated setup did not enable Hive additively while removing standalone writers: %+v", hiveIntegration)
+	}
 	prWorkflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "visual-hive-pr.yml"))
 	if err != nil || !strings.Contains(string(prWorkflow), config.VisualHiveRef) {
 		t.Fatalf("managed pull request workflow is missing or not pinned: %v", err)
+	}
+}
+
+func TestStandaloneVisualHiveWriterInventoryCoversGeneratedDefaults(t *testing.T) {
+	want := []string{
+		".github/workflows/visual-hive-lifecycle.yml",
+		".github/workflows/visual-hive-issue-lifecycle.yml",
+		".github/workflows/visual-hive-trusted-publisher.yml",
+		".github/workflows/visual-hive-failure-issue.yml",
+		".github/workflows/visual-hive-hive-handoff.yml",
+	}
+	got := standaloneVisualHiveWriterWorkflowPaths()
+	if len(got) != len(want) {
+		t.Fatalf("standalone writer inventory = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("standalone writer inventory = %v, want %v", got, want)
+		}
+	}
+	for _, inventory := range [][]string{managedSetupFiles(true), authorizerTransferAbsentFiles(Config{VisualHive: true})} {
+		if !contains(inventory, ".github/workflows/visual-hive-failure-issue.yml") || !contains(inventory, ".github/workflows/visual-hive-hive-handoff.yml") {
+			t.Fatalf("single-writer lifecycle inventory omitted Visual Hive generated defaults: %v", inventory)
+		}
+	}
+	authorizationJob := setupAuthorizationWorkflowJob(Config{VisualHive: true})
+	for _, relative := range want {
+		if !strings.Contains(authorizationJob, relative) {
+			t.Fatalf("setup authorization workflow omitted standalone writer %q", relative)
+		}
 	}
 }
 

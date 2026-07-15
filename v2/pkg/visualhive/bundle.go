@@ -23,34 +23,38 @@ import (
 )
 
 const (
-	ManifestSchema             = "visual-hive.bundle.v2"
-	PublicationDigestAlgorithm = "visual-hive.bundle.publication-digest.v1"
-	maxManifestSize            = 2 << 20
-	maxFileSize                = 25 << 20
-	maxBundleSize              = 100 << 20
-	maxBundleFiles             = 512
+	ManifestSchema                  = "visual-hive.bundle.v2"
+	ManifestSchemaV3                = "visual-hive.bundle.v3"
+	PublicationDigestAlgorithm      = "visual-hive.bundle.publication-digest.v1"
+	ContentAddressedDigestAlgorithm = "visual-hive.bundle.content-addressed-digest.v1"
+	maxManifestSize                 = 2 << 20
+	maxFileSize                     = 25 << 20
+	maxBundleSize                   = 100 << 20
+	maxBundleFiles                  = 512
 )
 
 type Manifest struct {
-	SchemaVersion     string           `json:"schemaVersion"`
-	DigestAlgorithm   string           `json:"digestAlgorithm,omitempty"`
-	BundleID          string           `json:"bundleId"`
-	GeneratedAt       time.Time        `json:"generatedAt"`
-	ExpiresAt         time.Time        `json:"expiresAt"`
-	Producer          Producer         `json:"producer"`
-	Source            Source           `json:"source"`
-	Project           string           `json:"project"`
-	Mode              string           `json:"mode"`
-	Verdict           string           `json:"verdict"`
-	ACMMRequest       int              `json:"acmmRequest"`
-	ExternalCallsMade int              `json:"externalCallsMade"`
-	Scan              Scan             `json:"scan"`
-	Observations      []Observation    `json:"observations"`
-	Files             []File           `json:"files"`
-	OverallDigest     string           `json:"overallDigest"`
-	ReplayProtection  ReplayProtection `json:"replayProtection"`
-	Provenance        Provenance       `json:"provenance"`
-	Safety            Safety           `json:"safety"`
+	SchemaVersion     string                   `json:"schemaVersion"`
+	DigestAlgorithm   string                   `json:"digestAlgorithm,omitempty"`
+	BundleID          string                   `json:"bundleId"`
+	GeneratedAt       time.Time                `json:"generatedAt"`
+	ExpiresAt         time.Time                `json:"expiresAt"`
+	Producer          Producer                 `json:"producer"`
+	Source            Source                   `json:"source"`
+	Project           string                   `json:"project"`
+	Mode              string                   `json:"mode"`
+	Verdict           string                   `json:"verdict"`
+	ACMMRequest       int                      `json:"acmmRequest"`
+	ExternalCallsMade int                      `json:"externalCallsMade"`
+	Scan              Scan                     `json:"scan"`
+	Observations      []Observation            `json:"observations"`
+	Files             []File                   `json:"files"`
+	ArtifactIndex     *ArtifactIndexBinding    `json:"artifactIndex,omitempty"`
+	CapabilityParity  *CapabilityParityBinding `json:"capabilityParity,omitempty"`
+	OverallDigest     string                   `json:"overallDigest"`
+	ReplayProtection  ReplayProtection         `json:"replayProtection"`
+	Provenance        Provenance               `json:"provenance"`
+	Safety            Safety                   `json:"safety"`
 }
 
 type Producer struct {
@@ -125,14 +129,48 @@ type Safety struct {
 	AbsenceRequiresAuthoritativeScan bool `json:"absenceRequiresAuthoritativeScan"`
 }
 
+type ArtifactIndexBinding struct {
+	Path             string `json:"path"`
+	SourcePath       string `json:"sourcePath"`
+	SHA256           string `json:"sha256"`
+	SchemaVersion    int    `json:"schemaVersion"`
+	ContentAddressed bool   `json:"contentAddressed"`
+	Complete         bool   `json:"complete"`
+	ArtifactCount    int64  `json:"artifactCount"`
+	TotalBytes       int64  `json:"totalBytes"`
+}
+
+type CapabilityParitySummary struct {
+	Expected   int64 `json:"expected"`
+	Actual     int64 `json:"actual"`
+	Present    int64 `json:"present"`
+	Blocked    int64 `json:"blocked"`
+	Missing    int64 `json:"missing"`
+	Unexpected int64 `json:"unexpected"`
+	Mismatched int64 `json:"mismatched"`
+}
+
+type CapabilityParityBinding struct {
+	Path            string                  `json:"path"`
+	SourcePath      string                  `json:"sourcePath"`
+	SHA256          string                  `json:"sha256"`
+	SchemaVersion   string                  `json:"schemaVersion"`
+	BaselineVersion string                  `json:"baselineVersion"`
+	Status          string                  `json:"status"`
+	RuntimeStatus   string                  `json:"runtimeStatus"`
+	Summary         CapabilityParitySummary `json:"summary"`
+}
+
 type ValidationOptions struct {
-	Now                   time.Time
-	MaxACMM               int
-	AllowLocal            bool
-	VerifiedProvenance    bool
-	ExpectedRepository    string
-	ExpectedRepositoryID  string
-	ExpectedWorkflowRunID string
+	Now                        time.Time
+	MaxACMM                    int
+	AllowLocal                 bool
+	VerifiedProvenance         bool
+	ExpectedProducerGitCommit  string
+	ExpectedRepository         string
+	ExpectedRepositoryID       string
+	ExpectedWorkflowRunID      string
+	ExpectedWorkflowRunAttempt string
 }
 
 type Validation struct {
@@ -166,13 +204,18 @@ type Projection struct {
 }
 
 type ValidatedBundle struct {
-	Manifest   Manifest
-	Validation Validation
-	Beads      []Projection
+	Manifest           Manifest
+	Validation         Validation
+	Beads              []Projection
+	artifactIndex      *ArtifactIndexReport
+	provenanceVerified bool
+	sourceVerified     bool
+	verifiedSourceRoot string
 }
 
 var (
 	hexDigest    = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	exactCommit  = regexp.MustCompile(`^[a-f0-9]{40}$`)
 	safeID       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	absolutePath = regexp.MustCompile(`(?i)(/home/|/Users/|[A-Z]:[/\\]+Users[/\\]+)`)
 	secretValue  = regexp.MustCompile(`(?i)(github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
@@ -181,6 +224,9 @@ var (
 )
 
 func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedBundle, error) {
+	if options.AllowLocal && options.VerifiedProvenance {
+		return nil, fmt.Errorf("local bundle validation and independently verified provenance are mutually exclusive")
+	}
 	manifestFile, err := os.Open(manifestPath)
 	if err != nil {
 		return nil, err
@@ -190,17 +236,35 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	if err := decodeStrict(io.LimitReader(manifestFile, maxManifestSize+1), &manifest); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
+	if manifest.SchemaVersion == ManifestSchemaV3 {
+		manifestData, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return nil, err
+		}
+		if len(manifestData) > maxManifestSize {
+			return nil, fmt.Errorf("bundle v3 manifest exceeds %d bytes", maxManifestSize)
+		}
+		if err := validateV3ManifestJSONPresence(manifestData); err != nil {
+			return nil, err
+		}
+	}
 	if err := validateManifest(manifest, options); err != nil {
 		return nil, err
 	}
 
 	root := filepath.Dir(manifestPath)
 	seenPaths := make(map[string]bool, len(manifest.Files))
+	seenSourcePaths := make(map[string]bool, len(manifest.Files))
 	fileLines := make([]string, 0, len(manifest.Files))
+	boundEvidence := make(map[string][]byte, 2)
 	var total int64
 	var projections []Projection
 	for _, file := range manifest.Files {
-		if err := validateFileRecord(file, seenPaths); err != nil {
+		var sourcePaths map[string]bool
+		if manifest.SchemaVersion == ManifestSchemaV3 {
+			sourcePaths = seenSourcePaths
+		}
+		if err := validateFileRecord(file, seenPaths, sourcePaths); err != nil {
 			return nil, err
 		}
 		target := filepath.Join(root, filepath.FromSlash(file.Path))
@@ -229,6 +293,9 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 			return nil, fmt.Errorf("bundle exceeds %d bytes", maxBundleSize)
 		}
 		fileLines = append(fileLines, fmt.Sprintf("file\x00%s\x00%s\x00%d", file.Path, file.SHA256, file.Size))
+		if manifest.SchemaVersion == ManifestSchemaV3 && ((manifest.ArtifactIndex != nil && file.SourcePath == manifest.ArtifactIndex.SourcePath) || (manifest.CapabilityParity != nil && file.SourcePath == manifest.CapabilityParity.SourcePath)) {
+			boundEvidence[file.SourcePath] = data
+		}
 		if strings.HasSuffix(file.SourcePath, "/hive/beads.json") || strings.HasSuffix(file.SourcePath, "/hive/hive-beads.json") || file.SourcePath == ".visual-hive/hive/beads.json" {
 			if err := decodeStrict(bytes.NewReader(data), &projections); err != nil {
 				return nil, fmt.Errorf("decode beads: %w", err)
@@ -239,17 +306,24 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	if overall != manifest.OverallDigest || manifest.Provenance.SubjectDigest != overall {
 		return nil, fmt.Errorf("bundle overall digest mismatch")
 	}
+	var artifactIndex *ArtifactIndexReport
+	if manifest.SchemaVersion == ManifestSchemaV3 {
+		artifactIndex, err = validateV3BoundEvidence(manifest, boundEvidence, options.VerifiedProvenance)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if projections == nil {
 		return nil, fmt.Errorf("bundle does not contain .visual-hive/hive/beads.json")
 	}
 	if err := validateProjections(projections); err != nil {
 		return nil, err
 	}
-	return &ValidatedBundle{Manifest: manifest, Beads: projections, Validation: Validation{
+	return &ValidatedBundle{Manifest: manifest, Beads: projections, artifactIndex: artifactIndex, provenanceVerified: options.VerifiedProvenance, Validation: Validation{
 		SchemaVersion: "hive.visual-hive-validation.v1", Status: "passed", BundleID: manifest.BundleID,
 		Project: manifest.Project, Digest: overall, Files: len(manifest.Files), Bytes: total,
-		Beads: len(projections), Trusted: options.AllowLocal || options.VerifiedProvenance,
-		Authoritative: manifest.Scan.AuthoritativeForResolution, Observations: len(manifest.Observations),
+		Beads: len(projections), Trusted: options.AllowLocal,
+		Authoritative: false, Observations: len(manifest.Observations),
 	}}, nil
 }
 
@@ -281,11 +355,17 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 	if options.MaxACMM == 0 {
 		options.MaxACMM = 3
 	}
-	if m.SchemaVersion != ManifestSchema || !safeID.MatchString(m.BundleID) {
+	if (m.SchemaVersion != ManifestSchema && m.SchemaVersion != ManifestSchemaV3) || !safeID.MatchString(m.BundleID) {
 		return fmt.Errorf("unsupported or invalid bundle identity")
 	}
-	if m.DigestAlgorithm != "" && m.DigestAlgorithm != PublicationDigestAlgorithm {
+	if m.SchemaVersion == ManifestSchema && m.DigestAlgorithm != "" && m.DigestAlgorithm != PublicationDigestAlgorithm {
 		return fmt.Errorf("unsupported bundle digest algorithm %q", m.DigestAlgorithm)
+	}
+	if m.SchemaVersion == ManifestSchemaV3 && m.DigestAlgorithm != ContentAddressedDigestAlgorithm {
+		return fmt.Errorf("unsupported bundle digest algorithm %q", m.DigestAlgorithm)
+	}
+	if err := validateV3ManifestContract(m); err != nil {
+		return err
 	}
 	if m.Producer.Name != "visual-hive" || strings.TrimSpace(m.Producer.Version) == "" || strings.TrimSpace(m.Producer.GitCommit) == "" {
 		return fmt.Errorf("invalid Visual Hive producer")
@@ -293,7 +373,11 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 	if strings.TrimSpace(m.Project) == "" || strings.TrimSpace(m.Source.Repository) == "" || strings.TrimSpace(m.Source.CommitSHA) == "" {
 		return fmt.Errorf("bundle source identity is incomplete")
 	}
-	for _, value := range []string{m.Source.Repository, m.Source.RepositoryID, m.Source.Ref, m.Source.CommitSHA, m.Source.WorkflowRunID, m.Source.WorkflowArtifactID, m.Source.Conclusion} {
+	sourceIdentity := []string{m.Source.Repository, m.Source.RepositoryID, m.Source.Ref, m.Source.CommitSHA, m.Source.WorkflowRunID, m.Source.WorkflowArtifactID, m.Source.Conclusion}
+	if m.SchemaVersion == ManifestSchemaV3 {
+		sourceIdentity = append(sourceIdentity, m.Source.Event, m.Source.WorkflowName, m.Source.WorkflowRunAttempt)
+	}
+	for _, value := range sourceIdentity {
 		if strings.ContainsRune(value, '\x00') {
 			return fmt.Errorf("bundle source identity cannot contain NUL delimiters")
 		}
@@ -316,12 +400,7 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 	if !safeID.MatchString(m.ReplayProtection.Nonce) || !hexDigest.MatchString(m.ReplayProtection.Key) {
 		return fmt.Errorf("bundle replay protection is invalid")
 	}
-	expectedReplayKey := digest([]byte(strings.Join([]string{
-		m.Source.Repository,
-		m.Source.CommitSHA,
-		valueOr(m.Source.WorkflowRunID, "local"),
-		m.BundleID,
-	}, "\x00")))
+	expectedReplayKey := replayKeyForManifest(m)
 	if m.ReplayProtection.Nonce != m.BundleID || m.ReplayProtection.Key != expectedReplayKey {
 		return fmt.Errorf("bundle replay protection mismatch")
 	}
@@ -333,7 +412,17 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 		if !options.VerifiedProvenance {
 			return fmt.Errorf("bundle provenance was not independently verified by Hive")
 		}
-		if m.Source.Event == "pull_request" || m.Source.Conclusion != "success" || m.Provenance.Kind != "github-actions" || !m.Provenance.AttestationRequired {
+		if m.SchemaVersion != ManifestSchemaV3 {
+			return fmt.Errorf("integrated trusted production authority requires a Visual Hive bundle v3")
+		}
+		expectedProducerCommit := strings.TrimSpace(options.ExpectedProducerGitCommit)
+		if !exactCommit.MatchString(expectedProducerCommit) {
+			return fmt.Errorf("independently verified provenance requires an exact 40-character Visual Hive producer commit")
+		}
+		if m.Producer.GitCommit != expectedProducerCommit {
+			return fmt.Errorf("Visual Hive producer commit does not match the independently pinned release commit")
+		}
+		if m.Source.Event == "pull_request" || m.Source.Event == "pull_request_target" || m.Source.Conclusion != "success" || m.Provenance.Kind != "github-actions" || !m.Provenance.AttestationRequired {
 			return fmt.Errorf("bundle is not from a successful attested non-PR workflow")
 		}
 		if options.ExpectedRepository != "" && !strings.EqualFold(options.ExpectedRepository, m.Source.Repository) {
@@ -345,6 +434,9 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 		if options.ExpectedWorkflowRunID != "" && options.ExpectedWorkflowRunID != m.Source.WorkflowRunID {
 			return fmt.Errorf("bundle workflow run does not match independently verified source")
 		}
+		if m.SchemaVersion == ManifestSchemaV3 && options.ExpectedWorkflowRunAttempt != "" && options.ExpectedWorkflowRunAttempt != m.Source.WorkflowRunAttempt {
+			return fmt.Errorf("bundle workflow run attempt does not match independently verified source")
+		}
 	}
 	return nil
 }
@@ -353,6 +445,12 @@ func validateScanAndObservations(m Manifest) error {
 	validScope := m.Scan.Scope == "full" || m.Scan.Scope == "partial" || m.Scan.Scope == "changed-files" || m.Scan.Scope == "targeted"
 	if !validScope || strings.TrimSpace(m.Scan.TestPlanVersion) == "" || strings.TrimSpace(m.Scan.ToolRegistryVersion) == "" {
 		return fmt.Errorf("bundle scan contract is invalid")
+	}
+	// V2 artifact evidence has no versioned, digest-bound broker/executor
+	// receipt. It remains useful for advisory repair context, but its producer
+	// fields cannot establish finding-resolution authority.
+	if m.SchemaVersion == ManifestSchema && m.Scan.AuthoritativeForResolution {
+		return fmt.Errorf("bundle v2 artifact evidence is advisory and cannot claim authoritative resolution")
 	}
 	if m.Scan.AuthoritativeForResolution && m.Scan.Scope != "full" {
 		return fmt.Errorf("only a full scan can be authoritative for resolution")
@@ -407,6 +505,9 @@ func validateScanAndObservations(m Manifest) error {
 		if observation.State != "present" && observation.State != "absent" {
 			return fmt.Errorf("bundle lifecycle observation state is invalid")
 		}
+		if m.SchemaVersion == ManifestSchema && observation.State == "absent" {
+			return fmt.Errorf("bundle v2 artifact evidence is advisory and cannot claim finding absence or resolution")
+		}
 		if observation.State == "absent" && !m.Scan.AuthoritativeForResolution {
 			return fmt.Errorf("absent lifecycle observation requires an authoritative scan")
 		}
@@ -446,7 +547,10 @@ func validateScanAndObservations(m Manifest) error {
 	if legacyPublicationMetadata && explicitPublicationMetadata {
 		return fmt.Errorf("bundle cannot mix legacy and explicit publication metadata")
 	}
-	if m.DigestAlgorithm == "" && explicitPublicationMetadata {
+	if m.SchemaVersion == ManifestSchemaV3 && legacyPublicationMetadata {
+		return fmt.Errorf("bundle v3 requires complete explicit publication metadata")
+	}
+	if m.SchemaVersion == ManifestSchema && m.DigestAlgorithm == "" && explicitPublicationMetadata {
 		return fmt.Errorf("explicit publication metadata requires digest algorithm %q", PublicationDigestAlgorithm)
 	}
 	if m.DigestAlgorithm == PublicationDigestAlgorithm && legacyPublicationMetadata {
@@ -533,7 +637,7 @@ func isHexByte(value byte) bool {
 	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F')
 }
 
-func validateFileRecord(file File, seen map[string]bool) error {
+func validateFileRecord(file File, seen, seenSources map[string]bool) error {
 	if file.Path == "" || file.SourcePath == "" || strings.Contains(file.Path, "\\") || strings.Contains(file.SourcePath, "\\") {
 		return fmt.Errorf("unsafe bundle file path")
 	}
@@ -543,10 +647,13 @@ func validateFileRecord(file File, seen map[string]bool) error {
 	if err := validateSourcePath(file.SourcePath); err != nil {
 		return err
 	}
-	if seen[file.Path] || !hexDigest.MatchString(file.SHA256) || file.Size < 0 {
+	if seen[file.Path] || (seenSources != nil && seenSources[file.SourcePath]) || !hexDigest.MatchString(file.SHA256) || file.Size < 0 {
 		return fmt.Errorf("invalid or duplicate bundle file %q", file.Path)
 	}
 	seen[file.Path] = true
+	if seenSources != nil {
+		seenSources[file.SourcePath] = true
+	}
 	return nil
 }
 
@@ -597,6 +704,9 @@ func decodeStrict(reader io.Reader, target interface{}) error {
 }
 
 func digestBundleContent(manifest Manifest, fileLines []string) string {
+	if manifest.DigestAlgorithm == ContentAddressedDigestAlgorithm {
+		return digestV3BundleContent(manifest)
+	}
 	if manifest.DigestAlgorithm == PublicationDigestAlgorithm {
 		return digestPublicationBundleContent(manifest)
 	}

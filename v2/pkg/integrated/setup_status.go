@@ -54,11 +54,13 @@ func authorizeManagedSetupPullRequest(ctx context.Context, store *Store, client 
 	requiredPresent := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
 	requiredAbsent := []string{}
 	if operation == string(OperationUninstall) {
-		requiredPresent = nil
-		requiredAbsent = append(requiredAbsent, managedSetupFiles(config.VisualHive)...)
+		if managedPathPreimagesConfigured(config) && !hasValidManagedPathPreimages(config) {
+			return result, fmt.Errorf("setup authorization refuses an invalid managed-path preimage ledger")
+		}
+		requiredPresent, requiredAbsent = managedUninstallRequiredPaths(config)
 	} else if config.VisualHive {
 		requiredPresent = append(requiredPresent, ".github/workflows/visual-hive-pr.yml", "docs/visual-hive.md", "visual-hive.config.yaml")
-		requiredAbsent = append(requiredAbsent, ".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml")
+		requiredAbsent = append(requiredAbsent, standaloneVisualHiveWriterWorkflowPaths()...)
 	}
 	binding, diff, err := BuildSetupAuthorizationBindingWithDiff(ctx, SetupAuthorizationRequest{
 		CheckoutDir: checkout, Repository: config.Repository, RepositoryID: config.RepositoryID, PullRequest: pullNumber,

@@ -289,7 +289,7 @@ func newAuthorizerTransferFixture(t *testing.T) *authorizerTransferFixture {
 	runIntegratedGit(t, root, "init", "-b", "main", seed)
 	writeFixture(t, seed, "README.md", "authorizer transfer fixture\n")
 	writeFixture(t, seed, "package.json", "{\"scripts\":{\"test\":\"node --test\"}}\n")
-	visualConfig := "project:\n  name: transfer-fixture\n  setupProfile: complex-app\ntargets: []\n"
+	visualConfig := "project:\n  name: transfer-fixture\n  setupProfile: complex-app\ntargets: []\nintegrations:\n  hive:\n    enabled: true\n"
 	writeFixture(t, seed, "visual-hive.config.yaml", visualConfig)
 	writeFixture(t, seed, "docs/visual-hive.md", "# Visual Hive\n\nTransfer fixture.\n")
 	visualDigest := sha256.Sum256([]byte(normalizeManagedText(visualConfig)))

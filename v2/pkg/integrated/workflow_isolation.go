@@ -346,6 +346,9 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
       - name: Terminate target account and reverify immutable tooling
         if: always()
         shell: bash
+        env:
+          HIVE_TARGET_PIPELINE_OUTCOME: ${{ steps.target_visual_pipeline.outcome }}
+          HIVE_TARGET_PIPELINE_CONCLUSION: ${{ steps.target_visual_pipeline.conclusion }}
         run: |
           set -euo pipefail
           target_workspace="${HIVE_TARGET_WORKSPACE:-}"
@@ -397,6 +400,26 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           fi
           test ! -e "$expected_browser_path"
           test ! -e "$expected_browser_manifest"
+          runner_outcome="$RUNNER_TEMP/hive-visual-runner-outcome-${GITHUB_RUN_ID}.json"
+          RUNNER_OUTCOME_PATH="$runner_outcome" node <<'NODE'
+          const fs = require("fs");
+          const outcome = process.env.HIVE_TARGET_PIPELINE_OUTCOME;
+          const conclusion = process.env.HIVE_TARGET_PIPELINE_CONCLUSION;
+          if (!["success", "failure"].includes(outcome) || !["success", "failure"].includes(conclusion)) {
+            throw new Error("Visual pipeline lacks a terminal runner-owned outcome receipt");
+          }
+          fs.writeFileSync(process.env.RUNNER_OUTCOME_PATH, JSON.stringify({
+            schemaVersion: "hive.visual-runner-outcome.v1",
+            outcome,
+            conclusion
+          }) + "\n", { flag: "wx", mode: 0o600 });
+          NODE
+          sudo rm -f -- .visual-hive/hive-runner-outcome.json
+          sudo install -o root -g root -m 0444 "$runner_outcome" .visual-hive/hive-runner-outcome.json
+          rm -f -- "$runner_outcome"
+          test -f .visual-hive/hive-runner-outcome.json
+          test ! -L .visual-hive/hive-runner-outcome.json
+          test ! -w .visual-hive/hive-runner-outcome.json
       - name: Upload isolated raw Visual evidence
         if: always()
         uses: actions/upload-artifact@%s
@@ -580,7 +603,11 @@ func productionAggregatorWorkflowJob(config Config, needs string) string {
           while IFS= read -r contract; do
             if [ -n "$contract" ]; then args+=(--evaluated-contract "$contract"); fi
           done < .visual-hive/evaluated-contracts.txt
-          env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL node "$VISUAL_HIVE_CLI" hive bundle --config visual-hive.config.yaml --issues .visual-hive/issues.json --acmm-request %d --scan-scope full --authoritative-for-resolution "${args[@]}"
+          authority_args=()
+          if [ "$(tr -d '\r\n' < .visual-hive/authoritative-resolution.txt)" = "true" ]; then
+            authority_args+=(--authoritative-for-resolution)
+          fi
+          env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL node "$VISUAL_HIVE_CLI" hive bundle --config visual-hive.config.yaml --issues .visual-hive/issues.json --acmm-request %d --scan-scope full "${authority_args[@]}" "${args[@]}"
       - name: Upload trusted Hive bundle
         id: bundle
         uses: actions/upload-artifact@%s
@@ -735,6 +762,143 @@ func runnerOwnedVerifierSetupSteps(config Config, targetRef, condition string) s
 		setupNodeActionSHA, conditionLine, conditionLine, config.VisualHiveRef, conditionLine)
 }
 
+func runnerOwnedEvaluationScopeScript() string {
+	return `const fs = require("fs");
+ const readJSON = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+ const runnerOutcome = readJSON(".visual-hive/hive-runner-outcome.json");
+ if (runnerOutcome.schemaVersion !== "hive.visual-runner-outcome.v1" || !["success", "failure"].includes(runnerOutcome.outcome) ||
+     !["success", "failure"].includes(runnerOutcome.conclusion)) {
+   throw new Error("runner-owned Visual pipeline outcome receipt is malformed");
+ }
+ const pipeline = readJSON(".visual-hive/pipeline.json");
+const report = readJSON(".visual-hive/report.json");
+if (!Number.isInteger(pipeline.exitCode) || !["passed", "failed", "blocked"].includes(pipeline.status)) {
+  throw new Error("pipeline report lacks a terminal deterministic status");
+}
+fs.writeFileSync(".visual-hive/pipeline-exit-code.txt", String(pipeline.exitCode) + "\n");
+
+ const planPath = ".visual-hive/plan.json";
+ const plan = fs.existsSync(planPath) ? readJSON(planPath) : {};
+const planRows = Array.isArray(plan.items) ? plan.items : [];
+const planExcluded = Array.isArray(plan.excluded) ? plan.excluded : [];
+const reportSelected = Array.isArray(report.selectedContracts) ? report.selectedContracts : [];
+const reportExcluded = Array.isArray(report.excludedContracts) ? report.excludedContracts : [];
+const results = Array.isArray(report.results) ? report.results : [];
+const normalizedID = (value) => typeof value === "string" && value.trim() ? value.trim() : null;
+const rowID = (row) => row && typeof row === "object" ? normalizedID(row.contractId || row.id) : null;
+const sorted = (values) => [...values].sort();
+const unique = (values) => new Set(values).size === values.length;
+const sameIDs = (left, right) => JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
+const plannedIDs = planRows.map(rowID);
+const excludedPlanIDs = planExcluded.map(rowID);
+const selectedIDs = reportSelected.map(normalizedID);
+const excludedReportIDs = reportExcluded.map(rowID);
+const resultIDs = results.map((result) => result && typeof result === "object" ? normalizedID(result.contractId) : null);
+const identityComplete = Boolean(planPath) && Array.isArray(plan.items) && Array.isArray(plan.excluded) &&
+  Array.isArray(report.selectedContracts) && Array.isArray(report.excludedContracts) && Array.isArray(report.results) &&
+  [...plannedIDs, ...excludedPlanIDs, ...selectedIDs, ...excludedReportIDs, ...resultIDs].every(Boolean) &&
+  results.every((result) => result && typeof result === "object" && normalizedID(result.contractId) && ["passed", "failed", "created", "skipped"].includes(result.status));
+if (!identityComplete || !unique(plannedIDs) || !unique(excludedPlanIDs) || !unique(selectedIDs) || !unique(excludedReportIDs) || !unique(resultIDs) ||
+    !sameIDs(plannedIDs, selectedIDs) || !sameIDs(excludedPlanIDs, excludedReportIDs) || !sameIDs(selectedIDs, resultIDs) ||
+    selectedIDs.some((contractID) => excludedPlanIDs.includes(contractID))) {
+  throw new Error("plan and report lack an exact one-to-one contract evaluation binding");
+}
+ const passedIDs = runnerOutcome.outcome === "success"
+   ? sorted(results.filter((result) => result.status === "passed").map((result) => normalizedID(result.contractId)))
+   : [];
+fs.writeFileSync(".visual-hive/evaluated-contracts.txt", passedIDs.length ? passedIDs.join("\n") + "\n" : "");
+ const authoritative = runnerOutcome.outcome === "success" && plannedIDs.length > 0 && passedIDs.length === plannedIDs.length && pipeline.mode === "full" && plan.mode === "full" && report.mode === "full" &&
+   pipeline.status === "passed" && pipeline.exitCode === 0 && report.status === "passed";
+ fs.writeFileSync(".visual-hive/authoritative-resolution.txt", authoritative ? "true\n" : "false\n");`
+}
+
+func runnerOwnedPlanRegenerationAndEvaluationShell() string {
+	return `rm -f .visual-hive/plan.json .visual-hive/plan.full.json
+safe_env=(env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u NODE_OPTIONS -u BASH_ENV -u ENV)
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" plan --config visual-hive.config.yaml --mode full --output .visual-hive/plan.json
+test -f .visual-hive/plan.json
+test ! -e .visual-hive/plan.full.json
+node <<'NODE'
+` + runnerOwnedEvaluationScopeScript() + `
+NODE`
+}
+
+// runnerOwnedResolutionScopeReceiptScript admits repository-level resolution
+// scopes only from artifacts freshly regenerated by the immutable CLI in the
+// verifier job. The rebuild removes the target-authored copies first, so a
+// successful validation is also a current-run source binding.
+func runnerOwnedResolutionScopeReceiptScript() string {
+	return `const fs = require("fs");
+const readJSON = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+const fail = (message) => { throw new Error(message); };
+const scopes = fs.readFileSync(".visual-hive/evaluated-contracts.txt", "utf8").split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+
+const layers = readJSON(".visual-hive/testing-layers.json");
+const layerStatuses = new Set(["covered", "partial", "missing", "not_applicable", "unknown"]);
+if (layers.schemaVersion !== 1 || !Array.isArray(layers.layers) || layers.layers.length !== 12) fail("runner-owned testing-layer receipt is incomplete");
+const layerIDs = layers.layers.map((layer) => layer && Number.isInteger(layer.id) ? layer.id : -1);
+if (new Set(layerIDs).size !== 12 || layerIDs.some((id) => id < 0 || id > 11) ||
+    layers.layers.some((layer) => !layerStatuses.has(layer.status) || !Array.isArray(layer.evidence) || !Array.isArray(layer.gaps) || !Array.isArray(layer.skippedReasons))) {
+  fail("runner-owned testing-layer receipt is malformed");
+}
+const resolvedLayerStatuses = new Set(["covered", "not_applicable"]);
+for (const layer of layers.layers) {
+  if (resolvedLayerStatuses.has(layer.status) && layer.gaps.length === 0 && layer.skippedReasons.length === 0) {
+    scopes.push("testing-layer:" + layer.id);
+  }
+}
+
+const workflows = readJSON(".visual-hive/workflows.json");
+if (workflows.schemaVersion !== 1 || !workflows.summary || typeof workflows.summary !== "object" ||
+    !Array.isArray(workflows.workflows) || workflows.workflows.length === 0 || !Array.isArray(workflows.findings) ||
+    workflows.workflows.some((workflow) => !workflow || typeof workflow.path !== "string" || !workflow.path.trim())) {
+  fail("runner-owned workflow-safety receipt is malformed");
+}
+const workflowPaths = workflows.workflows.map((workflow) => workflow.path.trim());
+if (new Set(workflowPaths).size !== workflowPaths.length) fail("runner-owned workflow-safety receipt contains duplicate paths");
+if (workflows.findings.length === 0) scopes.push("workflow-safety");
+
+const providers = readJSON(".visual-hive/provider-results.json");
+const evidence = readJSON(".visual-hive/evidence-packet.json");
+const report = readJSON(".visual-hive/report.json");
+if (providers.schemaVersion !== 1 || !Array.isArray(providers.providers) || providers.providers.length === 0 || !Array.isArray(evidence.providers)) {
+  fail("runner-owned provider-governance receipt is incomplete");
+}
+const providerRows = providers.providers.map((provider) => ({
+  id: provider && typeof provider.providerId === "string" ? provider.providerId.trim() : "",
+  resultID: provider && provider.result && typeof provider.result.providerId === "string" ? provider.result.providerId.trim() : "",
+  status: provider && provider.result && typeof provider.result.status === "string" ? provider.result.status : "",
+  uploadStatus: provider && provider.result && provider.result.upload && typeof provider.result.upload.status === "string" ? provider.result.upload.status : ""
+}));
+const evidenceRows = evidence.providers.map((provider) => ({
+  id: provider && typeof provider.providerId === "string" ? provider.providerId.trim() : "",
+  status: provider && typeof provider.status === "string" ? provider.status : "",
+  uploadStatus: provider && provider.upload && typeof provider.upload.status === "string" ? provider.upload.status : ""
+}));
+const reportRows = (Array.isArray(report.providerResults) ? report.providerResults : []).map((provider) => ({
+  id: provider && typeof provider.providerId === "string" ? provider.providerId.trim() : "",
+  status: provider && typeof provider.status === "string" ? provider.status : "",
+  uploadStatus: provider && provider.upload && typeof provider.upload.status === "string" ? provider.upload.status : ""
+}));
+const providerStatuses = new Set(["passed", "failed", "skipped", "missing_credentials", "mock"]);
+const providerUploadStatuses = new Set(["uploaded", "skipped", "blocked", "missing_credentials", "failed", "dry_run"]);
+const providerReceipt = (row) => row.id + "\u0000" + row.status + "\u0000" + row.uploadStatus;
+if (providerRows.some((row) => !row.id || row.id !== row.resultID || !providerStatuses.has(row.status) || (row.uploadStatus && !providerUploadStatuses.has(row.uploadStatus))) ||
+    new Set(providerRows.map((row) => row.id)).size !== providerRows.length ||
+    reportRows.some((row) => !row.id || !providerStatuses.has(row.status) || (row.uploadStatus && !providerUploadStatuses.has(row.uploadStatus))) ||
+    new Set(reportRows.map((row) => row.id)).size !== reportRows.length ||
+    JSON.stringify([...reportRows, ...providerRows].map(providerReceipt).sort()) !== JSON.stringify(evidenceRows.map(providerReceipt).sort())) {
+  fail("runner-owned provider-governance receipt does not match rebuilt evidence");
+}
+const issueProducingProviderStatuses = new Set(["failed", "missing_credentials", "blocked"]);
+if (evidenceRows.every((row) => !issueProducingProviderStatuses.has(row.status) && !issueProducingProviderStatuses.has(row.uploadStatus))) {
+  scopes.push("provider-governance");
+}
+
+const evaluated = [...new Set(scopes)].sort();
+fs.writeFileSync(".visual-hive/evaluated-contracts.txt", evaluated.join("\n") + "\n");`
+}
+
 func runnerOwnedEvidenceRebuildShell(_ bool) string {
 	return `set -euo pipefail
 runner_workspace="$(readlink -f "$GITHUB_WORKSPACE")"
@@ -764,39 +928,21 @@ artifact_files="$(find .visual-hive -type f | wc -l)"
 artifact_bytes="$(du -sb .visual-hive | cut -f 1)"
 test "$artifact_files" -le 5000
 test "$artifact_bytes" -le 1073741824
-rm -f .visual-hive/evidence-packet.json .visual-hive/evidence-summary.md .visual-hive/verdict.json .visual-hive/verdict.md .visual-hive/issues.json .visual-hive/issues.md .visual-hive/baselines.json .visual-hive/artifacts-index.json
-safe_env=(env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u NODE_OPTIONS -u BASH_ENV -u ENV)
-"${safe_env[@]}" node "$VISUAL_HIVE_CLI" artifacts --config visual-hive.config.yaml
+ rm -f .visual-hive/evidence-packet.json .visual-hive/evidence-summary.md .visual-hive/verdict.json .visual-hive/verdict.md .visual-hive/issues.json .visual-hive/issues.md .visual-hive/baselines.json .visual-hive/artifacts-index.json .visual-hive/capability-parity.json .visual-hive/workflows.json .visual-hive/provider-results.json .visual-hive/testing-layers.json .visual-hive/testing-layers.md
+ ` + runnerOwnedPlanRegenerationAndEvaluationShell() + `
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" workflows --config visual-hive.config.yaml
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" providers list --config visual-hive.config.yaml --mock-results --format json
 "${safe_env[@]}" node "$VISUAL_HIVE_CLI" evidence --config visual-hive.config.yaml
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" layers --config visual-hive.config.yaml --format json
 "${safe_env[@]}" node "$VISUAL_HIVE_CLI" verdict --config visual-hive.config.yaml
 "${safe_env[@]}" node "$VISUAL_HIVE_CLI" issues --config visual-hive.config.yaml --write
 "${safe_env[@]}" node "$VISUAL_HIVE_CLI" baselines list --config visual-hive.config.yaml --write
 "${safe_env[@]}" node "$VISUAL_HIVE_CLI" hive integration-smoke --config visual-hive.config.yaml --mode measured
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" capabilities --config visual-hive.config.yaml
 node <<'NODE'
-const fs = require("fs");
-const pipeline = JSON.parse(fs.readFileSync(".visual-hive/pipeline.json", "utf8"));
-if (!Number.isInteger(pipeline.exitCode) || !["passed", "failed", "blocked"].includes(pipeline.status)) {
-  throw new Error("pipeline report lacks a terminal deterministic status");
-}
-fs.writeFileSync(".visual-hive/pipeline-exit-code.txt", String(pipeline.exitCode) + "\n");
-const candidates = [".visual-hive/plan.full.json", ".visual-hive/plan.json"];
-const planPath = candidates.find(fs.existsSync);
-const plan = planPath ? JSON.parse(fs.readFileSync(planPath, "utf8")) : {};
-const rows = Array.isArray(plan.items) ? plan.items : [];
-const layerPath = ".visual-hive/testing-layers.json";
-const layerReport = fs.existsSync(layerPath) ? JSON.parse(fs.readFileSync(layerPath, "utf8")) : {};
-const layers = Array.isArray(layerReport.layers) ? layerReport.layers : [];
-const systemScopes = [
-  ["workflow-safety", ".visual-hive/workflows.json"],
-  ["provider-governance", ".visual-hive/provider-results.json"]
-].filter(([, artifact]) => fs.existsSync(artifact)).map(([scope]) => scope);
-const ids = [...new Set([
-  ...rows.map((item) => item.contractId || item.id),
-  ...layers.map((layer) => Number.isInteger(layer.id) ? "testing-layer:" + layer.id : null),
-  ...systemScopes
-].filter(Boolean))].sort();
-fs.writeFileSync(".visual-hive/evaluated-contracts.txt", ids.join("\n") + "\n");
+` + runnerOwnedResolutionScopeReceiptScript() + `
 NODE
+"${safe_env[@]}" node "$VISUAL_HIVE_CLI" artifacts --config visual-hive.config.yaml --complete
 cleanup_review_workspace
 trap - EXIT
 if mountpoint -q "$review_workspace"; then
@@ -834,12 +980,12 @@ const fs = require("fs");
           const verdict = JSON.parse(fs.readFileSync(".visual-hive/verdict.json", "utf8"));
           const readiness = fs.existsSync(".visual-hive/readiness.json") ? JSON.parse(fs.readFileSync(".visual-hive/readiness.json", "utf8")) : {};
           const visualVerdict = verdict?.summary?.visualHiveVerdict;
-          const visualPassed = needs["visual-hive-execution"].result === "success" && process.env.HIVE_TRUSTED_REBUILD_OUTCOME === "success" && pipeline.exitCode === 0 && ["passed", "warning"].includes(visualVerdict);
           const summary = report.summary || {};
           const verdictSummary = verdict.summary || {};
           const contributions = Array.isArray(verdict.gatingContributions) ? verdict.gatingContributions : [];
           const screenshots = (Array.isArray(report.results) ? report.results : []).flatMap((result) => Array.isArray(result.screenshotAssertions) ? result.screenshotAssertions : []);
           const blocking = contributions.filter((item) => item && item.gating === true && item.status !== "passed");
+          const visualPassed = needs["visual-hive-execution"].result === "success" && process.env.HIVE_TRUSTED_REBUILD_OUTCOME === "success" && pipeline.exitCode === 0 && ["passed", "warning"].includes(visualVerdict) && Array.isArray(verdict.gatingContributions) && blocking.length === 0;
           const missing = screenshots.filter((item) => item && item.status === "missing_baseline");
           const readinessBlocked = (Array.isArray(readiness.gates) ? readiness.gates : []).filter((gate) => gate && gate.status === "blocked");
           const exclusiveMissingBaselineReadiness = readiness.status === "blocked" && readinessBlocked.some((gate) => gate.id === "baselines:missing-baseline") &&

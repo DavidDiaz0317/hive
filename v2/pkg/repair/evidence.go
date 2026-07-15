@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
@@ -73,19 +74,117 @@ type coverageRecommendation struct {
 
 type testCreationEvidence struct {
 	SchemaVersion   string                       `json:"schemaVersion"`
+	GeneratedAt     string                       `json:"generatedAt"`
+	Project         string                       `json:"project"`
+	OutputResource  *testCreationOutputResource  `json:"outputResource,omitempty"`
+	SourceArtifacts *testCreationSourceArtifacts `json:"sourceArtifacts"`
+	Governance      *testCreationGovernance      `json:"governance"`
+	Summary         *testCreationSummary         `json:"summary"`
 	Recommendations []testCreationRecommendation `json:"recommendations"`
 }
 
 type testCreationRecommendation struct {
-	ID             string   `json:"id"`
-	GapID          string   `json:"gapId"`
-	Source         string   `json:"source"`
-	Kind           string   `json:"kind"`
-	Priority       string   `json:"priority"`
-	Title          string   `json:"title"`
-	Rationale      []string `json:"rationale"`
-	SuggestedTests []string `json:"suggestedTests"`
-	Artifacts      []string `json:"artifacts"`
+	ID                       string                         `json:"id"`
+	GapID                    string                         `json:"gapId"`
+	Source                   string                         `json:"source"`
+	Kind                     string                         `json:"kind"`
+	Priority                 string                         `json:"priority"`
+	Title                    string                         `json:"title"`
+	Rationale                []string                       `json:"rationale"`
+	Affected                 *testCreationAffected          `json:"affected"`
+	CurrentEvidence          []string                       `json:"currentEvidence"`
+	Grounding                *testCreationGrounding         `json:"grounding"`
+	SuggestedContract        *testCreationSuggestedContract `json:"suggestedContract"`
+	SuggestedMutation        string                         `json:"suggestedMutation"`
+	ValidationCommand        string                         `json:"validationCommand"`
+	HiveOwner                string                         `json:"hiveOwner"`
+	Layer                    *testCreationLayer             `json:"layer,omitempty"`
+	TargetID                 string                         `json:"targetId,omitempty"`
+	ContractID               string                         `json:"contractId,omitempty"`
+	MutationOperator         string                         `json:"mutationOperator,omitempty"`
+	CoverageRecommendationID string                         `json:"coverageRecommendationId,omitempty"`
+	HandoffWorkItemID        string                         `json:"handoffWorkItemId,omitempty"`
+	SuggestedTests           []string                       `json:"suggestedTests"`
+	SuggestedConfigYAML      string                         `json:"suggestedConfigYaml,omitempty"`
+	Artifacts                []string                       `json:"artifacts"`
+	TrustedOnly              *bool                          `json:"trustedOnly"`
+	ApplyMode                string                         `json:"applyMode"`
+}
+
+type testCreationOutputResource struct {
+	ArtifactPath                string `json:"artifactPath"`
+	EvidenceResourceID          string `json:"evidenceResourceId"`
+	EvidenceResourceURI         string `json:"evidenceResourceUri"`
+	EvidenceResourceTitle       string `json:"evidenceResourceTitle"`
+	EvidenceResourceDescription string `json:"evidenceResourceDescription"`
+	EvidenceReadToolName        string `json:"evidenceReadToolName,omitempty"`
+}
+
+type testCreationSourceArtifacts struct {
+	EvidencePacket          string `json:"evidencePacket,omitempty"`
+	CoverageRecommendations string `json:"coverageRecommendations,omitempty"`
+	HandoffPacket           string `json:"handoffPacket,omitempty"`
+}
+
+type testCreationGovernance struct {
+	VerdictAuthority string `json:"verdictAuthority"`
+	AgentAuthority   string `json:"agentAuthority"`
+	WritePolicy      string `json:"writePolicy"`
+	SecretPolicy     string `json:"secretPolicy"`
+}
+
+type testCreationSummary struct {
+	Total                       *int64 `json:"total"`
+	High                        *int64 `json:"high"`
+	Medium                      *int64 `json:"medium"`
+	Low                         *int64 `json:"low"`
+	FromTestingLayers           *int64 `json:"fromTestingLayers"`
+	FromCoverageRecommendations *int64 `json:"fromCoverageRecommendations"`
+	FromMutationSurvivors       *int64 `json:"fromMutationSurvivors"`
+	FromHandoffWorkItems        *int64 `json:"fromHandoffWorkItems"`
+}
+
+type testCreationAffected struct {
+	Route     string `json:"route,omitempty"`
+	Component string `json:"component,omitempty"`
+	Viewport  string `json:"viewport,omitempty"`
+	State     string `json:"state,omitempty"`
+}
+
+type testCreationGrounding struct {
+	Status            string   `json:"status"`
+	Evidence          []string `json:"evidence"`
+	UnresolvedReasons []string `json:"unresolvedReasons"`
+}
+
+type testCreationSuggestedContract struct {
+	ID                    string   `json:"id"`
+	Description           string   `json:"description"`
+	TargetID              string   `json:"targetId,omitempty"`
+	Route                 string   `json:"route,omitempty"`
+	Viewport              string   `json:"viewport,omitempty"`
+	Selectors             []string `json:"selectors"`
+	MustNotExistSelectors []string `json:"mustNotExistSelectors"`
+	TextMustExist         []string `json:"textMustExist"`
+	TextMustNotExist      []string `json:"textMustNotExist"`
+	MaskSelectors         []string `json:"maskSelectors"`
+}
+
+type testCreationLayer struct {
+	ID     *int64 `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+type testCreationSummaryCounts struct {
+	Total                       int64
+	High                        int64
+	Medium                      int64
+	Low                         int64
+	FromTestingLayers           int64
+	FromCoverageRecommendations int64
+	FromMutationSurvivors       int64
+	FromHandoffWorkItems        int64
 }
 
 // LoadEvidenceSummary reads only the deterministic verdict from an independently
@@ -394,28 +493,47 @@ func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLife
 		return "", err
 	}
 	defer file.Close()
-	var evidence testCreationEvidence
-	if err := json.NewDecoder(io.LimitReader(file, maxTestCreationEvidenceBytes+1)).Decode(&evidence); err != nil {
+	data, err := io.ReadAll(io.LimitReader(file, maxTestCreationEvidenceBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxTestCreationEvidenceBytes {
+		return "", fmt.Errorf("verified Visual Hive test-creation evidence exceeds size limit")
+	}
+	var header struct {
+		SchemaVersion string `json:"schemaVersion"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
 		return "", fmt.Errorf("decode verified Visual Hive test-creation evidence: %w", err)
 	}
-	if evidence.SchemaVersion != "visual-hive.test-creation-plan.v1" {
-		return "", fmt.Errorf("verified Visual Hive test-creation evidence has unsupported schema %q", evidence.SchemaVersion)
+	if header.SchemaVersion != "visual-hive.test-creation-plan.v2" {
+		return "", fmt.Errorf("%w: verified Visual Hive test-creation evidence has unsupported schema %q", ErrNoActionableEvidence, header.SchemaVersion)
 	}
-	if len(evidence.Recommendations) > 2048 {
-		return "", fmt.Errorf("verified Visual Hive test-creation evidence has too many recommendations")
+	var evidence testCreationEvidence
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&evidence); err != nil {
+		return "", fmt.Errorf("decode strict Visual Hive test-creation-plan v2: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return "", fmt.Errorf("decode strict Visual Hive test-creation-plan v2: trailing JSON content")
+	}
+	if err := validateStrictTestCreationEvidence(evidence); err != nil {
+		return "", fmt.Errorf("validate strict Visual Hive test-creation-plan v2: %w", err)
 	}
 	title := strings.ToLower(strings.TrimSpace(finding.Title))
 	lines := make([]string, 0, 1)
 	for _, recommendation := range evidence.Recommendations {
-		if !strings.EqualFold(strings.TrimSpace(recommendation.Source), "testing_layer") || !strings.EqualFold(strings.TrimSpace(recommendation.Kind), "unit_test") {
+		if !groundedTestCreationRecommendation(recommendation) {
 			continue
 		}
-		if recommendation.Title != "" && !strings.Contains(title, strings.ToLower(strings.TrimSpace(recommendation.Title))) {
+		if !strings.Contains(title, strings.ToLower(strings.TrimSpace(recommendation.Title))) {
 			continue
 		}
 		values := []string{
 			recommendation.ID, recommendation.GapID, recommendation.Source, recommendation.Kind, recommendation.Priority,
 			recommendation.Title, strings.Join(recommendation.Rationale, ","), strings.Join(recommendation.SuggestedTests, ","), strings.Join(recommendation.Artifacts, ","),
+			strings.Join(recommendation.Grounding.Evidence, ","),
 		}
 		for index, value := range values {
 			safe, err := safeEvidenceValue(value)
@@ -424,10 +542,10 @@ func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLife
 			}
 			values[index] = safe
 		}
-		lines = append(lines, fmt.Sprintf("- key=test_creation.%s gap=%s source=%s kind=%s priority=%s title=%s rationale=%s suggested_tests=%s artifacts=%s required_scope=test_files_only", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]))
+		lines = append(lines, fmt.Sprintf("- key=test_creation.%s gap=%s source=%s kind=%s priority=%s title=%s rationale=%s suggested_tests=%s artifacts=%s grounding_evidence=%s required_scope=test_files_only", values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]))
 	}
 	if len(lines) == 0 {
-		return "", fmt.Errorf("verified Visual Hive test-creation evidence has no matching unit-test recommendation")
+		return "", fmt.Errorf("%w: verified Visual Hive test-creation evidence has no matching grounded unit-test recommendation", ErrNoActionableEvidence)
 	}
 	sort.Strings(lines)
 	summary := strings.Join(lines, "\n")
@@ -435,6 +553,192 @@ func loadTestCreationEvidenceSummary(root string, finding visualhive.FindingLife
 		return "", fmt.Errorf("verified Visual Hive test-creation evidence summary exceeds limit")
 	}
 	return string(bytes.Clone([]byte(summary))), nil
+}
+
+func validateStrictTestCreationEvidence(evidence testCreationEvidence) error {
+	if evidence.SchemaVersion != "visual-hive.test-creation-plan.v2" || !validTestCreationTimestamp(evidence.GeneratedAt) || !nonemptyTestCreationString(evidence.Project) {
+		return fmt.Errorf("plan identity is incomplete")
+	}
+	if evidence.SourceArtifacts == nil || evidence.Governance == nil || evidence.Summary == nil || evidence.Recommendations == nil || len(evidence.Recommendations) > 2048 {
+		return fmt.Errorf("plan is missing required source, governance, summary, or recommendations")
+	}
+	if evidence.Governance.VerdictAuthority != "visual_hive" || evidence.Governance.AgentAuthority != "advisory_test_generation_only" || evidence.Governance.WritePolicy != "no_config_or_test_files_written" || evidence.Governance.SecretPolicy != "redacted_values_names_only" {
+		return fmt.Errorf("plan governance is invalid")
+	}
+	if evidence.OutputResource != nil {
+		resource := evidence.OutputResource
+		if resource.ArtifactPath != ".visual-hive/test-creation-plan.json" || resource.EvidenceResourceID != "test-creation-plan" || resource.EvidenceResourceURI != "visual-hive://test-creation-plan" || resource.EvidenceResourceTitle != "Test Creation Plan" || !nonemptyTestCreationString(resource.EvidenceResourceDescription) || (resource.EvidenceReadToolName != "" && resource.EvidenceReadToolName != "visual_hive_read_test_creation_plan") {
+			return fmt.Errorf("plan output resource identity is invalid")
+		}
+	}
+	for _, value := range []string{evidence.SourceArtifacts.EvidencePacket, evidence.SourceArtifacts.CoverageRecommendations, evidence.SourceArtifacts.HandoffPacket} {
+		if !boundedTestCreationString(value) {
+			return fmt.Errorf("plan source artifact path exceeds its bound")
+		}
+	}
+
+	actual := testCreationSummaryCounts{Total: int64(len(evidence.Recommendations))}
+	seen := make(map[string]bool, len(evidence.Recommendations))
+	for index, recommendation := range evidence.Recommendations {
+		if err := validateStrictTestCreationRecommendation(recommendation); err != nil {
+			return fmt.Errorf("recommendation %d: %w", index, err)
+		}
+		if seen[recommendation.ID] {
+			return fmt.Errorf("recommendation %d duplicates id %q", index, recommendation.ID)
+		}
+		seen[recommendation.ID] = true
+		switch recommendation.Priority {
+		case "high":
+			actual.High++
+		case "medium":
+			actual.Medium++
+		case "low":
+			actual.Low++
+		}
+		switch recommendation.Source {
+		case "testing_layer":
+			actual.FromTestingLayers++
+		case "coverage_recommendation":
+			actual.FromCoverageRecommendations++
+		case "mutation_survivor":
+			actual.FromMutationSurvivors++
+		case "handoff_work_item":
+			actual.FromHandoffWorkItems++
+		}
+	}
+	expected, err := testCreationSummaryValues(evidence.Summary)
+	if err != nil {
+		return err
+	}
+	if expected != actual {
+		return fmt.Errorf("plan summary does not match its recommendations")
+	}
+	return nil
+}
+
+func validateStrictTestCreationRecommendation(recommendation testCreationRecommendation) error {
+	if !nonemptyTestCreationString(recommendation.ID) || !nonemptyTestCreationString(recommendation.GapID) || !nonemptyTestCreationString(recommendation.Title) || !nonemptyTestCreationString(recommendation.SuggestedMutation) || !nonemptyTestCreationString(recommendation.ValidationCommand) {
+		return fmt.Errorf("required identity or guidance is empty")
+	}
+	if !oneOfTestCreation(recommendation.Source, "testing_layer", "coverage_recommendation", "mutation_survivor", "handoff_work_item") || !oneOfTestCreation(recommendation.Kind, "unit_test", "accessibility_check", "api_contract", "selector_assertion", "screenshot", "flow", "mutation_mapping", "workflow_setup", "provider_review", "protected_canary", "history_review", "agent_handoff") || !oneOfTestCreation(recommendation.Priority, "low", "medium", "high") || !oneOfTestCreation(recommendation.HiveOwner, "quality", "tester", "ci-maintainer") || recommendation.ApplyMode != "advisory_no_write" || recommendation.TrustedOnly == nil {
+		return fmt.Errorf("enumerated source, kind, priority, owner, trust, or apply mode is invalid")
+	}
+	if recommendation.Affected == nil || recommendation.Grounding == nil || recommendation.SuggestedContract == nil || recommendation.Rationale == nil || recommendation.CurrentEvidence == nil || recommendation.SuggestedTests == nil || recommendation.Artifacts == nil {
+		return fmt.Errorf("required evidence, grounding, contract, or guidance field is missing")
+	}
+	for _, values := range [][]string{recommendation.Rationale, recommendation.CurrentEvidence, recommendation.SuggestedTests, recommendation.Artifacts} {
+		if !validTestCreationStringList(values) {
+			return fmt.Errorf("evidence or guidance list is invalid")
+		}
+	}
+	for _, value := range []string{recommendation.Affected.Route, recommendation.Affected.Component, recommendation.Affected.Viewport, recommendation.Affected.State, recommendation.TargetID, recommendation.ContractID, recommendation.MutationOperator, recommendation.CoverageRecommendationID, recommendation.HandoffWorkItemID, recommendation.SuggestedConfigYAML} {
+		if !boundedTestCreationString(value) {
+			return fmt.Errorf("optional repository-specific value exceeds its bound")
+		}
+	}
+	grounding := recommendation.Grounding
+	if !oneOfTestCreation(grounding.Status, "grounded", "unresolved") || grounding.Evidence == nil || grounding.UnresolvedReasons == nil || !validTestCreationStringList(grounding.Evidence) || !validTestCreationStringList(grounding.UnresolvedReasons) {
+		return fmt.Errorf("grounding is structurally invalid")
+	}
+	if grounding.Status == "grounded" {
+		if len(grounding.Evidence) == 0 || len(grounding.UnresolvedReasons) != 0 {
+			return fmt.Errorf("grounded recommendation lacks evidence or retains unresolved reasons")
+		}
+		for _, value := range grounding.Evidence {
+			if !nonemptyTestCreationString(value) {
+				return fmt.Errorf("grounded recommendation contains empty evidence")
+			}
+		}
+	}
+	contract := recommendation.SuggestedContract
+	if !nonemptyTestCreationString(contract.ID) || !nonemptyTestCreationString(contract.Description) || !boundedTestCreationString(contract.TargetID) || !boundedTestCreationString(contract.Route) || !boundedTestCreationString(contract.Viewport) || contract.Selectors == nil || contract.MustNotExistSelectors == nil || contract.TextMustExist == nil || contract.TextMustNotExist == nil || contract.MaskSelectors == nil {
+		return fmt.Errorf("suggested contract is structurally invalid")
+	}
+	for _, values := range [][]string{contract.Selectors, contract.MustNotExistSelectors, contract.TextMustExist, contract.TextMustNotExist, contract.MaskSelectors} {
+		if !validTestCreationStringList(values) {
+			return fmt.Errorf("suggested contract assertion list is invalid")
+		}
+	}
+	if recommendation.Layer != nil && (recommendation.Layer.ID == nil || !nonemptyTestCreationString(recommendation.Layer.Name) || !oneOfTestCreation(recommendation.Layer.Status, "covered", "partial", "missing", "not_applicable", "unknown")) {
+		return fmt.Errorf("testing layer identity is invalid")
+	}
+	return nil
+}
+
+func testCreationSummaryValues(summary *testCreationSummary) (testCreationSummaryCounts, error) {
+	values := []*int64{summary.Total, summary.High, summary.Medium, summary.Low, summary.FromTestingLayers, summary.FromCoverageRecommendations, summary.FromMutationSurvivors, summary.FromHandoffWorkItems}
+	for _, value := range values {
+		if value == nil || *value < 0 {
+			return testCreationSummaryCounts{}, fmt.Errorf("plan summary is missing a required non-negative count")
+		}
+	}
+	return testCreationSummaryCounts{
+		Total: *summary.Total, High: *summary.High, Medium: *summary.Medium, Low: *summary.Low,
+		FromTestingLayers: *summary.FromTestingLayers, FromCoverageRecommendations: *summary.FromCoverageRecommendations,
+		FromMutationSurvivors: *summary.FromMutationSurvivors, FromHandoffWorkItems: *summary.FromHandoffWorkItems,
+	}, nil
+}
+
+func validTestCreationTimestamp(value string) bool {
+	if !nonemptyTestCreationString(value) {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil
+}
+
+func validTestCreationStringList(values []string) bool {
+	if len(values) > 8192 {
+		return false
+	}
+	for _, value := range values {
+		if !boundedTestCreationString(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func boundedTestCreationString(value string) bool {
+	return len(value) <= 32768 && !strings.ContainsRune(value, '\x00')
+}
+
+func nonemptyTestCreationString(value string) bool {
+	return boundedTestCreationString(value) && strings.TrimSpace(value) != ""
+}
+
+func oneOfTestCreation(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func groundedTestCreationRecommendation(recommendation testCreationRecommendation) bool {
+	if strings.TrimSpace(recommendation.Source) != "testing_layer" || strings.TrimSpace(recommendation.Kind) != "unit_test" {
+		return false
+	}
+	priority := strings.TrimSpace(recommendation.Priority)
+	if priority != "high" && priority != "medium" {
+		return false
+	}
+	if strings.TrimSpace(recommendation.ID) == "" || strings.TrimSpace(recommendation.GapID) == "" || strings.TrimSpace(recommendation.Title) == "" {
+		return false
+	}
+	if recommendation.Rationale == nil || recommendation.SuggestedTests == nil || recommendation.Artifacts == nil || recommendation.Grounding == nil {
+		return false
+	}
+	if recommendation.Grounding.Status != "grounded" || len(recommendation.Grounding.Evidence) == 0 || recommendation.Grounding.UnresolvedReasons == nil || len(recommendation.Grounding.UnresolvedReasons) != 0 {
+		return false
+	}
+	for _, item := range recommendation.Grounding.Evidence {
+		if strings.TrimSpace(item) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func loadCoverageEvidenceSummary(root string, finding visualhive.FindingLifecycle, contracts map[string]bool) (string, error) {

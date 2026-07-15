@@ -573,7 +573,7 @@ func authorizerTransferAbsentFiles(config Config) []string {
 	if !config.VisualHive {
 		return nil
 	}
-	return []string{".github/workflows/visual-hive-issue-lifecycle.yml", ".github/workflows/visual-hive-trusted-publisher.yml"}
+	return standaloneVisualHiveWriterWorkflowPaths()
 }
 
 func validateAuthorizerTransferSnapshot(intent AuthorizerTransferIntent, snapshot hivegithub.ManagedPullRequestSnapshot) error {

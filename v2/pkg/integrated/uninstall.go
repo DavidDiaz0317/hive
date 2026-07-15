@@ -1,6 +1,7 @@
 package integrated
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -133,7 +134,7 @@ func validateUninstallIntent(intent UninstallIntent) error {
 }
 
 func newUninstallIntent(config Config, defaultBranch, branch, commitSHA, baseSHA, marker string, changedFiles []string) (UninstallIntent, error) {
-	pathsDigest, err := digestPaths(managedSetupFiles(config.VisualHive))
+	pathsDigest, err := managedPathPolicyDigest(config)
 	if err != nil {
 		return UninstallIntent{}, err
 	}
@@ -350,7 +351,7 @@ func finalizeUninstall(ctx context.Context, options ManagementOptions, store *St
 }
 
 func validateUninstallIntentBinding(intent UninstallIntent, config Config) error {
-	digest, err := digestPaths(managedSetupFiles(config.VisualHive))
+	digest, err := managedPathPolicyDigest(config)
 	if err != nil {
 		return err
 	}
@@ -758,9 +759,10 @@ func currentDefaultBranchHead(ctx context.Context, client *hivegithub.Client, co
 }
 
 // VerifyUninstalledSetupAtCommit is the inverse of installed setup
-// verification. Every managed read is bound to one immutable target commit and
-// must return an exact 404; an API error or directory response never proves
-// absence.
+// verification. Every managed read is bound to one immutable target commit.
+// Hive-owned paths must return an exact 404 while repository-owned preimages
+// must be restored byte-for-byte; an API error or directory response proves
+// neither condition.
 func VerifyUninstalledSetupAtCommit(ctx context.Context, client *hivegithub.Client, config Config, commitSHA string) error {
 	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
 	if client == nil || client.GoGitHub() == nil || !immutableCommit.MatchString(commitSHA) {
@@ -770,10 +772,29 @@ func VerifyUninstalledSetupAtCommit(ctx context.Context, client *hivegithub.Clie
 	if !ok || owner == "" || repo == "" {
 		return fmt.Errorf("repository identity is invalid")
 	}
+	if managedPathPreimagesConfigured(config) && !hasValidManagedPathPreimages(config) {
+		return fmt.Errorf("uninstall verification refuses an invalid managed-path preimage ledger")
+	}
+	preimagesValid := hasValidManagedPathPreimages(config)
 	for _, relative := range managedSetupFiles(config.VisualHive) {
 		content, directory, response, err := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, relative, &gh.RepositoryContentGetOptions{Ref: commitSHA})
+		preimage := config.ManagedPathPreimages[relative]
+		if preimagesValid && preimage.Existed {
+			if err != nil || content == nil || len(directory) != 0 {
+				return fmt.Errorf("repository-owned setup path %s was not restored at target commit %s", relative, commitSHA)
+			}
+			value, decodeErr := content.GetContent()
+			if decodeErr != nil {
+				return fmt.Errorf("decode restored repository-owned setup path %s: %w", relative, decodeErr)
+			}
+			digest := sha256.Sum256([]byte(value))
+			if !bytes.Equal([]byte(value), preimage.Content) || !strings.EqualFold(preimage.ContentSHA256, hex.EncodeToString(digest[:])) {
+				return fmt.Errorf("repository-owned setup path %s was not restored byte-for-byte at target commit %s", relative, commitSHA)
+			}
+			continue
+		}
 		if err == nil || content != nil || len(directory) != 0 {
-			return fmt.Errorf("managed setup path %s still exists at target commit %s", relative, commitSHA)
+			return fmt.Errorf("Hive-owned managed setup path %s still exists at target commit %s", relative, commitSHA)
 		}
 		if response == nil || response.StatusCode != http.StatusNotFound {
 			return fmt.Errorf("verify absence of managed setup path %s: %w", relative, err)

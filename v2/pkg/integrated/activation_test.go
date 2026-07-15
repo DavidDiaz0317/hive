@@ -89,7 +89,7 @@ func (s *activationRepositoryServer) serve(t *testing.T, writer http.ResponseWri
 			return
 		}
 		installed := installedRepositoryConfig{
-			SchemaVersion: ConfigSchema, Repository: s.config.Repository, RepositoryID: s.config.RepositoryID, DefaultBranch: s.config.DefaultBranch,
+			SchemaVersion: managedRepositoryConfigSchema, Repository: s.config.Repository, RepositoryID: s.config.RepositoryID, DefaultBranch: s.config.DefaultBranch,
 			Coverage: s.config.Coverage, Automation: s.config.Automation, Provider: s.config.Provider, ACMMLevel: s.config.ACMMLevel,
 			MaxActiveIssues: s.config.MaxActiveIssues, MaxRepairAttempts: s.config.MaxRepairAttempts, VisualHive: true,
 			VisualHiveRepo: s.config.VisualHiveRepo, VisualHiveRef: s.config.VisualHiveRef, TestCommands: s.config.TestCommands,
@@ -102,8 +102,8 @@ func (s *activationRepositoryServer) serve(t *testing.T, writer http.ResponseWri
 	case "/repos/owner/repo/contents/.github/workflows/visual-hive-pr.yml":
 		writeActivationContent(writer, []byte(pullRequestWorkflow(s.config)))
 	case "/repos/owner/repo/contents/visual-hive.config.yaml":
-		writeActivationContent(writer, []byte("project:\n  setupProfile: complex-app\n"))
-	case "/repos/owner/repo/contents/.github/workflows/visual-hive-issue-lifecycle.yml", "/repos/owner/repo/contents/.github/workflows/visual-hive-trusted-publisher.yml":
+		writeActivationContent(writer, []byte("project:\n  setupProfile: complex-app\nintegrations:\n  hive:\n    enabled: true\n"))
+	case "/repos/owner/repo/contents/.github/workflows/visual-hive-lifecycle.yml", "/repos/owner/repo/contents/.github/workflows/visual-hive-issue-lifecycle.yml", "/repos/owner/repo/contents/.github/workflows/visual-hive-trusted-publisher.yml", "/repos/owner/repo/contents/.github/workflows/visual-hive-failure-issue.yml", "/repos/owner/repo/contents/.github/workflows/visual-hive-hive-handoff.yml":
 		http.Error(writer, "missing", http.StatusNotFound)
 	case "/repos/owner/repo/branches/main/protection":
 		if request.Method == http.MethodPut {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,13 @@ type visualImportOutput struct {
 	Created int  `json:"created"`
 	Skipped int  `json:"skipped"`
 }
+
+const (
+	trustedVisualHiveWorkflowName = "Hive Visual Hive Production"
+	trustedVisualHiveWorkflowPath = ".github/workflows/hive-visual-hive.yml"
+)
+
+var exactVisualHiveProducerCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
 
 type visualLifecycleOutput struct {
 	visualhive.ApplyLifecycleResult
@@ -85,7 +93,7 @@ func runVisualCommand(args []string) int {
 
 func runVisualLifecycleCommand(args []string) int {
 	if len(args) == 0 || (args[0] != "fetch-apply" && args[0] != "apply" && args[0] != "status" && args[0] != "sync" && args[0] != "repair") {
-		fmt.Fprintln(os.Stderr, "usage: hive visual lifecycle <fetch-apply|apply|sync|repair|status> [--repo owner/name] [--run-id N] [--artifact-id N] [--bundle <manifest.json>] [--state-dir <dir>] [--beads-dir <dir>] [--target-ref main] [--max-acmm 3] [--allow-local]")
+		fmt.Fprintln(os.Stderr, "usage: hive visual lifecycle <fetch-apply|apply|sync|repair|status> [--repo owner/name] [--run-id N] [--artifact-id N] [--source-artifact-id N] [--visual-hive-ref <40-char-commit>] [--bundle <manifest.json>] [--state-dir <dir>] [--beads-dir <dir>] [--target-ref main] [--max-acmm 3] [--allow-local]")
 		return 2
 	}
 	action := args[0]
@@ -103,7 +111,8 @@ func runVisualLifecycleCommand(args []string) int {
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
 	workflowRunID := flags.Int64("run-id", 0, "GitHub Actions workflow run ID for trusted artifact ingestion")
 	artifactID := flags.Int64("artifact-id", 0, "GitHub Actions artifact ID for trusted artifact ingestion")
-	sourceArtifactID := flags.Int64("source-artifact-id", 0, "GitHub Actions evidence artifact ID bound inside the bundle (defaults to artifact-id for compatibility)")
+	sourceArtifactID := flags.Int64("source-artifact-id", 0, "required GitHub Actions full evidence artifact ID bound inside the bundle")
+	visualHiveRef := flags.String("visual-hive-ref", "", "required immutable 40-character Visual Hive producer commit")
 	artifactDir := flags.String("artifact-dir", "/data/visual-hive/artifacts", "trusted artifact cache directory")
 	paused := flags.Bool("paused", false, "deny lifecycle writes while repository automation is paused")
 	killSwitch := flags.Bool("kill-switch", false, "deny all lifecycle writes")
@@ -232,8 +241,8 @@ func runVisualLifecycleCommand(args []string) int {
 	var bundle *visualhive.ValidatedBundle
 	var provenance *hivegithub.VerifiedVisualHiveArtifact
 	if action == "fetch-apply" {
-		if strings.TrimSpace(*repository) == "" || *workflowRunID <= 0 || *artifactID <= 0 {
-			fmt.Fprintln(os.Stderr, "--repo, --run-id, and --artifact-id are required")
+		if err := validateVisualFetchApplyIdentity(*repository, *workflowRunID, *artifactID, *sourceArtifactID, *visualHiveRef); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
 		token := os.Getenv(*githubTokenEnv)
@@ -247,7 +256,10 @@ func runVisualLifecycleCommand(args []string) int {
 		defer cancel()
 		verifiedBundle, verified, fetchErr := client.FetchAndVerifyVisualHiveBundle(ctx, hivegithub.VisualHiveArtifactRequest{
 			Repository: *repository, WorkflowRunID: *workflowRunID, ArtifactID: *artifactID, SourceArtifactID: *sourceArtifactID,
-			DestinationDir: *artifactDir, TargetRef: *targetRef, MaxACMM: *maxACMM,
+			FetchSourceArtifact: true, DestinationDir: *artifactDir, TargetRef: *targetRef, MaxACMM: *maxACMM,
+			ExpectedProducerGitCommit: *visualHiveRef,
+			ExpectedWorkflowName:      trustedVisualHiveWorkflowName,
+			ExpectedWorkflowPath:      trustedVisualHiveWorkflowPath,
 		})
 		if fetchErr != nil {
 			fmt.Fprintln(os.Stderr, "trusted visual evidence rejected:", fetchErr)
@@ -285,6 +297,19 @@ func runVisualLifecycleCommand(args []string) int {
 	snapshot := lifecycle.Snapshot()
 	output := visualLifecycleOutput{ApplyLifecycleResult: result, PendingOutbox: len(lifecycle.PendingOutbox()), Findings: len(snapshot.Findings), Provenance: provenance}
 	return encodeJSON(output)
+}
+
+func validateVisualFetchApplyIdentity(repository string, workflowRunID, artifactID, sourceArtifactID int64, expectedProducerCommit string) error {
+	if strings.TrimSpace(repository) == "" || workflowRunID <= 0 || artifactID <= 0 {
+		return fmt.Errorf("--repo, --run-id, and --artifact-id are required")
+	}
+	if sourceArtifactID <= 0 {
+		return fmt.Errorf("--source-artifact-id is required for full trusted evidence verification")
+	}
+	if !exactVisualHiveProducerCommit.MatchString(strings.TrimSpace(expectedProducerCommit)) {
+		return fmt.Errorf("--visual-hive-ref must be the exact 40-character Visual Hive producer commit")
+	}
+	return nil
 }
 
 func parseAutomationMode(value string) (automation.Mode, bool) {

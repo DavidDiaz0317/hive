@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,28 +20,35 @@ import (
 )
 
 const (
-	maxVisualHiveArtifactBytes = 110 << 20
-	maxVisualHiveArchiveFiles  = 1024
+	maxVisualHiveArtifactBytes       = 110 << 20
+	maxVisualHiveArchiveFiles        = 1024
+	maxVisualHiveSourceArtifactBytes = int64(1 << 30)
+	maxVisualHiveSourceDownloadBytes = int64(1100 << 20)
+	maxVisualHiveSourceArchiveFiles  = 5000
 )
 
+var exactVisualHiveProducerCommit = regexp.MustCompile(`^[a-f0-9]{40}$`)
+
 type VisualHiveArtifactRequest struct {
-	Repository             string
-	WorkflowRunID          int64
-	ArtifactID             int64
-	SourceArtifactID       int64
-	FetchSourceArtifact    bool
-	DestinationDir         string
-	TargetRef              string
-	MaxACMM                int
-	ExpectedWorkflowName   string
-	ExpectedWorkflowPath   string
-	ExpectedRunName        string
-	AllowFailedWorkflowRun bool
+	Repository                string
+	WorkflowRunID             int64
+	ArtifactID                int64
+	SourceArtifactID          int64
+	FetchSourceArtifact       bool
+	DestinationDir            string
+	TargetRef                 string
+	MaxACMM                   int
+	ExpectedProducerGitCommit string
+	ExpectedWorkflowName      string
+	ExpectedWorkflowPath      string
+	ExpectedRunName           string
+	AllowFailedWorkflowRun    bool
 }
 
 type VerifiedVisualHiveArtifact struct {
 	RepositoryID       string `json:"repository_id"`
 	WorkflowRunID      string `json:"workflow_run_id"`
+	WorkflowRunAttempt string `json:"workflow_run_attempt"`
 	ArtifactID         string `json:"artifact_id"`
 	SourceArtifactID   string `json:"source_artifact_id"`
 	ArtifactName       string `json:"artifact_name"`
@@ -53,6 +61,7 @@ type VerifiedVisualHiveArtifact struct {
 	RunURL             string `json:"run_url"`
 	ManifestPath       string `json:"manifest_path"`
 	SourceArtifactPath string `json:"source_artifact_path"`
+	EvidenceRootPath   string `json:"evidence_root_path"`
 }
 
 type PullRequestArtifactRequest struct {
@@ -157,6 +166,18 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if request.WorkflowRunID <= 0 || request.ArtifactID <= 0 || strings.TrimSpace(request.DestinationDir) == "" {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("workflow run id, artifact id, and destination directory are required")
 	}
+	if !request.FetchSourceArtifact {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("trusted Visual Hive ingestion requires full source artifact fetch and content verification")
+	}
+	expectedProducerCommit := strings.TrimSpace(request.ExpectedProducerGitCommit)
+	if !exactVisualHiveProducerCommit.MatchString(expectedProducerCommit) {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("trusted Visual Hive ingestion requires an exact 40-character expected producer commit")
+	}
+	expectedWorkflowName := strings.TrimSpace(request.ExpectedWorkflowName)
+	expectedWorkflowPath := strings.TrimSpace(request.ExpectedWorkflowPath)
+	if expectedWorkflowName == "" || expectedWorkflowPath == "" {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("trusted Visual Hive ingestion requires an exact approved workflow name and path")
+	}
 	repository, _, err := c.client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify Visual Hive repository: %w", err)
@@ -166,7 +187,7 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify Visual Hive workflow run: %w", err)
 	}
 	allowedConclusion := run.GetConclusion() == "success" || (request.AllowFailedWorkflowRun && run.GetConclusion() == "failure")
-	if run.GetID() != request.WorkflowRunID || run.GetStatus() != "completed" || !allowedConclusion || run.GetEvent() == "pull_request" || strings.TrimSpace(run.GetHeadSHA()) == "" {
+	if run.GetID() != request.WorkflowRunID || run.GetStatus() != "completed" || !allowedConclusion || run.GetEvent() == "pull_request" || run.GetEvent() == "pull_request_target" || strings.TrimSpace(run.GetHeadSHA()) == "" {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run is not an allowed completed non-PR run")
 	}
 	if targetRef := strings.TrimPrefix(strings.TrimSpace(request.TargetRef), "refs/heads/"); targetRef != "" && run.GetHeadBranch() != targetRef {
@@ -184,10 +205,10 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if definition.GetID() != run.GetWorkflowID() || strings.TrimSpace(definition.GetName()) == "" || definitionPath == "" || definitionPath != runPath {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition does not match the exact workflow run")
 	}
-	if request.ExpectedWorkflowName != "" && definition.GetName() != request.ExpectedWorkflowName {
+	if definition.GetName() != expectedWorkflowName {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition name mismatch")
 	}
-	if request.ExpectedWorkflowPath != "" && !workflowPathMatches(definition.GetPath(), request.ExpectedWorkflowPath) {
+	if !workflowPathMatches(definition.GetPath(), expectedWorkflowPath) {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow definition path mismatch")
 	}
 	if request.ExpectedRunName != "" {
@@ -195,10 +216,10 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive correlated workflow run name mismatch")
 		}
 		runtimeName := strings.TrimSpace(run.GetName())
-		if runtimeName != request.ExpectedRunName && runtimeName != request.ExpectedWorkflowName {
+		if runtimeName != request.ExpectedRunName && runtimeName != expectedWorkflowName {
 			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow runtime name mismatch")
 		}
-	} else if request.ExpectedWorkflowName != "" && run.GetName() != request.ExpectedWorkflowName {
+	} else if run.GetName() != expectedWorkflowName {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow runtime name mismatch")
 	}
 	artifact, err := c.findRunArtifact(ctx, owner, repo, request.WorkflowRunID, request.ArtifactID)
@@ -218,20 +239,15 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 		if err != nil {
 			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify Visual Hive source artifact: %w", err)
 		}
-		if sourceArtifact.GetExpired() || sourceArtifact.GetSizeInBytes() <= 0 || sourceArtifact.GetSizeInBytes() > maxVisualHiveArtifactBytes {
+		if sourceArtifact.GetExpired() || sourceArtifact.GetSizeInBytes() <= 0 || sourceArtifact.GetSizeInBytes() > maxVisualHiveSourceDownloadBytes {
 			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive source artifact is expired or has an invalid size")
 		}
 	}
-	if artifact.WorkflowRun != nil {
-		if artifact.WorkflowRun.GetID() != 0 && artifact.WorkflowRun.GetID() != request.WorkflowRunID {
-			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive artifact workflow run mismatch")
-		}
-		if artifact.WorkflowRun.GetRepositoryID() != 0 && artifact.WorkflowRun.GetRepositoryID() != repository.GetID() {
-			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive artifact repository mismatch")
-		}
-		if artifact.WorkflowRun.GetHeadSHA() != "" && artifact.WorkflowRun.GetHeadSHA() != run.GetHeadSHA() {
-			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive artifact commit mismatch")
-		}
+	if err := validateVisualHiveArtifactIdentity(artifact, request.WorkflowRunID, repository.GetID(), run.GetHeadSHA(), "bundle"); err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, err
+	}
+	if err := validateVisualHiveArtifactIdentity(sourceArtifact, request.WorkflowRunID, repository.GetID(), run.GetHeadSHA(), "source"); err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, err
 	}
 	manifestPath, err := c.downloadAndExtractVisualHiveArtifact(ctx, owner, repo, request.ArtifactID, request.DestinationDir)
 	if err != nil {
@@ -239,14 +255,17 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	}
 	verified := VerifiedVisualHiveArtifact{
 		RepositoryID: strconv.FormatInt(repository.GetID(), 10), WorkflowRunID: strconv.FormatInt(request.WorkflowRunID, 10),
-		ArtifactID: strconv.FormatInt(request.ArtifactID, 10), ArtifactName: artifact.GetName(), CommitSHA: run.GetHeadSHA(),
+		WorkflowRunAttempt: strconv.Itoa(run.GetRunAttempt()),
+		ArtifactID:         strconv.FormatInt(request.ArtifactID, 10), ArtifactName: artifact.GetName(), CommitSHA: run.GetHeadSHA(),
 		SourceArtifactID: strconv.FormatInt(sourceArtifactID, 10),
 		HeadBranch:       run.GetHeadBranch(), Event: run.GetEvent(), WorkflowName: definition.GetName(), WorkflowRunName: run.GetName(),
 		WorkflowPath: definitionPath, RunURL: run.GetHTMLURL(), ManifestPath: manifestPath,
 	}
 	bundle, err := visualhive.ValidateBundle(manifestPath, visualhive.ValidationOptions{
 		MaxACMM: request.MaxACMM, VerifiedProvenance: true, ExpectedRepository: request.Repository,
-		ExpectedRepositoryID: verified.RepositoryID, ExpectedWorkflowRunID: verified.WorkflowRunID,
+		ExpectedProducerGitCommit: expectedProducerCommit,
+		ExpectedRepositoryID:      verified.RepositoryID, ExpectedWorkflowRunID: verified.WorkflowRunID,
+		ExpectedWorkflowRunAttempt: verified.WorkflowRunAttempt,
 	})
 	if err != nil {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("validate independently fetched Visual Hive bundle: %w", err)
@@ -261,14 +280,39 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	if manifest.Source.WorkflowName != "" && verified.WorkflowName != "" && manifest.Source.WorkflowName != verified.WorkflowName {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive manifest workflow name mismatch")
 	}
-	if request.FetchSourceArtifact {
-		sourceArtifactPath, err := c.downloadAndExtractArtifact(ctx, owner, repo, sourceArtifactID, request.DestinationDir, "source-artifact")
-		if err != nil {
-			return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("download verified Visual Hive source artifact: %w", err)
-		}
-		verified.SourceArtifactPath = sourceArtifactPath
+	sourceArtifactPath, err := c.downloadAndExtractArtifact(ctx, owner, repo, sourceArtifactID, request.DestinationDir, "source-artifact")
+	if err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("download verified Visual Hive source artifact: %w", err)
 	}
+	verified.SourceArtifactPath = sourceArtifactPath
+	if err := bundle.VerifySourceArtifact(sourceArtifactPath); err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("verify content-addressed Visual Hive source artifact: %w", err)
+	}
+	if !bundle.Validation.Trusted {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive source artifact verification did not establish trusted ingestion")
+	}
+	evidenceRootPath, err := bundle.VerifiedEvidenceRoot()
+	if err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("resolve verified Visual Hive evidence root: %w", err)
+	}
+	verified.EvidenceRootPath = evidenceRootPath
 	return bundle, verified, nil
+}
+
+func validateVisualHiveArtifactIdentity(artifact *gh.Artifact, runID, repositoryID int64, headSHA, label string) error {
+	if artifact.WorkflowRun == nil {
+		return nil
+	}
+	if artifact.WorkflowRun.GetID() != 0 && artifact.WorkflowRun.GetID() != runID {
+		return fmt.Errorf("Visual Hive %s artifact workflow run mismatch", label)
+	}
+	if artifact.WorkflowRun.GetRepositoryID() != 0 && artifact.WorkflowRun.GetRepositoryID() != repositoryID {
+		return fmt.Errorf("Visual Hive %s artifact repository mismatch", label)
+	}
+	if artifact.WorkflowRun.GetHeadSHA() != "" && artifact.WorkflowRun.GetHeadSHA() != headSHA {
+		return fmt.Errorf("Visual Hive %s artifact commit mismatch", label)
+	}
+	return nil
 }
 
 func (c *Client) findRunArtifact(ctx context.Context, owner, repo string, runID, artifactID int64) (*gh.Artifact, error) {
@@ -328,6 +372,10 @@ func (c *Client) downloadAndExtractVisualHiveArtifact(ctx context.Context, owner
 }
 
 func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo string, artifactID int64, destinationDir, prefix string) (string, error) {
+	maxDownloadBytes, maxExtractedBytes, maxFiles := int64(maxVisualHiveArtifactBytes), int64(maxVisualHiveArtifactBytes), maxVisualHiveArchiveFiles
+	if prefix == "source-artifact" {
+		maxDownloadBytes, maxExtractedBytes, maxFiles = maxVisualHiveSourceDownloadBytes, maxVisualHiveSourceArtifactBytes, maxVisualHiveSourceArchiveFiles
+	}
 	if err := os.MkdirAll(destinationDir, 0o700); err != nil {
 		return "", fmt.Errorf("create Visual Hive artifact directory: %w", err)
 	}
@@ -361,7 +409,11 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 	// DownloadArtifact returns a short-lived signed object URL. Sending the
 	// GitHub API Authorization header to that storage host both leaks authority
 	// across a trust boundary and is rejected by GitHub's artifact backend.
-	downloadClient := &http.Client{Timeout: 2 * time.Minute}
+	downloadTimeout := 2 * time.Minute
+	if prefix == "source-artifact" {
+		downloadTimeout = 10 * time.Minute
+	}
+	downloadClient := &http.Client{Timeout: downloadTimeout}
 	response, err := downloadClient.Do(httpRequest)
 	if err != nil {
 		return "", fmt.Errorf("download Visual Hive artifact: %w", err)
@@ -376,9 +428,9 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 	}
 	temporaryZip := temporaryFile.Name()
 	defer os.Remove(temporaryZip)
-	written, copyErr := io.Copy(temporaryFile, io.LimitReader(response.Body, maxVisualHiveArtifactBytes+1))
+	written, copyErr := io.Copy(temporaryFile, io.LimitReader(response.Body, maxDownloadBytes+1))
 	closeErr := temporaryFile.Close()
-	if copyErr != nil || closeErr != nil || written > maxVisualHiveArtifactBytes {
+	if copyErr != nil || closeErr != nil || written > maxDownloadBytes {
 		return "", fmt.Errorf("Visual Hive artifact download exceeded limits or failed")
 	}
 	temporaryDir, err := os.MkdirTemp(destinationDir, ".visual-hive-extract-")
@@ -386,7 +438,7 @@ func (c *Client) downloadAndExtractArtifact(ctx context.Context, owner, repo str
 		return "", err
 	}
 	defer os.RemoveAll(temporaryDir)
-	if err := extractVisualHiveZip(temporaryZip, temporaryDir); err != nil {
+	if err := extractVisualHiveZipWithLimits(temporaryZip, temporaryDir, maxExtractedBytes, maxFiles); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(temporaryDir, ".hive-extraction-complete"), []byte(strconv.FormatInt(artifactID, 10)+"\n"), 0o600); err != nil {
@@ -416,24 +468,29 @@ func isLoopbackDownload(host string) bool {
 }
 
 func extractVisualHiveZip(zipPath, destination string) error {
+	return extractVisualHiveZipWithLimits(zipPath, destination, maxVisualHiveArtifactBytes, maxVisualHiveArchiveFiles)
+}
+
+func extractVisualHiveZipWithLimits(zipPath, destination string, maxBytes int64, maxFiles int) error {
 	archive, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return fmt.Errorf("open Visual Hive artifact zip: %w", err)
 	}
 	defer archive.Close()
-	if len(archive.File) == 0 || len(archive.File) > maxVisualHiveArchiveFiles {
+	if len(archive.File) == 0 || len(archive.File) > maxFiles*4+100 {
 		return fmt.Errorf("Visual Hive artifact zip has an invalid file count")
 	}
 	var total uint64
+	files := 0
 	for _, entry := range archive.File {
 		clean := filepath.Clean(filepath.FromSlash(entry.Name))
 		if clean == "." || clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || entry.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("unsafe Visual Hive artifact zip entry %q", entry.Name)
 		}
-		total += entry.UncompressedSize64
-		if total > maxVisualHiveArtifactBytes {
+		if entry.UncompressedSize64 > uint64(maxBytes) || total > uint64(maxBytes)-entry.UncompressedSize64 {
 			return fmt.Errorf("Visual Hive artifact uncompressed size exceeds limit")
 		}
+		total += entry.UncompressedSize64
 		target := filepath.Join(destination, clean)
 		relative, err := filepath.Rel(destination, target)
 		if err != nil || strings.HasPrefix(relative, "..") || filepath.IsAbs(relative) {
@@ -444,6 +501,10 @@ func extractVisualHiveZip(zipPath, destination string) error {
 				return err
 			}
 			continue
+		}
+		files++
+		if files > maxFiles {
+			return fmt.Errorf("Visual Hive artifact zip has an invalid file count")
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
@@ -457,10 +518,10 @@ func extractVisualHiveZip(zipPath, destination string) error {
 			reader.Close()
 			return err
 		}
-		_, copyErr := io.Copy(file, io.LimitReader(reader, int64(entry.UncompressedSize64)+1))
+		written, copyErr := io.Copy(file, io.LimitReader(reader, int64(entry.UncompressedSize64)+1))
 		closeFileErr := file.Close()
 		closeReaderErr := reader.Close()
-		if copyErr != nil || closeFileErr != nil || closeReaderErr != nil {
+		if copyErr != nil || closeFileErr != nil || closeReaderErr != nil || written != int64(entry.UncompressedSize64) {
 			return fmt.Errorf("extract Visual Hive artifact entry %q", entry.Name)
 		}
 	}
@@ -484,7 +545,7 @@ func findVisualHiveManifest(root string) (string, error) {
 		var identity struct {
 			SchemaVersion string `json:"schemaVersion"`
 		}
-		if err := json.NewDecoder(io.LimitReader(file, 2<<20)).Decode(&identity); err == nil && identity.SchemaVersion == visualhive.ManifestSchema {
+		if err := json.NewDecoder(io.LimitReader(file, 2<<20)).Decode(&identity); err == nil && (identity.SchemaVersion == visualhive.ManifestSchema || identity.SchemaVersion == visualhive.ManifestSchemaV3) {
 			matches = append(matches, filePath)
 		}
 		return nil

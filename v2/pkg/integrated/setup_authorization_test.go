@@ -26,10 +26,7 @@ var setupAuthorizationRequiredFiles = []string{
 	"visual-hive.config.yaml",
 }
 
-var setupAuthorizationRequiredAbsent = []string{
-	".github/workflows/visual-hive-issue-lifecycle.yml",
-	".github/workflows/visual-hive-trusted-publisher.yml",
-}
+var setupAuthorizationRequiredAbsent = standaloneVisualHiveWriterWorkflowPaths()
 
 func TestGeneratedUninstallPublisherCreatesAndRecoversOnlyExactAuthorizedCheck(t *testing.T) {
 	bash := workflowBash(t)

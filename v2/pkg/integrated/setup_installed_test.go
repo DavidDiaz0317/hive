@@ -97,7 +97,7 @@ func installedSetupTestServerWithWorkflow(t *testing.T, config Config, productio
 func installedSetupTestServerWithWorkflowAndRef(t *testing.T, config Config, productionWorkflow, expectedRef string) *httptest.Server {
 	t.Helper()
 	installed := installedRepositoryConfig{
-		SchemaVersion: ConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
+		SchemaVersion: managedRepositoryConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
 		Coverage: config.Coverage, Automation: config.Automation, Provider: config.Provider, ACMMLevel: config.ACMMLevel,
 		MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
 		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, TestCommands: config.TestCommands,
@@ -129,7 +129,7 @@ func installedSetupTestServerWithWorkflowAndRef(t *testing.T, config Config, pro
 		case "/repos/owner/repo/contents/.github/workflows/visual-hive-pr.yml":
 			_, _ = io.WriteString(writer, `{"type":"file","encoding":"base64","content":"`+base64.StdEncoding.EncodeToString([]byte(pullRequestWorkflow(config)))+`"}`)
 		case "/repos/owner/repo/contents/visual-hive.config.yaml":
-			_, _ = io.WriteString(writer, `{"type":"file","encoding":"base64","content":"`+base64.StdEncoding.EncodeToString([]byte("project:\n  setupProfile: complex-app\n"))+`"}`)
+			_, _ = io.WriteString(writer, `{"type":"file","encoding":"base64","content":"`+base64.StdEncoding.EncodeToString([]byte("project:\n  setupProfile: complex-app\nintegrations:\n  hive:\n    enabled: true\n"))+`"}`)
 		default:
 			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
 		}

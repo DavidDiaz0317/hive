@@ -208,6 +208,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	if bundle == nil {
 		return ApplyLifecycleResult{}, fmt.Errorf("validated Visual Hive bundle is required")
 	}
+	if !bundle.Validation.Trusted {
+		return ApplyLifecycleResult{}, fmt.Errorf("trusted Visual Hive bundle validation is required before lifecycle application")
+	}
 	if beadStore == nil {
 		return ApplyLifecycleResult{}, fmt.Errorf("persistent Hive bead store is required")
 	}
@@ -215,6 +218,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	defer s.mu.Unlock()
 
 	manifest := bundle.Manifest
+	validatedAuthoritative := bundle.Validation.Authoritative
 	result := ApplyLifecycleResult{BundleID: manifest.BundleID}
 	if priorDigest, exists := s.state.ReplayKeys[manifest.ReplayProtection.Key]; exists {
 		if priorDigest != manifest.OverallDigest {
@@ -325,7 +329,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				result.IgnoredAbsent++
 				continue
 			}
-			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
+			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, validatedAuthoritative, targetRef, options, presentRoots); !allowed {
 				result.IgnoredAbsent++
 				if err := audit(LifecycleAuditEntry{Action: "resolve_finding", Allowed: false, Repository: manifest.Source.Repository, RepositoryFingerprint: observation.RepositoryFingerprint, BundleID: manifest.BundleID, Detail: reason}); err != nil {
 					return result, err
@@ -482,7 +486,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	// inventory only when every affected contract was actually executed. This
 	// lets a trusted target-branch run close findings without copying Hive's
 	// private lifecycle database into the target workflow.
-	if manifest.Scan.Scope == "full" && manifest.Scan.AuthoritativeForResolution && refsEquivalent(manifest.Source.Ref, targetRef) {
+	if validatedAuthoritative && manifest.Scan.Scope == "full" && refsEquivalent(manifest.Source.Ref, targetRef) {
 		keys := make([]string, 0, len(s.state.Findings))
 		for key := range s.state.Findings {
 			keys = append(keys, key)
@@ -493,7 +497,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			if finding == nil || !strings.EqualFold(finding.Repository, manifest.Source.Repository) || observedFingerprints[key] || finding.Status == StatusIssueClosed {
 				continue
 			}
-			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, targetRef, options, presentRoots); !allowed {
+			if allowed, reason := s.rootResolutionAllowedLocked(finding, manifest, validatedAuthoritative, targetRef, options, presentRoots); !allowed {
 				if err := audit(LifecycleAuditEntry{Action: "infer_absent_finding", Allowed: false, Repository: finding.Repository, RepositoryFingerprint: key, BundleID: manifest.BundleID, Detail: reason}); err != nil {
 					return result, err
 				}
@@ -1648,9 +1652,9 @@ func refsEquivalent(left, right string) bool {
 	return normalize(left) != "" && normalize(left) == normalize(right)
 }
 
-func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions, presentRoots map[string]bool) (bool, string) {
+func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, manifest Manifest, validatedAuthoritative bool, targetRef string, options ApplyLifecycleOptions, presentRoots map[string]bool) (bool, string) {
 	resolutionSubject := s.publicationResolutionSubjectLocked(finding)
-	allowed, reason := resolutionAllowed(resolutionSubject, manifest, targetRef, options)
+	allowed, reason := resolutionAllowed(resolutionSubject, manifest, validatedAuthoritative, targetRef, options)
 	if !allowed || finding == nil || finding.RootCauseKey == "" {
 		return allowed, reason
 	}
@@ -1661,7 +1665,7 @@ func (s *LifecycleStore) rootResolutionAllowedLocked(finding *FindingLifecycle, 
 		if related == nil || related == finding || related.RootCauseKey != finding.RootCauseKey || !strings.EqualFold(related.Repository, finding.Repository) || related.Status == StatusResolved || related.Status == StatusIssueClosed {
 			continue
 		}
-		if relatedAllowed, relatedReason := resolutionAllowed(s.publicationResolutionSubjectLocked(related), manifest, targetRef, options); !relatedAllowed {
+		if relatedAllowed, relatedReason := resolutionAllowed(s.publicationResolutionSubjectLocked(related), manifest, validatedAuthoritative, targetRef, options); !relatedAllowed {
 			return false, fmt.Sprintf("root %q is not authoritatively absent: %s", finding.RootCauseKey, relatedReason)
 		}
 	}
@@ -1685,8 +1689,8 @@ func (s *LifecycleStore) publicationResolutionSubjectLocked(finding *FindingLife
 	return owner
 }
 
-func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, targetRef string, options ApplyLifecycleOptions) (bool, string) {
-	if !manifest.Scan.AuthoritativeForResolution || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, targetRef) {
+func resolutionAllowed(finding *FindingLifecycle, manifest Manifest, validatedAuthoritative bool, targetRef string, options ApplyLifecycleOptions) (bool, string) {
+	if !validatedAuthoritative || !manifest.Scan.AuthoritativeForResolution || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, targetRef) {
 		return false, "absence was not from an authoritative target-ref scan"
 	}
 	if options.CurrentTargetCommitSHA != "" && !strings.EqualFold(options.CurrentTargetCommitSHA, manifest.Source.CommitSHA) {

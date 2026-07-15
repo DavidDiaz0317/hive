@@ -272,7 +272,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		}
 	}
 	if config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge {
-		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact.SourceArtifactPath)
+		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact.EvidenceRootPath)
 		result.Repairs, result.Gates = orchestration.Repairs, orchestration.Gates
 		result.PostMergeWorkflow, result.PostMergeLifecycle = orchestration.PostMergeWorkflow, orchestration.PostMergeLifecycle
 		result.Outbox.Succeeded += orchestration.Outbox.Succeeded
@@ -415,8 +415,9 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 		FetchSourceArtifact: true,
 		TargetRef:           config.DefaultBranch, MaxACMM: config.ACMMLevel,
 		ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath,
-		ExpectedRunName:        workflowDispatchDisplayTitle(workflow.CorrelationID),
-		AllowFailedWorkflowRun: workflow.RepositoryTestOverall != 0,
+		ExpectedRunName:           workflowDispatchDisplayTitle(workflow.CorrelationID),
+		ExpectedProducerGitCommit: config.VisualHiveRef,
+		AllowFailedWorkflowRun:    workflow.RepositoryTestOverall != 0,
 	})
 	if err != nil {
 		return visualhive.Validation{}, visualhive.ApplyLifecycleResult{}, visualhive.OutboxProcessorResult{}, hivegithub.VerifiedVisualHiveArtifact{}, err

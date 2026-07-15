@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -167,8 +168,8 @@ func TestLoadEvidenceSummaryEscapesMutationControlCharacters(t *testing.T) {
 
 func TestLoadEvidenceSummaryRejectsCredentials(t *testing.T) {
 	tests := []struct{ value, rule string }{
-		{value: "github_pat_abcdefghijklmnopqrstuvwxyz123456", rule: "github-token-v1"},
-		{value: "AKIAABCDEFGHIJKLMNOP", rule: "aws-access-key-id-v1"},
+		{value: "github_" + "pat_" + strings.Repeat("a", 24), rule: "github-token-v1"},
+		{value: "AK" + "IA" + strings.Repeat("A", 16), rule: "aws-access-key-id-v1"},
 		{value: `clientSecret = "actual-operator-value-must-not-leave"`, rule: "sensitive-assignment-v2"},
 	}
 	for _, test := range tests {
@@ -235,11 +236,26 @@ func TestLoadEvidenceSummaryUsesVerifiedTestCreationRecommendation(t *testing.T)
 	if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(`{"schemaVersion":"visual-hive.verdict.v1","allContributions":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan := `{"schemaVersion":"visual-hive.test-creation-plan.v1","recommendations":[
-{"id":"layer-2-unknown","gapId":"testing-layer:2:unknown","source":"testing_layer","kind":"unit_test","priority":"medium","title":"Add unit test evidence for Unit","rationale":["No repository unit test was detected."],"suggestedTests":["Add focused tests for non-visual behavior."],"artifacts":[".visual-hive/repo-map.json"]},
-{"id":"layer-3-unknown","source":"testing_layer","kind":"accessibility_check","title":"unrelated"}
-]}`
-	if err := os.WriteFile(filepath.Join(root, "test-creation-plan.json"), []byte(plan), 0o600); err != nil {
+	unresolved := strictTestCreationRecommendation()
+	unresolved["id"] = "unresolved-layer-2"
+	unresolved["rationale"] = []string{"unresolved-sentinel"}
+	unresolved["suggestedTests"] = []string{"invented-edit-sentinel"}
+	unresolved["grounding"] = map[string]interface{}{"status": "unresolved", "evidence": []string{}, "unresolvedReasons": []string{"Repository evidence is incomplete."}}
+	unresolved["suggestedContract"] = map[string]interface{}{"id": "unresolved-layer-2", "description": "Resolve repository mapping", "selectors": []string{}, "mustNotExistSelectors": []string{}, "textMustExist": []string{}, "textMustNotExist": []string{}, "maskSelectors": []string{}}
+
+	grounded := strictTestCreationRecommendation()
+	grounded["id"] = "layer-2-unknown"
+	grounded["rationale"] = []string{"No repository unit test was detected."}
+	grounded["suggestedTests"] = []string{"Add focused tests for non-visual behavior."}
+	grounded["artifacts"] = []string{".visual-hive/repo-map.json"}
+	grounded["grounding"] = map[string]interface{}{"status": "grounded", "evidence": []string{".visual-hive/repo-map.json"}, "unresolvedReasons": []string{}}
+
+	unrelated := strictTestCreationRecommendation()
+	unrelated["id"] = "layer-3-unknown"
+	unrelated["gapId"] = "testing-layer:3:unknown"
+	unrelated["kind"] = "accessibility_check"
+	unrelated["title"] = "unrelated"
+	if err := os.WriteFile(filepath.Join(root, "test-creation-plan.json"), strictTestCreationPlan(t, []map[string]interface{}{unresolved, grounded, unrelated}), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
@@ -248,7 +264,167 @@ func TestLoadEvidenceSummaryUsesVerifiedTestCreationRecommendation(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(summary, "test_creation.layer-2-unknown") || !strings.Contains(summary, "required_scope=test_files_only") || strings.Contains(summary, "unrelated") {
+	if !strings.Contains(summary, "test_creation.layer-2-unknown") || !strings.Contains(summary, "grounding_evidence=.visual-hive/repo-map.json") || !strings.Contains(summary, "required_scope=test_files_only") || strings.Contains(summary, "unrelated") || strings.Contains(summary, "unresolved-sentinel") || strings.Contains(summary, "invented-edit-sentinel") {
 		t.Fatalf("unexpected test-creation evidence: %s", summary)
+	}
+}
+
+func TestLoadEvidenceSummaryRejectsLegacyUnresolvedAndMalformedTestCreationRecommendations(t *testing.T) {
+	unresolved := strictTestCreationRecommendation()
+	unresolved["id"] = "unresolved"
+	unresolved["suggestedTests"] = []string{"unresolved-edit-sentinel"}
+	unresolved["grounding"] = map[string]interface{}{"status": "unresolved", "evidence": []string{}, "unresolvedReasons": []string{"No repository mapping."}}
+	unresolved["suggestedContract"] = map[string]interface{}{"id": "unresolved", "description": "Resolve repository mapping", "selectors": []string{}, "mustNotExistSelectors": []string{}, "textMustExist": []string{}, "textMustNotExist": []string{}, "maskSelectors": []string{}}
+
+	missingGrounding := strictTestCreationRecommendation()
+	missingGrounding["id"] = "missing-grounding"
+	missingGrounding["suggestedTests"] = []string{"missing-grounding-edit-sentinel"}
+	delete(missingGrounding, "grounding")
+
+	missingEvidence := strictTestCreationRecommendation()
+	missingEvidence["id"] = "missing-evidence"
+	missingEvidence["suggestedTests"] = []string{"missing-evidence-edit-sentinel"}
+	missingEvidence["grounding"] = map[string]interface{}{"status": "grounded", "evidence": []string{}, "unresolvedReasons": []string{}}
+
+	unknownField := strictTestCreationRecommendation()
+	unknownField["id"] = "unknown-field"
+	unknownField["inventedScope"] = "src/**"
+
+	validEmpty := strictTestCreationPlan(t, []map[string]interface{}{})
+	trailing := append(append([]byte(nil), validEmpty...), []byte(`
+{"suggestedTests":["trailing-edit-sentinel"]}`)...)
+	cases := []struct {
+		name               string
+		plan               []byte
+		expectNoActionable bool
+	}{
+		{
+			name:               "legacy v1 cannot claim grounded authority",
+			plan:               []byte(`{"schemaVersion":"visual-hive.test-creation-plan.v1","recommendations":[{"id":"legacy","suggestedTests":["legacy-edit-sentinel"]}]}`),
+			expectNoActionable: true,
+		},
+		{
+			name: "relabeled v1 subset is not strict v2",
+			plan: []byte(`{"schemaVersion":"visual-hive.test-creation-plan.v2","recommendations":[{"id":"relabeled","gapId":"testing-layer:2:unknown","source":"testing_layer","kind":"unit_test","priority":"medium","title":"Add unit test evidence for Unit","rationale":[],"suggestedTests":["legacy-edit-sentinel"],"artifacts":[],"grounding":{"status":"grounded","evidence":["legacy"],"unresolvedReasons":[]}}]}`),
+		},
+		{
+			name:               "unresolved v2 has no edit scope",
+			plan:               strictTestCreationPlan(t, []map[string]interface{}{unresolved}),
+			expectNoActionable: true,
+		},
+		{
+			name: "missing grounding is malformed",
+			plan: strictTestCreationPlan(t, []map[string]interface{}{missingGrounding}),
+		},
+		{
+			name: "grounded without evidence is malformed",
+			plan: strictTestCreationPlan(t, []map[string]interface{}{missingEvidence}),
+		},
+		{
+			name: "unknown recommendation field is malformed",
+			plan: strictTestCreationPlan(t, []map[string]interface{}{unknownField}),
+		},
+		{
+			name: "trailing JSON is malformed",
+			plan: trailing,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "verdict.json"), []byte(`{"schemaVersion":"visual-hive.verdict.v1","allContributions":[]}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "test-creation-plan.json"), test.plan, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+				IssueKind: "test_adequacy_gap", Title: "[Visual Hive] Add repository test coverage: Add unit test evidence for Unit",
+			})
+			if err == nil || summary != "" {
+				t.Fatalf("expected no repair scope, got summary=%q err=%v", summary, err)
+			}
+			if test.expectNoActionable && !errors.Is(err, ErrNoActionableEvidence) {
+				t.Fatalf("expected no-actionable-evidence classification, got %v", err)
+			}
+			for _, sentinel := range []string{"legacy-edit-sentinel", "unresolved-edit-sentinel", "missing-grounding-edit-sentinel", "missing-evidence-edit-sentinel", "trailing-edit-sentinel"} {
+				if strings.Contains(summary, sentinel) {
+					t.Fatalf("rejected scope leaked %q: %s", sentinel, summary)
+				}
+			}
+		})
+	}
+}
+
+func strictTestCreationPlan(t *testing.T, recommendations []map[string]interface{}) []byte {
+	t.Helper()
+	summary := map[string]int{
+		"total": len(recommendations), "high": 0, "medium": 0, "low": 0,
+		"fromTestingLayers": 0, "fromCoverageRecommendations": 0, "fromMutationSurvivors": 0, "fromHandoffWorkItems": 0,
+	}
+	for _, recommendation := range recommendations {
+		if priority, ok := recommendation["priority"].(string); ok {
+			summary[priority]++
+		}
+		switch recommendation["source"] {
+		case "testing_layer":
+			summary["fromTestingLayers"]++
+		case "coverage_recommendation":
+			summary["fromCoverageRecommendations"]++
+		case "mutation_survivor":
+			summary["fromMutationSurvivors"]++
+		case "handoff_work_item":
+			summary["fromHandoffWorkItems"]++
+		}
+	}
+	plan := map[string]interface{}{
+		"schemaVersion": "visual-hive.test-creation-plan.v2",
+		"generatedAt":   "2026-07-14T12:00:00.000Z",
+		"project":       "demo",
+		"sourceArtifacts": map[string]interface{}{
+			"evidencePacket": ".visual-hive/evidence-packet.json",
+		},
+		"governance": map[string]interface{}{
+			"verdictAuthority": "visual_hive", "agentAuthority": "advisory_test_generation_only",
+			"writePolicy": "no_config_or_test_files_written", "secretPolicy": "redacted_values_names_only",
+		},
+		"summary":         summary,
+		"recommendations": recommendations,
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func strictTestCreationRecommendation() map[string]interface{} {
+	return map[string]interface{}{
+		"id":       "layer-2-unit",
+		"gapId":    "testing-layer:2:unknown",
+		"source":   "testing_layer",
+		"kind":     "unit_test",
+		"priority": "medium",
+		"title":    "Add unit test evidence for Unit",
+		"rationale": []string{
+			"No repository unit test was detected.",
+		},
+		"affected":        map[string]interface{}{"route": "/observed"},
+		"currentEvidence": []string{"Artifact: .visual-hive/repo-map.json"},
+		"grounding":       map[string]interface{}{"status": "grounded", "evidence": []string{"repoMap.node:unit"}, "unresolvedReasons": []string{}},
+		"suggestedContract": map[string]interface{}{
+			"id": "unit", "description": "Observed unit contract", "route": "/observed",
+			"selectors": []string{"[data-testid='observed']"}, "mustNotExistSelectors": []string{},
+			"textMustExist": []string{}, "textMustNotExist": []string{}, "maskSelectors": []string{},
+		},
+		"suggestedMutation": "not_applicable",
+		"validationCommand": "go test ./...",
+		"hiveOwner":         "tester",
+		"layer":             map[string]interface{}{"id": 2, "name": "Unit", "status": "unknown"},
+		"suggestedTests":    []string{"Add focused tests for non-visual behavior."},
+		"artifacts":         []string{".visual-hive/repo-map.json"},
+		"trustedOnly":       false,
+		"applyMode":         "advisory_no_write",
 	}
 }
