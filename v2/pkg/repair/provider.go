@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -68,8 +66,11 @@ func sanitizeProviderRunError(err error) error {
 // unsupported because Hive cannot seal the eventual executable across Health
 // and Run. Prefix is limited to native Codex options.
 type CodexProvider struct {
-	Command string
-	Prefix  []string
+	Command   string
+	Prefix    []string
+	CodexHome string
+
+	runtimeEnvironment []string
 }
 
 // Codex can gain tool surfaces independently of the shell sandbox. Keep this
@@ -131,25 +132,45 @@ var codexDisabledToolFeatures = []string{
 func (p CodexProvider) Name() string { return "codex" }
 
 func (p CodexProvider) Health(ctx context.Context) error {
-	if strings.TrimSpace(p.Command) == "" {
-		return fmt.Errorf("Codex provider command is required")
+	attestation, err := p.healthAttestation(ctx)
+	if err != nil {
+		// A failed no-model check must never leave an older authorization for
+		// this provider configuration runnable. The specialist child path uses
+		// an exact per-request authorization ID; this also keeps the legacy
+		// Provider interface fail-closed when callers perform health-only probes.
+		forgetCodexProviderAttestation(p)
+		return err
 	}
-	// A failed or interrupted Health call must never leave an older executable
-	// identity authorized for Run.
-	forgetCodexProviderAttestation(p)
+	rememberCodexProviderAttestation(p, attestation)
+	return nil
+}
+
+// healthAttestation performs every no-model check and returns one exact,
+// unshared authorization. Callers either enqueue it for the legacy Provider
+// API or bind it directly to one child-dispatch reservation.
+func (p CodexProvider) healthAttestation(ctx context.Context) (*codexProviderIdentityAttestation, error) {
+	if strings.TrimSpace(p.Command) == "" {
+		return nil, fmt.Errorf("Codex provider command is required")
+	}
 	attestation, err := prepareCodexProviderAttestation(p)
 	if err != nil {
-		return fmt.Errorf("Codex executable identity health check failed before model accounting: %w", err)
+		return nil, fmt.Errorf("Codex executable identity health check failed before model accounting: %w", err)
 	}
 	defer attestation.cleanupSeal()
+	privateRuntime, err := prepareCodexPrivateRuntime(attestation, p.Command, "")
+	if err != nil {
+		return nil, fmt.Errorf("prepare private Codex health runtime: %w", err)
+	}
+	defer privateRuntime.cleanup()
 	securedProvider := attestation.provider()
+	securedProvider.runtimeEnvironment = privateRuntime.environment
 	isolatedCWD, err := os.MkdirTemp("", "hive-codex-provider-health-")
 	if err != nil {
-		return fmt.Errorf("create isolated Codex health directory: %w", err)
+		return nil, fmt.Errorf("create isolated Codex health directory: %w", err)
 	}
 	defer os.RemoveAll(isolatedCWD)
 	if err := securedProvider.verifyReviewedCapabilities(ctx, isolatedCWD); err != nil {
-		return fmt.Errorf("Codex capability health check failed before model accounting: %w", err)
+		return nil, fmt.Errorf("Codex capability health check failed before model accounting: %w", err)
 	}
 	// Parse and resolve every mandatory security option without starting a
 	// model. `exec --help` is insufficient because Codex exits before validating
@@ -158,14 +179,14 @@ func (p CodexProvider) Health(ctx context.Context) error {
 	// resolved and then stops execution before a model request.
 	preflightStop, err := os.MkdirTemp("", "hive-codex-preflight-schema-")
 	if err != nil {
-		return fmt.Errorf("create Codex tool-isolation preflight stop: %w", err)
+		return nil, fmt.Errorf("create Codex tool-isolation preflight stop: %w", err)
 	}
 	defer os.Remove(preflightStop)
 	preflightArgs := securedProvider.securedExecArgs(isolatedCWD, "")
 	preflightArgs = append(preflightArgs, "--output-schema", preflightStop, "Hive security-option parse preflight; this prompt must never run.")
 	preflight := exec.CommandContext(ctx, securedProvider.Command, preflightArgs...)
 	preflight.Dir = isolatedCWD
-	preflight.Env = providerEnvironment()
+	preflight.Env = securedProvider.commandEnvironment()
 	preflight.Stdin = strings.NewReader("")
 	var preflightOutput limitedBuffer
 	preflight.Stdout, preflight.Stderr = &preflightOutput, &preflightOutput
@@ -175,31 +196,33 @@ func (p CodexProvider) Health(ctx context.Context) error {
 		if preflightErr == nil {
 			preflightErr = fmt.Errorf("Codex unexpectedly passed the intentional pre-model stop")
 		}
-		return fmt.Errorf("Codex tool-isolation preflight failed; install the packaged Codex version that supports every mandatory --disable, --ignore-user-config, --ignore-rules, --config, and --strict-config option: %w: %s", preflightErr, safeExcerpt(preflightText))
+		return nil, fmt.Errorf("Codex tool-isolation preflight failed; install the packaged Codex version that supports every mandatory --disable, --ignore-user-config, --ignore-rules, --config, and --strict-config option: %w: %s", preflightErr, safeExcerpt(preflightText))
 	}
 	// Keep the deterministic no-model runtime and containment checks before the
 	// operator-specific login check. This lets release CI prove the exact native
 	// artifact and active platform sandbox without storing model credentials,
 	// while Health still refuses to authorize Run until login succeeds.
-	if err := verifyCodexPlatformContainment(ctx, securedProvider.Command); err != nil {
-		return fmt.Errorf("Codex no-model platform containment health check failed before model accounting: %w", err)
+	if err := verifyCodexPlatformContainmentWithEnvironment(ctx, securedProvider.Command, securedProvider.commandEnvironment()); err != nil {
+		return nil, fmt.Errorf("Codex no-model platform containment health check failed before model accounting: %w", err)
+	}
+	if attestation.Auth.Path == "" && !codexProviderIsTestExecutable(p.Command) {
+		return nil, fmt.Errorf("Codex authentication health check failed: no bounded auth.json is available for a private child runtime")
 	}
 	command := exec.CommandContext(ctx, securedProvider.Command, append(append([]string(nil), securedProvider.Prefix...), "login", "status")...)
 	command.Dir = isolatedCWD
-	command.Env = providerEnvironment()
+	command.Env = securedProvider.commandEnvironment()
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil {
-		return fmt.Errorf("Codex authentication health check failed: %w: %s", err, safeExcerpt(output.String()))
+		return nil, fmt.Errorf("Codex authentication health check failed: %w: %s", err, safeExcerpt(output.String()))
 	}
 	if !strings.Contains(strings.ToLower(output.String()), "logged in") {
-		return fmt.Errorf("Codex authentication health check did not report a logged-in session")
+		return nil, fmt.Errorf("Codex authentication health check did not report a logged-in session")
 	}
 	if err := attestation.revalidate(ctx); err != nil {
-		return fmt.Errorf("Codex executable identity changed during Health: %w", err)
+		return nil, fmt.Errorf("Codex executable identity changed during Health: %w", err)
 	}
-	rememberCodexProviderAttestation(p, attestation.authorizationCopy())
-	return nil
+	return attestation.authorizationCopy(), nil
 }
 
 func (p CodexProvider) Run(ctx context.Context, _ string, prompt string) (ProviderResult, error) {
@@ -218,83 +241,11 @@ func (p CodexProvider) runAttested(ctx context.Context, prompt string, structure
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
-	if err := attestation.revalidateSource(ctx); err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("Codex executable identity pre-launch check failed: %w", err)}
-	}
-	sealedAttestation, err := attestation.sealForRun()
-	if err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("seal Codex executable for model invocation: %w", err)}
-	}
-	defer sealedAttestation.cleanupSeal()
-	securedProvider := sealedAttestation.provider()
-	// Codex has no reason to enter the target checkout: trusted Hive already
-	// supplied the bounded source context and every surfaced model tool is
-	// contained by the no-files permission profile. A
-	// neutral directory also prevents target-owned AGENTS.md and .codex config
-	// layers from influencing the request before the model starts.
-	isolatedCWD, err := os.MkdirTemp("", "hive-codex-provider-run-")
-	if err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("create isolated Codex run directory: %w", err)}
-	}
-	defer os.RemoveAll(isolatedCWD)
-	sandboxAlias, err := createCodexLinuxSandboxAlias(securedProvider.Command, isolatedCWD)
+	process, err := startCodexAttestedProcess(ctx, p, attestation, prompt, structured, "")
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
-	args := securedProvider.securedExecArgsInternal(isolatedCWD, "-", !structured)
-	if structured || sandboxAlias != "" {
-		// Linux exposes only this Hive-owned directory so the sandbox can execute
-		// the hard-linked alias of the sealed provider without reading CODEX_HOME.
-		// Structured release gates also surface one shell tool after all production
-		// disables to prove the profile denies real read/write/network calls.
-		filesystemProfile := `permissions.hive_repair_no_files.filesystem={":minimal"="read",` + strconv.Quote(filepath.ToSlash(isolatedCWD)) + `="read"`
-		if sandboxAlias != "" {
-			filesystemProfile += `,` + strconv.Quote(filepath.ToSlash(filepath.Dir(securedProvider.Command))) + `="read"`
-		}
-		filesystemProfile += `}`
-		terminalArgument := args[len(args)-1]
-		args = append(args[:len(args)-1], "--config", filesystemProfile)
-		if structured {
-			args = append(args, "--json")
-		}
-		args = append(args, terminalArgument)
-	}
-	command := exec.CommandContext(ctx, securedProvider.Command, args...)
-	command.Dir = isolatedCWD
-	command.Env = providerEnvironment()
-	if sandboxAlias != "" {
-		command.Env = prependProviderExecutablePath(command.Env, isolatedCWD)
-	}
-	command.Stdin = strings.NewReader(prompt)
-	var stdout providerOutputBuffer
-	var stderr limitedBuffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	// Revalidate after constructing every launch input and immediately before
-	// Start. The launched path is the Hive-owned sealed copy for standalone
-	// binaries, narrowing the remaining platform exec race to that protected
-	// artifact rather than the operator-configurable original.
-	if err := sealedAttestation.revalidate(ctx); err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("Codex executable identity changed immediately before launch: %w", err)}
-	}
-	if err := command.Start(); err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("start Codex repair run: %w", err)}
-	}
-	if err := command.Wait(); err != nil {
-		if rule, confidence := classifyRepairSourceSecret([]byte(stdout.String() + "\n" + stderr.String())); confidence != repairSourceSecretNone {
-			return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("Codex repair run emitted unsafe output matching %s rule %s", repairSourceSecretRulesetVersion, rule)}
-		}
-		output := safeProviderOutput(stdout.String())
-		return ProviderResult{Summary: safeExcerpt(output), Output: output}, &ProviderRunError{
-			Launched: true,
-			Cause:    fmt.Errorf("Codex repair run failed: %w: %s", err, safeExcerpt(stderr.String())),
-		}
-	}
-	if rule, confidence := classifyRepairSourceSecret([]byte(stdout.String())); confidence != repairSourceSecretNone {
-		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("Codex repair run emitted unsafe output matching %s rule %s", repairSourceSecretRulesetVersion, rule)}
-	}
-	output := safeProviderOutput(stdout.String())
-	return ProviderResult{Summary: safeExcerpt(output), Output: output}, nil
+	return process.WaitProvider()
 }
 
 func (p CodexProvider) securedExecArgs(worktree, terminalArgument string) []string {

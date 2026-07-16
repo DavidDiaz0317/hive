@@ -88,8 +88,8 @@ func TestGovernedQualityPromptPreservesMutationEvidenceAcrossMailboxReplay(t *te
 		Policies: config.PoliciesConfig{LocalDir: policyRoot},
 	}, logger)
 	if err := s.SetGovernedProposalExecutorProfile(scheduler.GovernedProposalExecutorProfile{
-		SchemaVersion: agent.SpecialistExecutorProfileSchema, Backend: agent.SpecialistExecutorBackendCodex,
-		Model: "proof-v1-codex", ConfigSHA256: strings.Repeat("9", 64), ContainmentProfile: agent.SpecialistExecutorContainmentProfileV1,
+		Backend: agent.SpecialistExecutorBackendCodex, ProviderSHA256: strings.Repeat("8", 64),
+		Model: "proof-v1-codex", ConfigurationSHA256: strings.Repeat("9", 64), ContainmentProfile: agent.SpecialistExecutorContainmentProfileV1,
 	}); err != nil {
 		t.Fatal(err)
 	}

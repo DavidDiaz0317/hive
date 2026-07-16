@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -31,12 +32,14 @@ var (
 )
 
 // SpecialistDispatcher is the narrow boundary between repair orchestration and
-// Hive's existing persistent specialist manager. *agent.Manager implements it.
+// the ordinary Hive Manager's contained-child or legacy specialist seams.
+// *agent.Manager implements it without exposing process/pane internals.
 type SpecialistDispatcher interface {
 	CheckSpecialistRole(context.Context, agent.SpecialistRole) (agent.SpecialistSessionIdentity, error)
 	InspectSpecialistRole(context.Context, agent.SpecialistRole) (agent.SpecialistSessionIdentity, error)
 	DispatchSpecialistTask(context.Context, agent.SpecialistDispatchRequest) (agent.SpecialistDispatchResult, error)
 	ObserveSpecialistTaskResponse(context.Context, agent.SpecialistTaskResponseRequest) (agent.SpecialistTaskResponse, error)
+	VerifySpecialistTaskCompletion(context.Context, agent.SpecialistTaskCompletionVerificationRequest) (agent.SpecialistTaskResponse, error)
 	ReleaseSpecialistTask(agent.SpecialistRole, string) error
 }
 
@@ -56,8 +59,8 @@ type specialistModelResult struct {
 }
 
 // SpecialistProviderConfig contains only controller-verified identity and
-// policy. The model prompt and exact checkout tree are added by Run so every
-// immutable work order is bound to what the repair Worker actually supplied.
+// policy. Run binds each immutable work order to the Worker's exact base/tree
+// identities and controller-supplied sealed source-context task prompt.
 type SpecialistProviderConfig struct {
 	Dispatcher            SpecialistDispatcher
 	Mailbox               *agent.SpecialistMailbox
@@ -68,6 +71,8 @@ type SpecialistProviderConfig struct {
 	ExpectedBaseSHA       string
 	ExpectedBaseTreeSHA   string
 	Evidence              agent.SpecialistEvidenceIdentity
+	WorkOrderKind         string
+	ExecutorProfile       *agent.SpecialistProposalExecutorProfile
 	Specialist            agent.SpecialistRole
 	RouteReason           string
 	AllowedPaths          []string
@@ -78,9 +83,9 @@ type SpecialistProviderConfig struct {
 	Now                   func() time.Time
 }
 
-// SpecialistProvider hands a bounded repair proposal to one of Hive's existing
-// persistent specialists. It never gives that specialist Git, GitHub, baseline,
-// lifecycle, or deterministic-verdict authority.
+// SpecialistProvider brokers a bounded repair proposal through the ordinary
+// Manager. It never grants Git, GitHub, baseline, lifecycle, or deterministic-
+// verdict authority to the proposal executor.
 type SpecialistProvider struct {
 	config SpecialistProviderConfig
 }
@@ -131,6 +136,18 @@ func NewSpecialistProvider(config SpecialistProviderConfig) (*SpecialistProvider
 	}
 	config.ExpectedBaseSHA = strings.ToLower(strings.TrimSpace(config.ExpectedBaseSHA))
 	config.ExpectedBaseTreeSHA = strings.ToLower(strings.TrimSpace(config.ExpectedBaseTreeSHA))
+	if config.WorkOrderKind != "" && config.WorkOrderKind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return nil, fmt.Errorf("unsupported specialist work-order kind %q", config.WorkOrderKind)
+	}
+	if config.WorkOrderKind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		if err := validateConfiguredSpecialistExecutorProfile(config.ExecutorProfile); err != nil {
+			return nil, err
+		}
+	}
+	if config.ExecutorProfile != nil {
+		profile := *config.ExecutorProfile
+		config.ExecutorProfile = &profile
+	}
 	config.AllowedPaths = append([]string(nil), config.AllowedPaths...)
 	config.Validation = append([]string(nil), config.Validation...)
 	return &SpecialistProvider{config: config}, nil
@@ -195,7 +212,11 @@ func (p *SpecialistProvider) prepareInvocation(ctx context.Context, worktree, pr
 
 func (p *SpecialistProvider) workOrderRequest(baseSHA, baseTreeSHA, prompt string) agent.SpecialistWorkOrderRequest {
 	promptDigest := sha256.Sum256([]byte(prompt))
+	executorProfile := cloneSpecialistExecutorProfile(p.config.ExecutorProfile)
 	return agent.SpecialistWorkOrderRequest{
+		Kind:                  p.config.WorkOrderKind,
+		ExecutorProfile:       executorProfile,
+		ExecutorProfileSHA256: specialistExecutorProfileSHA256(executorProfile),
 		Repository:            p.config.Repository,
 		RepositoryFingerprint: p.config.RepositoryFingerprint,
 		RecurrenceKey:         p.config.RecurrenceKey,
@@ -225,6 +246,21 @@ func (p *SpecialistProvider) recoverPreparedInvocation(ctx context.Context, work
 }
 
 func (p *SpecialistProvider) runPreparedInvocationMode(ctx context.Context, worktree, workOrderID string, recovering bool) (ProviderResult, error) {
+	result, runErr := p.runPreparedInvocationUnchecked(ctx, worktree, workOrderID, recovering)
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, _, verifyErr := p.checkoutIdentity(verifyCtx, worktree); verifyErr != nil {
+		launched := runErr == nil || providerRunWasLaunched(runErr)
+		cause := fmt.Errorf("specialist execution changed or invalidated the Worker-owned exact model base: %w", verifyErr)
+		if runErr != nil {
+			cause = errors.Join(runErr, cause)
+		}
+		return ProviderResult{}, &ProviderRunError{Launched: launched, Cause: cause}
+	}
+	return result, runErr
+}
+
+func (p *SpecialistProvider) runPreparedInvocationUnchecked(ctx context.Context, worktree, workOrderID string, recovering bool) (ProviderResult, error) {
 	if p == nil || p.config.Dispatcher == nil || p.config.Mailbox == nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: errors.New("specialist provider is not configured")}
 	}
@@ -247,11 +283,26 @@ func (p *SpecialistProvider) runPreparedInvocationMode(ctx context.Context, work
 	if err := validate(order, request); err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("validate recovered specialist work order: %w", err)}
 	}
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		paths, pathErr := p.config.Mailbox.Paths(order.ID)
+		if pathErr != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: pathErr}
+		}
+		if err := rejectGovernedLegacySpecialistFiles(paths); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
+		}
+	}
 
 	// Crash-safe replay consumes a fully verified completion before touching the
 	// persistent agent. This is the core no-duplicate dispatch guarantee.
-	_, receipt, diff, completionErr := p.config.Mailbox.LoadCompletion(order)
+	completedLease, receipt, diff, completionErr := p.config.Mailbox.LoadCompletion(order)
 	if completionErr == nil {
+		if err := p.verifyGovernedCompletion(order, completedLease, receipt, diff); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("verify governed completion replay: %w", err)}
+		}
+		if err := p.finalizeGovernedReplay(order); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
+		}
 		return p.resultFromCompletion(order, receipt, diff, true)
 	}
 	if !errors.Is(completionErr, os.ErrNotExist) && !errors.Is(completionErr, agent.ErrSpecialistReceiptPending) {
@@ -275,19 +326,32 @@ func (p *SpecialistProvider) dispatchPreparedOrder(ctx context.Context, order ag
 	if err := validateSpecialistSession(identity, p.config.Specialist); err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
+	if err := validateSpecialistOrderExecutorProfile(order, identity); err != nil {
+		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
+	}
 	paths, err := p.config.Mailbox.Paths(order.ID)
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
-	if err := requirePathWithinSpecialistWorkDir(identity.WorkDir, paths.OrderDirectory); err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
+	if identity.ContainmentProfile == "" {
+		if err := requirePathWithinSpecialistWorkDir(identity.WorkDir, paths.OrderDirectory); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
+		}
+	} else if identity.ContainmentProfile != agent.SpecialistContainmentProfileV1 {
+		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: errors.New("unsupported specialist containment profile")}
 	}
 
 	lease, err := p.config.Mailbox.AcquireLease(order, p.config.LeaseOwner, identity.SessionID, order.Deadline)
 	if errors.Is(err, agent.ErrSpecialistOrderComplete) {
-		_, receipt, diff, loadErr := p.config.Mailbox.LoadCompletion(order)
+		completedLease, receipt, diff, loadErr := p.config.Mailbox.LoadCompletion(order)
 		if loadErr != nil {
 			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("load concurrently completed specialist order: %w", loadErr)}
+		}
+		if err := p.verifyGovernedCompletion(order, completedLease, receipt, diff); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("verify concurrently completed governed order: %w", err)}
+		}
+		if err := p.finalizeGovernedReplay(order); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 		}
 		return p.resultFromCompletion(order, receipt, diff, true)
 	}
@@ -303,9 +367,12 @@ func (p *SpecialistProvider) dispatchPreparedOrder(ctx context.Context, order ag
 	}
 
 	dispatchResult, err := p.config.Dispatcher.DispatchSpecialistTask(ctx, agent.SpecialistDispatchRequest{
-		TaskID:     order.ID,
-		Specialist: order.Specialist,
-		Message:    message,
+		TaskID: order.ID, Specialist: order.Specialist, Message: message,
+		Order: order, Lease: lease, RequestSHA256: order.RequestSHA256,
+		SessionID: identity.SessionID, AgentName: identity.AgentName, AgentID: identity.AgentID,
+		ConfiguredBackend: configuredSpecialistBackend(identity), ProviderSHA256: identity.ProviderSHA256,
+		ExecutorBackend: identity.ExecutorBackend, BackendParityClaimed: identity.BackendParityClaimed, ContainmentProfile: identity.ContainmentProfile,
+		ExecutorModel: identity.ExecutorModel, ExecutorConfigSHA256: identity.ExecutorConfigSHA256, ExecutorAuthorizationID: identity.ExecutorAuthorizationID,
 	})
 	if err != nil {
 		if errors.Is(err, agent.ErrSpecialistTaskNotDelivered) {
@@ -318,11 +385,11 @@ func (p *SpecialistProvider) dispatchPreparedOrder(ctx context.Context, order ag
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("dispatch specialist work order returned an unclassified delivery error: %w", err)}
 	}
 	if err := validateSpecialistSession(dispatchResult.SpecialistSessionIdentity, order.Specialist); err != nil {
-		releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused)
+		releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused, false)
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: errors.Join(err, releaseErr)}
 	}
 	if dispatchResult.SessionID != lease.SessionID || !sameSpecialistSession(identity, dispatchResult.SpecialistSessionIdentity) {
-		releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused)
+		releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused, false)
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: errors.Join(errors.New("dispatched specialist session does not match the durable work order lease"), releaseErr)}
 	}
 
@@ -335,7 +402,10 @@ func (p *SpecialistProvider) dispatchPreparedOrder(ctx context.Context, order ag
 		}
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("wait for specialist receipt: %w", waitErr)}
 	}
-	releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused)
+	if err := p.verifyGovernedCompletion(order, lease, receipt, diff); err != nil {
+		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
+	}
+	releaseErr := releaseDispatchedSpecialist(p.config.Dispatcher, order, dispatchResult.Reused, true)
 	if releaseErr != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: releaseErr}
 	}
@@ -350,12 +420,19 @@ func (p *SpecialistProvider) resumeLeasedOrder(ctx context.Context, order agent.
 	if err := validateSpecialistSession(identity, order.Specialist); err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
 	}
+	if err := validateSpecialistOrderExecutorProfile(order, identity); err != nil {
+		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
+	}
 	paths, err := p.config.Mailbox.Paths(order.ID)
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
 	}
-	if err := requirePathWithinSpecialistWorkDir(identity.WorkDir, paths.OrderDirectory); err != nil {
-		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
+	if identity.ContainmentProfile == "" {
+		if err := requirePathWithinSpecialistWorkDir(identity.WorkDir, paths.OrderDirectory); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
+		}
+	} else if identity.ContainmentProfile != agent.SpecialistContainmentProfileV1 {
+		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: errors.New("unsupported specialist containment profile")}
 	}
 	if identity.SessionID != lease.SessionID {
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: errors.New("live specialist lease does not match the exact inspected session")}
@@ -367,6 +444,9 @@ func (p *SpecialistProvider) resumeLeasedOrder(ctx context.Context, order agent.
 	if !p.config.Now().UTC().Before(lease.Deadline) {
 		receipt, diff, observeErr := p.observeSpecialistCompletion(order, lease, paths, message, identity.ProviderSHA256)
 		if observeErr == nil {
+			if err := p.verifyGovernedCompletion(order, lease, receipt, diff); err != nil {
+				return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
+			}
 			if releaseErr := p.config.Dispatcher.ReleaseSpecialistTask(order.Specialist, order.ID); releaseErr != nil && !errors.Is(releaseErr, agent.ErrSpecialistTaskLeaseAbsent) {
 				return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("release recovered specialist task: %w", releaseErr)}
 			}
@@ -385,6 +465,9 @@ func (p *SpecialistProvider) resumeLeasedOrder(ctx context.Context, order agent.
 			return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("%w: %s until %s", ErrSpecialistWorkPending, order.ID, lease.Deadline.Format(time.RFC3339Nano))}
 		}
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("recover leased specialist receipt: %w", waitErr)}
+	}
+	if err := p.verifyGovernedCompletion(order, lease, receipt, diff); err != nil {
+		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: err}
 	}
 	if releaseErr := p.config.Dispatcher.ReleaseSpecialistTask(order.Specialist, order.ID); releaseErr != nil && !errors.Is(releaseErr, agent.ErrSpecialistTaskLeaseAbsent) {
 		return ProviderResult{}, &ProviderRunError{Launched: true, Cause: fmt.Errorf("release recovered specialist task: %w", releaseErr)}
@@ -446,12 +529,80 @@ func (p *SpecialistProvider) resultFromCompletion(order agent.SpecialistWorkOrde
 	}
 }
 
+func (p *SpecialistProvider) verifyGovernedCompletion(order agent.SpecialistWorkOrder, lease agent.SpecialistLease, receipt agent.SpecialistReceipt, diff []byte) error {
+	if order.Kind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return nil
+	}
+	if receipt.ContainedChild == nil {
+		return errors.New("governed completion has no contained-child provenance")
+	}
+	message, err := specialistDispatchMessage(order, lease)
+	if err != nil {
+		return err
+	}
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	response, err := p.config.Dispatcher.VerifySpecialistTaskCompletion(verifyCtx, agent.SpecialistTaskCompletionVerificationRequest{
+		TaskID: order.ID, Specialist: order.Specialist, RequestSHA256: order.RequestSHA256,
+		SessionID: lease.SessionID, Message: message, Provenance: *receipt.ContainedChild,
+	})
+	if err != nil {
+		return fmt.Errorf("Manager-owned child evidence verification failed: %w", err)
+	}
+	if err := validateSpecialistTaskResponse(response, order, lease, message, order.ExecutorProfile.ProviderSHA256); err != nil {
+		return fmt.Errorf("verified child response identity is invalid: %w", err)
+	}
+	modelResult, responseDiff, err := parseSpecialistModelResult(response.Response, order, lease)
+	if err != nil {
+		return fmt.Errorf("verified child response content is invalid: %w", err)
+	}
+	expected, err := agent.NewGovernedSpecialistReceipt(order, lease, modelResult.Status, responseDiff, modelResult.Summary, response.CompletedAt, agent.SpecialistContainedChildProvenance{
+		ExecutorProfile: *order.ExecutorProfile, AuthorizationSHA256: response.AuthorizationSHA256,
+		SessionID: response.SessionID, TurnID: response.TurnID, DispatchSHA256: response.DispatchSHA256,
+		ResponseSHA256: response.ResponseSHA256, IntentSHA256: response.IntentSHA256,
+		StartedSHA256: response.StartedSHA256, CompletionSpoolSHA256: response.CompletionSpoolSHA256,
+	})
+	if err != nil {
+		return fmt.Errorf("reconstruct governed receipt from verified child: %w", err)
+	}
+	expectedJSON, expectedErr := json.Marshal(expected)
+	actualJSON, actualErr := json.Marshal(receipt)
+	if expectedErr != nil || actualErr != nil || !bytes.Equal(expectedJSON, actualJSON) || !bytes.Equal(responseDiff, diff) {
+		return errors.New("governed mailbox receipt or proposal does not match the exact verified child response")
+	}
+	return nil
+}
+
+func (p *SpecialistProvider) finalizeGovernedReplay(order agent.SpecialistWorkOrder) error {
+	if order.Kind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return nil
+	}
+	if err := p.config.Dispatcher.ReleaseSpecialistTask(order.Specialist, order.ID); err != nil && !errors.Is(err, agent.ErrSpecialistTaskLeaseAbsent) {
+		return fmt.Errorf("finalize verified governed child replay: %w", err)
+	}
+	return nil
+}
+
 func validateSpecialistSession(identity agent.SpecialistSessionIdentity, role agent.SpecialistRole) error {
 	if identity.Specialist != role {
 		return fmt.Errorf("specialist session role mismatch: expected %s, got %s", role, identity.Specialist)
 	}
 	if strings.TrimSpace(identity.AgentName) == "" || strings.TrimSpace(identity.AgentID) == "" || strings.TrimSpace(identity.Backend) == "" || strings.TrimSpace(identity.SessionID) == "" || strings.TrimSpace(identity.WorkDir) == "" {
 		return errors.New("specialist session identity is incomplete")
+	}
+	if identity.ContainmentProfile != "" {
+		if identity.ContainmentProfile != agent.SpecialistContainmentProfileV1 || !strings.EqualFold(identity.ExecutorBackend, "codex") {
+			return errors.New("specialist child session is not using reviewed Codex containment profile v1")
+		}
+		if strings.TrimSpace(identity.ExecutorModel) == "" || len(strings.TrimSpace(identity.ExecutorConfigSHA256)) != 64 || strings.TrimSpace(identity.ExecutorAuthorizationID) == "" {
+			return errors.New("specialist child logical executor identity is incomplete")
+		}
+		if identity.BackendParityClaimed {
+			return errors.New("specialist child must not claim parity with the configured persistent backend")
+		}
+		if identity.TmuxSession != "" || identity.TmuxSocket != "" {
+			return errors.New("ephemeral specialist child must not have a tmux identity")
+		}
 	}
 	providerSHA256 := strings.ToLower(strings.TrimSpace(identity.ProviderSHA256))
 	if len(providerSHA256) != 64 {
@@ -483,11 +634,74 @@ func sameSpecialistSession(expected, actual agent.SpecialistSessionIdentity) boo
 		expected.AgentName == actual.AgentName &&
 		expected.AgentID == actual.AgentID &&
 		expected.Backend == actual.Backend &&
+		expected.ConfiguredBackend == actual.ConfiguredBackend &&
+		expected.ExecutorBackend == actual.ExecutorBackend &&
+		expected.BackendParityClaimed == actual.BackendParityClaimed &&
+		expected.ContainmentProfile == actual.ContainmentProfile &&
+		expected.ExecutorModel == actual.ExecutorModel &&
+		expected.ExecutorConfigSHA256 == actual.ExecutorConfigSHA256 &&
+		expected.ExecutorAuthorizationID == actual.ExecutorAuthorizationID &&
 		expected.SessionID == actual.SessionID &&
 		expected.TmuxSession == actual.TmuxSession &&
 		expected.TmuxSocket == actual.TmuxSocket &&
 		expected.ProviderSHA256 == actual.ProviderSHA256 &&
 		filepath.Clean(expected.WorkDir) == filepath.Clean(actual.WorkDir)
+}
+
+func configuredSpecialistBackend(identity agent.SpecialistSessionIdentity) string {
+	configured := strings.ToLower(strings.TrimSpace(identity.ConfiguredBackend))
+	if configured == "" {
+		configured = strings.ToLower(strings.TrimSpace(identity.Backend))
+	}
+	return configured
+}
+
+func cloneSpecialistExecutorProfile(profile *agent.SpecialistProposalExecutorProfile) *agent.SpecialistProposalExecutorProfile {
+	if profile == nil {
+		return nil
+	}
+	copy := *profile
+	return &copy
+}
+
+func specialistExecutorProfileSHA256(profile *agent.SpecialistProposalExecutorProfile) string {
+	if profile == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(profile)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func validateConfiguredSpecialistExecutorProfile(profile *agent.SpecialistProposalExecutorProfile) error {
+	if profile == nil || !strings.EqualFold(strings.TrimSpace(profile.Backend), "codex") || profile.BackendParityClaimed ||
+		profile.ContainmentProfile != agent.SpecialistContainmentProfileV1 || !recoveryDigestPattern.MatchString(strings.ToLower(strings.TrimSpace(profile.ProviderSHA256))) ||
+		!recoveryDigestPattern.MatchString(strings.ToLower(strings.TrimSpace(profile.ConfigurationSHA256))) || strings.TrimSpace(profile.Model) == "" {
+		return errors.New("governed specialist order requires a full separate Codex executor profile v1 without backend parity")
+	}
+	return nil
+}
+
+func validateSpecialistOrderExecutorProfile(order agent.SpecialistWorkOrder, identity agent.SpecialistSessionIdentity) error {
+	if order.Kind == "" {
+		return nil
+	}
+	if order.Kind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return fmt.Errorf("unsupported specialist work-order kind %q", order.Kind)
+	}
+	profile := order.ExecutorProfile
+	if err := validateConfiguredSpecialistExecutorProfile(profile); err != nil {
+		return err
+	}
+	if !strings.EqualFold(profile.ProviderSHA256, identity.ProviderSHA256) || profile.Model != identity.ExecutorModel ||
+		!strings.EqualFold(profile.ConfigurationSHA256, identity.ExecutorConfigSHA256) || profile.ContainmentProfile != identity.ContainmentProfile ||
+		!strings.EqualFold(profile.Backend, identity.ExecutorBackend) || identity.BackendParityClaimed {
+		return errors.New("contained specialist session does not match the governed order's exact executor profile")
+	}
+	return nil
 }
 
 func requirePathWithinSpecialistWorkDir(workDir, candidate string) error {
@@ -574,13 +788,19 @@ func (p *SpecialistProvider) observeSpecialistCompletion(order agent.SpecialistW
 		return agent.SpecialistReceipt{}, nil, err
 	}
 
-	// Preserve recovery for a work order delivered by the earlier mailbox-file
-	// transport. New specialists have no model-tool write surface and complete
-	// through the content-bound Codex journal path below.
-	if receipt, diff, found, err := p.observeLegacySpecialistFiles(order, lease, paths); err != nil {
-		return agent.SpecialistReceipt{}, nil, err
-	} else if found {
-		return receipt, diff, nil
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		if err := rejectGovernedLegacySpecialistFiles(paths); err != nil {
+			return agent.SpecialistReceipt{}, nil, err
+		}
+	} else {
+		// Preserve recovery only for an order actually delivered by the earlier
+		// persistent mailbox-file transport. Governed children can never obtain
+		// receipt authority through these files.
+		if receipt, diff, found, err := p.observeLegacySpecialistFiles(order, lease, paths); err != nil {
+			return agent.SpecialistReceipt{}, nil, err
+		} else if found {
+			return receipt, diff, nil
+		}
 	}
 
 	response, err := p.config.Dispatcher.ObserveSpecialistTaskResponse(context.Background(), agent.SpecialistTaskResponseRequest{
@@ -592,11 +812,36 @@ func (p *SpecialistProvider) observeSpecialistCompletion(order agent.SpecialistW
 	if err := validateSpecialistTaskResponse(response, order, lease, message, providerSHA256); err != nil {
 		return agent.SpecialistReceipt{}, nil, err
 	}
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		provenance, err := governedSpecialistProvenance(order, response)
+		if err != nil {
+			return agent.SpecialistReceipt{}, nil, err
+		}
+		verified, err := p.config.Dispatcher.VerifySpecialistTaskCompletion(context.Background(), agent.SpecialistTaskCompletionVerificationRequest{
+			TaskID: order.ID, Specialist: order.Specialist, RequestSHA256: order.RequestSHA256,
+			SessionID: lease.SessionID, Message: message, Provenance: provenance,
+		})
+		if err != nil {
+			return agent.SpecialistReceipt{}, nil, fmt.Errorf("verify governed child before mailbox reconstruction: %w", err)
+		}
+		if verified != response {
+			return agent.SpecialistReceipt{}, nil, errors.New("governed observation differs from exact Manager-owned completion spool")
+		}
+	}
 	result, diff, err := parseSpecialistModelResult(response.Response, order, lease)
 	if err != nil {
 		return agent.SpecialistReceipt{}, nil, err
 	}
-	receipt, err := agent.NewSpecialistReceipt(order, lease, result.Status, diff, result.Summary, response.CompletedAt)
+	var receipt agent.SpecialistReceipt
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		provenance, provenanceErr := governedSpecialistProvenance(order, response)
+		if provenanceErr != nil {
+			return agent.SpecialistReceipt{}, nil, provenanceErr
+		}
+		receipt, err = agent.NewGovernedSpecialistReceipt(order, lease, result.Status, diff, result.Summary, response.CompletedAt, provenance)
+	} else {
+		receipt, err = agent.NewSpecialistReceipt(order, lease, result.Status, diff, result.Summary, response.CompletedAt)
+	}
 	if err != nil {
 		return agent.SpecialistReceipt{}, nil, fmt.Errorf("broker specialist model result: %w", err)
 	}
@@ -604,6 +849,40 @@ func (p *SpecialistProvider) observeSpecialistCompletion(order agent.SpecialistW
 		return agent.SpecialistReceipt{}, nil, fmt.Errorf("persist brokered specialist model result: %w", err)
 	}
 	return p.config.Mailbox.LoadReceipt(order, lease)
+}
+
+func rejectGovernedLegacySpecialistFiles(paths agent.SpecialistMailboxPaths) error {
+	root, err := os.OpenRoot(paths.OrderDirectory)
+	if err != nil {
+		return fmt.Errorf("open governed specialist order directory: %w", err)
+	}
+	defer root.Close()
+	// proposal.diff is not a legacy authority surface here. SubmitReceipt
+	// deliberately persists it before receipt.json, so a crash can leave an
+	// exact broker partial write. The governed path below first verifies the
+	// retained Manager spool and SubmitReceipt then accepts only byte identity.
+	for _, name := range []string{"completion.status", "summary.txt"} {
+		if _, err := root.Lstat(name); err == nil {
+			return fmt.Errorf("governed specialist order rejects legacy completion file %s", name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect governed specialist legacy completion file %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func governedSpecialistProvenance(order agent.SpecialistWorkOrder, response agent.SpecialistTaskResponse) (agent.SpecialistContainedChildProvenance, error) {
+	profile := order.ExecutorProfile
+	if profile == nil {
+		return agent.SpecialistContainedChildProvenance{}, errors.New("governed specialist completion has no immutable executor profile")
+	}
+	return agent.SpecialistContainedChildProvenance{
+		ExecutorProfile: *profile, SessionID: response.SessionID, TurnID: response.TurnID,
+		AuthorizationSHA256: response.AuthorizationSHA256,
+		DispatchSHA256:      response.DispatchSHA256, ResponseSHA256: response.ResponseSHA256,
+		IntentSHA256: response.IntentSHA256, StartedSHA256: response.StartedSHA256,
+		CompletionSpoolSHA256: response.CompletionSpoolSHA256,
+	}, nil
 }
 
 func (p *SpecialistProvider) observeLegacySpecialistFiles(order agent.SpecialistWorkOrder, lease agent.SpecialistLease, paths agent.SpecialistMailboxPaths) (agent.SpecialistReceipt, []byte, bool, error) {
@@ -658,6 +937,15 @@ func validateSpecialistTaskResponse(response agent.SpecialistTaskResponse, order
 		response.ProviderSHA256 != providerSHA256 || response.DispatchSHA256 != hex.EncodeToString(dispatchDigest[:]) || response.ResponseSHA256 != hex.EncodeToString(responseDigest[:]) ||
 		strings.TrimSpace(response.TurnID) == "" || strings.TrimSpace(response.Response) == "" || response.CompletedAt.Location() != time.UTC {
 		return errors.New("specialist task response identity is invalid")
+	}
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		profile := order.ExecutorProfile
+		if profile == nil || !strings.EqualFold(response.ExecutorBackend, profile.Backend) || response.ExecutorModel != profile.Model ||
+			!strings.EqualFold(response.ExecutorConfigSHA256, profile.ConfigurationSHA256) || response.ContainmentProfile != profile.ContainmentProfile ||
+			!recoveryDigestPattern.MatchString(strings.ToLower(response.AuthorizationSHA256)) || !recoveryDigestPattern.MatchString(strings.ToLower(response.IntentSHA256)) || !recoveryDigestPattern.MatchString(strings.ToLower(response.StartedSHA256)) ||
+			!recoveryDigestPattern.MatchString(strings.ToLower(response.CompletionSpoolSHA256)) {
+			return errors.New("governed specialist response lacks exact contained-child transport provenance")
+		}
 	}
 	return nil
 }
@@ -734,13 +1022,13 @@ func readContainedSpecialistFile(root *os.Root, name string, limit int64) ([]byt
 	return value, nil
 }
 
-func releaseDispatchedSpecialist(dispatcher SpecialistDispatcher, order agent.SpecialistWorkOrder, reused bool) error {
-	if reused {
-		// Another waiter already owns this exact in-memory lease. It is
-		// responsible for releasing it after consuming the same receipt.
+func releaseDispatchedSpecialist(dispatcher SpecialistDispatcher, order agent.SpecialistWorkOrder, reused, verified bool) error {
+	if reused && !verified {
+		// A reused but unverified result cannot authorize durable consumption.
 		return nil
 	}
-	if err := dispatcher.ReleaseSpecialistTask(order.Specialist, order.ID); err != nil {
+	if err := dispatcher.ReleaseSpecialistTask(order.Specialist, order.ID); err != nil &&
+		!(verified && order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal && errors.Is(err, agent.ErrSpecialistTaskLeaseAbsent)) {
 		return fmt.Errorf("release specialist task lease: %w", err)
 	}
 	return nil

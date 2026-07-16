@@ -114,19 +114,26 @@ type ProjectContext struct {
 }
 
 type Manager struct {
-	agents            map[string]*AgentProcess
-	idToName          map[string]string
-	specialistLeases  map[string]string
-	specialistsDown   bool
-	specialistsClosed bool
-	mu                sync.RWMutex
-	logger            *slog.Logger
-	workDir           string
-	project           ProjectContext
-	copilotAuthToken  string
-	claudeAuthToken   string
-	uidMap            *UIDMap
-	appAuth           AppTokenMinter
+	agents           map[string]*AgentProcess
+	idToName         map[string]string
+	specialistLeases map[string]string
+	// specialistChildren is the ordinary Manager's proposal-only, ephemeral
+	// child-dispatch state. It is deliberately separate from agents and from
+	// the legacy persistent-specialist lease map: a child can never inherit a
+	// parent's pane, cancel function, reaper identity, or launch generation.
+	specialistChildren      map[SpecialistRole]*specialistChildSession
+	specialistChildExecutor SpecialistChildExecutor
+	specialistChildRoot     string
+	specialistsDown         bool
+	specialistsClosed       bool
+	mu                      sync.RWMutex
+	logger                  *slog.Logger
+	workDir                 string
+	project                 ProjectContext
+	copilotAuthToken        string
+	claudeAuthToken         string
+	uidMap                  *UIDMap
+	appAuth                 AppTokenMinter
 	// specialistProvider is set only by NewSpecialistManager. The ordinary
 	// Manager never consults this sealed executable identity.
 	specialistProvider  *specialistProviderIdentity
@@ -305,15 +312,16 @@ func newManager(agents map[string]config.AgentConfig, logger *slog.Logger, proje
 
 func newManagerWithUIDMap(agents map[string]config.AgentConfig, logger *slog.Logger, project ProjectContext, workDir, copilotToken, claudeToken string, uidMap *UIDMap) *Manager {
 	m := &Manager{
-		agents:           make(map[string]*AgentProcess),
-		idToName:         make(map[string]string),
-		specialistLeases: make(map[string]string),
-		logger:           logger,
-		workDir:          workDir,
-		project:          project,
-		copilotAuthToken: copilotToken,
-		claudeAuthToken:  claudeToken,
-		uidMap:           uidMap,
+		agents:             make(map[string]*AgentProcess),
+		idToName:           make(map[string]string),
+		specialistLeases:   make(map[string]string),
+		specialistChildren: make(map[SpecialistRole]*specialistChildSession),
+		logger:             logger,
+		workDir:            workDir,
+		project:            project,
+		copilotAuthToken:   copilotToken,
+		claudeAuthToken:    claudeToken,
+		uidMap:             uidMap,
 	}
 
 	for name, cfg := range agents {

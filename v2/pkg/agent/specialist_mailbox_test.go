@@ -960,14 +960,14 @@ func testGovernedSpecialistRequest(now time.Time, externalRef string, deadline t
 	request.ToolPolicySHA256 = strings.Repeat("5", 64)
 	request.CapabilitySHA256 = strings.Repeat("6", 64)
 	request.ExecutorProfile = &SpecialistExecutorProfile{
-		SchemaVersion: SpecialistExecutorProfileSchema, Backend: SpecialistExecutorBackendCodex,
-		Model: "proof-model-v1", ConfigSHA256: strings.Repeat("8", 64),
-		ContainmentProfile: SpecialistExecutorContainmentProfileV1,
+		Backend: SpecialistExecutorBackendCodex, ProviderSHA256: strings.Repeat("7", 64),
+		Model: "proof-model-v1", ConfigurationSHA256: strings.Repeat("8", 64),
+		ContainmentProfile: SpecialistExecutorContainmentProfileV1, BackendParityClaimed: false,
 	}
 	request.ExecutorProfileSHA256 = specialistExecutorProfileDigest(*request.ExecutorProfile)
 	request.RoleConfigSnapshot = &SpecialistRoleConfigSnapshot{
 		SchemaVersion: SpecialistRoleConfigSnapshotSchema, Backend: "copilot", Model: "normal-role-model", Mode: "ADVISORY",
-		LaunchCmdPresent: true, LaunchCmdSHA256: strings.Repeat("9", 64), CavemanMode: "full", IncludeRepositories: true,
+		LaunchCmdPresent: true, LaunchCmdSHA256: strings.Repeat("9", 64), IncludeRepositories: true,
 		ToolRulesSHA256: strings.Repeat("a", 64), ConnectionsSHA256: strings.Repeat("b", 64), ConnectionCount: 1,
 		FullConfigSHA256: request.ToolPolicySHA256,
 	}

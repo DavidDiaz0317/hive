@@ -89,23 +89,44 @@ var (
 // specialist's persistent tmux session. Work orders bind this value into the
 // durable mailbox lease and receipt.
 type SpecialistSessionIdentity struct {
-	Specialist     SpecialistRole `json:"specialist"`
-	AgentName      string         `json:"agent_name"`
-	AgentID        string         `json:"agent_id"`
-	Backend        string         `json:"backend"`
-	SessionID      string         `json:"session_id"`
-	TmuxSession    string         `json:"tmux_session"`
-	TmuxSocket     string         `json:"tmux_socket,omitempty"`
-	WorkDir        string         `json:"work_dir"`
-	ProviderSHA256 string         `json:"provider_sha256"`
+	Specialist              SpecialistRole `json:"specialist"`
+	AgentName               string         `json:"agent_name"`
+	AgentID                 string         `json:"agent_id"`
+	Backend                 string         `json:"backend"`
+	ConfiguredBackend       string         `json:"configured_backend,omitempty"`
+	ExecutorBackend         string         `json:"executor_backend,omitempty"`
+	BackendParityClaimed    bool           `json:"backend_parity_claimed"`
+	ContainmentProfile      string         `json:"containment_profile,omitempty"`
+	ExecutorModel           string         `json:"executor_model,omitempty"`
+	ExecutorConfigSHA256    string         `json:"executor_config_sha256,omitempty"`
+	ExecutorAuthorizationID string         `json:"-"`
+	SessionID               string         `json:"session_id"`
+	TmuxSession             string         `json:"tmux_session"`
+	TmuxSocket              string         `json:"tmux_socket,omitempty"`
+	WorkDir                 string         `json:"work_dir"`
+	ProviderSHA256          string         `json:"provider_sha256"`
 }
 
 // SpecialistDispatchRequest assigns one already-persisted, immutable mailbox
 // work order to the matching existing Hive specialist.
 type SpecialistDispatchRequest struct {
-	TaskID     string         `json:"task_id"`
-	Specialist SpecialistRole `json:"specialist"`
-	Message    string         `json:"message"`
+	TaskID                  string              `json:"task_id"`
+	Specialist              SpecialistRole      `json:"specialist"`
+	Message                 string              `json:"message"`
+	Order                   SpecialistWorkOrder `json:"order,omitempty"`
+	Lease                   SpecialistLease     `json:"lease,omitempty"`
+	RequestSHA256           string              `json:"request_sha256,omitempty"`
+	SessionID               string              `json:"session_id,omitempty"`
+	AgentName               string              `json:"agent_name,omitempty"`
+	AgentID                 string              `json:"agent_id,omitempty"`
+	ConfiguredBackend       string              `json:"configured_backend,omitempty"`
+	ExecutorBackend         string              `json:"executor_backend,omitempty"`
+	BackendParityClaimed    bool                `json:"backend_parity_claimed"`
+	ContainmentProfile      string              `json:"containment_profile,omitempty"`
+	ProviderSHA256          string              `json:"provider_sha256,omitempty"`
+	ExecutorModel           string              `json:"executor_model,omitempty"`
+	ExecutorConfigSHA256    string              `json:"executor_config_sha256,omitempty"`
+	ExecutorAuthorizationID string              `json:"-"`
 }
 
 type SpecialistDispatchResult struct {
@@ -232,7 +253,23 @@ func (m *Manager) SpecialistProviderSHA256() string {
 // sending a task. Starting or restarting the CLI is prompt-free, so this can
 // run before provider model accounting.
 func (m *Manager) CheckSpecialistRole(ctx context.Context, role SpecialistRole) (SpecialistSessionIdentity, error) {
+	if m.specialistChildDispatcherConfigured() {
+		return m.checkSpecialistChildRole(ctx, role)
+	}
+	if !m.legacySpecialistManagerConfigured() {
+		return SpecialistSessionIdentity{}, errors.New("ordinary manager has no explicitly injected contained specialist child executor")
+	}
 	return m.checkSpecialistRole(ctx, role, m.specialistRuntime())
+}
+
+func (m *Manager) legacySpecialistManagerConfigured() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	configured := m.specialistProvider != nil || m.specialistNamespace != ""
+	m.mu.RUnlock()
+	return configured
 }
 
 func (m *Manager) checkSpecialistRole(ctx context.Context, role SpecialistRole, runtime specialistDispatchRuntime) (SpecialistSessionIdentity, error) {
@@ -249,6 +286,19 @@ func (m *Manager) checkSpecialistRole(ctx context.Context, role SpecialistRole, 
 // persistent specialist, and delivers the task through Manager.SendKick's
 // readiness path. The lease remains held until ReleaseSpecialistTask.
 func (m *Manager) DispatchSpecialistTask(ctx context.Context, request SpecialistDispatchRequest) (SpecialistDispatchResult, error) {
+	if m.specialistChildDispatcherConfigured() {
+		result, err := m.dispatchSpecialistChildTask(ctx, request)
+		if err != nil {
+			if errors.Is(err, ErrSpecialistTaskDeliveryAmbiguous) {
+				return result, err
+			}
+			return result, fmt.Errorf("%w: %v", ErrSpecialistTaskNotDelivered, err)
+		}
+		return result, nil
+	}
+	if !m.legacySpecialistManagerConfigured() {
+		return SpecialistDispatchResult{}, fmt.Errorf("%w: ordinary manager has no explicitly injected contained specialist child executor", ErrSpecialistTaskNotDelivered)
+	}
 	result, err := m.dispatchSpecialistTask(ctx, request, m.specialistRuntime())
 	if err != nil {
 		if errors.Is(err, ErrSpecialistTaskDeliveryAmbiguous) {
@@ -267,6 +317,12 @@ func (m *Manager) DispatchSpecialistTask(ctx context.Context, request Specialist
 // Recovery of a live durable lease uses this path so a new controller cannot
 // destroy the still-running specialist before consuming its completion.
 func (m *Manager) InspectSpecialistRole(ctx context.Context, role SpecialistRole) (SpecialistSessionIdentity, error) {
+	if m.specialistChildDispatcherConfigured() {
+		return m.inspectSpecialistChildRole(ctx, role)
+	}
+	if !m.legacySpecialistManagerConfigured() {
+		return SpecialistSessionIdentity{}, errors.New("ordinary manager has no explicitly injected contained specialist child executor")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -293,7 +349,12 @@ func (m *Manager) inspectSpecialistRole(ctx context.Context, role SpecialistRole
 		m.mu.RUnlock()
 		return SpecialistSessionIdentity{}, fmt.Errorf("specialist agent %s is not configured", role)
 	}
-	snapshot := *agent
+	snapshot := AgentProcess{
+		Name: agent.Name, ID: agent.ID, Config: agent.Config, State: agent.State, PID: agent.PID, UID: agent.UID,
+		HasLaunched: agent.HasLaunched, specialistReady: agent.specialistReady,
+		BackendOverride: agent.BackendOverride, specialistProviderSHA256: agent.specialistProviderSHA256,
+		tmuxSession: agent.tmuxSession, tmuxSocket: agent.tmuxSocket,
+	}
 	provider := m.specialistProvider
 	namespace := m.specialistNamespace
 	root := m.workDir
@@ -352,6 +413,12 @@ func (m *Manager) dispatchSpecialistTask(ctx context.Context, request Specialist
 // ReleaseSpecialistTask explicitly relinquishes the role's in-memory task
 // lease after the controller has durably consumed the specialist receipt.
 func (m *Manager) ReleaseSpecialistTask(role SpecialistRole, taskID string) error {
+	if m.specialistChildDispatcherConfigured() {
+		return m.releaseSpecialistChildTask(role, taskID)
+	}
+	if !m.legacySpecialistManagerConfigured() {
+		return errors.New("ordinary manager has no explicitly injected contained specialist child executor")
+	}
 	if !isAllowedSpecialistRole(role) {
 		return fmt.Errorf("unsupported specialist role %q", role)
 	}

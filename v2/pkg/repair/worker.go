@@ -1272,7 +1272,7 @@ func runRepairCommand(ctx context.Context, worktree string, command Command, tim
 		_, err := io.Copy(&output, readOutput)
 		readDone <- err
 	}()
-	wait, err := startRepairProcessTree(process)
+	wait, err := startRepairProcessTree(commandCtx, process)
 	_ = writeOutput.Close()
 	if err == nil {
 		err = wait()

@@ -40,21 +40,41 @@ type SpecialistTaskResponseRequest struct {
 	Message    string         `json:"message"`
 }
 
+// SpecialistTaskCompletionVerificationRequest asks the ordinary Manager to
+// prove that governed mailbox provenance came from its exact retained child
+// transport evidence. It grants no launch or observation capability.
+type SpecialistTaskCompletionVerificationRequest struct {
+	TaskID        string                             `json:"task_id"`
+	Specialist    SpecialistRole                     `json:"specialist"`
+	RequestSHA256 string                             `json:"request_sha256"`
+	SessionID     string                             `json:"session_id"`
+	Message       string                             `json:"message"`
+	Provenance    SpecialistContainedChildProvenance `json:"provenance"`
+}
+
 // SpecialistTaskResponse is raw proposal text observed from Codex's private,
 // controller-owned session journal. It is transport evidence only. The repair
 // broker still validates the model envelope and constructs the authoritative
 // SpecialistReceipt itself.
 type SpecialistTaskResponse struct {
-	SchemaVersion  string         `json:"schema_version"`
-	WorkOrderID    string         `json:"work_order_id"`
-	Specialist     SpecialistRole `json:"specialist"`
-	SessionID      string         `json:"session_id"`
-	TurnID         string         `json:"turn_id"`
-	ProviderSHA256 string         `json:"provider_sha256"`
-	DispatchSHA256 string         `json:"dispatch_sha256"`
-	ResponseSHA256 string         `json:"response_sha256"`
-	Response       string         `json:"response"`
-	CompletedAt    time.Time      `json:"completed_at"`
+	SchemaVersion         string         `json:"schema_version"`
+	WorkOrderID           string         `json:"work_order_id"`
+	Specialist            SpecialistRole `json:"specialist"`
+	SessionID             string         `json:"session_id"`
+	TurnID                string         `json:"turn_id"`
+	ProviderSHA256        string         `json:"provider_sha256"`
+	ExecutorBackend       string         `json:"executor_backend,omitempty"`
+	ExecutorModel         string         `json:"executor_model,omitempty"`
+	ExecutorConfigSHA256  string         `json:"executor_config_sha256,omitempty"`
+	AuthorizationSHA256   string         `json:"authorization_sha256,omitempty"`
+	ContainmentProfile    string         `json:"containment_profile,omitempty"`
+	DispatchSHA256        string         `json:"dispatch_sha256"`
+	ResponseSHA256        string         `json:"response_sha256"`
+	IntentSHA256          string         `json:"intent_sha256,omitempty"`
+	StartedSHA256         string         `json:"started_sha256,omitempty"`
+	CompletionSpoolSHA256 string         `json:"-"`
+	Response              string         `json:"response"`
+	CompletedAt           time.Time      `json:"completed_at"`
 }
 
 type codexRolloutEvent struct {
@@ -96,6 +116,12 @@ type codexResponseCandidate struct {
 // private journals. Callers own polling and deadlines so they can also recover
 // legacy mailbox completions without racing a second delivery.
 func (m *Manager) ObserveSpecialistTaskResponse(ctx context.Context, request SpecialistTaskResponseRequest) (SpecialistTaskResponse, error) {
+	if m.specialistChildDispatcherConfigured() {
+		return m.observeSpecialistChildResponse(ctx, request)
+	}
+	if !m.legacySpecialistManagerConfigured() {
+		return SpecialistTaskResponse{}, errors.New("ordinary manager has no explicitly injected contained specialist child executor")
+	}
 	if ctx == nil {
 		return SpecialistTaskResponse{}, errors.New("specialist task response observation requires a context")
 	}
@@ -154,6 +180,15 @@ func (m *Manager) ObserveSpecialistTaskResponse(ctx context.Context, request Spe
 		Response:       candidate.response,
 		CompletedAt:    candidate.completedAt,
 	}, nil
+}
+
+// VerifySpecialistTaskCompletion is deliberately child-only and pane-blind.
+// Governed replay must call it before trusting an existing mailbox receipt.
+func (m *Manager) VerifySpecialistTaskCompletion(ctx context.Context, request SpecialistTaskCompletionVerificationRequest) (SpecialistTaskResponse, error) {
+	if !m.specialistChildDispatcherConfigured() {
+		return SpecialistTaskResponse{}, errors.New("contained specialist child dispatcher is not configured")
+	}
+	return m.verifySpecialistChildCompletion(ctx, request)
 }
 
 func validateSpecialistTaskResponseRequest(request SpecialistTaskResponseRequest) error {

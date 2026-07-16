@@ -187,7 +187,7 @@ func (p CodexProvider) runMetadataCommand(ctx context.Context, dir string, argum
 	args := append(append([]string(nil), p.Prefix...), arguments...)
 	command := exec.CommandContext(ctx, p.Command, args...)
 	command.Dir = dir
-	command.Env = providerEnvironment()
+	command.Env = p.commandEnvironment()
 	var stdout, stderr limitedBuffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {

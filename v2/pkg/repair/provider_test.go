@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,6 +32,42 @@ func TestMain(m *testing.M) {
 }
 
 func runCodexProviderInvocationHelper(args []string) {
+	if os.Getenv("HIVE_TEST_CODEX_DESCENDANT_ONLY") == "1" {
+		marker := os.Getenv("HIVE_TEST_CODEX_DESCENDANT_MARKER")
+		file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			os.Exit(3)
+		}
+		defer file.Close()
+		for {
+			_, _ = file.WriteString("alive\n")
+			_ = file.Sync()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if os.Getenv("HIVE_TEST_EXPECT_CLEAN_CODEX_ENV") == "1" {
+		for _, name := range []string{
+			"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_APP_PRIVATE_KEY", "SSH_AUTH_SOCK",
+			"DYNAMIC_PROVIDER_TOKEN", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+			"AWS_SHARED_CREDENTIALS_FILE", "GIT_CONFIG_GLOBAL", "SSL_CERT_FILE", "SSL_CERT_DIR", "COMSPEC",
+		} {
+			if os.Getenv(name) != "" {
+				fmt.Fprintf(os.Stderr, "ambient authority leaked through %s\n", name)
+				os.Exit(4)
+			}
+		}
+		if os.Getenv("HOME") == "ambient-home-canary" || os.Getenv("USERPROFILE") == "ambient-home-canary" ||
+			os.Getenv("CODEX_HOME") == "ambient-codex-home-canary" || os.Getenv("APPDATA") == "ambient-appdata-canary" ||
+			os.Getenv("LOCALAPPDATA") == "ambient-localappdata-canary" || os.Getenv("HOME") == "" || os.Getenv("CODEX_HOME") == "" ||
+			os.Getenv("APPDATA") == "" || os.Getenv("LOCALAPPDATA") == "" {
+			fmt.Fprintln(os.Stderr, "private HOME/CODEX_HOME/APPDATA/LOCALAPPDATA was not installed")
+			os.Exit(4)
+		}
+		if os.Getenv("PATH") == "" || os.Getenv("PATH") == "ambient-path-canary" {
+			fmt.Fprintln(os.Stderr, "private bounded PATH was not installed")
+			os.Exit(4)
+		}
+	}
 	if len(args) > 0 && args[0] == "sandbox" {
 		if configValue(args, "default_permissions") != `"hive_repair_no_files"` || configValue(args, `permissions.hive_repair_no_files.filesystem.:minimal`) != `"read"` ||
 			configValue(args, "permissions.hive_repair_no_files.network.enabled") != "false" || lastExactArgument(args, "--sandbox-state-disable-network") < 0 {
@@ -75,6 +112,48 @@ func runCodexProviderInvocationHelper(args []string) {
 	if output := os.Getenv("HIVE_TEST_CODEX_MODEL_OUTPUT"); output != "" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
 		fmt.Print(output)
 		os.Exit(0)
+	}
+	if os.Getenv("HIVE_TEST_CODEX_OUTPUT_OVERFLOW") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		block := strings.Repeat("x", 4096)
+		for written := 0; written <= codexStdoutHardLimit+len(block); written += len(block) {
+			fmt.Print(block)
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("HIVE_TEST_CODEX_WRITE_EXTRA_FILE") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		_ = os.WriteFile("unexpected-model-file", []byte("unexpected\n"), 0o600)
+		fmt.Print("DENIED")
+		os.Exit(0)
+	}
+	if marker := os.Getenv("HIVE_TEST_CODEX_DESCENDANT_MARKER"); marker != "" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		command := exec.Command(os.Args[0])
+		command.Env = append(os.Environ(), "HIVE_TEST_CODEX_DESCENDANT_ONLY=1")
+		if os.Getenv("HIVE_TEST_CODEX_INHERITED_OUTPUT_DESCENDANT") == "1" {
+			command.Stdout = os.Stdout
+			command.Stderr = os.Stderr
+		}
+		if err := command.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, "start descendant:", err)
+			os.Exit(5)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if info, err := os.Stat(marker); err == nil && info.Size() > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				fmt.Fprintln(os.Stderr, "descendant did not start")
+				os.Exit(5)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		for {
+			if os.Getenv("HIVE_TEST_CODEX_INHERITED_OUTPUT_DESCENDANT") == "1" {
+				fmt.Print("DENIED")
+				os.Exit(0)
+			}
+			time.Sleep(time.Second)
+		}
 	}
 	if os.Getenv("HIVE_TEST_FAIL_IF_MODEL_EXEC") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
 		fmt.Fprintln(os.Stderr, "Health unexpectedly reached a model exec")
@@ -188,8 +267,8 @@ func TestCodexProviderRealNoModelHealthPreflightWithoutAuthorization(t *testing.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(emptyCodexHome) })
-	t.Setenv("CODEX_HOME", emptyCodexHome)
-	provider := CodexProvider{Command: command}
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "ambient-codex-home-must-be-ignored"))
+	provider := CodexProvider{Command: command, CodexHome: emptyCodexHome}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	err = provider.Health(ctx)

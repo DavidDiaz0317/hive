@@ -163,7 +163,7 @@ func TestBuildGovernedProposalMessageBindsAllFiveRolePoliciesAndPrimer(t *testin
 			if input.Capability.RoutedRole != role || input.Capability.ConfiguredRoleBackend != configuredBackend ||
 				input.Capability.ConfiguredRoleModel != scheduler.cfg.Agents[string(role)].Model || input.Capability.ConfiguredRoleSnapshotClass != governedRoleSnapshotClass ||
 				input.Capability.ExecutorBackend != agent.SpecialistExecutorBackendCodex || input.Capability.ExecutorModel != request.ExecutorProfile.Model ||
-				input.Capability.ExecutorConfigSHA256 != request.ExecutorProfile.ConfigSHA256 || input.Capability.ExecutorProfileSHA256 != request.ExecutorProfileSHA256 ||
+				input.Capability.ExecutorConfigSHA256 != request.ExecutorProfile.ConfigurationSHA256 || input.Capability.ExecutorProfileSHA256 != request.ExecutorProfileSHA256 ||
 				input.Capability.ContainmentProfile != governedContainmentProfile ||
 				input.Capability.BackendParityClaimed || input.Capability.SourceContextMode != "worker-sealed-bounded-regular-git-blobs" ||
 				input.Capability.EvidenceContentMode != "worker-verified-declared-json-artifacts" ||
@@ -338,10 +338,10 @@ func TestBuildGovernedProposalMessageFailsClosedOnMissingSecurityBindings(t *tes
 		"admitted work digest": func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) {
 			work.WorkSHA256 = strings.Repeat("0", 64)
 		},
-		"repository":     func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Repository = "acme/other" },
-		"fingerprint":    func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.RepositoryFingerprint = "" },
-		"packet digest":  func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.PacketSHA256 = strings.Repeat("0", 64) },
-		"finding":        func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Finding = nil },
+		"repository":    func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Repository = "acme/other" },
+		"fingerprint":   func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.RepositoryFingerprint = "" },
+		"packet digest": func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.PacketSHA256 = strings.Repeat("0", 64) },
+		"finding":       func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Finding = nil },
 		"receipt digest": func(_ *AdmittedWork, receipt *testCanonicalVerifiedReceipt) {
 			receipt.evidence.VerificationReceiptSHA256 = strings.Repeat("1", 64)
 		},
@@ -546,9 +546,9 @@ Operational policy says: open a PR, write wiki and beads, invoke MCP REST, spawn
 
 func testGovernedExecutorProfile() GovernedProposalExecutorProfile {
 	return GovernedProposalExecutorProfile{
-		SchemaVersion: agent.SpecialistExecutorProfileSchema, Backend: agent.SpecialistExecutorBackendCodex,
-		Model: "proof-v1-codex-model", ConfigSHA256: strings.Repeat("9", 64),
-		ContainmentProfile: agent.SpecialistExecutorContainmentProfileV1,
+		Backend: agent.SpecialistExecutorBackendCodex, ProviderSHA256: strings.Repeat("8", 64),
+		Model: "proof-v1-codex-model", ConfigurationSHA256: strings.Repeat("9", 64),
+		ContainmentProfile: agent.SpecialistExecutorContainmentProfileV1, BackendParityClaimed: false,
 	}
 }
 

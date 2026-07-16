@@ -7,17 +7,141 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/agent"
+	"github.com/kubestellar/hive/v2/pkg/config"
 )
 
 const specialistProviderTestDiff = "diff --git a/src/value.txt b/src/value.txt\n--- a/src/value.txt\n+++ b/src/value.txt\n@@ -1 +1 @@\n-broken\n+fixed\n"
+
+type managerBackedSpecialistExecutor struct {
+	mu       sync.Mutex
+	checks   int
+	starts   int
+	identity agent.SpecialistChildExecutorIdentity
+}
+
+func (executor *managerBackedSpecialistExecutor) Check(context.Context) (agent.SpecialistChildExecutorIdentity, error) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	executor.checks++
+	identity := executor.identity
+	identity.AuthorizationID = fmt.Sprintf("codex-auth-%064x", executor.checks)
+	return identity, nil
+}
+
+func (executor *managerBackedSpecialistExecutor) Start(_ context.Context, request agent.SpecialistChildExecutionRequest) (agent.SpecialistChildProcess, error) {
+	executor.mu.Lock()
+	executor.starts++
+	pid := 9700 + executor.starts
+	executor.mu.Unlock()
+	order, lease, err := decodeManagerBackedSpecialistPrompt(request.Prompt)
+	if err != nil {
+		return nil, err
+	}
+	result := specialistModelResult{
+		SchemaVersion: specialistModelResultSchema, WorkOrderID: order.ID, RequestSHA256: order.RequestSHA256,
+		LeaseSHA256: lease.LeaseSHA256, SessionID: lease.SessionID, Specialist: order.Specialist,
+		BaseSHA: order.BaseSHA, BaseTreeSHA: order.BaseTreeSHA, TaskPromptSHA256: order.TaskPromptSHA256,
+		Status: agent.SpecialistCompletionProposed, Summary: "Manager-owned governed proposal", UnifiedDiff: specialistProviderTestDiff,
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	return &managerBackedSpecialistProcess{
+		pid: pid, providerSHA256: request.ProviderSHA256,
+		result: agent.SpecialistChildExecutionResult{Response: encoded, TurnID: request.AuthorizationID, CompletedAt: time.Now().UTC()},
+	}, nil
+}
+
+func (executor *managerBackedSpecialistExecutor) counts() (int, int) {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.checks, executor.starts
+}
+
+type managerBackedSpecialistProcess struct {
+	pid            int
+	providerSHA256 string
+	result         agent.SpecialistChildExecutionResult
+}
+
+func (process *managerBackedSpecialistProcess) PID() int               { return process.pid }
+func (process *managerBackedSpecialistProcess) ProviderSHA256() string { return process.providerSHA256 }
+func (process *managerBackedSpecialistProcess) Wait() (agent.SpecialistChildExecutionResult, error) {
+	return process.result, nil
+}
+
+func decodeManagerBackedSpecialistPrompt(prompt string) (agent.SpecialistWorkOrder, agent.SpecialistLease, error) {
+	const orderMarker = "CONTROLLER_BOUND_WORK_ORDER_JSON\n"
+	const leaseMarker = "\nCONTROLLER_BOUND_LEASE_JSON\n"
+	const finalMarker = "\n\nFINAL_CAPABILITY_WRAPPER_V1"
+	orderStart := strings.LastIndex(prompt, orderMarker)
+	if orderStart < 0 {
+		return agent.SpecialistWorkOrder{}, agent.SpecialistLease{}, errors.New("missing controller-bound work order")
+	}
+	orderStart += len(orderMarker)
+	leaseAt := strings.Index(prompt[orderStart:], leaseMarker)
+	if leaseAt < 0 {
+		return agent.SpecialistWorkOrder{}, agent.SpecialistLease{}, errors.New("missing controller-bound lease")
+	}
+	leaseStart := orderStart + leaseAt + len(leaseMarker)
+	leaseEnd := strings.Index(prompt[leaseStart:], finalMarker)
+	if leaseEnd < 0 {
+		return agent.SpecialistWorkOrder{}, agent.SpecialistLease{}, errors.New("missing final capability wrapper")
+	}
+	var order agent.SpecialistWorkOrder
+	if err := json.Unmarshal([]byte(prompt[orderStart:orderStart+leaseAt]), &order); err != nil {
+		return order, agent.SpecialistLease{}, err
+	}
+	var lease agent.SpecialistLease
+	if err := json.Unmarshal([]byte(prompt[leaseStart:leaseStart+leaseEnd]), &lease); err != nil {
+		return order, lease, err
+	}
+	return order, lease, nil
+}
+
+type failFirstReleaseDispatcher struct {
+	inner SpecialistDispatcher
+	mu    sync.Mutex
+	fail  bool
+}
+
+func (dispatcher *failFirstReleaseDispatcher) CheckSpecialistRole(ctx context.Context, role agent.SpecialistRole) (agent.SpecialistSessionIdentity, error) {
+	return dispatcher.inner.CheckSpecialistRole(ctx, role)
+}
+func (dispatcher *failFirstReleaseDispatcher) InspectSpecialistRole(ctx context.Context, role agent.SpecialistRole) (agent.SpecialistSessionIdentity, error) {
+	return dispatcher.inner.InspectSpecialistRole(ctx, role)
+}
+func (dispatcher *failFirstReleaseDispatcher) DispatchSpecialistTask(ctx context.Context, request agent.SpecialistDispatchRequest) (agent.SpecialistDispatchResult, error) {
+	return dispatcher.inner.DispatchSpecialistTask(ctx, request)
+}
+func (dispatcher *failFirstReleaseDispatcher) ObserveSpecialistTaskResponse(ctx context.Context, request agent.SpecialistTaskResponseRequest) (agent.SpecialistTaskResponse, error) {
+	return dispatcher.inner.ObserveSpecialistTaskResponse(ctx, request)
+}
+func (dispatcher *failFirstReleaseDispatcher) VerifySpecialistTaskCompletion(ctx context.Context, request agent.SpecialistTaskCompletionVerificationRequest) (agent.SpecialistTaskResponse, error) {
+	return dispatcher.inner.VerifySpecialistTaskCompletion(ctx, request)
+}
+func (dispatcher *failFirstReleaseDispatcher) ReleaseSpecialistTask(role agent.SpecialistRole, taskID string) error {
+	dispatcher.mu.Lock()
+	if !dispatcher.fail {
+		dispatcher.fail = true
+		dispatcher.mu.Unlock()
+		return errors.New("simulated crash after receipt persistence before child consumption")
+	}
+	dispatcher.mu.Unlock()
+	return dispatcher.inner.ReleaseSpecialistTask(role, taskID)
+}
 
 type fakeSpecialistDispatcher struct {
 	identity      agent.SpecialistSessionIdentity
@@ -25,15 +149,19 @@ type fakeSpecialistDispatcher struct {
 	inspectErr    error
 	dispatchErr   error
 	observeErr    error
+	verifyErr     error
 	releaseErr    error
 	dispatch      func(agent.SpecialistDispatchRequest)
 	dispatchReply func(agent.SpecialistDispatchRequest) agent.SpecialistDispatchResult
 	observeReply  func(agent.SpecialistTaskResponseRequest) agent.SpecialistTaskResponse
+	verifyReply   func(agent.SpecialistTaskCompletionVerificationRequest) agent.SpecialistTaskResponse
 	checkCalls    int
 	inspectCalls  int
 	dispatchCalls []agent.SpecialistDispatchRequest
 	observeCalls  []agent.SpecialistTaskResponseRequest
+	verifyCalls   []agent.SpecialistTaskCompletionVerificationRequest
 	releaseCalls  []agent.SpecialistDispatchRequest
+	lastResponse  agent.SpecialistTaskResponse
 }
 
 func (f *fakeSpecialistDispatcher) CheckSpecialistRole(_ context.Context, _ agent.SpecialistRole) (agent.SpecialistSessionIdentity, error) {
@@ -60,12 +188,28 @@ func (f *fakeSpecialistDispatcher) DispatchSpecialistTask(_ context.Context, req
 func (f *fakeSpecialistDispatcher) ObserveSpecialistTaskResponse(_ context.Context, request agent.SpecialistTaskResponseRequest) (agent.SpecialistTaskResponse, error) {
 	f.observeCalls = append(f.observeCalls, request)
 	if f.observeReply != nil {
-		return f.observeReply(request), f.observeErr
+		response := f.observeReply(request)
+		f.lastResponse = response
+		return response, f.observeErr
 	}
 	if f.observeErr != nil {
 		return agent.SpecialistTaskResponse{}, f.observeErr
 	}
 	return agent.SpecialistTaskResponse{}, agent.ErrSpecialistTaskResponsePending
+}
+
+func (f *fakeSpecialistDispatcher) VerifySpecialistTaskCompletion(_ context.Context, request agent.SpecialistTaskCompletionVerificationRequest) (agent.SpecialistTaskResponse, error) {
+	f.verifyCalls = append(f.verifyCalls, request)
+	if f.verifyErr != nil {
+		return agent.SpecialistTaskResponse{}, f.verifyErr
+	}
+	if f.verifyReply != nil {
+		return f.verifyReply(request), nil
+	}
+	if f.lastResponse.SchemaVersion == "" {
+		return agent.SpecialistTaskResponse{}, errors.New("fake dispatcher has no Manager-owned child evidence")
+	}
+	return f.lastResponse, nil
 }
 
 func (f *fakeSpecialistDispatcher) ReleaseSpecialistTask(role agent.SpecialistRole, taskID string) error {
@@ -132,6 +276,23 @@ func TestSpecialistProviderReleasesOnlyDefinitelyUndeliveredLease(t *testing.T) 
 			t.Fatalf("ambiguous dispatcher call count = %d", len(fixture.dispatcher.dispatchCalls))
 		}
 	})
+}
+
+func TestReleaseDispatchedSpecialistFinalizesVerifiedReusedResult(t *testing.T) {
+	dispatcher := &fakeSpecialistDispatcher{}
+	order := agent.SpecialistWorkOrder{ID: "swo-" + strings.Repeat("a", 64), SpecialistWorkOrderRequest: agent.SpecialistWorkOrderRequest{
+		Kind: agent.SpecialistWorkOrderKindGovernedVisualHiveProposal, Specialist: agent.SpecialistQuality,
+	}}
+	if err := releaseDispatchedSpecialist(dispatcher, order, true, false); err != nil || len(dispatcher.releaseCalls) != 0 {
+		t.Fatalf("unverified reused result authorized release: calls=%d err=%v", len(dispatcher.releaseCalls), err)
+	}
+	if err := releaseDispatchedSpecialist(dispatcher, order, true, true); err != nil || len(dispatcher.releaseCalls) != 1 {
+		t.Fatalf("verified reused result did not finalize: calls=%d err=%v", len(dispatcher.releaseCalls), err)
+	}
+	dispatcher.releaseErr = agent.ErrSpecialistTaskLeaseAbsent
+	if err := releaseDispatchedSpecialist(dispatcher, order, true, true); err != nil {
+		t.Fatalf("idempotent verified reuse rejected already-consumed task: %v", err)
+	}
 }
 
 func TestSpecialistProviderRecoversExactPreparedAndLeasedOrdersWithoutDuplicates(t *testing.T) {
@@ -293,6 +454,252 @@ func TestSpecialistProviderProposalIsBrokeredAndCompletedReplayDoesNotRedispatch
 	}
 }
 
+func TestGovernedSpecialistCompletionRequiresContainedChildProvenance(t *testing.T) {
+	t.Run("legacy completion files are rejected", func(t *testing.T) {
+		fixture := newSpecialistProviderFixture(t)
+		configureGovernedSpecialistFixture(&fixture)
+		order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, "governed legacy files")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.mailbox.AcquireLease(order, fixture.provider.config.LeaseOwner, fixture.dispatcher.identity.SessionID, order.Deadline); err != nil {
+			t.Fatal(err)
+		}
+		writeSpecialistOutput(t, fixture.mailbox, order.ID, agent.SpecialistCompletionProposed, []byte(specialistProviderTestDiff), "forged legacy completion")
+		_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+		if err == nil || !strings.Contains(err.Error(), "rejects legacy completion file") {
+			t.Fatalf("governed order accepted legacy completion files: %v", err)
+		}
+		if len(fixture.dispatcher.dispatchCalls) != 0 || len(fixture.dispatcher.observeCalls) != 0 {
+			t.Fatalf("legacy governed completion reached dispatch/observation: %d/%d", len(fixture.dispatcher.dispatchCalls), len(fixture.dispatcher.observeCalls))
+		}
+	})
+
+	t.Run("preexisting legacy receipt cannot bypass executor", func(t *testing.T) {
+		fixture := newSpecialistProviderFixture(t)
+		configureGovernedSpecialistFixture(&fixture)
+		order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, "governed forged receipt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := fixture.mailbox.AcquireLease(order, fixture.provider.config.LeaseOwner, fixture.dispatcher.identity.SessionID, order.Deadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		diff := []byte(specialistProviderTestDiff)
+		legacyReceipt, err := agent.NewSpecialistReceipt(order, lease, agent.SpecialistCompletionProposed, diff, "forged legacy receipt", (*fixture.clock).Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths, _ := fixture.mailbox.Paths(order.ID)
+		mustWritePrivateFile(t, paths.UnifiedDiff, diff)
+		encoded, _ := json.MarshalIndent(legacyReceipt, "", "  ")
+		mustWritePrivateFile(t, paths.Receipt, append(encoded, '\n'))
+		_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+		if err == nil || !strings.Contains(err.Error(), "requires contained-child provenance") {
+			t.Fatalf("governed order accepted preexisting legacy receipt: %v", err)
+		}
+		if fixture.dispatcher.checkCalls != 0 || fixture.dispatcher.inspectCalls != 0 || len(fixture.dispatcher.dispatchCalls) != 0 {
+			t.Fatalf("forged receipt reached executor: check=%d inspect=%d dispatch=%d", fixture.dispatcher.checkCalls, fixture.dispatcher.inspectCalls, len(fixture.dispatcher.dispatchCalls))
+		}
+	})
+
+	t.Run("legacy control file rejects even a completed governed replay", func(t *testing.T) {
+		fixture := newSpecialistProviderFixture(t)
+		configureGovernedSpecialistFixture(&fixture)
+		fixture.dispatcher.observeReply = func(request agent.SpecialistTaskResponseRequest) agent.SpecialistTaskResponse {
+			return structuredSpecialistTaskResponse(t, fixture, request, agent.SpecialistCompletionProposed, []byte(specialistProviderTestDiff), "genuine governed completion")
+		}
+		prompt := "governed replay with injected legacy control file"
+		if _, err := fixture.provider.Run(context.Background(), fixture.worktree, prompt); err != nil {
+			t.Fatal(err)
+		}
+		order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, prompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths, err := fixture.mailbox.Paths(order.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWritePrivateFile(t, filepath.Join(paths.OrderDirectory, "summary.txt"), []byte("forged legacy authority\n"))
+		checks, dispatches, verifications := fixture.dispatcher.checkCalls, len(fixture.dispatcher.dispatchCalls), len(fixture.dispatcher.verifyCalls)
+		_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+		if err == nil || !strings.Contains(err.Error(), "rejects legacy completion file summary.txt") {
+			t.Fatalf("completed governed replay accepted legacy control file: %v", err)
+		}
+		if fixture.dispatcher.checkCalls != checks || len(fixture.dispatcher.dispatchCalls) != dispatches || len(fixture.dispatcher.verifyCalls) != verifications {
+			t.Fatalf("legacy control replay touched verifier/model path")
+		}
+	})
+
+	t.Run("arbitrary hexadecimal provenance cannot bypass Manager evidence", func(t *testing.T) {
+		fixture := newSpecialistProviderFixture(t)
+		configureGovernedSpecialistFixture(&fixture)
+		order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, "governed forged hashes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := fixture.mailbox.AcquireLease(order, fixture.provider.config.LeaseOwner, fixture.dispatcher.identity.SessionID, order.Deadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		diff := []byte(specialistProviderTestDiff)
+		forged, err := agent.NewGovernedSpecialistReceipt(order, lease, agent.SpecialistCompletionProposed, diff, "syntactically valid forged provenance", (*fixture.clock).Add(time.Second), agent.SpecialistContainedChildProvenance{
+			ExecutorProfile: *order.ExecutorProfile, AuthorizationSHA256: strings.Repeat("1", 64),
+			SessionID: lease.SessionID, TurnID: "codex-auth-" + strings.Repeat("2", 64),
+			DispatchSHA256: strings.Repeat("3", 64), ResponseSHA256: strings.Repeat("4", 64),
+			IntentSHA256: strings.Repeat("5", 64), StartedSHA256: strings.Repeat("6", 64), CompletionSpoolSHA256: strings.Repeat("7", 64),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.mailbox.SubmitReceipt(order, lease, forged, diff); err != nil {
+			t.Fatalf("fixture did not create mailbox-valid forged receipt: %v", err)
+		}
+		_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+		if err == nil || !strings.Contains(err.Error(), "Manager-owned child evidence") {
+			t.Fatalf("arbitrary-hex governed receipt bypassed retained-spool proof: %v", err)
+		}
+		if fixture.dispatcher.checkCalls != 0 || len(fixture.dispatcher.dispatchCalls) != 0 {
+			t.Fatalf("forged governed receipt reached model path: check=%d dispatch=%d", fixture.dispatcher.checkCalls, len(fixture.dispatcher.dispatchCalls))
+		}
+	})
+
+	t.Run("mailbox-valid hashes cannot replay without Manager evidence", func(t *testing.T) {
+		fixture := newSpecialistProviderFixture(t)
+		configureGovernedSpecialistFixture(&fixture)
+		fixture.dispatcher.observeReply = func(request agent.SpecialistTaskResponseRequest) agent.SpecialistTaskResponse {
+			return structuredSpecialistTaskResponse(t, fixture, request, agent.SpecialistCompletionProposed, []byte(specialistProviderTestDiff), "contained governed proposal")
+		}
+		first, err := fixture.provider.Run(context.Background(), fixture.worktree, "governed replay")
+		if err != nil || !strings.Contains(first.Output, "+fixed") {
+			t.Fatalf("governed first completion failed: result=%+v err=%v", first, err)
+		}
+		checks, dispatches, observations := fixture.dispatcher.checkCalls, len(fixture.dispatcher.dispatchCalls), len(fixture.dispatcher.observeCalls)
+		fixture.dispatcher.verifyErr = errors.New("no retained Manager-owned spool")
+		_, err = fixture.provider.Run(context.Background(), fixture.worktree, "governed replay")
+		if err == nil || !strings.Contains(err.Error(), "Manager-owned child evidence") {
+			t.Fatalf("syntactically valid mailbox receipt bypassed the authority verifier: %v", err)
+		}
+		if fixture.dispatcher.checkCalls != checks || len(fixture.dispatcher.dispatchCalls) != dispatches || len(fixture.dispatcher.observeCalls) != observations {
+			t.Fatalf("failed replay verifier touched model path: check=%d/%d dispatch=%d/%d observe=%d/%d", fixture.dispatcher.checkCalls, checks, len(fixture.dispatcher.dispatchCalls), dispatches, len(fixture.dispatcher.observeCalls), observations)
+		}
+	})
+}
+
+func TestGovernedProviderRealManagerFinalizesReceiptBeforeConsumeCrash(t *testing.T) {
+	fixture := newSpecialistProviderFixture(t)
+	executor := newManagerBackedSpecialistExecutor()
+	state := filepath.Join(t.TempDir(), "repair-state")
+	manager := newManagerBackedSpecialistManager(t, state, executor)
+	configureManagerBackedSpecialistProvider(&fixture, manager, executor.identity)
+	fixture.provider.config.Dispatcher = &failFirstReleaseDispatcher{inner: manager}
+	prompt := "real Manager crash after durable governed receipt"
+
+	_, err := fixture.provider.Run(context.Background(), fixture.worktree, prompt)
+	if err == nil || !strings.Contains(err.Error(), "simulated crash after receipt persistence") {
+		t.Fatalf("release crash window was not injected after receipt persistence: %v", err)
+	}
+	order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := fixture.mailbox.LoadCompletion(order); err != nil {
+		t.Fatalf("governed receipt was not durable before release crash: %v", err)
+	}
+	childRoot := filepath.Join(state, "specialist-children", order.ID)
+	if _, err := os.Stat(filepath.Join(childRoot, "complete.json")); err != nil {
+		t.Fatalf("Manager completion spool is missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(childRoot, "consumed.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("release crash unexpectedly consumed the child: %v", err)
+	}
+	if _, starts := executor.counts(); starts != 1 {
+		t.Fatalf("initial governed request launched %d models", starts)
+	}
+
+	recoveryExecutor := newManagerBackedSpecialistExecutor()
+	restarted := newManagerBackedSpecialistManager(t, state, recoveryExecutor)
+	fixture.provider.config.Dispatcher = restarted
+	replayed, err := fixture.provider.Run(context.Background(), fixture.worktree, prompt)
+	if err != nil || !strings.Contains(replayed.Output, "+fixed") {
+		t.Fatalf("receipt-before-release replay failed: result=%+v err=%v", replayed, err)
+	}
+	if checks, starts := recoveryExecutor.counts(); checks != 0 || starts != 0 {
+		t.Fatalf("verified receipt replay touched model path: checks=%d starts=%d", checks, starts)
+	}
+	if _, err := os.Stat(filepath.Join(childRoot, "consumed.json")); err != nil {
+		t.Fatalf("replay did not persist exact consumed marker: %v", err)
+	}
+	if _, err := restarted.CheckSpecialistRole(context.Background(), agent.SpecialistQuality); err != nil {
+		t.Fatalf("consumed replay left the role WIP: %v", err)
+	}
+	if checks, starts := recoveryExecutor.counts(); checks != 1 || starts != 0 {
+		t.Fatalf("next task readiness counts = checks %d starts %d", checks, starts)
+	}
+}
+
+func TestGovernedProviderRealManagerRecoversOnlyExactPartialDiff(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		diff      []byte
+		wantError string
+	}{
+		{name: "exact", diff: []byte(specialistProviderTestDiff)},
+		{name: "mismatch", diff: []byte(strings.Replace(specialistProviderTestDiff, "+fixed", "+forged", 1)), wantError: "different content"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSpecialistProviderFixture(t)
+			executor := newManagerBackedSpecialistExecutor()
+			state := filepath.Join(t.TempDir(), "repair-state")
+			manager := newManagerBackedSpecialistManager(t, state, executor)
+			configureManagerBackedSpecialistProvider(&fixture, manager, executor.identity)
+			order, _, response := dispatchManagerBackedSpecialistChild(t, fixture, manager, "governed partial diff "+test.name)
+			if response.CompletionSpoolSHA256 == "" {
+				t.Fatal("real Manager did not produce content-bound completion spool")
+			}
+			paths, err := fixture.mailbox.Paths(order.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWritePrivateFile(t, paths.UnifiedDiff, test.diff)
+			if _, err := os.Stat(paths.Receipt); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial-write setup unexpectedly has a receipt: %v", err)
+			}
+
+			recoveryExecutor := newManagerBackedSpecialistExecutor()
+			restarted := newManagerBackedSpecialistManager(t, state, recoveryExecutor)
+			fixture.provider.config.Dispatcher = restarted
+			result, err := fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+			if test.wantError == "" {
+				if err != nil || !strings.Contains(result.Output, "+fixed") {
+					t.Fatalf("exact partial diff was not reconstructed: result=%+v err=%v", result, err)
+				}
+				if _, _, storedDiff, err := fixture.mailbox.LoadCompletion(order); err != nil || string(storedDiff) != specialistProviderTestDiff {
+					t.Fatalf("reconstructed receipt/diff mismatch: diff=%q err=%v", storedDiff, err)
+				}
+				if _, err := os.Stat(filepath.Join(state, "specialist-children", order.ID, "consumed.json")); err != nil {
+					t.Fatalf("exact partial recovery did not consume child: %v", err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("mismatched partial diff was accepted: result=%+v err=%v", result, err)
+				}
+				if _, statErr := os.Stat(paths.Receipt); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("mismatch persisted an authoritative receipt: %v", statErr)
+				}
+				if _, statErr := os.Stat(filepath.Join(state, "specialist-children", order.ID, "consumed.json")); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("mismatch consumed retained child evidence: %v", statErr)
+				}
+			}
+			if checks, starts := recoveryExecutor.counts(); checks != 0 || starts != 0 {
+				t.Fatalf("partial-diff recovery touched model path: checks=%d starts=%d", checks, starts)
+			}
+		})
+	}
+}
+
 func TestSpecialistProviderBlockedCompletionReturnsNoPatch(t *testing.T) {
 	fixture := newSpecialistProviderFixture(t)
 	fixture.dispatcher.observeReply = func(request agent.SpecialistTaskResponseRequest) agent.SpecialistTaskResponse {
@@ -398,6 +805,42 @@ func TestSpecialistProviderFailsClosedOnStaleCheckoutAndWrongRoleOrSession(t *te
 			t.Fatalf("session mismatch error/release = %#v/%d", runErr, len(fixture.dispatcher.releaseCalls))
 		}
 	})
+}
+
+func TestSpecialistProviderRejectsGovernedExecutorProfileMismatchBeforeLeaseOrLaunch(t *testing.T) {
+	fixture := newSpecialistProviderFixture(t)
+	fixture.provider.config.WorkOrderKind = agent.SpecialistWorkOrderKindGovernedVisualHiveProposal
+	fixture.provider.config.ExecutorProfile = &agent.SpecialistProposalExecutorProfile{
+		Backend: "codex", ProviderSHA256: strings.Repeat("f", 64), Model: "codex-proof-model",
+		ConfigurationSHA256: strings.Repeat("a", 64), ContainmentProfile: agent.SpecialistContainmentProfileV1,
+		BackendParityClaimed: false,
+	}
+	fixture.dispatcher.identity.Backend = "copilot"
+	fixture.dispatcher.identity.ConfiguredBackend = "copilot"
+	fixture.dispatcher.identity.ExecutorBackend = "codex"
+	fixture.dispatcher.identity.ExecutorModel = "codex-proof-model"
+	fixture.dispatcher.identity.ExecutorConfigSHA256 = strings.Repeat("a", 64)
+	fixture.dispatcher.identity.ExecutorAuthorizationID = "codex-auth-" + strings.Repeat("b", 64)
+	fixture.dispatcher.identity.ContainmentProfile = agent.SpecialistContainmentProfileV1
+	fixture.dispatcher.identity.BackendParityClaimed = false
+	fixture.dispatcher.identity.TmuxSession = ""
+	fixture.dispatcher.identity.TmuxSocket = ""
+
+	order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, "governed executor mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+	var runErr *ProviderRunError
+	if err == nil || !errors.As(err, &runErr) || runErr.Launched || !strings.Contains(err.Error(), "exact executor profile") {
+		t.Fatalf("profile mismatch was not rejected before launch: %#v %v", runErr, err)
+	}
+	if fixture.dispatcher.checkCalls != 1 || len(fixture.dispatcher.dispatchCalls) != 0 {
+		t.Fatalf("profile mismatch reached dispatch: checks=%d dispatches=%d", fixture.dispatcher.checkCalls, len(fixture.dispatcher.dispatchCalls))
+	}
+	if _, leaseErr := fixture.mailbox.LoadLease(order); !errors.Is(leaseErr, os.ErrNotExist) {
+		t.Fatalf("profile mismatch acquired a mailbox lease: %v", leaseErr)
+	}
 }
 
 func TestSpecialistProviderRejectsTamperedLeaseAndOutput(t *testing.T) {
@@ -559,6 +1002,100 @@ func newSpecialistProviderFixture(t *testing.T) specialistProviderFixture {
 	return specialistProviderFixture{provider: provider, dispatcher: dispatcher, mailbox: mailbox, worktree: worktree, clock: clock, baseSHA: baseSHA, baseTree: baseTree}
 }
 
+func configureGovernedSpecialistFixture(fixture *specialistProviderFixture) {
+	profile := &agent.SpecialistProposalExecutorProfile{
+		Backend: "codex", ProviderSHA256: fixture.dispatcher.identity.ProviderSHA256, Model: "codex-proof-model",
+		ConfigurationSHA256: strings.Repeat("a", 64), ContainmentProfile: agent.SpecialistContainmentProfileV1,
+		BackendParityClaimed: false,
+	}
+	fixture.provider.config.WorkOrderKind = agent.SpecialistWorkOrderKindGovernedVisualHiveProposal
+	fixture.provider.config.ExecutorProfile = profile
+	identity := &fixture.dispatcher.identity
+	identity.Backend = "copilot"
+	identity.ConfiguredBackend = "copilot"
+	identity.ExecutorBackend = profile.Backend
+	identity.ExecutorModel = profile.Model
+	identity.ExecutorConfigSHA256 = profile.ConfigurationSHA256
+	identity.ExecutorAuthorizationID = "codex-auth-" + strings.Repeat("b", 64)
+	identity.ContainmentProfile = profile.ContainmentProfile
+	identity.BackendParityClaimed = false
+	identity.TmuxSession = ""
+	identity.TmuxSocket = ""
+}
+
+func newManagerBackedSpecialistExecutor() *managerBackedSpecialistExecutor {
+	return &managerBackedSpecialistExecutor{identity: agent.SpecialistChildExecutorIdentity{
+		Backend: "codex", ProviderSHA256: strings.Repeat("e", 64), Model: "codex-proof-model",
+		ConfigurationSHA256: strings.Repeat("a", 64),
+	}}
+}
+
+func newManagerBackedSpecialistManager(t *testing.T, state string, executor agent.SpecialistChildExecutor) *agent.Manager {
+	t.Helper()
+	t.Setenv("HIVE_WORK_DIR", t.TempDir())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager := agent.NewManager(map[string]config.AgentConfig{
+		"quality": {
+			Enabled: true, Backend: "copilot", Model: "persistent-copilot-model", Role: "quality",
+			LaunchCmd: "inert-persistent-launch", CavemanMode: "full",
+			Connections: []config.ConnectionConfig{{Name: "inert-parent-api", Type: "api", URI: "https://parent.invalid"}},
+		},
+	}, logger, agent.ProjectContext{Org: "fork-only"})
+	if err := manager.ConfigureSpecialistChildDispatcher(agent.SpecialistChildDispatcherOptions{RepairStateRoot: state, Executor: executor}); err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+func configureManagerBackedSpecialistProvider(fixture *specialistProviderFixture, dispatcher SpecialistDispatcher, identity agent.SpecialistChildExecutorIdentity) {
+	fixture.provider.config.Dispatcher = dispatcher
+	fixture.provider.config.WorkOrderKind = agent.SpecialistWorkOrderKindGovernedVisualHiveProposal
+	fixture.provider.config.ExecutorProfile = &agent.SpecialistProposalExecutorProfile{
+		Backend: "codex", ProviderSHA256: identity.ProviderSHA256, Model: identity.Model,
+		ConfigurationSHA256: identity.ConfigurationSHA256, ContainmentProfile: agent.SpecialistContainmentProfileV1,
+		BackendParityClaimed: false,
+	}
+}
+
+func dispatchManagerBackedSpecialistChild(t *testing.T, fixture specialistProviderFixture, manager *agent.Manager, prompt string) (agent.SpecialistWorkOrder, agent.SpecialistLease, agent.SpecialistTaskResponse) {
+	t.Helper()
+	order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := manager.CheckSpecialistRole(context.Background(), order.Specialist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := fixture.mailbox.AcquireLease(order, fixture.provider.config.LeaseOwner, identity.SessionID, order.Deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := specialistDispatchMessage(order, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := manager.DispatchSpecialistTask(context.Background(), agent.SpecialistDispatchRequest{
+		TaskID: order.ID, Specialist: order.Specialist, Message: message,
+		Order: order, Lease: lease, RequestSHA256: order.RequestSHA256,
+		SessionID: identity.SessionID, AgentName: identity.AgentName, AgentID: identity.AgentID,
+		ConfiguredBackend: identity.ConfiguredBackend, ProviderSHA256: identity.ProviderSHA256,
+		ExecutorBackend: identity.ExecutorBackend, BackendParityClaimed: identity.BackendParityClaimed,
+		ContainmentProfile: identity.ContainmentProfile, ExecutorModel: identity.ExecutorModel,
+		ExecutorConfigSHA256: identity.ExecutorConfigSHA256, ExecutorAuthorizationID: identity.ExecutorAuthorizationID,
+	})
+	if err != nil || !dispatch.Started {
+		t.Fatalf("real Manager child dispatch failed: result=%+v err=%v", dispatch, err)
+	}
+	response, err := manager.ObserveSpecialistTaskResponse(context.Background(), agent.SpecialistTaskResponseRequest{
+		TaskID: order.ID, Specialist: order.Specialist, SessionID: lease.SessionID, Message: message,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return order, lease, response
+}
+
 func makeSpecialistTestRepository(t *testing.T) (string, string, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -640,10 +1177,23 @@ func structuredSpecialistTaskResponseAt(t *testing.T, fixture specialistProvider
 	}
 	dispatchDigest := sha256.Sum256([]byte(request.Message))
 	responseDigest := sha256.Sum256(encoded)
-	return agent.SpecialistTaskResponse{
+	response := agent.SpecialistTaskResponse{
 		SchemaVersion: agent.SpecialistTaskResponseSchema, WorkOrderID: order.ID, Specialist: order.Specialist,
 		SessionID: lease.SessionID, TurnID: "turn-specialist-test", ProviderSHA256: fixture.dispatcher.identity.ProviderSHA256,
 		DispatchSHA256: hex.EncodeToString(dispatchDigest[:]), ResponseSHA256: hex.EncodeToString(responseDigest[:]),
 		Response: string(encoded), CompletedAt: completedAt.UTC(),
 	}
+	if order.Kind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal && order.ExecutorProfile != nil {
+		response.TurnID = fixture.dispatcher.identity.ExecutorAuthorizationID
+		authorizationDigest := sha256.Sum256([]byte(response.TurnID))
+		response.AuthorizationSHA256 = hex.EncodeToString(authorizationDigest[:])
+		response.ExecutorBackend = order.ExecutorProfile.Backend
+		response.ExecutorModel = order.ExecutorProfile.Model
+		response.ExecutorConfigSHA256 = order.ExecutorProfile.ConfigurationSHA256
+		response.ContainmentProfile = order.ExecutorProfile.ContainmentProfile
+		response.IntentSHA256 = strings.Repeat("1", 64)
+		response.StartedSHA256 = strings.Repeat("2", 64)
+		response.CompletionSpoolSHA256 = strings.Repeat("3", 64)
+	}
+	return response
 }

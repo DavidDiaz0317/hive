@@ -325,24 +325,21 @@ func (s *Scheduler) governedProposalExecutorProfile() (GovernedProposalExecutorP
 }
 
 func normalizeGovernedProposalExecutorProfile(profile GovernedProposalExecutorProfile) (GovernedProposalExecutorProfile, error) {
-	profile.SchemaVersion = strings.TrimSpace(profile.SchemaVersion)
 	profile.Backend = strings.ToLower(strings.TrimSpace(profile.Backend))
+	profile.ProviderSHA256 = strings.ToLower(strings.TrimSpace(profile.ProviderSHA256))
 	profile.Model = strings.TrimSpace(profile.Model)
-	profile.ConfigSHA256 = strings.ToLower(strings.TrimSpace(profile.ConfigSHA256))
+	profile.ConfigurationSHA256 = strings.ToLower(strings.TrimSpace(profile.ConfigurationSHA256))
 	profile.ContainmentProfile = strings.TrimSpace(profile.ContainmentProfile)
-	if profile.SchemaVersion != agent.SpecialistExecutorProfileSchema {
-		return GovernedProposalExecutorProfile{}, errors.New("unsupported governed proposal executor profile schema")
-	}
 	if profile.Backend != agent.SpecialistExecutorBackendCodex {
 		return GovernedProposalExecutorProfile{}, errors.New("governed proposal v1 executor backend must be codex")
 	}
 	if profile.Model == "" || len(profile.Model) > 256 || strings.IndexByte(profile.Model, 0) >= 0 {
 		return GovernedProposalExecutorProfile{}, errors.New("bounded governed proposal executor model is required")
 	}
-	if !governedDigestPattern.MatchString(profile.ConfigSHA256) {
-		return GovernedProposalExecutorProfile{}, errors.New("governed proposal executor config digest is required")
+	if !governedDigestPattern.MatchString(profile.ProviderSHA256) || !governedDigestPattern.MatchString(profile.ConfigurationSHA256) {
+		return GovernedProposalExecutorProfile{}, errors.New("governed proposal executor provider and configuration digests are required")
 	}
-	if profile.ContainmentProfile != governedContainmentProfile {
+	if profile.ContainmentProfile != governedContainmentProfile || profile.BackendParityClaimed {
 		return GovernedProposalExecutorProfile{}, errors.New("unsupported governed proposal executor containment profile")
 	}
 	return profile, nil
@@ -455,8 +452,8 @@ func (s *Scheduler) BuildGovernedProposalMessage(role agent.SpecialistRole, work
 		ConfiguredRoleLaunchCmdPresent: strings.TrimSpace(toolPolicy.LaunchCmd) != "",
 		ConfiguredRoleConnectionCount:  len(toolPolicy.Connections), ConfiguredRoleCavemanMode: roleSnapshot.CavemanMode,
 		ConfiguredRoleSnapshotClass: governedRoleSnapshotClass, ConfiguredRoleSnapshotSHA256: roleSnapshotSHA,
-		ExecutorProfileSchema: executorProfile.SchemaVersion, ExecutorBackend: executorProfile.Backend,
-		ExecutorModel: executorProfile.Model, ExecutorConfigSHA256: executorProfile.ConfigSHA256,
+		ExecutorProfileSchema: agent.SpecialistExecutorProfileSchema, ExecutorBackend: executorProfile.Backend,
+		ExecutorModel: executorProfile.Model, ExecutorConfigSHA256: executorProfile.ConfigurationSHA256,
 		ExecutorProfileSHA256: executorProfileSHA, ContainmentProfile: executorProfile.ContainmentProfile,
 		BackendParityClaimed: false,
 		ToolPolicySHA256:     toolPolicySHA, Authority: authority,

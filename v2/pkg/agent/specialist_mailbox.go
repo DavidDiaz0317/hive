@@ -24,14 +24,17 @@ import (
 )
 
 const (
-	SpecialistWorkOrderSchema                         = "hive.specialist-work-order.v1"
-	SpecialistReceiptSchema                           = "hive.specialist-receipt.v1"
-	SpecialistLeaseSchema                             = "hive.specialist-lease.v1"
+	SpecialistWorkOrderSchema = "hive.specialist-work-order.v1"
+	SpecialistReceiptSchema   = "hive.specialist-receipt.v1"
+	SpecialistLeaseSchema     = "hive.specialist-lease.v1"
+	// SpecialistWorkOrderKindGovernedVisualHiveProposal is the only mailbox
+	// order kind accepted by the contained proposal-only child dispatcher.
+	// Empty remains valid for the existing persistent specialist flow.
 	SpecialistWorkOrderKindGovernedVisualHiveProposal = "visual-hive-governed-proposal"
 	SpecialistExecutorProfileSchema                   = "hive.specialist-executor-profile.v1"
 	SpecialistRoleConfigSnapshotSchema                = "hive.specialist-role-config-snapshot.v1"
 	SpecialistExecutorBackendCodex                    = "codex"
-	SpecialistExecutorContainmentProfileV1            = "codex-repair-containment-v1"
+	SpecialistExecutorContainmentProfileV1            = SpecialistContainmentProfileV1
 	SpecialistReproductionModeNone                    = "none-authorized"
 	SpecialistReproductionModeVerifiedValidation      = "worker-verified-validation"
 
@@ -78,19 +81,6 @@ const (
 // the exact verified receipt type with Visual Hive admission.
 type SpecialistEvidenceIdentity = visualhive.SpecialistEvidenceIdentity
 
-// SpecialistExecutorProfile is the controller-owned proposal executor
-// identity bound into governed work orders. It is deliberately independent
-// from the selected role's normal backend, model, launch command, tools, and
-// connections. ConfigSHA256 identifies the sealed runtime configuration the
-// dispatcher must compare before a model call.
-type SpecialistExecutorProfile struct {
-	SchemaVersion      string `json:"schema_version"`
-	Backend            string `json:"backend"`
-	Model              string `json:"model"`
-	ConfigSHA256       string `json:"config_sha256"`
-	ContainmentProfile string `json:"containment_profile"`
-}
-
 // SpecialistRoleConfigSnapshot is an inert, canonical comparison surface for
 // the selected normal role. Potentially operational values are represented by
 // digests and counts; this snapshot grants no live tool, connection, launch,
@@ -110,42 +100,75 @@ type SpecialistRoleConfigSnapshot struct {
 	FullConfigSHA256    string `json:"full_config_sha256"`
 }
 
+// SpecialistProposalExecutorProfile is the stable, governed one-shot model
+// identity. It is separate from the persistent role's configured backend and
+// deliberately excludes the ephemeral per-invocation authorization ID.
+type SpecialistProposalExecutorProfile struct {
+	Backend              string `json:"backend"`
+	ProviderSHA256       string `json:"provider_sha256"`
+	Model                string `json:"model"`
+	ConfigurationSHA256  string `json:"configuration_sha256"`
+	ContainmentProfile   string `json:"containment_profile"`
+	BackendParityClaimed bool   `json:"backend_parity_claimed"`
+}
+
+// SpecialistExecutorProfile is retained as the scheduler-facing name for the
+// same sealed one-shot profile consumed by the governed dispatcher. It is not
+// a second executor identity or a normal role backend configuration.
+type SpecialistExecutorProfile = SpecialistProposalExecutorProfile
+
+// SpecialistContainedChildProvenance is broker-observed transport evidence
+// for governed one-shot proposals. It binds the mailbox receipt to the exact
+// contained executor, session/turn, request/response bytes, and durable child
+// intent/start/completion spool. Legacy persistent completions omit it.
+type SpecialistContainedChildProvenance struct {
+	ExecutorProfile       SpecialistProposalExecutorProfile `json:"executor_profile"`
+	AuthorizationSHA256   string                            `json:"authorization_sha256"`
+	SessionID             string                            `json:"session_id"`
+	TurnID                string                            `json:"turn_id"`
+	DispatchSHA256        string                            `json:"dispatch_sha256"`
+	ResponseSHA256        string                            `json:"response_sha256"`
+	IntentSHA256          string                            `json:"intent_sha256"`
+	StartedSHA256         string                            `json:"started_sha256"`
+	CompletionSpoolSHA256 string                            `json:"completion_spool_sha256"`
+}
+
 // SpecialistWorkOrderRequest is the caller-owned, content-bound task input.
 // Prepare derives the immutable ID and request digest from every field here.
 type SpecialistWorkOrderRequest struct {
-	Kind                       string                        `json:"kind,omitempty"`
-	Repository                 string                        `json:"repository"`
-	RepositoryFingerprint      string                        `json:"repository_fingerprint"`
-	ExternalRef                string                        `json:"external_ref,omitempty"`
-	PacketSHA256               string                        `json:"packet_sha256,omitempty"`
-	FindingSHA256              string                        `json:"finding_sha256,omitempty"`
-	SourceContextSHA256        string                        `json:"source_context_sha256,omitempty"`
-	SourceContextBindingSHA256 string                        `json:"source_context_binding_sha256,omitempty"`
-	RecurrenceKey              string                        `json:"recurrence_key"`
-	Attempt                    uint64                        `json:"attempt"`
-	BaseSHA                    string                        `json:"base_sha"`
-	BaseTreeSHA                string                        `json:"base_tree_sha"`
-	Evidence                   SpecialistEvidenceIdentity    `json:"evidence"`
-	Specialist                 SpecialistRole                `json:"specialist"`
-	RouteReason                string                        `json:"route_reason"`
-	AuthorityClass             string                        `json:"authority_class,omitempty"`
-	PolicySHA256               string                        `json:"policy_sha256,omitempty"`
-	KnowledgeSHA256            string                        `json:"knowledge_sha256,omitempty"`
-	ToolPolicySHA256           string                        `json:"tool_policy_sha256,omitempty"`
-	CapabilitySHA256           string                        `json:"capability_sha256,omitempty"`
-	ExecutorProfile            *SpecialistExecutorProfile    `json:"executor_profile,omitempty"`
-	ExecutorProfileSHA256      string                        `json:"executor_profile_sha256,omitempty"`
-	RoleConfigSnapshot         *SpecialistRoleConfigSnapshot `json:"role_config_snapshot,omitempty"`
-	RoleConfigSnapshotSHA256   string                        `json:"role_config_snapshot_sha256,omitempty"`
-	AllowedPaths               []string                      `json:"allowed_paths"`
-	ReproductionMode           string                        `json:"reproduction_mode,omitempty"`
-	Reproduction               []string                      `json:"reproduction,omitempty"`
-	Validation                 []string                      `json:"validation"`
-	AffectedContracts          []string                      `json:"affected_contracts,omitempty"`
-	KnowledgeKeywords          []string                      `json:"knowledge_keywords,omitempty"`
-	TaskPrompt                 string                        `json:"task_prompt"`
-	TaskPromptSHA256           string                        `json:"task_prompt_sha256"`
-	Deadline                   time.Time                     `json:"deadline"`
+	Kind                       string                             `json:"kind,omitempty"`
+	ExecutorProfile            *SpecialistProposalExecutorProfile `json:"executor_profile,omitempty"`
+	ExecutorProfileSHA256      string                             `json:"executor_profile_sha256,omitempty"`
+	Repository                 string                             `json:"repository"`
+	RepositoryFingerprint      string                             `json:"repository_fingerprint"`
+	ExternalRef                string                             `json:"external_ref,omitempty"`
+	PacketSHA256               string                             `json:"packet_sha256,omitempty"`
+	FindingSHA256              string                             `json:"finding_sha256,omitempty"`
+	SourceContextSHA256        string                             `json:"source_context_sha256,omitempty"`
+	SourceContextBindingSHA256 string                             `json:"source_context_binding_sha256,omitempty"`
+	RecurrenceKey              string                             `json:"recurrence_key"`
+	Attempt                    uint64                             `json:"attempt"`
+	BaseSHA                    string                             `json:"base_sha"`
+	BaseTreeSHA                string                             `json:"base_tree_sha"`
+	Evidence                   SpecialistEvidenceIdentity         `json:"evidence"`
+	Specialist                 SpecialistRole                     `json:"specialist"`
+	RouteReason                string                             `json:"route_reason"`
+	AuthorityClass             string                             `json:"authority_class,omitempty"`
+	PolicySHA256               string                             `json:"policy_sha256,omitempty"`
+	KnowledgeSHA256            string                             `json:"knowledge_sha256,omitempty"`
+	ToolPolicySHA256           string                             `json:"tool_policy_sha256,omitempty"`
+	CapabilitySHA256           string                             `json:"capability_sha256,omitempty"`
+	RoleConfigSnapshot         *SpecialistRoleConfigSnapshot      `json:"role_config_snapshot,omitempty"`
+	RoleConfigSnapshotSHA256   string                             `json:"role_config_snapshot_sha256,omitempty"`
+	AllowedPaths               []string                           `json:"allowed_paths"`
+	ReproductionMode           string                             `json:"reproduction_mode,omitempty"`
+	Reproduction               []string                           `json:"reproduction,omitempty"`
+	Validation                 []string                           `json:"validation"`
+	AffectedContracts          []string                           `json:"affected_contracts,omitempty"`
+	KnowledgeKeywords          []string                           `json:"knowledge_keywords,omitempty"`
+	TaskPrompt                 string                             `json:"task_prompt"`
+	TaskPromptSHA256           string                             `json:"task_prompt_sha256"`
+	Deadline                   time.Time                          `json:"deadline"`
 }
 
 // SpecialistWorkOrder is an immutable request stored in the mailbox.
@@ -173,21 +196,22 @@ type SpecialistLease struct {
 // SpecialistReceipt binds a proposed patch to the exact request, checkout,
 // role, lease, session, and task prompt that produced it.
 type SpecialistReceipt struct {
-	SchemaVersion     string                     `json:"schema_version"`
-	Status            SpecialistCompletionStatus `json:"status"`
-	WorkOrderID       string                     `json:"work_order_id"`
-	RequestSHA256     string                     `json:"request_sha256"`
-	Specialist        SpecialistRole             `json:"specialist"`
-	LeaseOwner        string                     `json:"lease_owner"`
-	SessionID         string                     `json:"session_id"`
-	LeaseSHA256       string                     `json:"lease_sha256"`
-	BaseSHA           string                     `json:"base_sha"`
-	BaseTreeSHA       string                     `json:"base_tree_sha"`
-	TaskPromptSHA256  string                     `json:"task_prompt_sha256"`
-	UnifiedDiffSHA256 string                     `json:"unified_diff_sha256"`
-	CompletedAt       time.Time                  `json:"completed_at"`
-	Summary           string                     `json:"summary"`
-	ReceiptSHA256     string                     `json:"receipt_sha256"`
+	SchemaVersion     string                              `json:"schema_version"`
+	Status            SpecialistCompletionStatus          `json:"status"`
+	WorkOrderID       string                              `json:"work_order_id"`
+	RequestSHA256     string                              `json:"request_sha256"`
+	Specialist        SpecialistRole                      `json:"specialist"`
+	LeaseOwner        string                              `json:"lease_owner"`
+	SessionID         string                              `json:"session_id"`
+	LeaseSHA256       string                              `json:"lease_sha256"`
+	BaseSHA           string                              `json:"base_sha"`
+	BaseTreeSHA       string                              `json:"base_tree_sha"`
+	TaskPromptSHA256  string                              `json:"task_prompt_sha256"`
+	UnifiedDiffSHA256 string                              `json:"unified_diff_sha256"`
+	CompletedAt       time.Time                           `json:"completed_at"`
+	Summary           string                              `json:"summary"`
+	ContainedChild    *SpecialistContainedChildProvenance `json:"contained_child,omitempty"`
+	ReceiptSHA256     string                              `json:"receipt_sha256"`
 }
 
 // SpecialistMailboxPaths are safe, deterministic paths the existing agent
@@ -322,7 +346,14 @@ func (m *SpecialistMailbox) PrepareGoverned(request SpecialistWorkOrderRequest) 
 	if strings.TrimSpace(request.Kind) != SpecialistWorkOrderKindGovernedVisualHiveProposal {
 		return SpecialistWorkOrder{}, errors.New("governed specialist work-order kind is required")
 	}
-	return m.Prepare(request)
+	normalized, err := m.normalizeRequest(request, true)
+	if err != nil {
+		return SpecialistWorkOrder{}, err
+	}
+	if err := validateGovernedSpecialistRequest(normalized); err != nil {
+		return SpecialistWorkOrder{}, err
+	}
+	return m.Prepare(normalized)
 }
 
 // Paths resolves paths only for a structurally valid content-derived order ID.
@@ -690,6 +721,26 @@ func NewSpecialistReceipt(order SpecialistWorkOrder, lease SpecialistLease, stat
 	return receipt, nil
 }
 
+// NewGovernedSpecialistReceipt adds the contained-child provenance required
+// for a governed Visual Hive proposal. The mailbox independently validates
+// every field again during submit and replay.
+func NewGovernedSpecialistReceipt(order SpecialistWorkOrder, lease SpecialistLease, status SpecialistCompletionStatus, unifiedDiff []byte, summary string, completedAt time.Time, provenance SpecialistContainedChildProvenance) (SpecialistReceipt, error) {
+	if order.Kind != SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return SpecialistReceipt{}, errors.New("contained-child provenance is only valid for a governed specialist order")
+	}
+	receipt, err := NewSpecialistReceipt(order, lease, status, unifiedDiff, summary, completedAt)
+	if err != nil {
+		return SpecialistReceipt{}, err
+	}
+	receipt.ContainedChild = &provenance
+	digest, err := digestReceipt(receipt)
+	if err != nil {
+		return SpecialistReceipt{}, err
+	}
+	receipt.ReceiptSHA256 = digest
+	return receipt, nil
+}
+
 // SubmitReceipt validates the active lease and writes the diff first and the
 // receipt last. A byte-identical resubmission is idempotent.
 func (m *SpecialistMailbox) SubmitReceipt(order SpecialistWorkOrder, lease SpecialistLease, receipt SpecialistReceipt, unifiedDiff []byte) error {
@@ -857,10 +908,10 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 	request.ExecutorProfileSHA256 = strings.ToLower(strings.TrimSpace(request.ExecutorProfileSHA256))
 	if request.ExecutorProfile != nil {
 		profile := *request.ExecutorProfile
-		profile.SchemaVersion = strings.TrimSpace(profile.SchemaVersion)
 		profile.Backend = strings.ToLower(strings.TrimSpace(profile.Backend))
+		profile.ProviderSHA256 = strings.ToLower(strings.TrimSpace(profile.ProviderSHA256))
 		profile.Model = strings.TrimSpace(profile.Model)
-		profile.ConfigSHA256 = strings.ToLower(strings.TrimSpace(profile.ConfigSHA256))
+		profile.ConfigurationSHA256 = strings.ToLower(strings.TrimSpace(profile.ConfigurationSHA256))
 		profile.ContainmentProfile = strings.TrimSpace(profile.ContainmentProfile)
 		request.ExecutorProfile = &profile
 	}
@@ -974,7 +1025,7 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 			return request, errors.New("specialist executor and role snapshots are reserved for governed work orders")
 		}
 	case SpecialistWorkOrderKindGovernedVisualHiveProposal:
-		if err := validateGovernedSpecialistRequest(request); err != nil {
+		if err := validateDispatchableGovernedSpecialistRequest(request); err != nil {
 			return request, err
 		}
 	default:
@@ -1072,15 +1123,11 @@ func validateGovernedSpecialistRequest(request SpecialistWorkOrderRequest) error
 			return fmt.Errorf("governed specialist %s digest is required", name)
 		}
 	}
-	if err := validateSpecialistExecutorProfile(request.ExecutorProfile); err != nil {
+	if err := validateDispatchableGovernedSpecialistRequest(request); err != nil {
 		return err
 	}
-	profileSHA256, err := digestJSON(*request.ExecutorProfile)
-	if err != nil {
-		return fmt.Errorf("digest governed specialist executor profile: %w", err)
-	}
-	if request.ExecutorProfileSHA256 != profileSHA256 {
-		return errors.New("governed specialist executor profile digest mismatch")
+	if err := validateSpecialistExecutorProfile(request.ExecutorProfile); err != nil {
+		return err
 	}
 	if err := validateSpecialistRoleConfigSnapshot(request.RoleConfigSnapshot, request.ToolPolicySHA256); err != nil {
 		return err
@@ -1095,12 +1142,30 @@ func validateGovernedSpecialistRequest(request SpecialistWorkOrderRequest) error
 	return nil
 }
 
+// validateDispatchableGovernedSpecialistRequest is the narrow lower-layer
+// invariant shared with the contained dispatcher. Normal Visual Hive intake
+// must use PrepareGoverned, which additionally requires every controller,
+// source, policy, knowledge, role, and reproduction binding above.
+func validateDispatchableGovernedSpecialistRequest(request SpecialistWorkOrderRequest) error {
+	if request.ExecutorProfile == nil {
+		return errors.New("governed specialist executor profile is required")
+	}
+	if !digestPattern.MatchString(request.ExecutorProfileSHA256) {
+		return errors.New("governed specialist executor profile digest is required")
+	}
+	profileSHA256, err := digestJSON(*request.ExecutorProfile)
+	if err != nil {
+		return fmt.Errorf("digest governed specialist executor profile: %w", err)
+	}
+	if request.ExecutorProfileSHA256 != profileSHA256 {
+		return errors.New("governed specialist executor profile digest mismatch")
+	}
+	return nil
+}
+
 func validateSpecialistExecutorProfile(profile *SpecialistExecutorProfile) error {
 	if profile == nil {
 		return errors.New("governed specialist executor profile is required")
-	}
-	if profile.SchemaVersion != SpecialistExecutorProfileSchema {
-		return errors.New("unsupported governed specialist executor profile schema")
 	}
 	if profile.Backend != SpecialistExecutorBackendCodex {
 		return errors.New("governed specialist executor backend must be codex")
@@ -1108,10 +1173,10 @@ func validateSpecialistExecutorProfile(profile *SpecialistExecutorProfile) error
 	if profile.Model == "" || len(profile.Model) > 256 || strings.IndexByte(profile.Model, 0) >= 0 {
 		return errors.New("bounded governed specialist executor model is required")
 	}
-	if !digestPattern.MatchString(profile.ConfigSHA256) {
-		return errors.New("governed specialist executor config digest is required")
+	if !digestPattern.MatchString(profile.ProviderSHA256) || !digestPattern.MatchString(profile.ConfigurationSHA256) {
+		return errors.New("governed specialist executor provider and configuration digests are required")
 	}
-	if profile.ContainmentProfile != SpecialistExecutorContainmentProfileV1 {
+	if profile.ContainmentProfile != SpecialistExecutorContainmentProfileV1 || profile.BackendParityClaimed {
 		return errors.New("unsupported governed specialist containment profile")
 	}
 	return nil
@@ -1183,6 +1248,9 @@ func (m *SpecialistMailbox) validateReceipt(order SpecialistWorkOrder, lease Spe
 	if strings.TrimSpace(receipt.Summary) == "" || receipt.Summary != strings.TrimSpace(receipt.Summary) || len(receipt.Summary) > 16<<10 || strings.IndexByte(receipt.Summary, 0) >= 0 {
 		return errors.New("specialist receipt summary is invalid")
 	}
+	if err := validateSpecialistReceiptProvenance(order, lease, receipt.ContainedChild); err != nil {
+		return err
+	}
 	switch receipt.Status {
 	case SpecialistCompletionProposed:
 		if err := validateUnifiedDiff(unifiedDiff, m.maxUnifiedDiffBytes); err != nil {
@@ -1208,6 +1276,37 @@ func (m *SpecialistMailbox) validateReceipt(order SpecialistWorkOrder, lease Spe
 	}
 	if receipt.ReceiptSHA256 != digest {
 		return errors.New("specialist receipt content digest mismatch")
+	}
+	return nil
+}
+
+func validateSpecialistReceiptProvenance(order SpecialistWorkOrder, lease SpecialistLease, provenance *SpecialistContainedChildProvenance) error {
+	if order.Kind != SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		if provenance != nil {
+			return errors.New("legacy specialist receipt must not claim contained-child provenance")
+		}
+		return nil
+	}
+	if provenance == nil || order.ExecutorProfile == nil {
+		return errors.New("governed specialist receipt requires contained-child provenance")
+	}
+	profile := provenance.ExecutorProfile
+	if !strings.EqualFold(strings.TrimSpace(profile.Backend), "codex") || profile.BackendParityClaimed ||
+		profile.ContainmentProfile != SpecialistContainmentProfileV1 || !digestPattern.MatchString(strings.ToLower(strings.TrimSpace(profile.ProviderSHA256))) ||
+		!digestPattern.MatchString(strings.ToLower(strings.TrimSpace(profile.ConfigurationSHA256))) || strings.TrimSpace(profile.Model) == "" ||
+		strings.IndexByte(profile.Model, 0) >= 0 || len(profile.Model) > 256 || !equalJSON(profile, *order.ExecutorProfile) {
+		return errors.New("governed specialist receipt executor provenance does not match the immutable order")
+	}
+	if provenance.SessionID != lease.SessionID || !safeIdentityPattern.MatchString(provenance.TurnID) {
+		return errors.New("governed specialist receipt session or turn provenance is invalid")
+	}
+	for _, digest := range []string{
+		provenance.AuthorizationSHA256, provenance.DispatchSHA256, provenance.ResponseSHA256, provenance.IntentSHA256,
+		provenance.StartedSHA256, provenance.CompletionSpoolSHA256,
+	} {
+		if !digestPattern.MatchString(strings.ToLower(strings.TrimSpace(digest))) {
+			return errors.New("governed specialist receipt transport provenance is incomplete")
+		}
 	}
 	return nil
 }

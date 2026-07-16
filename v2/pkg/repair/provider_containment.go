@@ -22,6 +22,11 @@ const windowsRestrictedReadDenial = "Restricted read-only access requires the el
 // write, and loopback-network operations. Health cannot authorize Run unless
 // every operation is observably denied and all parent-side invariants hold.
 func verifyCodexPlatformContainment(ctx context.Context, codexCommand string) error {
+	base := cleanCodexEnvironment(codexCommand, os.TempDir(), os.TempDir(), os.TempDir(), os.TempDir(), os.TempDir(), os.TempDir(), os.TempDir(), os.TempDir())
+	return verifyCodexPlatformContainmentWithEnvironment(ctx, codexCommand, base)
+}
+
+func verifyCodexPlatformContainmentWithEnvironment(ctx context.Context, codexCommand string, environment []string) error {
 	root, err := os.MkdirTemp("", "hive-codex-containment-")
 	if err != nil {
 		return fmt.Errorf("create Codex containment probe root: %w", err)
@@ -67,13 +72,13 @@ func verifyCodexPlatformContainment(ctx context.Context, codexCommand string) er
 		return err
 	}
 
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "read", readPath, "", containmentProbeReadBlocked); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "read", readPath, "", containmentProbeReadBlocked, environment); err != nil {
 		return err
 	}
 	if actual, err := os.ReadFile(readPath); err != nil || string(actual) != string(readValue) {
 		return fmt.Errorf("Codex containment read probe changed or removed its sentinel")
 	}
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "write", writePath, "", containmentProbeWriteBlocked); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "write", writePath, "", containmentProbeWriteBlocked, environment); err != nil {
 		return err
 	}
 	if actual, err := os.ReadFile(writePath); err != nil || string(actual) != string(writeValue) {
@@ -85,7 +90,7 @@ func verifyCodexPlatformContainment(ctx context.Context, codexCommand string) er
 		return fmt.Errorf("create Codex containment loopback listener: %w", err)
 	}
 	defer listener.Close()
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "network", "", listener.Addr().String(), containmentProbeNetworkBlocked); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "network", "", listener.Addr().String(), containmentProbeNetworkBlocked, environment); err != nil {
 		return err
 	}
 	if tcp, ok := listener.(*net.TCPListener); ok {
@@ -99,7 +104,7 @@ func verifyCodexPlatformContainment(ctx context.Context, codexCommand string) er
 	return nil
 }
 
-func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath, mode, target, address, expectedMarker string) error {
+func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath, mode, target, address, expectedMarker string, environment []string) error {
 	args := []string{"sandbox", "-C", cwd}
 	args = append(args, codexNoFilesPermissionArgs()...)
 	args = append(args,
@@ -115,7 +120,7 @@ func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath,
 	)
 	command := exec.CommandContext(ctx, codexCommand, args...)
 	command.Dir = cwd
-	command.Env = containmentProbeEnvironment(mode, target, address, cwd)
+	command.Env = containmentProbeEnvironment(mode, target, address, cwd, environment)
 	var stdout, stderr limitedBuffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	err := command.Run()
@@ -158,9 +163,9 @@ func containmentProbeFailureDetail(err error, output string) string {
 	return err.Error() + ": " + detail
 }
 
-func containmentProbeEnvironment(mode, target, address, runtimeRoot string) []string {
-	result := make([]string, 0, len(providerEnvironment())+3)
-	for _, pair := range providerEnvironment() {
+func containmentProbeEnvironment(mode, target, address, runtimeRoot string, environment []string) []string {
+	result := make([]string, 0, len(environment)+3)
+	for _, pair := range environment {
 		name, _, _ := strings.Cut(pair, "=")
 		if name == containmentProbeModeEnv || name == containmentProbeTargetEnv || name == containmentProbeAddressEnv {
 			continue

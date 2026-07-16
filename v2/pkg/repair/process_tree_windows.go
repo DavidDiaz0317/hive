@@ -3,6 +3,8 @@
 package repair
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"syscall"
@@ -12,7 +14,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func startRepairProcessTree(command *exec.Cmd) (func() error, error) {
+func startRepairProcessTree(ctx context.Context, command *exec.Cmd) (func() error, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create repair command job: %w", err)
@@ -54,8 +56,25 @@ func startRepairProcessTree(command *exec.Cmd) (func() error, error) {
 	}
 	closeJob = false
 	return func() error {
-		waitErr := command.Wait()
-		terminateErr := windows.TerminateJobObject(job, 1)
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- command.Wait() }()
+		var waitErr error
+		var waitTimedOut bool
+		var terminateErr error
+		select {
+		case waitErr = <-waitDone:
+			terminateErr = windows.TerminateJobObject(job, 1)
+		case <-ctx.Done():
+			// Kill the exact Job before waiting. Descendants may retain inherited
+			// output handles after the leader exits; they cannot delay cleanup.
+			terminateErr = windows.TerminateJobObject(job, 1)
+			select {
+			case waitErr = <-waitDone:
+			case <-time.After(5 * time.Second):
+				waitErr = ctx.Err()
+				waitTimedOut = true
+			}
+		}
 		emptyErr := waitForEmptyRepairJob(job)
 		closeErr := windows.CloseHandle(job)
 		var containmentErr error
@@ -65,6 +84,9 @@ func startRepairProcessTree(command *exec.Cmd) (func() error, error) {
 			containmentErr = emptyErr
 		} else if closeErr != nil {
 			containmentErr = fmt.Errorf("close repair command job: %w", closeErr)
+		}
+		if waitTimedOut {
+			containmentErr = errors.Join(containmentErr, errors.New("repair command did not exit within the bounded post-termination wait"))
 		}
 		if containmentErr != nil {
 			return patchEngineInfrastructureFailure(fmt.Errorf("repair command result %v; process-tree containment failed: %w", waitErr, containmentErr))
@@ -108,32 +130,49 @@ func waitForEmptyRepairJob(job windows.Handle) error {
 }
 
 func resumePrimaryProcessThread(processID uint32) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resumed, err := resumePrimaryProcessThreadOnce(processID)
+		if err != nil {
+			return err
+		}
+		if resumed {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("suspended repair command has no primary thread")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func resumePrimaryProcessThreadOnce(processID uint32) (bool, error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
-		return fmt.Errorf("enumerate suspended repair command threads: %w", err)
+		return false, fmt.Errorf("enumerate suspended repair command threads: %w", err)
 	}
 	defer windows.CloseHandle(snapshot)
 	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
 	if err := windows.Thread32First(snapshot, &entry); err != nil {
-		return fmt.Errorf("read suspended repair command threads: %w", err)
+		return false, fmt.Errorf("read suspended repair command threads: %w", err)
 	}
 	for {
 		if entry.OwnerProcessID == processID {
 			thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
 			if err != nil {
-				return fmt.Errorf("open suspended repair command thread: %w", err)
+				return false, fmt.Errorf("open suspended repair command thread: %w", err)
 			}
 			_, resumeErr := windows.ResumeThread(thread)
 			_ = windows.CloseHandle(thread)
 			if resumeErr != nil {
-				return fmt.Errorf("resume contained repair command: %w", resumeErr)
+				return false, fmt.Errorf("resume contained repair command: %w", resumeErr)
 			}
-			return nil
+			return true, nil
 		}
 		entry.Size = uint32(unsafe.Sizeof(windows.ThreadEntry32{}))
 		if err := windows.Thread32Next(snapshot, &entry); err != nil {
 			break
 		}
 	}
-	return fmt.Errorf("suspended repair command has no primary thread")
+	return false, nil
 }
