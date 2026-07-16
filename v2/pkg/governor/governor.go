@@ -152,7 +152,7 @@ func New(cfg config.GovernorConfig, agents map[string]config.AgentConfig, logger
 
 	return &Governor{
 		cfg:    cfg,
-		agents: agents,
+		agents: cloneAgentConfigs(agents),
 		state: State{
 			Mode:     ModeIdle,
 			Cadences: make(map[string]AgentCadence),
@@ -173,6 +173,31 @@ func (g *Governor) UpdateConfig(cfg config.GovernorConfig) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.cfg = cfg
+}
+
+// UpdateConfigAndAgents replaces the Governor configuration and its enabled
+// agent snapshot under the same lock. Config reloaders should use this method
+// so admission and cadence decisions never combine a new Governor policy with
+// the agent set captured at startup.
+func (g *Governor) UpdateConfigAndAgents(cfg config.GovernorConfig, agents map[string]config.AgentConfig) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.cfg = cfg
+	g.agents = cloneAgentConfigs(agents)
+	for name := range g.state.Cadences {
+		if _, enabled := g.agents[name]; !enabled {
+			delete(g.state.Cadences, name)
+		}
+	}
+}
+
+func cloneAgentConfigs(agents map[string]config.AgentConfig) map[string]config.AgentConfig {
+	cloned := make(map[string]config.AgentConfig, len(agents))
+	for name, agentConfig := range agents {
+		cloned[name] = agentConfig
+	}
+	return cloned
 }
 
 func (g *Governor) Evaluate(queueIssues, queuePRs, queueHold, slaViolations int) []string {
@@ -346,6 +371,9 @@ func (g *Governor) agentsDueForKick() []string {
 	suppressed := 0
 
 	for agentName, cadence := range g.state.Cadences {
+		if _, enabled := g.agents[agentName]; !enabled {
+			continue
+		}
 		if cadence.Paused {
 			continue
 		}
