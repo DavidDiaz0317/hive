@@ -164,6 +164,13 @@ Effective proposal capability denies GitHub/Hive/bead/wiki/graph/MCP/API/subagen
   owned through the ordinary Manager facade. Claude, Copilot, inference backends,
   launch-command overrides, live connections, and fallback to persistent agent
   panes fail before process launch. Other backends wait for equivalent enforcement.
+- This executor profile is separate from the existing role's normal backend/model/
+  launch/connection configuration. Hive MUST NOT require an existing Copilot, Claude,
+  or other role to be reconfigured to Codex. That normal role configuration is
+  preserved unchanged and may be digest-bound only as inert expertise/policy context;
+  it cannot select, configure, or grant capability to the proposal child. The child
+  binds its own Codex model/provider/config/containment identity and explicitly makes
+  no backend-parity claim.
 - The child receives no checkout, `.git`, repository instructions, or repository
   read/write capability. Existing Worker code seals the exact base tree and supplies
   bounded regular-file source context from exact Git blobs; Worker remains the sole
