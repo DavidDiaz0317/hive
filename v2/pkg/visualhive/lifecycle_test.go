@@ -805,6 +805,57 @@ func TestApplyBundleSequentialEvidenceApplicationsShareOnePendingWIPSlot(t *test
 	}
 }
 
+func TestApplyBundleManualReviewRerunDoesNotAdvanceIssueBacklog(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	options := ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1, PreferRepairable: true}
+
+	held := publicationTestObservation("held", "canonical", "test-adequacy/repository/held", "test_adequacy_gap", "Add a deterministic contract assertion")
+	firstBundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "first"), "bundle-manual-review-first", []Observation{held}, false))
+	firstResult, err := lifecycle.ApplyBundle(firstBundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldFingerprint := firstBundle.Manifest.Observations[0].RepositoryFingerprint
+	if firstResult.OutboxCreated != 1 {
+		t.Fatalf("first evidence application did not reserve one issue slot: %+v", firstResult)
+	}
+	if err := lifecycle.MarkIssueOpened(heldFingerprint, 17, "https://example.test/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkManualReviewRequired(heldFingerprint, "repair_scope", "review the exact bounded repair scope"); err != nil {
+		t.Fatal(err)
+	}
+
+	actionable := publicationTestObservation("actionable", "canonical", "test-adequacy/repository/actionable", "test_adequacy_gap", "Add another deterministic contract assertion")
+	secondBundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "second"), "bundle-manual-review-rerun", []Observation{held, actionable}, false))
+	secondResult, err := lifecycle.ApplyBundle(secondBundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionableFingerprint := secondBundle.Manifest.Observations[1].RepositoryFingerprint
+	if secondResult.Deferred != 1 {
+		t.Fatalf("manual-review rerun did not defer exactly the issue backlog behind WIP=1: %+v", secondResult)
+	}
+	for _, entry := range lifecycle.PendingOutbox() {
+		if entry.RepositoryFingerprint == actionableFingerprint && entry.Action == OutboxOpenIssue {
+			t.Fatalf("manual-review rerun advanced a second issue into the outbox: %+v", entry)
+		}
+	}
+	heldFinding, heldOK := lifecycle.Finding(heldFingerprint)
+	if !heldOK || heldFinding.IssueNumber != 17 || !heldFinding.HumanReviewRequired || heldFinding.ManualReviewKind != "repair_scope" {
+		t.Fatalf("rerun did not preserve the exact human-held issue: found=%t finding=%+v", heldOK, heldFinding)
+	}
+	actionableFinding, actionableOK := lifecycle.Finding(actionableFingerprint)
+	if !actionableOK || actionableFinding.IssueNumber != 0 || actionableFinding.Status != StatusDetected {
+		t.Fatalf("deferred backlog was not retained locally without publication: found=%t finding=%+v", actionableOK, actionableFinding)
+	}
+}
+
 func TestExplicitRootPublicationCollapsesNineObservationsToTwoIssues(t *testing.T) {
 	mutationRoot := "mutation/api-500/localPreview/dashboard-shell"
 	testRoot := "test-adequacy/repository/testing-layer:2"
