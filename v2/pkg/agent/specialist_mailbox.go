@@ -22,9 +22,12 @@ import (
 )
 
 const (
-	SpecialistWorkOrderSchema = "hive.specialist-work-order.v1"
-	SpecialistReceiptSchema   = "hive.specialist-receipt.v1"
-	SpecialistLeaseSchema     = "hive.specialist-lease.v1"
+	SpecialistWorkOrderSchema                         = "hive.specialist-work-order.v1"
+	SpecialistReceiptSchema                           = "hive.specialist-receipt.v1"
+	SpecialistLeaseSchema                             = "hive.specialist-lease.v1"
+	SpecialistWorkOrderKindGovernedVisualHiveProposal = "visual-hive-governed-proposal"
+	SpecialistReproductionModeNone                    = "none-authorized"
+	SpecialistReproductionModeVerifiedValidation      = "worker-verified-validation"
 
 	defaultMaxWorkOrderBytes     = int64(2 << 20)
 	defaultMaxReceiptBytes       = int64(512 << 10)
@@ -82,8 +85,13 @@ type SpecialistEvidenceIdentity struct {
 // SpecialistWorkOrderRequest is the caller-owned, content-bound task input.
 // Prepare derives the immutable ID and request digest from every field here.
 type SpecialistWorkOrderRequest struct {
+	Kind                  string                     `json:"kind,omitempty"`
 	Repository            string                     `json:"repository"`
 	RepositoryFingerprint string                     `json:"repository_fingerprint"`
+	ExternalRef           string                     `json:"external_ref,omitempty"`
+	PacketSHA256          string                     `json:"packet_sha256,omitempty"`
+	FindingSHA256         string                     `json:"finding_sha256,omitempty"`
+	SourceContextSHA256   string                     `json:"source_context_sha256,omitempty"`
 	RecurrenceKey         string                     `json:"recurrence_key"`
 	Attempt               uint64                     `json:"attempt"`
 	BaseSHA               string                     `json:"base_sha"`
@@ -91,8 +99,17 @@ type SpecialistWorkOrderRequest struct {
 	Evidence              SpecialistEvidenceIdentity `json:"evidence"`
 	Specialist            SpecialistRole             `json:"specialist"`
 	RouteReason           string                     `json:"route_reason"`
+	AuthorityClass        string                     `json:"authority_class,omitempty"`
+	PolicySHA256          string                     `json:"policy_sha256,omitempty"`
+	KnowledgeSHA256       string                     `json:"knowledge_sha256,omitempty"`
+	ToolPolicySHA256      string                     `json:"tool_policy_sha256,omitempty"`
+	CapabilitySHA256      string                     `json:"capability_sha256,omitempty"`
 	AllowedPaths          []string                   `json:"allowed_paths"`
+	ReproductionMode      string                     `json:"reproduction_mode,omitempty"`
+	Reproduction          []string                   `json:"reproduction,omitempty"`
 	Validation            []string                   `json:"validation"`
+	AffectedContracts     []string                   `json:"affected_contracts,omitempty"`
+	KnowledgeKeywords     []string                   `json:"knowledge_keywords,omitempty"`
 	TaskPrompt            string                     `json:"task_prompt"`
 	TaskPromptSHA256      string                     `json:"task_prompt_sha256"`
 	Deadline              time.Time                  `json:"deadline"`
@@ -263,6 +280,16 @@ func (m *SpecialistMailbox) Prepare(request SpecialistWorkOrderRequest) (Special
 		return stored, nil
 	}
 	return order, nil
+}
+
+// PrepareGoverned validates the additional security bindings required by a
+// governed proposal and then delegates to the canonical mailbox Prepare path.
+// It creates no parallel request, lease, receipt, or proposal store.
+func (m *SpecialistMailbox) PrepareGoverned(request SpecialistWorkOrderRequest) (SpecialistWorkOrder, error) {
+	if strings.TrimSpace(request.Kind) != SpecialistWorkOrderKindGovernedVisualHiveProposal {
+		return SpecialistWorkOrder{}, errors.New("governed specialist work-order kind is required")
+	}
+	return m.Prepare(request)
 }
 
 // Paths resolves paths only for a structurally valid content-derived order ID.
@@ -744,12 +771,23 @@ func (m *SpecialistMailbox) WaitReceipt(ctx context.Context, order SpecialistWor
 }
 
 func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest, requireFuture bool) (SpecialistWorkOrderRequest, error) {
+	request.Kind = strings.TrimSpace(request.Kind)
 	request.Repository = strings.ToLower(strings.TrimSpace(request.Repository))
 	request.RepositoryFingerprint = strings.ToLower(strings.TrimSpace(request.RepositoryFingerprint))
+	request.ExternalRef = strings.TrimSpace(request.ExternalRef)
+	request.PacketSHA256 = strings.ToLower(strings.TrimSpace(request.PacketSHA256))
+	request.FindingSHA256 = strings.ToLower(strings.TrimSpace(request.FindingSHA256))
+	request.SourceContextSHA256 = strings.ToLower(strings.TrimSpace(request.SourceContextSHA256))
 	request.RecurrenceKey = strings.TrimSpace(request.RecurrenceKey)
 	request.BaseSHA = strings.ToLower(strings.TrimSpace(request.BaseSHA))
 	request.BaseTreeSHA = strings.ToLower(strings.TrimSpace(request.BaseTreeSHA))
 	request.RouteReason = strings.TrimSpace(request.RouteReason)
+	request.AuthorityClass = strings.TrimSpace(request.AuthorityClass)
+	request.PolicySHA256 = strings.ToLower(strings.TrimSpace(request.PolicySHA256))
+	request.KnowledgeSHA256 = strings.ToLower(strings.TrimSpace(request.KnowledgeSHA256))
+	request.ToolPolicySHA256 = strings.ToLower(strings.TrimSpace(request.ToolPolicySHA256))
+	request.CapabilitySHA256 = strings.ToLower(strings.TrimSpace(request.CapabilitySHA256))
+	request.ReproductionMode = strings.TrimSpace(request.ReproductionMode)
 	request.TaskPromptSHA256 = strings.ToLower(strings.TrimSpace(request.TaskPromptSHA256))
 	request.Deadline = request.Deadline.UTC()
 	request.Evidence.BundleSchemaVersion = strings.TrimSpace(request.Evidence.BundleSchemaVersion)
@@ -760,6 +798,19 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 	request.Evidence.ArtifactSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.ArtifactSHA256))
 	if !repositoryPattern.MatchString(request.Repository) || !digestPattern.MatchString(request.RepositoryFingerprint) {
 		return request, errors.New("valid repository identity and fingerprint are required")
+	}
+	for name, value := range map[string]string{
+		"packet": request.PacketSHA256, "finding": request.FindingSHA256, "source context": request.SourceContextSHA256,
+		"policy": request.PolicySHA256, "knowledge": request.KnowledgeSHA256,
+		"tool policy": request.ToolPolicySHA256, "capability": request.CapabilitySHA256,
+	} {
+		if value != "" && !digestPattern.MatchString(value) {
+			return request, fmt.Errorf("specialist %s digest is invalid", name)
+		}
+	}
+	if len(request.ExternalRef) > 1024 || strings.IndexByte(request.ExternalRef, 0) >= 0 ||
+		len(request.AuthorityClass) > 256 || strings.IndexByte(request.AuthorityClass, 0) >= 0 || len(request.ReproductionMode) > 128 {
+		return request, errors.New("specialist source reference or authority class is not bounded")
 	}
 	if request.RecurrenceKey == "" || len(request.RecurrenceKey) > 1024 || strings.IndexByte(request.RecurrenceKey, 0) >= 0 || request.Attempt == 0 {
 		return request, errors.New("bounded recurrence key and positive attempt are required")
@@ -781,11 +832,29 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 		return request, err
 	}
 	request.AllowedPaths = paths
+	if len(request.Reproduction) > 0 {
+		request.Reproduction, err = normalizeValidation(request.Reproduction)
+		if err != nil {
+			return request, fmt.Errorf("normalize specialist reproduction: %w", err)
+		}
+	}
 	validation, err := normalizeValidation(request.Validation)
 	if err != nil {
 		return request, err
 	}
 	request.Validation = validation
+	if len(request.AffectedContracts) > 0 {
+		request.AffectedContracts, err = normalizeBoundedSpecialistValues("affected contracts", request.AffectedContracts)
+		if err != nil {
+			return request, err
+		}
+	}
+	if len(request.KnowledgeKeywords) > 0 {
+		request.KnowledgeKeywords, err = normalizeBoundedSpecialistValues("knowledge keywords", request.KnowledgeKeywords)
+		if err != nil {
+			return request, err
+		}
+	}
 	if strings.TrimSpace(request.TaskPrompt) == "" || len(request.TaskPrompt) > maxSpecialistTaskPromptBytes || strings.IndexByte(request.TaskPrompt, 0) >= 0 {
 		return request, errors.New("bounded specialist task prompt is required")
 	}
@@ -795,6 +864,15 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 	}
 	if request.Deadline.IsZero() || (requireFuture && !request.Deadline.After(m.now().UTC())) {
 		return request, errors.New("specialist work order deadline must be in the future")
+	}
+	switch request.Kind {
+	case "":
+	case SpecialistWorkOrderKindGovernedVisualHiveProposal:
+		if err := validateGovernedSpecialistRequest(request); err != nil {
+			return request, err
+		}
+	default:
+		return request, fmt.Errorf("unsupported specialist work-order kind %q", request.Kind)
 	}
 	return request, nil
 }
@@ -855,6 +933,35 @@ func (m *SpecialistMailbox) validateStoredOrder(order SpecialistWorkOrder) error
 	}
 	if order.RequestSHA256 != digest || order.ID != "swo-"+digest {
 		return errors.New("specialist work order content digest mismatch")
+	}
+	return nil
+}
+
+func validateGovernedSpecialistRequest(request SpecialistWorkOrderRequest) error {
+	if request.Kind != SpecialistWorkOrderKindGovernedVisualHiveProposal || strings.TrimSpace(request.ExternalRef) == "" || strings.TrimSpace(request.AuthorityClass) == "" ||
+		len(request.AffectedContracts) == 0 || len(request.KnowledgeKeywords) == 0 {
+		return errors.New("governed specialist source, authority, contracts, and derived knowledge keywords are required")
+	}
+	switch request.ReproductionMode {
+	case SpecialistReproductionModeNone:
+		if len(request.Reproduction) != 0 {
+			return errors.New("governed specialist none-authorized reproduction mode cannot carry commands")
+		}
+	case SpecialistReproductionModeVerifiedValidation:
+		if len(request.Reproduction) == 0 {
+			return errors.New("governed specialist verified-validation reproduction mode requires commands")
+		}
+	default:
+		return errors.New("governed specialist reproduction mode is required")
+	}
+	for name, value := range map[string]string{
+		"packet": request.PacketSHA256, "finding": request.FindingSHA256, "source context": request.SourceContextSHA256,
+		"policy": request.PolicySHA256, "knowledge": request.KnowledgeSHA256,
+		"tool policy": request.ToolPolicySHA256, "capability": request.CapabilitySHA256,
+	} {
+		if !digestPattern.MatchString(strings.ToLower(strings.TrimSpace(value))) {
+			return fmt.Errorf("governed specialist %s digest is required", name)
+		}
 	}
 	return nil
 }
@@ -1015,6 +1122,26 @@ func normalizeValidation(values []string) ([]string, error) {
 		}
 		if _, exists := seen[value]; exists {
 			return nil, errors.New("specialist validation commands must be unique")
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func normalizeBoundedSpecialistValues(name string, values []string) ([]string, error) {
+	if len(values) == 0 || len(values) > 128 {
+		return nil, fmt.Errorf("at least one bounded specialist %s value is required", name)
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 4096 || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("specialist %s values must be bounded single lines", name)
+		}
+		if _, exists := seen[value]; exists {
+			return nil, fmt.Errorf("specialist %s values must be unique", name)
 		}
 		seen[value] = struct{}{}
 		result = append(result, value)

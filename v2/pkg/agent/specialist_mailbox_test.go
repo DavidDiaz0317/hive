@@ -99,6 +99,146 @@ func TestSpecialistMailboxPrepareIsContentBoundAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestSpecialistMailboxReadsAndPreparesPersistedOrdinaryV1WithoutGovernedFields(t *testing.T) {
+	now := time.Date(2026, 7, 16, 1, 20, 0, 0, time.UTC)
+	source := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
+	request := testSpecialistRequest(now, "failed-pr-revision:18", now.Add(2*time.Hour))
+	request.RouteReason = "existing failed-PR revision route"
+	order, err := source.Prepare(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePaths, err := source.Paths(order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := os.ReadFile(sourcePaths.Order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, governedField := range []string{
+		"kind", "external_ref", "packet_sha256", "finding_sha256", "source_context_sha256", "authority_class",
+		"policy_sha256", "knowledge_sha256", "tool_policy_sha256", "capability_sha256",
+		"reproduction_mode", "reproduction", "affected_contracts", "knowledge_keywords",
+	} {
+		if strings.Contains(string(fixture), `"`+governedField+`"`) {
+			t.Fatalf("ordinary persisted v1 unexpectedly contains governed field %q: %s", governedField, fixture)
+		}
+	}
+
+	target := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
+	targetPaths, err := target.Paths(order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(targetPaths.OrderDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPaths.Order, fixture, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := target.LoadWorkOrder(order.ID)
+	if err != nil {
+		t.Fatalf("LoadWorkOrder(old v1 fixture) error = %v", err)
+	}
+	prepared, err := target.Prepare(request)
+	if err != nil {
+		t.Fatalf("Prepare(old v1 ordinary request) error = %v", err)
+	}
+	if !equalJSON(loaded, order) || !equalJSON(prepared, order) {
+		t.Fatalf("persisted ordinary v1 changed during compatibility round trip:\nloaded=%+v\nprepared=%+v\nwant=%+v", loaded, prepared, order)
+	}
+}
+
+func TestSpecialistMailboxPrepareGovernedBindsAndRequiresSecurityContext(t *testing.T) {
+	now := time.Date(2026, 7, 16, 1, 30, 0, 0, time.UTC)
+	mailbox := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
+	request := testGovernedSpecialistRequest(now, "visual:packet-7/finding-3", now.Add(2*time.Hour))
+
+	first, err := mailbox.PrepareGoverned(request)
+	if err != nil {
+		t.Fatalf("PrepareGoverned() error = %v", err)
+	}
+	if first.ExternalRef != request.ExternalRef || first.AuthorityClass != request.AuthorityClass || first.ID != "swo-"+first.RequestSHA256 {
+		t.Fatalf("governed identity was not carried by the canonical work order: %+v", first)
+	}
+
+	mutations := map[string]func(*SpecialistWorkOrderRequest){
+		"external ref":   func(value *SpecialistWorkOrderRequest) { value.ExternalRef += "/changed" },
+		"packet":         func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = strings.Repeat("7", 64) },
+		"finding":        func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = strings.Repeat("8", 64) },
+		"source context": func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = strings.Repeat("d", 64) },
+		"authority":      func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "other-proposal" },
+		"policy":         func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = strings.Repeat("9", 64) },
+		"knowledge":      func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = strings.Repeat("a", 64) },
+		"tool policy":    func(value *SpecialistWorkOrderRequest) { value.ToolPolicySHA256 = strings.Repeat("b", 64) },
+		"capability":     func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = strings.Repeat("c", 64) },
+		"reproduction mode": func(value *SpecialistWorkOrderRequest) {
+			value.ReproductionMode = SpecialistReproductionModeNone
+			value.Reproduction = nil
+		},
+		"reproduction": func(value *SpecialistWorkOrderRequest) {
+			value.Reproduction = append(value.Reproduction, "go test ./... -run Reproduce -count=1")
+		},
+		"affected contracts": func(value *SpecialistWorkOrderRequest) {
+			value.AffectedContracts = append(value.AffectedContracts, "widget-contract-v2")
+		},
+		"knowledge keywords": func(value *SpecialistWorkOrderRequest) {
+			value.KnowledgeKeywords = append(value.KnowledgeKeywords, "regression")
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run("binds_"+name, func(t *testing.T) {
+			changed := cloneSpecialistRequest(request)
+			mutate(&changed)
+			order, err := mailbox.PrepareGoverned(changed)
+			if err != nil {
+				t.Fatalf("PrepareGoverned(changed) error = %v", err)
+			}
+			if order.ID == first.ID {
+				t.Fatalf("mutation %q did not change the canonical swo identity", name)
+			}
+		})
+	}
+
+	required := map[string]func(*SpecialistWorkOrderRequest){
+		"kind":               func(value *SpecialistWorkOrderRequest) { value.Kind = "" },
+		"external ref":       func(value *SpecialistWorkOrderRequest) { value.ExternalRef = "" },
+		"packet":             func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = "" },
+		"finding":            func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = "" },
+		"source context":     func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = "" },
+		"authority":          func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "" },
+		"policy":             func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = "" },
+		"knowledge":          func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = "" },
+		"tool policy":        func(value *SpecialistWorkOrderRequest) { value.ToolPolicySHA256 = "" },
+		"capability":         func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = "" },
+		"reproduction mode":  func(value *SpecialistWorkOrderRequest) { value.ReproductionMode = "" },
+		"reproduction":       func(value *SpecialistWorkOrderRequest) { value.Reproduction = nil },
+		"affected contracts": func(value *SpecialistWorkOrderRequest) { value.AffectedContracts = nil },
+		"knowledge keywords": func(value *SpecialistWorkOrderRequest) { value.KnowledgeKeywords = nil },
+	}
+	for name, mutate := range required {
+		t.Run("requires_"+name, func(t *testing.T) {
+			changed := cloneSpecialistRequest(request)
+			mutate(&changed)
+			if _, err := mailbox.PrepareGoverned(changed); err == nil {
+				t.Fatalf("PrepareGoverned accepted a missing %s binding", name)
+			}
+		})
+	}
+	ordinary := testSpecialistRequest(now, "ordinary-cannot-claim-governed-kind", now.Add(time.Hour))
+	ordinary.Kind = SpecialistWorkOrderKindGovernedVisualHiveProposal
+	if _, err := mailbox.Prepare(ordinary); err == nil {
+		t.Fatal("ordinary Prepare accepted a governed kind without its governed security bindings")
+	}
+	withoutReproduction := cloneSpecialistRequest(request)
+	withoutReproduction.ReproductionMode = SpecialistReproductionModeNone
+	withoutReproduction.Reproduction = nil
+	if _, err := mailbox.PrepareGoverned(withoutReproduction); err != nil {
+		t.Fatalf("PrepareGoverned rejected explicit no-reproduction mode: %v", err)
+	}
+}
+
 func TestSpecialistMailboxRejectsExistingIDWithAlteredBody(t *testing.T) {
 	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)
 	mailbox := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
@@ -600,10 +740,32 @@ func testSpecialistRequest(now time.Time, recurrence string, deadline time.Time)
 	}
 }
 
+func testGovernedSpecialistRequest(now time.Time, externalRef string, deadline time.Time) SpecialistWorkOrderRequest {
+	request := testSpecialistRequest(now, externalRef+":recurrence", deadline)
+	request.Kind = SpecialistWorkOrderKindGovernedVisualHiveProposal
+	request.ExternalRef = externalRef
+	request.PacketSHA256 = strings.Repeat("1", 64)
+	request.FindingSHA256 = strings.Repeat("2", 64)
+	request.SourceContextSHA256 = strings.Repeat("7", 64)
+	request.AuthorityClass = "sealed-source-context-proposal-v1"
+	request.PolicySHA256 = strings.Repeat("3", 64)
+	request.KnowledgeSHA256 = strings.Repeat("4", 64)
+	request.ToolPolicySHA256 = strings.Repeat("5", 64)
+	request.CapabilitySHA256 = strings.Repeat("6", 64)
+	request.ReproductionMode = SpecialistReproductionModeVerifiedValidation
+	request.Reproduction = []string{"go test ./... -run Reproduce"}
+	request.AffectedContracts = []string{"widget-contract-v1"}
+	request.KnowledgeKeywords = []string{"widget", "visual"}
+	return request
+}
+
 func cloneSpecialistRequest(value SpecialistWorkOrderRequest) SpecialistWorkOrderRequest {
 	copy := value
 	copy.AllowedPaths = append([]string(nil), value.AllowedPaths...)
+	copy.Reproduction = append([]string(nil), value.Reproduction...)
 	copy.Validation = append([]string(nil), value.Validation...)
+	copy.AffectedContracts = append([]string(nil), value.AffectedContracts...)
+	copy.KnowledgeKeywords = append([]string(nil), value.KnowledgeKeywords...)
 	return copy
 }
 

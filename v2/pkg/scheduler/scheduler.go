@@ -315,6 +315,9 @@ const maxIssuesPerKick = 100
 // BuildAgentMessage constructs a kick prompt for the named agent using the
 // template resolution chain (config kick_template → convention → embedded → hardcoded).
 func (s *Scheduler) BuildAgentMessage(agentName string, issues []github.Issue, actionable *github.ActionableResult) string {
+	if actionable == nil {
+		actionable = &github.ActionableResult{}
+	}
 	// 1. Config-driven: use kick_template field if set
 	if agentCfg, ok := s.cfg.Agents[agentName]; ok && agentCfg.KickTemplate != "" {
 		if template := s.loadNamedTemplate(agentCfg.KickTemplate); template != "" {
@@ -737,10 +740,7 @@ const maxIssuesToPrime = 5
 // primeKnowledge queries the wiki layers for facts relevant to the given issues
 // and returns a formatted section for injection into the kick message.
 func (s *Scheduler) primeKnowledge(issues []github.Issue) string {
-	s.mu.RLock()
-	primer := s.primer
-	s.mu.RUnlock()
-	if primer == nil || len(issues) == 0 {
+	if len(issues) == 0 {
 		return ""
 	}
 
@@ -752,6 +752,16 @@ func (s *Scheduler) primeKnowledge(issues []github.Issue) string {
 	keywords := extractKeywords(issues[:limit])
 	if len(keywords) == 0 {
 		s.logger.Debug("knowledge primer: no keywords extracted from issues", "issue_count", len(issues))
+		return ""
+	}
+	return s.primeKnowledgeKeywords(keywords)
+}
+
+func (s *Scheduler) primeKnowledgeKeywords(keywords []string) string {
+	s.mu.RLock()
+	primer := s.primer
+	s.mu.RUnlock()
+	if primer == nil || len(keywords) == 0 {
 		return ""
 	}
 
@@ -841,14 +851,14 @@ func keywordSample(keywords []string) string {
 }
 
 var noiseLabels = map[string]bool{
-	"triage/accepted":   true,
-	"ai-fix-requested":  true,
-	"kind/bug":          true,
-	"kind/feature":      true,
-	"kind/task":         true,
-	"good first issue":  true,
-	"help wanted":       true,
-	"hold":              true,
+	"triage/accepted":  true,
+	"ai-fix-requested": true,
+	"kind/bug":         true,
+	"kind/feature":     true,
+	"kind/task":        true,
+	"good first issue": true,
+	"help wanted":      true,
+	"hold":             true,
 }
 
 func isNoiseLabel(label string) bool {
