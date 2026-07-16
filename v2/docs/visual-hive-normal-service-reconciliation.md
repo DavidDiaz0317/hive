@@ -42,9 +42,10 @@ The adapter belongs with intake because only intake can prove that its durable
 envelope is canonical. It must perform these operations in order:
 
 1. Revalidate the complete `DispatchEnvelope` and its canonical v3 receipt.
-2. Use the exact immutable admitted-work JSON as Scheduler packet bytes and the
-   exact finding JSON as finding bytes. Do not hash a mutable envelope after
-   mailbox reservation fields are added.
+2. Preserve the exact immutable admitted-work JSON as Scheduler `Work`, the
+   exact packet JSON as `Packet`, and the exact finding JSON as `Finding`, each
+   with its own digest. Do not hash a mutable envelope after mailbox reservation
+   fields are added.
 3. Do not equate the v3 aggregate `PacketDigest` with the SHA-256 of the
    Scheduler's canonical packet projection. Preserve and bind both identities.
 4. Map repository, repository fingerprint, source ref, base commit/tree,
