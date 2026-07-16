@@ -27,12 +27,16 @@ type testCanonicalVerifiedReceipt struct {
 }
 
 type testWorkerSourceContextComposer struct {
-	result   WorkerSealedSourceContext
-	err      error
-	requests []WorkerSourceContextRequest
+	result           WorkerSealedSourceContext
+	err              error
+	requests         []WorkerSourceContextRequest
+	evidenceResult   WorkerEvidenceArtifactReadResult
+	evidenceErr      error
+	evidenceRequests []WorkerEvidenceArtifactRequest
 }
 
 var _ WorkerSourceContextComposer = (*testWorkerSourceContextComposer)(nil)
+var _ WorkerEvidenceArtifactReader = (*testWorkerSourceContextComposer)(nil)
 
 func (composer *testWorkerSourceContextComposer) ComposeGovernedSourceContext(request WorkerSourceContextRequest) (WorkerSealedSourceContext, error) {
 	composer.requests = append(composer.requests, request)
@@ -41,6 +45,16 @@ func (composer *testWorkerSourceContextComposer) ComposeGovernedSourceContext(re
 	}
 	result := composer.result
 	result.Files = append([]WorkerSourceBlobIdentity(nil), composer.result.Files...)
+	return result, nil
+}
+
+func (composer *testWorkerSourceContextComposer) ReadGovernedEvidenceArtifacts(request WorkerEvidenceArtifactRequest) (WorkerEvidenceArtifactReadResult, error) {
+	request.Artifacts = append([]EvidenceArtifact(nil), request.Artifacts...)
+	composer.evidenceRequests = append(composer.evidenceRequests, request)
+	if composer.evidenceErr != nil {
+		return WorkerEvidenceArtifactReadResult{}, composer.evidenceErr
+	}
+	result := WorkerEvidenceArtifactReadResult{Artifacts: append([]WorkerEvidenceArtifactContent(nil), composer.evidenceResult.Artifacts...)}
 	return result, nil
 }
 
@@ -101,6 +115,8 @@ func TestBuildGovernedProposalMessageBindsAllFiveRolePoliciesAndPrimer(t *testin
 				"Never write to GitHub", "beads", "wiki", "MCP", "subagents", "baselines",
 				"AllowedPaths remain Worker-enforced structured data",
 				"no checkout", "no .git directory", "no repository read or write authority",
+				"WORKER-VERIFIED BOUNDED DECLARED EVIDENCE CONTENT",
+				"EXACT TYPED OBSERVATION/FINDING JSON", "selector-account-ready",
 				"WORKER-SEALED BOUNDED SOURCE CONTEXT", sourceComposer.result.Content,
 				"normal role backend, model, launch command, connections, tools, and caveman setting are inert",
 			} {
@@ -118,7 +134,8 @@ func TestBuildGovernedProposalMessageBindsAllFiveRolePoliciesAndPrimer(t *testin
 				t.Fatalf("canonical work-order request lost bindings: %+v", request)
 			}
 			input := decodeGovernedPrompt(t, request.TaskPrompt)
-			if input.ExternalRef != work.ExternalRef || input.PacketJSON != string(work.Packet) || input.FindingJSON != string(work.Finding) ||
+			if input.ExternalRef != work.ExternalRef || input.AdmittedWorkJSON != string(work.Work) || input.AdmittedWorkSHA256 != work.WorkSHA256 ||
+				input.PacketJSON != string(work.Packet) || input.FindingJSON != string(work.Finding) ||
 				input.VerifiedReceiptJSON != string(receipt.canonical) || input.SourceContextSHA256 != sourceComposer.result.SHA256 || input.SourceContextBindingSHA256 != request.SourceContextBindingSHA256 || input.BaseSHA != work.BaseSHA || input.BaseTreeSHA != work.BaseTreeSHA ||
 				input.RoutingReason != work.RoutingReason || input.RolePolicyExpertise == "" || input.ProjectContextSnapshot == "" ||
 				input.KnowledgePrimerSnapshot == "" || input.PolicySHA256 != governedSHA256(input.RolePolicyExpertise) ||
@@ -149,6 +166,7 @@ func TestBuildGovernedProposalMessageBindsAllFiveRolePoliciesAndPrimer(t *testin
 				input.Capability.ExecutorConfigSHA256 != request.ExecutorProfile.ConfigSHA256 || input.Capability.ExecutorProfileSHA256 != request.ExecutorProfileSHA256 ||
 				input.Capability.ContainmentProfile != governedContainmentProfile ||
 				input.Capability.BackendParityClaimed || input.Capability.SourceContextMode != "worker-sealed-bounded-regular-git-blobs" ||
+				input.Capability.EvidenceContentMode != "worker-verified-declared-json-artifacts" ||
 				input.Capability.ReproductionMode != agent.SpecialistReproductionModeNone || !input.Capability.Authority.SealedSourceContextRead ||
 				input.Capability.Authority.RepositoryRead || input.Capability.Authority.DisposableWorktreeWrite ||
 				input.Capability.Authority.RunReproduction || input.Capability.Authority.RunValidation ||
@@ -161,8 +179,11 @@ func TestBuildGovernedProposalMessageBindsAllFiveRolePoliciesAndPrimer(t *testin
 			}
 			if artifacts["hive:verified-manifest"] != receipt.evidence.ArtifactSHA256 ||
 				artifacts["hive:canonical-verification-receipt"] != receipt.evidence.VerificationReceiptSHA256 ||
-				artifacts["screenshots/account.actual.png"] != strings.Repeat("f", 64) {
+				artifacts[".visual-hive/evidence/account.json"] != testGovernedSHA([]byte(testGovernedEvidenceContent)) {
 				t.Fatalf("controller-owned verified evidence artifacts were not composed: %v", artifacts)
+			}
+			if len(input.EvidenceArtifactContents) != 1 || input.EvidenceArtifactContents[0].Content != testGovernedEvidenceContent || input.EvidenceArtifactContentSHA == "" || len(sourceComposer.evidenceRequests) != 1 {
+				t.Fatalf("bounded declared evidence content was not composed exactly: input=%+v requests=%+v", input.EvidenceArtifactContents, sourceComposer.evidenceRequests)
 			}
 			roleConfig := scheduler.cfg.Agents[string(role)]
 			expectedToolPolicy := governedToolPolicy{
@@ -244,7 +265,7 @@ func TestBuildGovernedProposalMessageComposesNoKnowledgeAndControllerReproductio
 	}
 	input := decodeGovernedPrompt(t, request.TaskPrompt)
 	if input.KnowledgePrimerSnapshot != noApplicableKnowledgeSnapshot || request.KnowledgeSHA256 != governedSHA256(noApplicableKnowledgeSnapshot) ||
-		strings.Join(input.KnowledgeKeywords, ",") != "visual-regression,quality,account-shell-visual" ||
+		strings.Join(input.KnowledgeKeywords, ",") != "visual_regression,quality,account-shell-visual" ||
 		request.ReproductionMode != agent.SpecialistReproductionModeNone || len(request.Reproduction) != 0 {
 		t.Fatalf("explicit no-knowledge/no-reproduction composition is invalid: input=%+v request=%+v", input, request)
 	}
@@ -313,6 +334,10 @@ func TestBuildGovernedProposalMessageFailsClosedOnMissingSecurityBindings(t *tes
 	tests := map[string]func(*AdmittedWork, *testCanonicalVerifiedReceipt){
 		"verified route": func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.RoutedRole = agent.SpecialistScanner },
 		"external ref":   func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.ExternalRef = "" },
+		"admitted work":  func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Work = nil },
+		"admitted work digest": func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) {
+			work.WorkSHA256 = strings.Repeat("0", 64)
+		},
 		"repository":     func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.Repository = "acme/other" },
 		"fingerprint":    func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.RepositoryFingerprint = "" },
 		"packet digest":  func(work *AdmittedWork, _ *testCanonicalVerifiedReceipt) { work.PacketSHA256 = strings.Repeat("0", 64) },
@@ -389,6 +414,24 @@ func TestBuildGovernedProposalMessageRequiresWorkerOwnedCrossBoundSourceContext(
 			mutate(&composer.result)
 			if _, err := scheduler.BuildGovernedProposalMessage(agent.SpecialistQuality, work, receipt, composer); err == nil {
 				t.Fatal("unbound Worker source context was accepted")
+			}
+		})
+	}
+}
+
+func TestGovernedMutationAndTestAdequacyRequireStructuredEvidenceContent(t *testing.T) {
+	for _, issueKind := range []string{"mutation_survivor", "test_adequacy_gap"} {
+		t.Run(issueKind, func(t *testing.T) {
+			composer := &testWorkerSourceContextComposer{evidenceResult: WorkerEvidenceArtifactReadResult{Artifacts: []WorkerEvidenceArtifactContent{}}}
+			work := AdmittedWork{
+				ObservationKind: issueKind,
+				EvidenceArtifacts: []EvidenceArtifact{{
+					Reference: ".visual-hive/screenshots/failure.png", SHA256: strings.Repeat("a", 64),
+					Bytes: 128, Kind: "image", ContentType: "image/png",
+				}},
+			}
+			if _, _, err := composeWorkerEvidenceArtifacts(work, composer); err == nil || !strings.Contains(err.Error(), "none was safely embeddable") {
+				t.Fatalf("%s accepted an empty structured evidence subset: %v", issueKind, err)
 			}
 		})
 	}
@@ -509,9 +552,41 @@ func testGovernedExecutorProfile() GovernedProposalExecutorProfile {
 	}
 }
 
+const testGovernedEvidenceContent = `{"selector":"selector-account-ready","flow":["open-account","assert-ready"],"guidance":"preserve exact typed evidence"}`
+
 func testGovernedInputs(role agent.SpecialistRole) (AdmittedWork, *testCanonicalVerifiedReceipt) {
 	packet := json.RawMessage(`{"schema":"visual.packet.v1","external_ref":"visual-hive:packet-42"}`)
-	finding := json.RawMessage(`{"fingerprint":"finding-7","kind":"visual_regression","evidence":"exact"}`)
+	finding, err := json.Marshal(map[string]any{
+		"repository": "acme/console", "fingerprint": "finding-7", "repository_fingerprint": strings.Repeat("a", 64),
+		"publication_role": "canonical", "root_cause_key": "visual/account-ready", "status": "fix_queued",
+		"issue_kind": "visual_regression", "severity": "high", "title": "Account ready selector regressed",
+		"body":   "Distinct selector and flow evidence must reach the quality role: selector-account-ready.",
+		"labels": []string{"visual-hive"}, "affected_contracts": []string{"account-shell-visual"},
+		"validation_command": "npm test -- account.visual",
+	})
+	if err != nil {
+		panic(err)
+	}
+	artifact := EvidenceArtifact{
+		Reference: ".visual-hive/evidence/account.json", SHA256: testGovernedSHA([]byte(testGovernedEvidenceContent)),
+		Bytes: int64(len([]byte(testGovernedEvidenceContent))), Kind: "json", ContentType: "application/json",
+	}
+	admittedWork, err := json.Marshal(map[string]any{
+		"source_external_ref": "visual-hive:packet-42/finding-7", "packet": packet,
+		"finding_fingerprint": "finding-7", "repository_fingerprint": strings.Repeat("a", 64),
+		"observation_state": "present", "publication_role": "canonical", "root_cause_key": "visual/account-ready",
+		"blocked_by_root_keys": []string{}, "issue_kind": "visual_regression", "severity": "high",
+		"title": "Account ready selector regressed", "body": "Distinct selector and flow evidence must reach the quality role: selector-account-ready.",
+		"labels": []string{"visual-hive"}, "role": string(role), "routing_reason": "verified route owner", "routing_allowed": true,
+		"affected_contracts": []string{"account-shell-visual"}, "knowledge_keywords": []string{"selector-account-ready"},
+		"evidence_artifacts":    []map[string]any{{"path": artifact.Reference, "sha256": artifact.SHA256, "bytes": artifact.Bytes, "kind": artifact.Kind, "content_type": artifact.ContentType}},
+		"reproduction_commands": []string{"npm test -- account.visual"}, "reproduction_source": "verified_observation_validation_command",
+		"validation_commands": []string{"npm test -- account.visual"},
+		"authority":           map[string]any{"proposal_only": true, "github_write_allowed": false, "merge_allowed": false, "baseline_changes_allowed": false, "baseline_approval_allowed": false},
+	})
+	if err != nil {
+		panic(err)
+	}
 	receiptBytes, err := json.Marshal(testCanonicalV3Receipt{
 		RepositoryID: "R_acme_console", WorkflowRunID: "88", WorkflowRunAttempt: "2",
 		ArtifactID: "77", SourceArtifactID: "78", ArtifactName: "visual-hive-evidence",
@@ -525,15 +600,15 @@ func testGovernedInputs(role agent.SpecialistRole) (AdmittedWork, *testCanonical
 	}
 	receiptSHA := testGovernedSHA(receiptBytes)
 	return AdmittedWork{
-			ExternalRef: "visual-hive:packet-42/finding-7", Packet: packet, PacketSHA256: testGovernedSHA(packet),
-			Finding: finding, FindingSHA256: testGovernedSHA(finding),
+			ExternalRef: "visual-hive:packet-42/finding-7", Work: admittedWork, WorkSHA256: testGovernedSHA(admittedWork),
+			Packet: packet, PacketSHA256: testGovernedSHA(packet), Finding: finding, FindingSHA256: testGovernedSHA(finding),
 			Repository: "acme/console", RepositoryFingerprint: strings.Repeat("a", 64),
 			RecurrenceKey: "visual-hive:packet-42/finding-7:recurrence-2", Attempt: 2,
 			BaseSHA: strings.Repeat("b", 40), BaseTreeSHA: strings.Repeat("c", 40), RoutedRole: role, RoutingReason: "verified route owner",
-			ObservationKind: "visual-regression",
+			ObservationKind: "visual_regression",
 			AllowedPaths:    []string{"web/account.tsx", "web/account.visual.test.ts"}, Validation: []string{"npm test -- account.visual"},
 			AffectedContracts: []string{"account-shell-visual"},
-			EvidenceArtifacts: []EvidenceArtifact{{Reference: "screenshots/account.actual.png", SHA256: strings.Repeat("f", 64)}},
+			EvidenceArtifacts: []EvidenceArtifact{artifact},
 			Deadline:          time.Now().UTC().Add(time.Hour),
 		}, &testCanonicalVerifiedReceipt{
 			canonical: receiptBytes,
@@ -551,7 +626,10 @@ func testGovernedSourceComposer(work AdmittedWork, receipt *testCanonicalVerifie
 		Content: content, SHA256: testGovernedSHA([]byte(content)), BaseSHA: work.BaseSHA, BaseTreeSHA: work.BaseTreeSHA,
 		ManifestSHA256: receipt.evidence.ArtifactSHA256, VerificationReceiptSHA256: receipt.evidence.VerificationReceiptSHA256,
 		Files: []WorkerSourceBlobIdentity{{Path: "web/account.tsx", BlobOID: strings.Repeat("1", 40), ContentSHA256: testGovernedSHA([]byte("export const account = true;\n")), Bytes: 29}},
-	}}
+	}, evidenceResult: WorkerEvidenceArtifactReadResult{Artifacts: []WorkerEvidenceArtifactContent{{
+		Reference: work.EvidenceArtifacts[0].Reference, SHA256: work.EvidenceArtifacts[0].SHA256, Bytes: work.EvidenceArtifacts[0].Bytes,
+		Kind: work.EvidenceArtifacts[0].Kind, ContentType: work.EvidenceArtifacts[0].ContentType, Content: testGovernedEvidenceContent,
+	}}}}
 }
 
 func testGovernedSHA(value []byte) string {
@@ -565,7 +643,7 @@ func decodeGovernedPrompt(t *testing.T, prompt string) governedPromptInput {
 	if !ok {
 		t.Fatal("governed prompt has no canonical input marker")
 	}
-	encoded, _, ok = strings.Cut(encoded, "\n\nWORKER-SEALED BOUNDED SOURCE CONTEXT")
+	encoded, _, ok = strings.Cut(encoded, "\n\nEXACT TYPED OBSERVATION/FINDING JSON")
 	if !ok {
 		t.Fatal("governed prompt has no sealed source-context marker")
 	}
