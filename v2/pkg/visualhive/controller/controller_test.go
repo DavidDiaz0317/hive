@@ -145,6 +145,25 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 		envelope.SpecialistWorkOrderID != "" || envelope.SpecialistRequestSHA256 != "" {
 		t.Fatalf("dispatch envelope is incomplete: %+v", envelope)
 	}
+	admitted, canonicalReceipt, err := BuildSchedulerAdmittedWork(envelope)
+	if err != nil {
+		t.Fatalf("lossless Scheduler projection: %v", err)
+	}
+	workJSON, _ := json.Marshal(envelope.Work)
+	packetJSON, _ := json.Marshal(envelope.Work.Packet)
+	findingJSON, _ := json.Marshal(envelope.Finding)
+	receiptJSON, receiptErr := canonicalReceipt.CanonicalReceiptJSON()
+	if receiptErr != nil || string(admitted.Work) != string(workJSON) || string(admitted.Packet) != string(packetJSON) || string(admitted.Finding) != string(findingJSON) ||
+		admitted.ExternalRef != envelope.SourceExternalRef || admitted.RepositoryFingerprint != envelope.Work.RepositoryFingerprint ||
+		admitted.BaseSHA != envelope.BaseSHA || admitted.BaseTreeSHA != envelope.BaseTreeSHA || admitted.RoutedRole != agent.SpecialistQuality ||
+		string(receiptJSON) != envelope.VerificationReceiptJSON || !reflect.DeepEqual(canonicalReceipt.EvidenceIdentity(), envelope.Evidence) {
+		t.Fatalf("Scheduler projection lost intake bytes or identity: admitted=%+v receipt=%s err=%v", admitted, receiptJSON, receiptErr)
+	}
+	tamperedReceipt := cloneDispatchEnvelope(t, envelope)
+	tamperedReceipt.VerificationReceiptJSON = `{"repository_id":"different-but-valid-json"}`
+	if _, _, err := BuildSchedulerAdmittedWork(tamperedReceipt); err == nil {
+		t.Fatal("Scheduler projection accepted receipt bytes different from the evidence identity")
+	}
 	if !issueClient.admissionSeen || issueClient.upserts != 1 {
 		t.Fatalf("ordering/admission issue=%+v", issueClient)
 	}

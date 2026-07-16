@@ -210,6 +210,10 @@ func BuildSchedulerAdmittedWork(envelope DispatchEnvelope) (scheduler.AdmittedWo
 	if !json.Valid([]byte(envelope.VerificationReceiptJSON)) {
 		return scheduler.AdmittedWork{}, nil, errors.New("dispatch envelope has no canonical verification receipt")
 	}
+	expectedReceipt, err := evidenceReceiptJSON(envelope.Evidence)
+	if err != nil || expectedReceipt != envelope.VerificationReceiptJSON {
+		return scheduler.AdmittedWork{}, nil, errors.New("dispatch envelope verification receipt differs from its exact evidence identity")
+	}
 	artifacts := make([]scheduler.EvidenceArtifact, 0, len(envelope.Work.EvidenceArtifacts))
 	for _, artifact := range envelope.Work.EvidenceArtifacts {
 		artifacts = append(artifacts, scheduler.EvidenceArtifact{
