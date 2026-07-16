@@ -254,6 +254,7 @@ not on this critical path.
 | `0a5f95ab` | one reservation/fresh guard/leased recovery proof |
 | `102c4d94` | controller-owned resume without refetch/reimport |
 | `1d15ab47` | crash-safe no-dispatch workflow consumption |
+| `630d5fad` | exact verdict-byte persistence and ledger state validation |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.
