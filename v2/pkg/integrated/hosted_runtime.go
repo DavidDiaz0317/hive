@@ -2,6 +2,8 @@ package integrated
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -94,10 +96,11 @@ func reconcileHostedManagedPolicy(checkoutDir string, durable Config, current Ho
 		return Config{}, fmt.Errorf("managed hosted policy has trailing content")
 	}
 	if installed.SchemaVersion != managedRepositoryConfigSchema || installed.Repository != durable.Repository || installed.RepositoryID != durable.RepositoryID ||
-		installed.DefaultBranch != durable.DefaultBranch || installed.ExecutionMode != ExecutionHosted {
+		installed.DefaultBranch != durable.DefaultBranch || installed.ExecutionMode != ExecutionHosted || installed.HostedControllerProtocol != HostedControllerProtocol ||
+		!hostedDigestPattern.MatchString(installed.HostedWorkflowSHA256) {
 		return Config{}, fmt.Errorf("managed hosted policy does not match the signed repository identity")
 	}
-	installedRelease := HostedReleaseIdentity{Version: installed.HiveReleaseVersion, HiveCommit: installed.HiveCommit, VisualHiveCommit: installed.VisualHiveRef, DistributionManifestSHA256: installed.DistributionManifestSHA256}
+	installedRelease := HostedReleaseIdentity{Version: installed.HiveReleaseVersion, HiveCommit: installed.HiveCommit, VisualHiveCommit: installed.VisualHiveRef, DistributionManifestSHA256: installed.DistributionManifestSHA256, HostedControllerProtocol: installed.HostedControllerProtocol}
 	if !equalHostedReleaseIdentity(installedRelease, current) || !reflect.DeepEqual(installed.PreviousHostedRelease, previous) {
 		return Config{}, fmt.Errorf("managed hosted policy does not match the current and predecessor release identities")
 	}
@@ -108,6 +111,7 @@ func reconcileHostedManagedPolicy(checkoutDir string, durable Config, current Ho
 	candidate.HostedSchedule, candidate.HostedStateBranch = installed.HostedSchedule, installed.HostedStateBranch
 	candidate.HiveReleaseRepository, candidate.HiveReleaseVersion = installed.HiveReleaseRepository, installed.HiveReleaseVersion
 	candidate.HiveCommit, candidate.DistributionManifestSHA256 = installed.HiveCommit, installed.DistributionManifestSHA256
+	candidate.HostedControllerProtocol, candidate.HostedWorkflowSHA256 = installed.HostedControllerProtocol, installed.HostedWorkflowSHA256
 	candidate.PreviousHostedRelease = cloneHostedReleaseIdentity(installed.PreviousHostedRelease)
 	candidate.ACMMLevel, candidate.MaxActiveIssues, candidate.MaxRepairAttempts = installed.ACMMLevel, installed.MaxActiveIssues, installed.MaxRepairAttempts
 	candidate.VisualHive, candidate.VisualHiveRepo, candidate.VisualHiveRef = installed.VisualHive, installed.VisualHiveRepo, installed.VisualHiveRef
@@ -130,12 +134,17 @@ func reconcileHostedManagedPolicy(checkoutDir string, durable Config, current Ho
 	if string(actualWorkflow) != wantWorkflow {
 		return Config{}, fmt.Errorf("managed hosted controller does not exactly match the release-bound policy")
 	}
+	digest := sha256.Sum256(actualWorkflow)
+	if hex.EncodeToString(digest[:]) != candidate.HostedWorkflowSHA256 {
+		return Config{}, fmt.Errorf("managed hosted controller does not match its durable content digest")
+	}
 	return candidate, nil
 }
 
 func validHostedReleaseIdentity(identity HostedReleaseIdentity) bool {
 	return hostedReleaseTagPattern.MatchString(identity.Version) && hostedCommitPattern.MatchString(strings.ToLower(identity.HiveCommit)) &&
-		hostedCommitPattern.MatchString(strings.ToLower(identity.VisualHiveCommit)) && hostedDigestPattern.MatchString(strings.ToLower(identity.DistributionManifestSHA256))
+		hostedCommitPattern.MatchString(strings.ToLower(identity.VisualHiveCommit)) && hostedDigestPattern.MatchString(strings.ToLower(identity.DistributionManifestSHA256)) &&
+		identity.HostedControllerProtocol == HostedControllerProtocol
 }
 
 func readBoundedHostedCheckoutFile(path string, limit int64) ([]byte, error) {

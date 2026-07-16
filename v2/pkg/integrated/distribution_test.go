@@ -66,7 +66,8 @@ func TestBuildDistributionCreatesSelfContainedImmutableTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != DistributionSchema || manifest.HiveVersion != "v0.4.1-integrated.11" || manifest.VisualHiveVersion != "0.2.0" || len(manifest.Files) < 5 {
+	if manifest.SchemaVersion != DistributionSchema || manifest.HiveVersion != "v0.4.1-integrated.11" || manifest.VisualHiveVersion != "0.2.0" ||
+		manifest.HostedControllerProtocol != HostedControllerProtocol || len(manifest.Files) < 5 {
 		t.Fatalf("unexpected distribution manifest: %+v", manifest)
 	}
 	hiveName := "hive"

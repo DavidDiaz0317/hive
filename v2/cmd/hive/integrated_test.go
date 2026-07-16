@@ -115,6 +115,45 @@ func TestResumableRepairStatusReturnsSafeJSONTemplateAndRequiredAttestation(t *t
 	}
 }
 
+func TestPublicRepairAndHostedDoctorStatusRedactRunnerInternals(t *testing.T) {
+	attempt := repair.Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: "finding", Attempt: 2, Branch: "hive/repair-finding",
+		Stage: repair.StageFailed, Provider: "codex", Worktree: `C:\runner\private\worktree`,
+		ModelSummary: "provider-private-summary", ModelPatch: "provider-private-patch",
+		PortableBundlePath: `/home/runner/private/repair.bundle`, LastFailure: "private stderr with /home/runner/path",
+		StartedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	encoded, err := json.Marshal(publicRepairAttempt(attempt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"private\\worktree", "provider-private", "repair.bundle", "/home/runner/path", "model_patch", "worktree"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("public repair status exposed %q: %s", forbidden, encoded)
+		}
+	}
+	for _, required := range []string{"finding", "hive/repair-finding", `"stage":"failed"`} {
+		if !strings.Contains(string(encoded), required) {
+			t.Fatalf("public repair status omitted %q: %s", required, encoded)
+		}
+	}
+
+	checks := publicHostedDoctorChecks([]doctorCheck{
+		{Name: "provider", OK: false, Message: "failed under /home/runner/private with raw stderr"},
+		{Name: "visual_hive_pin", OK: true, Message: `C:\runner\visual-hive.mjs`},
+	})
+	checksJSON, err := json.Marshal(checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(checksJSON), "/home/runner") || strings.Contains(string(checksJSON), `C:\\runner`) || strings.Contains(string(checksJSON), "raw stderr") {
+		t.Fatalf("public hosted doctor exposed runner diagnostics: %s", checksJSON)
+	}
+	if checks[0].OK || !strings.Contains(checks[0].Message, "OPENAI_API_KEY") || !checks[1].OK {
+		t.Fatalf("public hosted doctor lost actionable readiness: %+v", checks)
+	}
+}
+
 func TestResolveVisualHiveLauncherUsesPackagedRuntime(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "visual-hive")

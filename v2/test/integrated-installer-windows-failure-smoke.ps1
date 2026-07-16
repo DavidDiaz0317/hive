@@ -238,6 +238,29 @@ function New-CaseDuplicateRelease {
     return $duplicateRoot
 }
 
+function New-ProtocolFailureRelease {
+    param([Parameter(Mandatory)][ValidateSet("missing", "wrong")][string]$Mode)
+    $protocolRoot = Join-Path $resolvedWorkRoot "protocol-$Mode-release"
+    $extractRoot = Join-Path $resolvedWorkRoot "protocol-$Mode-extract"
+    New-Item -ItemType Directory -Path $protocolRoot, $extractRoot -Force | Out-Null
+    Expand-Archive -LiteralPath $sourceAsset -DestinationPath $extractRoot
+    $roots = @(Get-ChildItem -LiteralPath $extractRoot -Directory)
+    if ($roots.Count -ne 1) { throw "Expected one archive root while preparing the protocol-$Mode fixture." }
+    $manifestPath = Join-Path $roots[0].FullName "distribution-manifest.json"
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($Mode -eq "missing") {
+        $manifest.PSObject.Properties.Remove("hosted_controller_protocol")
+    } else {
+        $manifest.hosted_controller_protocol = 2
+    }
+    [IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 100) + "`n"), $utf8NoBom)
+    $asset = Join-Path $protocolRoot $assetName
+    Compress-Archive -LiteralPath $roots[0].FullName -DestinationPath $asset -CompressionLevel Optimal
+    $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText((Join-Path $protocolRoot $checksumName), "$hash  $assetName`r`n", [Text.Encoding]::ASCII)
+    return $protocolRoot
+}
+
 try {
     $env:Path = "$fakeBin;$originalPath"
     $env:HIVE_FAKE_RELEASE_DIR = $resolvedReleaseDir
@@ -343,6 +366,12 @@ try {
     $caseDuplicateRelease = New-CaseDuplicateRelease
     $caseDuplicateFailure = Invoke-InstallerProcess -Name "case-duplicate-fail" -RequestedVersion $Version -LocalReleaseDir $caseDuplicateRelease -SkipAttestation
     Assert-InstallerFailure $caseDuplicateFailure "Duplicate distribution inventory path:"
+
+    foreach ($protocolMode in @("missing", "wrong")) {
+        $protocolRelease = New-ProtocolFailureRelease -Mode $protocolMode
+        $protocolFailure = Invoke-InstallerProcess -Name "protocol-$protocolMode-fail" -RequestedVersion $Version -LocalReleaseDir $protocolRelease -SkipAttestation
+        Assert-InstallerFailure $protocolFailure "distribution identity is incomplete or excessive"
+    }
 
     $nodeFailureRelease = New-NodeFailureRelease
     $nodeInstall = Join-Path $resolvedWorkRoot "install-node-fail"

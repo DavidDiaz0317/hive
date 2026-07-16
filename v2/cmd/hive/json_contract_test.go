@@ -6,11 +6,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestCLIJSONRequested(t *testing.T) {
-	for _, args := range [][]string{{"--json"}, {"-json"}, {"--json=true"}, {"-json=1"}, {"--other", "--json=invalid"}} {
+	for _, args := range [][]string{{"--json"}, {"-json"}, {"--json=true"}, {"-json=1"}, {"--other", "--json=invalid"}, {"--json=false", "--json=true"}, {"--json=false", "--json=invalid"}} {
 		if !cliJSONRequested(args) {
 			t.Fatalf("cliJSONRequested(%q) = false", args)
 		}
@@ -37,6 +38,8 @@ func TestRunCLICommandWithJSONContract(t *testing.T) {
 		{name: "empty success", wantRC: 1, wantCode: "invalid_json_stdout"},
 		{name: "human prefix", commandOut: "progress\n{\"ok\":true}", wantRC: 1, wantCode: "invalid_json_stdout"},
 		{name: "two documents", commandOut: "{}\n{}", wantRC: 1, wantCode: "invalid_json_stdout"},
+		{name: "null is not an object", commandOut: "null", wantRC: 1, wantCode: "invalid_json_stdout"},
+		{name: "array is not an object", commandOut: "[]", wantRC: 1, wantCode: "invalid_json_stdout"},
 		{name: "invalid UTF-8", commandOut: string([]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'}), wantRC: 1, wantCode: "invalid_json_stdout"},
 	}
 	for _, test := range tests {
@@ -60,6 +63,61 @@ func TestRunCLICommandWithJSONContract(t *testing.T) {
 				}
 			} else if document["error_code"] != test.wantCode {
 				t.Fatalf("error_code = %v, want %s: %s", document["error_code"], test.wantCode, output)
+			}
+		})
+	}
+}
+
+func TestRunCLICommandWithJSONContractRecoversPanic(t *testing.T) {
+	output, code := captureCLIContractStdout(t, func() int {
+		return runCLICommandWithJSONContract("doctor", []string{"--json"}, func() int {
+			panic("sensitive panic payload")
+		})
+	})
+	if code != 1 {
+		t.Fatalf("panic exit=%d output=%s", code, output)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(output, &document); err != nil || document["error_code"] != "command_panicked" {
+		t.Fatalf("panic was not converted into one safe JSON object: %v: %s", err, output)
+	}
+	if strings.Contains(string(output), "sensitive panic payload") {
+		t.Fatal("panic payload leaked into machine output")
+	}
+}
+
+func TestEarlyCLIJSONSurfacesAreStructuredAndDoNotStartStreams(t *testing.T) {
+	priorVersion, priorCommit := integratedVersion, gitHash
+	integratedVersion, gitHash = "v0.4.1-integrated.19", strings.Repeat("a", 40)
+	defer func() { integratedVersion, gitHash = priorVersion, priorCommit }()
+
+	tests := []struct {
+		name     string
+		args     []string
+		wantCode int
+		wantKey  string
+		wantVal  any
+	}{
+		{name: "version", args: []string{"--version", "--json"}, wantKey: "schema_version", wantVal: "hive.version.v1"},
+		{name: "mcp stream rejection", args: []string{"mcp-server", "--json"}, wantCode: 2, wantKey: "error_code", wantVal: "command_failed_before_json"},
+		{name: "unknown command", args: []string{"not-a-command", "--json"}, wantCode: 2, wantKey: "error_code", wantVal: "command_failed_before_json"},
+		{name: "later malformed JSON flag", args: []string{"status", "--json=false", "--json=invalid"}, wantCode: 2, wantKey: "error_code", wantVal: "command_failed_before_json"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output, code := captureCLIContractStdout(t, func() int {
+				handled, result := runEarlyCLI(test.args)
+				if !handled {
+					t.Fatal("JSON-bearing early command was not handled")
+				}
+				return result
+			})
+			if code != test.wantCode {
+				t.Fatalf("exit=%d want=%d output=%s", code, test.wantCode, output)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(output, &document); err != nil || document[test.wantKey] != test.wantVal {
+				t.Fatalf("unexpected structured result: err=%v document=%+v output=%s", err, document, output)
 			}
 		})
 	}

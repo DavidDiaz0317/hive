@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -24,7 +25,7 @@ import (
 
 const (
 	// SchemaVersion is the only hosted-state schema accepted by this package.
-	SchemaVersion = "hive.hosted-state.v1"
+	SchemaVersion = "hive.hosted-state.v2"
 
 	defaultMaxFiles      = 5000
 	defaultMaxTotalBytes = int64(32 << 20)
@@ -63,9 +64,11 @@ type RepositoryIdentity struct {
 }
 
 type ReleaseIdentity struct {
-	Version          string `json:"version"`
-	HiveCommit       string `json:"hiveCommit"`
-	VisualHiveCommit string `json:"visualHiveCommit"`
+	Version                    string `json:"version"`
+	HiveCommit                 string `json:"hiveCommit"`
+	VisualHiveCommit           string `json:"visualHiveCommit"`
+	DistributionManifestSHA256 string `json:"distributionManifestSha256"`
+	HostedControllerProtocol   int    `json:"hostedControllerProtocol"`
 }
 
 type ControllerIdentity struct {
@@ -420,11 +423,10 @@ func validateMetadata(metadata Metadata) error {
 	default:
 		return errors.New("execution owner must be hosted or the bounded initial bootstrap")
 	}
-	if err := validateText("integrated release version", metadata.Release.Version); err != nil {
-		return err
-	}
-	if !validGitOID(metadata.Release.HiveCommit) || !validGitOID(metadata.Release.VisualHiveCommit) {
-		return errors.New("release Hive and Visual Hive commits must be full Git object IDs")
+	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$`).MatchString(metadata.Release.Version) ||
+		!validGitOID(metadata.Release.HiveCommit) || !validGitOID(metadata.Release.VisualHiveCommit) ||
+		!regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(metadata.Release.DistributionManifestSHA256) || metadata.Release.HostedControllerProtocol != 1 {
+		return errors.New("release identity must bind an immutable integrated tag, full Hive and Visual Hive commits, manifest digest, and supported hosted controller protocol")
 	}
 	if err := validateText("controller event", metadata.Controller.Event); err != nil {
 		return err

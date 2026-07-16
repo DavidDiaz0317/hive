@@ -327,6 +327,7 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "skills/hive/SKILL.md") -PathType Leaf)) { throw "Default installer did not install the Hive Codex skill." }
             if ($installOutput -notmatch [regex]::Escape("& `"$expectedHive`" setup")) { throw "Installer did not print its exact absolute setup command." }
             $manifest = Get-Content -LiteralPath (Join-Path $install "distribution-manifest.json") -Raw | ConvertFrom-Json
+            if ($manifest.hosted_controller_protocol -ne 1) { throw "Packaged hosted controller protocol mismatch." }
             $savedPath = $env:PATH
             $env:PATH = "$install;$(Join-Path $env:SystemRoot 'System32');$env:SystemRoot"
             try {
@@ -485,28 +486,38 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}
     steps:
+      - name: Detect optional authenticated gate
+        id: auth-config
+        shell: bash
+        env:
+          HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}
+        run: |
+          set -euo pipefail
+          if test -n "$HIVE_RELEASE_CODEX_AUTH_JSON_B64"; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+          fi
       - name: Record optional authenticated gate is not configured
-        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 == ''
+        if: steps.auth-config.outputs.configured != 'true'
         shell: bash
         run: echo "Optional authenticated Codex release coverage is not configured; credential-free containment remains mandatory."
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: steps.auth-config.outputs.configured == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: steps.auth-config.outputs.configured == 'true'
         with:
           go-version: 1.25.12
           cache-dependency-path: v2/go.sum
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: steps.auth-config.outputs.configured == 'true'
         with:
           node-version: 22.23.1
       - name: Install Linux containment prerequisite (supplemental)
-        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Linux' && steps.auth-config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -517,7 +528,7 @@ jobs:
           sudo apparmor_parser -r "$profile"
           test -x "$(command -v bwrap)"
       - name: Install exact reviewed native Codex artifact (Linux supplemental)
-        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Linux' && steps.auth-config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -532,7 +543,7 @@ jobs:
           chmod 500 "$codex_path"
           printf '%s' "$codex_path" > "$RUNNER_TEMP/hive-real-codex-path"
       - name: Install exact reviewed native Codex artifact (Windows supplemental)
-        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Windows' && steps.auth-config.outputs.configured == 'true'
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "hive-codex-gate"
@@ -553,8 +564,10 @@ jobs:
           if (-not $codex) { throw "Exact native Codex artifact was not installed." }
           Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "hive-real-codex-path") -Value $codex.FullName -NoNewline
       - name: Install optional Codex authorization (Linux)
-        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Linux' && steps.auth-config.outputs.configured == 'true'
         shell: bash
+        env:
+          HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}
         run: |
           set -euo pipefail
           export CODEX_HOME="$RUNNER_TEMP/hive-release-codex-home"
@@ -562,14 +575,16 @@ jobs:
           printf '%s' "$HIVE_RELEASE_CODEX_AUTH_JSON_B64" | base64 --decode > "$CODEX_HOME/auth.json"
           chmod 600 "$CODEX_HOME/auth.json"
       - name: Install optional Codex authorization (Windows)
-        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Windows' && steps.auth-config.outputs.configured == 'true'
         shell: pwsh
+        env:
+          HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}
         run: |
           $home = Join-Path $env:RUNNER_TEMP "hive-release-codex-home"
           New-Item -ItemType Directory -Path $home -Force | Out-Null
           [IO.File]::WriteAllBytes((Join-Path $home "auth.json"), [Convert]::FromBase64String($env:HIVE_RELEASE_CODEX_AUTH_JSON_B64))
       - name: Prove authenticated structured containment (Linux supplemental)
-        if: runner.os == 'Linux' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Linux' && steps.auth-config.outputs.configured == 'true'
         working-directory: v2
         shell: bash
         run: |
@@ -578,7 +593,7 @@ jobs:
           export HIVE_REAL_CODEX="$(cat "$RUNNER_TEMP/hive-real-codex-path")"
           go test ./pkg/repair -run '^(TestCodexProviderRealWorktreeInstructionsAndToolsAreIsolated|TestCodexProviderRealStructuredContainmentDeniesReadWriteAndNetwork)$' -count=1 -timeout 8m
       - name: Prove authenticated structured containment (Windows supplemental)
-        if: runner.os == 'Windows' && env.HIVE_RELEASE_CODEX_AUTH_JSON_B64 != ''
+        if: runner.os == 'Windows' && steps.auth-config.outputs.configured == 'true'
         working-directory: v2
         shell: pwsh
         run: |
@@ -705,13 +720,13 @@ jobs:
           "$install_dir/hive" --version | grep -Fx "commit: $GITHUB_SHA"
           "$install_dir/bin/visual-hive" --version >/dev/null
           jq -e --arg version "$RELEASE_TAG" --arg hive "$GITHUB_SHA" --arg visual "$VISUAL_HIVE_REF" \
-            '.schema_version == "hive.integrated-distribution.v1" and .hive_version == $version and .hive_commit == $hive and .visual_hive_commit == $visual and .node_version == "v22.23.1"' \
+            '.schema_version == "hive.integrated-distribution.v1" and .hive_version == $version and .hive_commit == $hive and .visual_hive_commit == $visual and .hosted_controller_protocol == 1 and .node_version == "v22.23.1"' \
             "$install_dir/distribution-manifest.json" >/dev/null
           HOME="$install_home" CODEX_HOME="$codex_home" "$install_dir/hive" setup \
             --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 \
             --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --json > "$verify_dir/setup-plan.json"
           jq -e --arg version "$RELEASE_TAG" --arg hive "$GITHUB_SHA" \
-            '.plan.schema_version == "hive.setup-plan.v2" and .plan.execution_mode == "hosted" and .plan.read_only == true and .plan.hive_release_version == $version and .plan.hive_commit == $hive and (.plan.distribution_manifest_sha256 | test("^[a-f0-9]{64}$")) and (.plan.hosted_state_branch | startswith("hive/state-"))' \
+            '.plan.schema_version == "hive.setup-plan.v2" and .plan.execution_mode == "hosted" and .plan.read_only == true and .plan.hive_release_version == $version and .plan.hive_commit == $hive and .plan.hosted_controller_protocol == 1 and (.plan.distribution_manifest_sha256 | test("^[a-f0-9]{64}$")) and (.plan.hosted_workflow_sha256 | test("^[a-f0-9]{64}$")) and (.plan.hosted_state_branch | startswith("hive/state-"))' \
             "$verify_dir/setup-plan.json" >/dev/null
           release_verified=true
           trap - EXIT

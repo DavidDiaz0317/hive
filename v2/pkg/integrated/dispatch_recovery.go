@@ -31,6 +31,7 @@ type RecoverWorkflowDispatchOptions struct {
 	Reason                string
 	PlanOnly              bool
 	GitHub                *hivegithub.Client
+	HostedAuthority       HostedOperatorAuthority
 }
 
 type WorkflowDispatchRecoveryDiscovery struct {
@@ -133,10 +134,15 @@ func RecoverWorkflowDispatch(ctx context.Context, options RecoverWorkflowDispatc
 	}
 	result.CorrelationID, result.WorkflowFile, result.Ref, result.Operation = intent.CorrelationID, intent.WorkflowFile, intent.Ref, intent.Operation
 	result.DisplayTitle, result.RequestDigest, result.RequestState = intent.ExpectedDisplayTitle, intent.RequestDigest, "ambiguous_transport_failure"
-	actor, err := options.GitHub.AuthenticatedLogin(ctx)
+	operation := "recover-dispatch-apply"
+	if options.PlanOnly {
+		operation = "recover-dispatch-plan"
+	}
+	operator, err := resolveOperatorIdentity(ctx, options.GitHub, options.HostedAuthority, config.Repository, operation)
 	if err != nil {
 		return fail(err)
 	}
+	actor := operator.Login
 	result.Actor = actor
 	owner, repo, ok := strings.Cut(config.Repository, "/")
 	if !ok || owner == "" || repo == "" {

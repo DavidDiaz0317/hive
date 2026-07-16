@@ -16,12 +16,13 @@ import (
 const integratedReleaseRepository = "DavidDiaz0317/hive"
 
 type installedReleaseIdentity struct {
-	Repository       string
-	Version          string
-	HiveCommit       string
-	VisualHiveCommit string
-	ManifestSHA256   string
-	ManifestPath     string
+	Repository               string
+	Version                  string
+	HiveCommit               string
+	VisualHiveCommit         string
+	ManifestSHA256           string
+	ManifestPath             string
+	HostedControllerProtocol int
 }
 
 func loadInstalledReleaseIdentity() (installedReleaseIdentity, error) {
@@ -52,14 +53,14 @@ func loadReleaseIdentityBeside(executable, buildVersion, buildCommit string) (in
 	version := strings.TrimSpace(buildVersion)
 	commit := strings.ToLower(strings.TrimSpace(buildCommit))
 	if manifest.SchemaVersion != integrated.DistributionSchema || manifest.HiveVersion != version || manifest.HiveCommit != commit ||
-		len(manifest.VisualHiveCommit) != 40 || manifest.OS == "" || manifest.Architecture == "" {
+		len(manifest.VisualHiveCommit) != 40 || manifest.HostedControllerProtocol != integrated.HostedControllerProtocol || manifest.OS == "" || manifest.Architecture == "" {
 		return installedReleaseIdentity{}, fmt.Errorf("installed integrated release manifest does not match this Hive binary identity")
 	}
 	digest := sha256.Sum256(data)
 	return installedReleaseIdentity{
 		Repository: integratedReleaseRepository, Version: version, HiveCommit: commit,
 		VisualHiveCommit: strings.ToLower(manifest.VisualHiveCommit), ManifestSHA256: hex.EncodeToString(digest[:]),
-		ManifestPath: manifestPath,
+		ManifestPath: manifestPath, HostedControllerProtocol: manifest.HostedControllerProtocol,
 	}, nil
 }
 

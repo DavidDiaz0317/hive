@@ -79,6 +79,10 @@ try {
 	if (-not (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "skills/hive/SKILL.md") -PathType Leaf)) {
 		throw "Installer default path did not install the packaged Hive Codex skill."
 	}
+	$installedManifest = Get-Content -LiteralPath (Join-Path $installDir "distribution-manifest.json") -Raw | ConvertFrom-Json
+	if ($installedManifest.hosted_controller_protocol -ne 1) {
+		throw "Installed distribution did not retain hosted controller protocol 1."
+	}
 
     $savedVisualPath = $env:Path
     try {

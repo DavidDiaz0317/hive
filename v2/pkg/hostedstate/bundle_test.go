@@ -25,9 +25,11 @@ func testMetadata() Metadata {
 		PriorStateCommit: strings.Repeat("1", 40),
 		ExecutionOwner:   "hosted",
 		Release: ReleaseIdentity{
-			Version:          "v0.4.1-integrated.19",
-			HiveCommit:       strings.Repeat("2", 40),
-			VisualHiveCommit: strings.Repeat("3", 40),
+			Version:                    "v0.4.1-integrated.19",
+			HiveCommit:                 strings.Repeat("2", 40),
+			VisualHiveCommit:           strings.Repeat("3", 40),
+			DistributionManifestSHA256: strings.Repeat("6", 64),
+			HostedControllerProtocol:   1,
 		},
 		Controller: ControllerIdentity{
 			RunID:          98765,
@@ -134,6 +136,9 @@ func TestRoundTripCanonicalAuthenticatedBundle(t *testing.T) {
 	if bundle.SchemaVersion != SchemaVersion {
 		t.Fatalf("schema = %q", bundle.SchemaVersion)
 	}
+	if bundle.SchemaVersion != "hive.hosted-state.v2" {
+		t.Fatalf("hosted-state fixture did not exercise schema v2: %q", bundle.SchemaVersion)
+	}
 	gotPaths := []string{bundle.Files[0].Path, bundle.Files[1].Path}
 	if !sort.StringsAreSorted(gotPaths) {
 		t.Fatalf("inventory is not sorted: %v", gotPaths)
@@ -208,6 +213,24 @@ func TestBundleTamperIsRejected(t *testing.T) {
 		assertRestoreFailsWithoutDestination(t, resign(t, &changed, testSecret), testSecret, expected(metadata), "SHA-256")
 	})
 
+	t.Run("resigned release manifest tamper", func(t *testing.T) {
+		changed := bundle
+		changed.Metadata.Release.DistributionManifestSHA256 = strings.Repeat("a", 64)
+		assertRestoreFailsWithoutDestination(t, resign(t, &changed, testSecret), testSecret, expected(metadata), "release identity")
+	})
+
+	t.Run("resigned release protocol tamper", func(t *testing.T) {
+		changed := bundle
+		changed.Metadata.Release.HostedControllerProtocol++
+		assertRestoreFailsWithoutDestination(t, resign(t, &changed, testSecret), testSecret, expected(metadata), "release identity")
+	})
+
+	t.Run("signed legacy schema", func(t *testing.T) {
+		changed := bundle
+		changed.SchemaVersion = "hive.hosted-state.v1"
+		assertRestoreFailsWithoutDestination(t, resign(t, &changed, testSecret), testSecret, expected(metadata), "unsupported hosted state schema")
+	})
+
 	t.Run("unknown JSON field", func(t *testing.T) {
 		payload := append([]byte(nil), encoded...)
 		payload = []byte(strings.Replace(string(payload), "{", "{\"unexpected\":true,", 1))
@@ -250,6 +273,16 @@ func TestRestoreRejectsReplayPriorIdentityReleaseAndKey(t *testing.T) {
 		{name: "wrong Visual Hive commit", secret: testSecret, expected: func() ExpectedState {
 			value := expected(metadata)
 			value.Release.VisualHiveCommit = strings.Repeat("c", 40)
+			return value
+		}(), contains: "release"},
+		{name: "wrong manifest digest", secret: testSecret, expected: func() ExpectedState {
+			value := expected(metadata)
+			value.Release.DistributionManifestSHA256 = strings.Repeat("d", 64)
+			return value
+		}(), contains: "release"},
+		{name: "wrong controller protocol", secret: testSecret, expected: func() ExpectedState {
+			value := expected(metadata)
+			value.Release.HostedControllerProtocol++
 			return value
 		}(), contains: "release"},
 		{name: "wrong HMAC key", secret: []byte("abcdef0123456789abcdef0123456789"), expected: expected(metadata), contains: "signature"},

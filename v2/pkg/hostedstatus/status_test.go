@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -36,9 +38,11 @@ type serverScenario struct {
 	receiptOperation  string
 	receiptPaused     bool
 	receiptStateAfter string
+	receiptRelease    integrated.HostedReleaseIdentity
 	receiptOverride   []byte
 	artifactRunID     int64
 	artifactHead      string
+	noArtifactRuns    map[int64]bool
 	defaultHead       string
 }
 
@@ -106,6 +110,7 @@ func TestInspectRejectsMalformedOldAndWrongRunPauseReceipts(t *testing.T) {
 		{name: "old state", mutate: func(s *serverScenario) { s.receiptStateAfter = strings.Repeat("8", 40) }},
 		{name: "wrong run", mutate: func(s *serverScenario) { s.artifactRunID = 999 }},
 		{name: "wrong head", mutate: func(s *serverScenario) { s.artifactHead = strings.Repeat("9", 40) }},
+		{name: "wrong release", mutate: func(s *serverScenario) { s.receiptRelease.DistributionManifestSHA256 = strings.Repeat("9", 64) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -230,6 +235,7 @@ func greenScenario(t *testing.T, config integrated.Config, now time.Time) server
 		cycleJobs:        map[int64]bool{},
 		executedJobs:     map[int64]string{},
 		receiptOperation: "cycle",
+		receiptRelease:   testHostedRelease(config),
 		defaultHead:      testHeadSHA,
 	}
 }
@@ -308,6 +314,10 @@ func (scenario serverScenario) handler(t *testing.T, config integrated.Config, n
 		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/artifacts"):
 			var runID int64
 			_, _ = fmt.Sscanf(request.URL.Path, "/repos/acme/widget/actions/runs/%d/artifacts", &runID)
+			if scenario.noArtifactRuns[runID] {
+				_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "artifacts": []any{}})
+				return
+			}
 			job := scenario.executedJobs[runID]
 			if job == "" {
 				job = "cycle"
@@ -389,7 +399,7 @@ func (scenario serverScenario) receiptZip(runID int64, job string) []byte {
 			"schema_version": "hive.hosted-cycle.v1", "repository": "acme/widget",
 			"operation": operation, "request_id": fmt.Sprintf("request-%d", runID),
 			"state_branch": "hive/state-12345", "state_before": strings.Repeat("3", 40),
-			"state_after": stateAfter, "sequence": 3, "paused": scenario.receiptPaused,
+			"state_after": stateAfter, "sequence": 3, "paused": scenario.receiptPaused, "release": scenario.receiptRelease,
 		})
 	}
 	var buffer bytes.Buffer
@@ -414,11 +424,31 @@ func testRun(id int64, event, status, conclusion string, updated time.Time) map[
 
 func testConfig(t *testing.T) integrated.Config {
 	t.Helper()
-	return integrated.Config{
+	config := integrated.Config{
 		Repository: "acme/widget", RepositoryID: "12345", DefaultBranch: "main", ExecutionMode: integrated.ExecutionHosted,
 		RunIntervalSeconds: 900, HostedSchedule: "*/15 * * * *", HostedStateBranch: "hive/state-12345",
 		HiveReleaseRepository: "DavidDiaz0317/hive", HiveReleaseVersion: "v0.4.1-integrated.19",
 		HiveCommit: strings.Repeat("a", 40), VisualHiveRef: strings.Repeat("b", 40), DistributionManifestSHA256: strings.Repeat("c", 64),
+		HostedControllerProtocol: integrated.HostedControllerProtocol,
+	}
+	workflow, err := integrated.GenerateHostedControllerWorkflow(integrated.HostedWorkflowConfig{
+		Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
+		ScheduleCron: config.HostedSchedule, StateBranch: config.HostedStateBranch, StateKeySecret: stateSecretName,
+		ReleaseRepository: config.HiveReleaseRepository, ReleaseTag: config.HiveReleaseVersion,
+		HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef, DistributionManifestSHA256: config.DistributionManifestSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(workflow))
+	config.HostedWorkflowSHA256 = hex.EncodeToString(digest[:])
+	return config
+}
+
+func testHostedRelease(config integrated.Config) integrated.HostedReleaseIdentity {
+	return integrated.HostedReleaseIdentity{
+		Version: config.HiveReleaseVersion, HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef,
+		DistributionManifestSHA256: config.DistributionManifestSHA256, HostedControllerProtocol: config.HostedControllerProtocol,
 	}
 }
 

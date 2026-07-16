@@ -48,6 +48,7 @@ const (
 
 var (
 	exactSHA            = regexp.MustCompile(`^[a-f0-9]{40}$`)
+	hostedDigestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	controllerRequestID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
@@ -61,19 +62,26 @@ type Check struct {
 // RunEvidence is the immutable identity and timing evidence retained for a
 // controller run. It deliberately excludes logs and target-repository data.
 type RunEvidence struct {
-	ID           int64     `json:"id"`
-	URL          string    `json:"url,omitempty"`
-	Event        string    `json:"event"`
-	Status       string    `json:"status"`
-	Conclusion   string    `json:"conclusion,omitempty"`
-	Path         string    `json:"path"`
-	HeadBranch   string    `json:"head_branch"`
-	HeadSHA      string    `json:"head_sha"`
-	RunNumber    int       `json:"run_number"`
-	RunAttempt   int       `json:"run_attempt"`
-	CreatedAt    time.Time `json:"created_at"`
-	RunStartedAt time.Time `json:"run_started_at,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID                   int64     `json:"id"`
+	URL                  string    `json:"url,omitempty"`
+	Event                string    `json:"event"`
+	Status               string    `json:"status"`
+	Conclusion           string    `json:"conclusion,omitempty"`
+	Path                 string    `json:"path"`
+	HeadBranch           string    `json:"head_branch"`
+	HeadSHA              string    `json:"head_sha"`
+	RunNumber            int       `json:"run_number"`
+	RunAttempt           int       `json:"run_attempt"`
+	DisplayTitle         string    `json:"display_title,omitempty"`
+	ActorID              int64     `json:"actor_id,omitempty"`
+	ActorLogin           string    `json:"actor_login,omitempty"`
+	ActorType            string    `json:"actor_type,omitempty"`
+	TriggeringActorID    int64     `json:"triggering_actor_id,omitempty"`
+	TriggeringActorLogin string    `json:"triggering_actor_login,omitempty"`
+	TriggeringActorType  string    `json:"triggering_actor_type,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	RunStartedAt         time.Time `json:"run_started_at,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // StateReceiptEvidence is a bounded, runner-produced receipt from the latest
@@ -81,16 +89,27 @@ type RunEvidence struct {
 // workflow run; the receipt binds the restored signed state to the operation,
 // state-branch commit, and pause state observed by that runner.
 type StateReceiptEvidence struct {
-	Run          RunEvidence `json:"run"`
-	Job          string      `json:"job"`
-	ArtifactID   int64       `json:"artifact_id"`
-	ArtifactName string      `json:"artifact_name"`
-	Operation    string      `json:"operation"`
-	RequestID    string      `json:"request_id"`
-	StateBefore  string      `json:"state_before"`
-	StateAfter   string      `json:"state_after"`
-	Sequence     uint64      `json:"sequence"`
-	Paused       bool        `json:"paused"`
+	Run                    RunEvidence                        `json:"run"`
+	Job                    string                             `json:"job"`
+	ArtifactID             int64                              `json:"artifact_id"`
+	ArtifactName           string                             `json:"artifact_name"`
+	Operation              string                             `json:"operation"`
+	RequestID              string                             `json:"request_id"`
+	RequestSHA256          string                             `json:"request_sha256,omitempty"`
+	StateBefore            string                             `json:"state_before"`
+	StateAfter             string                             `json:"state_after"`
+	Sequence               uint64                             `json:"sequence"`
+	Paused                 bool                               `json:"paused"`
+	Release                integrated.HostedReleaseIdentity   `json:"release"`
+	Actor                  *integrated.HostedOperatorIdentity `json:"actor,omitempty"`
+	RunResult              json.RawMessage                    `json:"run_result,omitempty"`
+	DoctorResult           json.RawMessage                    `json:"doctor_result,omitempty"`
+	StatusResult           json.RawMessage                    `json:"status_result,omitempty"`
+	OperatorResult         json.RawMessage                    `json:"operator_result,omitempty"`
+	OperatorStatus         string                             `json:"operator_status,omitempty"`
+	OperatorTerminalSHA256 string                             `json:"operator_terminal_sha256,omitempty"`
+	OperatorLedgerSequence uint64                             `json:"operator_ledger_sequence,omitempty"`
+	OperatorReplayed       bool                               `json:"operator_replayed,omitempty"`
 }
 
 // Result is suitable for direct inclusion in Hive status and doctor output.
@@ -145,21 +164,12 @@ func Inspect(ctx context.Context, client *gh.Client, config integrated.Config, n
 	}
 	result.FreshnessWindowSeconds = int64(window / time.Second)
 
-	expectedWorkflow, err := integrated.GenerateHostedControllerWorkflow(integrated.HostedWorkflowConfig{
-		Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
-		ScheduleCron: config.HostedSchedule, StateBranch: config.HostedStateBranch, StateKeySecret: stateSecretName,
-		ReleaseRepository: config.HiveReleaseRepository, ReleaseTag: config.HiveReleaseVersion,
-		HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef,
-		DistributionManifestSHA256: config.DistributionManifestSHA256,
-		PreviousRelease:            config.PreviousHostedRelease,
-	})
-	if err != nil {
-		return result, fmt.Errorf("generate expected hosted controller workflow: %w", err)
+	if config.HostedControllerProtocol != integrated.HostedControllerProtocol || !hostedDigestPattern.MatchString(config.HostedWorkflowSHA256) {
+		return result, errors.New("hosted status requires a supported controller protocol and exact managed workflow digest")
 	}
-	workflowDigest := sha256.Sum256([]byte(expectedWorkflow))
-	result.ManagedWorkflowSHA256 = hex.EncodeToString(workflowDigest[:])
+	result.ManagedWorkflowSHA256 = config.HostedWorkflowSHA256
 
-	workflowCheck, err := inspectWorkflow(ctx, client, owner, repository, config.DefaultBranch, []byte(expectedWorkflow))
+	workflowCheck, err := inspectWorkflow(ctx, client, owner, repository, config.DefaultBranch, config.HostedWorkflowSHA256)
 	if err != nil {
 		return result, err
 	}
@@ -251,7 +261,7 @@ func FreshnessWindow(runIntervalSeconds int64) (time.Duration, error) {
 	return window, nil
 }
 
-func inspectWorkflow(ctx context.Context, client *gh.Client, owner, repository, branch string, expected []byte) (Check, error) {
+func inspectWorkflow(ctx context.Context, client *gh.Client, owner, repository, branch, expectedSHA256 string) (Check, error) {
 	content, directory, response, err := client.Repositories.GetContents(ctx, owner, repository, integrated.HostedControllerWorkflowPath, &gh.RepositoryContentGetOptions{Ref: branch})
 	if err != nil {
 		if isNotFound(response, err) {
@@ -266,10 +276,11 @@ func inspectWorkflow(ctx context.Context, client *gh.Client, owner, repository, 
 	if err != nil {
 		return Check{Name: CheckManagedWorkflow, Details: "managed hosted controller content could not be decoded"}, nil
 	}
-	if !bytes.Equal([]byte(actual), expected) {
-		return Check{Name: CheckManagedWorkflow, Details: "managed hosted controller bytes differ from the generated release-bound workflow"}, nil
+	digest := sha256.Sum256([]byte(actual))
+	if hex.EncodeToString(digest[:]) != expectedSHA256 {
+		return Check{Name: CheckManagedWorkflow, Details: "managed hosted controller bytes differ from the durable content-bound workflow identity"}, nil
 	}
-	return Check{Name: CheckManagedWorkflow, Passed: true, Details: "managed hosted controller bytes exactly match the generated release-bound workflow"}, nil
+	return Check{Name: CheckManagedWorkflow, Passed: true, Details: "managed hosted controller bytes exactly match the durable content-bound workflow identity"}, nil
 }
 
 func inspectStateBranch(ctx context.Context, client *gh.Client, owner, repository, branch string) (Check, string, error) {
@@ -418,21 +429,29 @@ func inspectRuns(ctx context.Context, client *gh.Client, owner, repository strin
 }
 
 type controllerReceipt struct {
-	SchemaVersion string          `json:"schema_version"`
-	Repository    string          `json:"repository"`
-	Operation     string          `json:"operation"`
-	RequestID     string          `json:"request_id"`
-	StateBranch   string          `json:"state_branch"`
-	StateBefore   string          `json:"state_before"`
-	StateAfter    string          `json:"state_after"`
-	Sequence      uint64          `json:"sequence"`
-	Paused        *bool           `json:"paused"`
-	Skipped       bool            `json:"skipped,omitempty"`
-	Duplicate     bool            `json:"duplicate,omitempty"`
-	Run           json.RawMessage `json:"run,omitempty"`
-	Doctor        json.RawMessage `json:"doctor,omitempty"`
-	Status        json.RawMessage `json:"status,omitempty"`
-	Error         string          `json:"error,omitempty"`
+	SchemaVersion          string                             `json:"schema_version"`
+	Repository             string                             `json:"repository"`
+	Operation              string                             `json:"operation"`
+	RequestID              string                             `json:"request_id"`
+	RequestSHA256          string                             `json:"request_sha256,omitempty"`
+	StateBranch            string                             `json:"state_branch"`
+	StateBefore            string                             `json:"state_before"`
+	StateAfter             string                             `json:"state_after"`
+	Sequence               uint64                             `json:"sequence"`
+	Paused                 *bool                              `json:"paused"`
+	Release                integrated.HostedReleaseIdentity   `json:"release"`
+	Skipped                bool                               `json:"skipped,omitempty"`
+	Duplicate              bool                               `json:"duplicate,omitempty"`
+	Run                    json.RawMessage                    `json:"run,omitempty"`
+	Doctor                 json.RawMessage                    `json:"doctor,omitempty"`
+	Status                 json.RawMessage                    `json:"status,omitempty"`
+	Operator               json.RawMessage                    `json:"operator,omitempty"`
+	Actor                  *integrated.HostedOperatorIdentity `json:"actor,omitempty"`
+	OperatorStatus         string                             `json:"operator_status,omitempty"`
+	OperatorTerminalSHA256 string                             `json:"operator_terminal_sha256,omitempty"`
+	OperatorLedgerSequence uint64                             `json:"operator_ledger_sequence,omitempty"`
+	OperatorReplayed       bool                               `json:"operator_replayed,omitempty"`
+	Error                  string                             `json:"error,omitempty"`
 }
 
 func inspectLatestStateReceipt(ctx context.Context, client *gh.Client, owner, repository string, config integrated.Config, defaultHead, stateHead string, runs runInspection) (*StateReceiptEvidence, Check, error) {
@@ -476,8 +495,11 @@ func inspectLatestStateReceipt(ctx context.Context, client *gh.Client, owner, re
 	}
 	evidence := &StateReceiptEvidence{
 		Run: latest.evidence, Job: job, ArtifactID: artifact.GetID(), ArtifactName: artifact.GetName(),
-		Operation: receipt.Operation, RequestID: receipt.RequestID, StateBefore: receipt.StateBefore,
-		StateAfter: receipt.StateAfter, Sequence: receipt.Sequence, Paused: *receipt.Paused,
+		Operation: receipt.Operation, RequestID: receipt.RequestID, RequestSHA256: receipt.RequestSHA256, StateBefore: receipt.StateBefore,
+		StateAfter: receipt.StateAfter, Sequence: receipt.Sequence, Paused: *receipt.Paused, Release: receipt.Release, Actor: receipt.Actor,
+		RunResult: receipt.Run, DoctorResult: receipt.Doctor, StatusResult: receipt.Status, OperatorResult: receipt.Operator,
+		OperatorStatus: receipt.OperatorStatus, OperatorTerminalSHA256: receipt.OperatorTerminalSHA256,
+		OperatorLedgerSequence: receipt.OperatorLedgerSequence, OperatorReplayed: receipt.OperatorReplayed,
 	}
 	state := "active"
 	if evidence.Paused {
@@ -610,13 +632,18 @@ func validateControllerReceipt(receipt controllerReceipt, config integrated.Conf
 	if receipt.SchemaVersion != "hive.hosted-cycle.v1" || receipt.Repository != config.Repository || receipt.StateBranch != config.HostedStateBranch || receipt.Error != "" || receipt.Paused == nil {
 		return errors.New("controller result receipt has an invalid schema, repository, state branch, error, or pause field")
 	}
+	if !receiptMatchesHostedRelease(receipt.Release, config) {
+		return errors.New("controller result receipt does not match the exact immutable hosted release")
+	}
 	if !controllerRequestID.MatchString(receipt.RequestID) || !exactSHA.MatchString(receipt.StateBefore) || !exactSHA.MatchString(receipt.StateAfter) || receipt.StateAfter != stateHead || receipt.Sequence == 0 {
 		return errors.New("controller result receipt is not bound to the exact request and current state-branch commit")
 	}
 	allowed := map[string]map[string]bool{
-		"cycle":   {"cycle": true, "recover": true},
-		"control": {"pause": true, "resume": true},
-		"status":  {"status": true, "doctor": true},
+		"cycle": {"cycle": true},
+		"control": {"pause": true, "resume": true, "approve-baseline-plan": true, "approve-baseline-apply": true,
+			"approve-merge-plan": true, "approve-merge-apply": true, "retry-repair": true,
+			"recover-dispatch-plan": true, "recover-dispatch-apply": true},
+		"status": {"status": true, "doctor": true},
 	}
 	if !allowed[job][receipt.Operation] {
 		return fmt.Errorf("controller result receipt operation %q does not match successful job %q", receipt.Operation, job)
@@ -627,8 +654,56 @@ func validateControllerReceipt(receipt controllerReceipt, config integrated.Conf
 	if receipt.Operation == "resume" && *receipt.Paused {
 		return errors.New("resume controller receipt did not prove an active state")
 	}
+	operatorOperation := strings.HasPrefix(receipt.Operation, "approve-") || receipt.Operation == "retry-repair" || strings.HasPrefix(receipt.Operation, "recover-dispatch-")
+	if operatorOperation {
+		if !hostedDigestPattern.MatchString(receipt.RequestSHA256) || receipt.Actor == nil || receipt.Actor.ID <= 0 || strings.TrimSpace(receipt.Actor.Login) == "" {
+			return errors.New("hosted operator receipt lacks its exact request digest or human actor")
+		}
+		if err := validateHostedOperatorTerminalReceipt(receipt); err != nil {
+			return err
+		}
+	} else if receipt.RequestSHA256 != "" || receipt.Actor != nil || len(receipt.Operator) != 0 || receipt.OperatorStatus != "" ||
+		receipt.OperatorTerminalSHA256 != "" || receipt.OperatorLedgerSequence != 0 || receipt.OperatorReplayed {
+		return errors.New("non-operator controller receipt contains unexpected operator authority")
+	}
 	if run.Event == "schedule" && (job != "cycle" || receipt.Operation != "cycle") {
 		return errors.New("scheduled controller receipt is not an ordinary cycle")
+	}
+	return nil
+}
+
+func receiptMatchesHostedRelease(release integrated.HostedReleaseIdentity, config integrated.Config) bool {
+	return release.Version == config.HiveReleaseVersion && strings.EqualFold(release.HiveCommit, config.HiveCommit) &&
+		strings.EqualFold(release.VisualHiveCommit, config.VisualHiveRef) &&
+		strings.EqualFold(release.DistributionManifestSHA256, config.DistributionManifestSHA256) &&
+		release.HostedControllerProtocol == config.HostedControllerProtocol && release.HostedControllerProtocol == integrated.HostedControllerProtocol
+}
+
+type hostedOperatorTerminalReceipt struct {
+	SchemaVersion string          `json:"schema_version"`
+	Outcome       string          `json:"outcome"`
+	Result        json.RawMessage `json:"result,omitempty"`
+	Error         string          `json:"error,omitempty"`
+}
+
+func validateHostedOperatorTerminalReceipt(receipt controllerReceipt) error {
+	if receipt.OperatorStatus != "succeeded" && receipt.OperatorStatus != "failed" || !hostedDigestPattern.MatchString(receipt.OperatorTerminalSHA256) ||
+		receipt.OperatorLedgerSequence == 0 || receipt.OperatorLedgerSequence > receipt.Sequence || !receipt.OperatorReplayed && receipt.OperatorLedgerSequence != receipt.Sequence ||
+		receipt.OperatorReplayed && !receipt.Duplicate {
+		return errors.New("hosted operator receipt lacks an exact terminal ledger binding")
+	}
+	terminal := hostedOperatorTerminalReceipt{SchemaVersion: "hive.hosted-operator-terminal.v1", Outcome: receipt.OperatorStatus, Result: receipt.Operator, Error: receipt.Error}
+	if receipt.OperatorStatus == "succeeded" && (len(receipt.Operator) == 0 || receipt.Error != "") ||
+		receipt.OperatorStatus == "failed" && receipt.Error == "" {
+		return errors.New("hosted operator terminal outcome does not match its typed result or error")
+	}
+	encoded, err := json.Marshal(terminal)
+	if err != nil {
+		return errors.New("encode hosted operator terminal receipt")
+	}
+	digest := sha256.Sum256(encoded)
+	if hex.EncodeToString(digest[:]) != receipt.OperatorTerminalSHA256 {
+		return errors.New("hosted operator terminal digest does not match its exact result and error")
 	}
 	return nil
 }
@@ -690,6 +765,8 @@ func validateRun(run *gh.WorkflowRun, config integrated.Config, expectedStatus s
 	evidence := RunEvidence{
 		ID: run.GetID(), URL: run.GetHTMLURL(), Event: run.GetEvent(), Status: run.GetStatus(), Conclusion: run.GetConclusion(),
 		Path: run.GetPath(), HeadBranch: run.GetHeadBranch(), HeadSHA: run.GetHeadSHA(), RunNumber: run.GetRunNumber(), RunAttempt: run.GetRunAttempt(),
+		DisplayTitle: run.GetDisplayTitle(), ActorID: run.GetActor().GetID(), ActorLogin: run.GetActor().GetLogin(), ActorType: run.GetActor().GetType(),
+		TriggeringActorID: run.GetTriggeringActor().GetID(), TriggeringActorLogin: run.GetTriggeringActor().GetLogin(), TriggeringActorType: run.GetTriggeringActor().GetType(),
 		CreatedAt: run.GetCreatedAt().Time, RunStartedAt: run.GetRunStartedAt().Time, UpdatedAt: run.GetUpdatedAt().Time,
 	}
 	if evidence.ID <= 0 || evidence.RunNumber <= 0 || evidence.RunAttempt <= 0 {

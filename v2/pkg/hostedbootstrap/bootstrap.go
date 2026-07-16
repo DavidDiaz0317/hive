@@ -37,6 +37,8 @@ const (
 var (
 	ownerOrRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 	stateBranchPattern       = regexp.MustCompile(`^hive/state-[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`)
+	releaseVersionPattern    = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$`)
+	releaseDigestPattern     = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
 // Options binds a bootstrap to one repository and one prepared, private state
@@ -423,11 +425,16 @@ func validateOptions(opts Options) error {
 		return errors.New("prepared hosted-state root is required")
 	}
 	if opts.RestoreRelease != nil {
-		if opts.RestoreRelease.Version == "" || !validGitOID(opts.RestoreRelease.HiveCommit) || !validGitOID(opts.RestoreRelease.VisualHiveCommit) || *opts.RestoreRelease == opts.Metadata.Release {
+		if !validHostedReleaseIdentity(*opts.RestoreRelease) || *opts.RestoreRelease == opts.Metadata.Release {
 			return errors.New("hosted-state predecessor release identity is invalid")
 		}
 	}
 	return nil
+}
+
+func validHostedReleaseIdentity(identity hostedstate.ReleaseIdentity) bool {
+	return releaseVersionPattern.MatchString(identity.Version) && validGitOID(identity.HiveCommit) && validGitOID(identity.VisualHiveCommit) &&
+		releaseDigestPattern.MatchString(identity.DistributionManifestSHA256) && identity.HostedControllerProtocol == 1
 }
 
 func validateCreatedRef(ref *github.Reference, branch, commitSHA string) error {

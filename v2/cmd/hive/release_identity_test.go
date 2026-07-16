@@ -21,6 +21,7 @@ func TestLoadReleaseIdentityBesideBindsManifestToBinary(t *testing.T) {
 	manifest := integrated.DistributionManifest{
 		SchemaVersion: integrated.DistributionSchema, HiveVersion: "v0.4.1-integrated.19", HiveCommit: hiveCommit,
 		VisualHiveCommit: visualCommit, VisualHiveVersion: "0.4.0", NodeVersion: "v22.23.1", OS: "linux", Architecture: "amd64",
+		HostedControllerProtocol: integrated.HostedControllerProtocol,
 	}
 	data, _ := json.Marshal(manifest)
 	if err := os.WriteFile(filepath.Join(root, "distribution-manifest.json"), data, 0o600); err != nil {
@@ -30,7 +31,8 @@ func TestLoadReleaseIdentityBesideBindsManifestToBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.Repository != integratedReleaseRepository || identity.Version != manifest.HiveVersion || identity.HiveCommit != hiveCommit || identity.VisualHiveCommit != visualCommit || len(identity.ManifestSHA256) != 64 {
+	if identity.Repository != integratedReleaseRepository || identity.Version != manifest.HiveVersion || identity.HiveCommit != hiveCommit || identity.VisualHiveCommit != visualCommit ||
+		identity.HostedControllerProtocol != integrated.HostedControllerProtocol || len(identity.ManifestSHA256) != 64 {
 		t.Fatalf("unexpected installed identity: %+v", identity)
 	}
 	if _, err := loadReleaseIdentityBeside(executable, manifest.HiveVersion, strings.Repeat("c", 40)); err == nil {

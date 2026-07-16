@@ -7,6 +7,7 @@ import (
 )
 
 const HostedControllerWorkflowPath = ".github/workflows/hive-controller.yml"
+const HostedControllerProtocol = 1
 
 var (
 	hostedRepositoryPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`)
@@ -35,6 +36,7 @@ type HostedWorkflowConfig struct {
 	HiveCommit                 string
 	VisualHiveCommit           string
 	DistributionManifestSHA256 string
+	ProviderRequired           bool
 	PreviousRelease            *HostedReleaseIdentity
 }
 
@@ -48,6 +50,7 @@ func GenerateHostedControllerWorkflow(config HostedWorkflowConfig) (string, erro
 
 	common := hostedControllerJobSteps(config)
 	return fmt.Sprintf(`name: Hive Hosted Controller
+run-name: Hive ${{ inputs.operation || 'cycle' }} ${{ inputs.request_id || github.run_id }}
 
 on:
   schedule:
@@ -69,7 +72,21 @@ on:
           - doctor
           - pause
           - resume
-          - recover
+          - approve-baseline-plan
+          - approve-baseline-apply
+          - approve-merge-plan
+          - approve-merge-apply
+          - retry-repair
+          - recover-dispatch-plan
+          - recover-dispatch-apply
+      request_payload:
+        description: Base64url content-bound hosted operator request
+        required: false
+        type: string
+      request_sha256:
+        description: SHA-256 of the exact hosted operator request bytes
+        required: false
+        type: string
 
 permissions: {}
 
@@ -79,7 +96,7 @@ concurrency:
 
 jobs:
   cycle:
-    if: ${{ github.event_name == 'schedule' || inputs.operation == 'cycle' || inputs.operation == 'recover' }}
+    if: ${{ github.event_name == 'schedule' || inputs.operation == 'cycle' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -93,11 +110,16 @@ jobs:
 %s
 
   control:
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.operation == 'pause' || inputs.operation == 'resume') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.operation == 'pause' || inputs.operation == 'resume' || startsWith(inputs.operation, 'approve-') || inputs.operation == 'retry-repair' || startsWith(inputs.operation, 'recover-dispatch-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
     steps:
 %s
 
@@ -106,7 +128,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: read
+      issues: read
+      pull-requests: read
+      checks: read
+      statuses: read
     steps:
 %s
 `, config.ScheduleCron, config.RepositoryID, common, common, common), nil
@@ -154,10 +181,15 @@ func validateHostedWorkflowConfig(config HostedWorkflowConfig) error {
 	if config.PreviousRelease != nil {
 		previous := *config.PreviousRelease
 		if !hostedReleaseTagPattern.MatchString(previous.Version) || !hostedCommitPattern.MatchString(previous.HiveCommit) ||
-			!hostedCommitPattern.MatchString(previous.VisualHiveCommit) || !hostedDigestPattern.MatchString(previous.DistributionManifestSHA256) {
+			!hostedCommitPattern.MatchString(previous.VisualHiveCommit) || !hostedDigestPattern.MatchString(previous.DistributionManifestSHA256) ||
+			previous.HostedControllerProtocol != HostedControllerProtocol {
 			return fmt.Errorf("hosted workflow previous release identity must be a complete immutable integrated release")
 		}
-		if previous.Version == config.ReleaseTag || previous.HiveCommit == config.HiveCommit {
+		current := HostedReleaseIdentity{
+			Version: config.ReleaseTag, HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveCommit,
+			DistributionManifestSHA256: config.DistributionManifestSHA256, HostedControllerProtocol: HostedControllerProtocol,
+		}
+		if equalHostedReleaseIdentity(previous, current) {
 			return fmt.Errorf("hosted workflow previous release identity must differ from the current release")
 		}
 	}
@@ -168,7 +200,11 @@ func validateHostedWorkflowConfig(config HostedWorkflowConfig) error {
 }
 
 func hostedControllerJobSteps(config HostedWorkflowConfig) string {
-	previousVersion, previousHive, previousVisual, previousManifest := previousHostedReleaseValues(config.PreviousRelease)
+	previousVersion, previousHive, previousVisual, previousManifest, previousProtocol := previousHostedReleaseValues(config.PreviousRelease)
+	providerRequired := "false"
+	if config.ProviderRequired {
+		providerRequired = "true"
+	}
 	return fmt.Sprintf(`      - name: Validate controller invocation
         shell: bash
         env:
@@ -246,7 +282,7 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
           if (manifest.schema_version !== 'hive.integrated-distribution.v1' ||
               manifest.hive_version !== releaseTag || manifest.hive_commit !== hiveCommit ||
-              manifest.visual_hive_commit !== visualCommit || manifest.os !== 'linux' ||
+              manifest.visual_hive_commit !== visualCommit || manifest.hosted_controller_protocol !== 1 || manifest.os !== 'linux' ||
               manifest.architecture !== 'amd64') process.exit(1);
           NODE
           "$install_dir/hive" --version | grep -F "$HIVE_RELEASE_TAG" >/dev/null
@@ -254,7 +290,9 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
           printf 'HIVE_HOSTED_BIN=%%s\n' "$install_dir/hive" >> "$GITHUB_ENV"
           printf 'HIVE_HOSTED_INSTALL=%%s\n' "$install_dir" >> "$GITHUB_ENV"
       - name: Install exact integrity-bound Codex provider
-        if: ${{ github.event_name == 'schedule' || inputs.operation == 'cycle' || inputs.operation == 'recover' }}
+        id: provider-install
+        if: ${{ %s && (github.event_name == 'schedule' || inputs.operation == 'cycle' || inputs.operation == 'doctor') }}
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -270,21 +308,46 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
           test -n "$codex_path"
           chmod 0500 "$codex_path"
           test "$("$codex_path" --version)" = "codex-cli 0.144.1"
-          printf 'HIVE_HOSTED_CODEX=%%s\n' "$codex_path" >> "$GITHUB_ENV"
+          printf 'HIVE_HOSTED_CODEX_CANDIDATE=%%s\n' "$codex_path" >> "$GITHUB_ENV"
           printf 'CODEX_HOME=%%s\n' "$RUNNER_TEMP/hive-hosted-codex-home-${GITHUB_JOB}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+      - name: Authenticate exact Codex provider
+        id: provider-auth
+        if: ${{ %s && steps.provider-install.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$OPENAI_API_KEY"
+          mkdir -m 0700 -- "$CODEX_HOME"
+          printf '%%s' "$OPENAI_API_KEY" | "$HIVE_HOSTED_CODEX_CANDIDATE" login --with-api-key >/dev/null 2>&1
+          unset OPENAI_API_KEY
+          auth_file="$CODEX_HOME/auth.json"
+          test -f "$auth_file"
+          test ! -L "$auth_file"
+          chmod 0600 "$auth_file"
+          test "$(stat -c '%%a' "$auth_file")" = 600
+          "$HIVE_HOSTED_CODEX_CANDIDATE" login status >/dev/null 2>&1
+          printf 'HIVE_HOSTED_CODEX=%%s\n' "$HIVE_HOSTED_CODEX_CANDIDATE" >> "$GITHUB_ENV"
       - name: Run hosted Hive operation
         id: hosted
         shell: bash
         env:
           HIVE_HOSTED_STATE_KEY: ${{ secrets.%s }}
           HIVE_GITHUB_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           HIVE_INPUT_OPERATION: ${{ inputs.operation }}
           HIVE_INPUT_REQUEST_ID: ${{ inputs.request_id }}
+          HIVE_INPUT_REQUEST_PAYLOAD: ${{ inputs.request_payload }}
+          HIVE_INPUT_REQUEST_SHA256: ${{ inputs.request_sha256 }}
+          HIVE_EVENT_ACTOR_ID: ${{ github.event.sender.id }}
+          HIVE_EVENT_ACTOR_LOGIN: ${{ github.event.sender.login }}
           HIVE_PREVIOUS_RELEASE_VERSION: %q
           HIVE_PREVIOUS_HIVE_COMMIT: %q
           HIVE_PREVIOUS_VISUAL_COMMIT: %q
           HIVE_PREVIOUS_MANIFEST_SHA256: %q
+          HIVE_PREVIOUS_CONTROLLER_PROTOCOL: %d
         run: |
           set -euo pipefail
           umask 077
@@ -294,7 +357,7 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
             operation=cycle
             request_id="schedule-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           fi
-          case "$operation" in cycle|status|doctor|pause|resume|recover) ;; *) exit 2 ;; esac
+          case "$operation" in cycle|status|doctor|pause|resume|approve-baseline-plan|approve-baseline-apply|approve-merge-plan|approve-merge-apply|retry-repair|recover-dispatch-plan|recover-dispatch-apply) ;; *) exit 2 ;; esac
           printf '%%s' "$request_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
           result="$RUNNER_TEMP/hive-hosted-result-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
           set +e
@@ -307,10 +370,13 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
             --state-key-env HIVE_HOSTED_STATE_KEY \
             --operation "$operation" \
             --request-id "$request_id" \
+            --request-payload "$HIVE_INPUT_REQUEST_PAYLOAD" \
+            --request-sha256 "$HIVE_INPUT_REQUEST_SHA256" \
             --restore-release-version "$HIVE_PREVIOUS_RELEASE_VERSION" \
             --restore-hive-commit "$HIVE_PREVIOUS_HIVE_COMMIT" \
             --restore-visual-commit "$HIVE_PREVIOUS_VISUAL_COMMIT" \
             --restore-manifest-sha256 "$HIVE_PREVIOUS_MANIFEST_SHA256" \
+            --restore-controller-protocol "$HIVE_PREVIOUS_CONTROLLER_PROTOCOL" \
             --json >"$result"
           hive_exit=$?
           set -e
@@ -353,14 +419,14 @@ func hostedControllerJobSteps(config HostedWorkflowConfig) string {
 		config.Repository, HostedControllerWorkflowPath, config.DefaultBranch,
 		checkoutActionSHA, checkoutActionSHA, config.StateBranch,
 		config.ReleaseRepository, config.ReleaseTag, config.HiveCommit, config.VisualHiveCommit,
-		config.DistributionManifestSHA256, config.StateKeySecret,
-		previousVersion, previousHive, previousVisual, previousManifest, config.Repository,
+		config.DistributionManifestSHA256, providerRequired, providerRequired, config.StateKeySecret,
+		previousVersion, previousHive, previousVisual, previousManifest, previousProtocol, config.Repository,
 		config.RepositoryID, config.StateBranch, uploadArtifactActionSHA)
 }
 
-func previousHostedReleaseValues(identity *HostedReleaseIdentity) (string, string, string, string) {
+func previousHostedReleaseValues(identity *HostedReleaseIdentity) (string, string, string, string, int) {
 	if identity == nil {
-		return "", "", "", ""
+		return "", "", "", "", 0
 	}
-	return identity.Version, identity.HiveCommit, identity.VisualHiveCommit, identity.DistributionManifestSHA256
+	return identity.Version, identity.HiveCommit, identity.VisualHiveCommit, identity.DistributionManifestSHA256, identity.HostedControllerProtocol
 }

@@ -285,7 +285,7 @@ if (fs.lstatSync(suppliedRoot).isSymbolicLink()) throw new Error(`distribution r
 const root = fs.realpathSync(suppliedRoot);
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'distribution-manifest.json'), 'utf8'));
 if (manifest.schema_version !== 'hive.integrated-distribution.v1' || manifest.os !== 'linux' || manifest.architecture !== 'amd64') throw new Error('distribution platform mismatch');
-if (!/^[a-f0-9]{40}$/.test(manifest.hive_commit || '') || !/^[a-f0-9]{40}$/.test(manifest.visual_hive_commit || '') || !/^v22\./.test(manifest.node_version || '') || !Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('distribution identity is incomplete');
+if (!/^[a-f0-9]{40}$/.test(manifest.hive_commit || '') || !/^[a-f0-9]{40}$/.test(manifest.visual_hive_commit || '') || manifest.hosted_controller_protocol !== 1 || !/^v22\./.test(manifest.node_version || '') || !Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('distribution identity is incomplete');
 if (expectedVersion && manifest.hive_version !== expectedVersion) throw new Error(`distribution Hive version ${manifest.hive_version || '<missing>'} does not match requested release ${expectedVersion}`);
 if (manifest.hive_version && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(manifest.hive_version)) throw new Error('distribution Hive version is unsafe');
 const inventoried = new Set();

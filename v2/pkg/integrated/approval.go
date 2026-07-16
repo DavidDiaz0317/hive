@@ -41,6 +41,7 @@ type ApproveMergeOptions struct {
 	Reason          string
 	PlanOnly        bool
 	GitHub          *hivegithub.Client
+	HostedAuthority HostedOperatorAuthority
 }
 
 type ApproveMergeResult struct {
@@ -54,9 +55,10 @@ type ApproveMergeResult struct {
 }
 
 type RevokeMergeApprovalOptions struct {
-	StateDir string
-	Reason   string
-	GitHub   *hivegithub.Client
+	StateDir        string
+	Reason          string
+	GitHub          *hivegithub.Client
+	HostedAuthority HostedOperatorAuthority
 }
 
 type RevokeMergeApprovalResult struct {
@@ -218,10 +220,15 @@ func ApproveMerge(ctx context.Context, options ApproveMergeOptions) (ApproveMerg
 	if !strings.EqualFold(options.ExpectedBaseSHA, gate.BaseSHA) || !strings.EqualFold(options.ExpectedDiff, digest) {
 		return fail(fmt.Errorf("reviewed base SHA or diff digest no longer matches the live pull request; rerun approve-merge --plan"))
 	}
-	actor, err := options.GitHub.AuthenticatedLogin(ctx)
+	operation := "approve-merge-apply"
+	if options.PlanOnly {
+		operation = "approve-merge-plan"
+	}
+	operator, err := resolveOperatorIdentity(ctx, options.GitHub, options.HostedAuthority, config.Repository, operation)
 	if err != nil {
 		return fail(err)
 	}
+	actor := operator.Login
 	approval := MergeApproval{
 		SchemaVersion: MergeApprovalSchema, Repository: config.Repository, RepositoryID: liveRepositoryID, PRNumber: gate.Number,
 		HeadSHA: strings.ToLower(gate.HeadSHA), BaseSHA: strings.ToLower(gate.BaseSHA), BaseBranch: gate.BaseBranch, DiffDigest: digest,
@@ -268,10 +275,11 @@ func RevokeMergeApproval(ctx context.Context, options RevokeMergeApprovalOptions
 	if _, err := verifyLiveRepositoryIdentity(ctx, options.GitHub, config); err != nil {
 		return result, err
 	}
-	actor, err := options.GitHub.AuthenticatedLogin(ctx)
+	operator, err := resolveOperatorIdentity(ctx, options.GitHub, options.HostedAuthority, config.Repository, "revoke-merge-approval")
 	if err != nil {
 		return result, err
 	}
+	actor := operator.Login
 	result.Actor, result.Reason = actor, options.Reason
 	approval, exists, err := store.LoadMergeApproval()
 	if err != nil {

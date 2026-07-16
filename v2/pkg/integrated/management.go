@@ -98,6 +98,11 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 	if err != nil {
 		return result, err
 	}
+	if transition, exists, transitionErr := store.LoadHostedReleaseTransitionIntent(); transitionErr != nil {
+		return result, fmt.Errorf("read hosted release transition before %s: %w", options.Operation, transitionErr)
+	} else if exists {
+		return result, fmt.Errorf("hosted %s transition phase %s is pending; resume or explicitly cancel that exact transition before %s", transition.Operation, transition.Phase, options.Operation)
+	}
 	if transfer, exists, transferErr := store.LoadAuthorizerTransferIntent(); transferErr != nil {
 		return result, transferErr
 	} else if exists {
@@ -543,7 +548,7 @@ func validateManagedIntegratedStateInventory(integratedDir, stateDir string, con
 		protectionActivationFile: true, authorizerTransferIntentFile: true,
 		repairRefreshFile: true, repairRetirementFile: true, setupBaselineFile: true,
 		setupBaselineRebindFile: true, uninstallIntentFile: true, workflowDispatchFile: true,
-		schedulerStartIntentFile: true,
+		schedulerStartIntentFile: true, hostedReleaseTransitionFile: true,
 	}
 	managedDaemonFiles := map[string]bool{"daemon.json": true, "daemon.lease": true, "daemon.log": true}
 	entries, err := os.ReadDir(integratedDir)

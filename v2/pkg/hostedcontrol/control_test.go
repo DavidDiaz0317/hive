@@ -25,7 +25,8 @@ func testConfig(checkout, runtimeRoot string) Config {
 		Secret:      testSecret,
 		Repository:  hostedstate.RepositoryIdentity{FullName: "owner/repository", ID: 1234},
 		Release: hostedstate.ReleaseIdentity{
-			Version: "v0.4.1-integrated.test", HiveCommit: strings.Repeat("1", 40), VisualHiveCommit: strings.Repeat("2", 40),
+			Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("1", 40), VisualHiveCommit: strings.Repeat("2", 40),
+			DistributionManifestSHA256: strings.Repeat("5", 64), HostedControllerProtocol: 1,
 		},
 		Controller: hostedstate.ControllerIdentity{
 			RunID: 99, Attempt: 1, Event: "workflow_dispatch", WorkflowPath: ".github/workflows/hive-controller.yml",
@@ -199,7 +200,8 @@ func TestExplicitReleaseTransitionAndStrictSequence(t *testing.T) {
 	priorRelease := oldConfig.Release
 	upgrade.RestoreRelease = &priorRelease
 	upgrade.Release = hostedstate.ReleaseIdentity{
-		Version: "v0.4.1-integrated.next", HiveCommit: strings.Repeat("a", 40), VisualHiveCommit: strings.Repeat("b", 40),
+		Version: "v0.4.1-integrated.20", HiveCommit: strings.Repeat("a", 40), VisualHiveCommit: strings.Repeat("b", 40),
+		DistributionManifestSHA256: strings.Repeat("c", 64), HostedControllerProtocol: 1,
 	}
 	upgrade.Controller.RunID++
 	manager, err = Open(context.Background(), upgrade)

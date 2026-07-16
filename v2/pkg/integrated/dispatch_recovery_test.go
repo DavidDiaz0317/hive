@@ -374,7 +374,7 @@ func dispatchRecoveryTestServer(t *testing.T, workflowHandler http.HandlerFunc) 
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case "/user":
-			_, _ = io.WriteString(writer, `{"login":"operator"}`)
+			_, _ = io.WriteString(writer, `{"login":"operator","id":9002,"type":"User"}`)
 		case "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/runs",
 			"/repos/owner/repo/actions/workflows/hive-visual-hive.yml/dispatches":
 			workflowHandler(writer, request)

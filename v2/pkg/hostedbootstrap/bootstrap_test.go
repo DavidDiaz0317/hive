@@ -149,7 +149,8 @@ func TestBootstrapRejectsCompleteInstallationWithWrongMetadata(t *testing.T) {
 		want   string
 	}{
 		{name: "repository", mutate: func(value *hostedstate.Metadata) { value.Repository.ID++ }, want: "repository identity"},
-		{name: "release", mutate: func(value *hostedstate.Metadata) { value.Release.Version += "-other" }, want: "release identity"},
+		{name: "release", mutate: func(value *hostedstate.Metadata) { value.Release.Version = "v0.4.1-integrated.20" }, want: "release identity"},
+		{name: "release manifest", mutate: func(value *hostedstate.Metadata) { value.Release.DistributionManifestSHA256 = strings.Repeat("9", 64) }, want: "release identity"},
 		{name: "workflow", mutate: func(value *hostedstate.Metadata) { value.Controller.WorkflowPath = ".github/workflows/other.yml" }, want: "workflow path"},
 		{name: "bootstrap binding", mutate: func(value *hostedstate.Metadata) { value.Controller.DefaultHeadSHA = strings.Repeat("2", 40) }, want: "bootstrap controller binding"},
 	}
@@ -393,9 +394,11 @@ func testOptions(t *testing.T) Options {
 			Sequence:       1,
 			ExecutionOwner: "bootstrap",
 			Release: hostedstate.ReleaseIdentity{
-				Version:          "v0.4.1-integrated.19",
-				HiveCommit:       strings.Repeat("d", 40),
-				VisualHiveCommit: strings.Repeat("e", 40),
+				Version:                    "v0.4.1-integrated.19",
+				HiveCommit:                 strings.Repeat("d", 40),
+				VisualHiveCommit:           strings.Repeat("e", 40),
+				DistributionManifestSHA256: strings.Repeat("6", 64),
+				HostedControllerProtocol:   1,
 			},
 			Controller: hostedstate.ControllerIdentity{
 				RunID:          0,

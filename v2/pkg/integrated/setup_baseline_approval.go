@@ -35,6 +35,7 @@ type ApproveSetupBaselineOptions struct {
 	ExpectedPlanDigest      string
 	Reason                  string
 	GitHub                  *hivegithub.Client
+	HostedAuthority         HostedOperatorAuthority
 }
 
 type ApproveSetupBaselineResult struct {
@@ -124,7 +125,11 @@ func ApproveSetupBaseline(ctx context.Context, options ApproveSetupBaselineOptio
 		(intent.Phase != SetupBaselinePROpen && intent.Phase != SetupBaselineApproved) {
 		return result, fmt.Errorf("setup baseline approval state is not bound to the installed repository/authorizer or review phase")
 	}
-	actor, err := options.GitHub.AuthenticatedNumericUser(ctx)
+	operation := "approve-baseline-apply"
+	if options.PlanOnly {
+		operation = "approve-baseline-plan"
+	}
+	actor, err := resolveOperatorIdentity(ctx, options.GitHub, options.HostedAuthority, config.Repository, operation)
 	if err != nil {
 		return result, err
 	}

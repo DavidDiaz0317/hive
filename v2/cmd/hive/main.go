@@ -54,28 +54,11 @@ var (
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
-		os.Exit(runVersionCommand(os.Args[1:], os.Stdout, os.Stderr))
-	}
 	if len(os.Args) > 1 && os.Args[1] == repair.ContainmentProbeCommand {
 		os.Exit(repair.RunContainmentProbeChild())
 	}
-	if len(os.Args) > 1 && os.Args[1] == "visual" {
-		os.Exit(runCLICommandWithJSONContract("visual", os.Args[2:], func() int {
-			return runVisualCommand(os.Args[2:])
-		}))
-	}
-	if len(os.Args) > 1 && os.Args[1] == "mcp-server" {
-		os.Exit(runMCPServer())
-	}
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "hosted-cycle", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
-			command, args := os.Args[1], os.Args[2:]
-			os.Exit(runCLICommandWithJSONContract(command, args, func() int {
-				return runIntegratedCommand(command, args)
-			}))
-		}
+	if handled, code := runEarlyCLI(os.Args[1:]); handled {
+		os.Exit(code)
 	}
 	startTime := time.Now()
 	defaultConfig := "/etc/hive/hive.yaml"
@@ -1671,8 +1654,56 @@ func main() {
 	}
 }
 
+func runEarlyCLI(args []string) (bool, int) {
+	if len(args) == 0 {
+		return false, 0
+	}
+	command := args[0]
+	switch command {
+	case "--version", "version":
+		return true, runCLICommandWithJSONContract("version", args, func() int {
+			return runVersionCommand(args, os.Stdout, os.Stderr)
+		})
+	case "visual":
+		return true, runCLICommandWithJSONContract("visual", args[1:], func() int {
+			return runVisualCommand(args[1:])
+		})
+	case "mcp-server":
+		return true, runCLICommandWithJSONContract("mcp-server", args[1:], func() int {
+			return runMCPServerCommand(args[1:])
+		})
+	case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "hosted-cycle", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
+		return true, runCLICommandWithJSONContract(command, args[1:], func() int {
+			return runIntegratedCommand(command, args[1:])
+		})
+	default:
+		if cliJSONRequested(args) {
+			return true, runCLICommandWithJSONContract(command, args, func() int {
+				fmt.Fprintf(os.Stderr, "unknown Hive command %q\n", command)
+				return 2
+			})
+		}
+	}
+	return false, 0
+}
+
+func runMCPServerCommand(args []string) int {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: hive mcp-server")
+		return 2
+	}
+	return runMCPServer()
+}
+
 func runVersionCommand(args []string, stdout, stderr io.Writer) int {
-	if len(args) != 1 || (args[0] != "--version" && args[0] != "version") {
+	if len(args) == 0 || (args[0] != "--version" && args[0] != "version") {
+		fmt.Fprintln(stderr, "usage: hive --version")
+		return 2
+	}
+	flags := flag.NewFlagSet("hive version", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := parseExactFlags(flags, args[1:]); err != nil {
 		fmt.Fprintln(stderr, "usage: hive --version")
 		return 2
 	}
@@ -1683,6 +1714,13 @@ func runVersionCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	if commit == "" {
 		commit = "unknown"
+	}
+	if *jsonOutput {
+		if err := json.NewEncoder(stdout).Encode(map[string]any{"schema_version": "hive.version.v1", "version": version, "commit": commit}); err != nil {
+			fmt.Fprintln(stderr, "encode Hive version:", err)
+			return 1
+		}
+		return 0
 	}
 	fmt.Fprintf(stdout, "Hive %s\ncommit: %s\n", version, commit)
 	return 0

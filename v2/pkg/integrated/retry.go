@@ -21,6 +21,7 @@ type RetryRepairOptions struct {
 	ExpectedFailureID     string
 	Reason                string
 	GitHub                *hivegithub.Client
+	HostedAuthority       HostedOperatorAuthority
 }
 
 type RetryRepairResult struct {
@@ -62,10 +63,11 @@ func RetryRepair(ctx context.Context, options RetryRepairOptions) (RetryRepairRe
 	if _, err := verifyLiveRepositoryIdentity(ctx, options.GitHub, config); err != nil {
 		return result, err
 	}
-	actor, err := options.GitHub.AuthenticatedLogin(ctx)
+	operator, err := resolveOperatorIdentity(ctx, options.GitHub, options.HostedAuthority, config.Repository, "retry-repair")
 	if err != nil {
 		return result, err
 	}
+	actor := operator.Login
 	repairStore, err := repair.NewStore(filepath.Join(options.StateDir, "repair"))
 	if err != nil {
 		return result, err

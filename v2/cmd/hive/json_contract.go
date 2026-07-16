@@ -73,16 +73,27 @@ func runCLICommandWithJSONContract(command string, args []string, run func() int
 		_ = reader.Close()
 		readDone <- copyErr
 	}()
-	code := func() int {
+	var panicValue any
+	code := func() (code int) {
 		os.Stdout = writer
 		defer func() {
 			os.Stdout = originalStdout
 			_ = writer.Close()
 		}()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				panicValue = recovered
+				code = 1
+			}
+		}()
 		return run()
 	}()
 	if readErr := <-readDone; readErr != nil {
 		return emitCLIJSONContractFailure(originalStdout, command, nonzeroExit(code), "stdout_capture_failed", readErr)
+	}
+	if panicValue != nil {
+		fmt.Fprintf(os.Stderr, "%s --json stopped after an internal panic; no panic payload was written to machine output\n", command)
+		return emitCLIJSONContractFailure(originalStdout, command, nonzeroExit(code), "command_panicked", nil)
 	}
 	if captured.total > maxCLIJSONOutputBytes {
 		fmt.Fprintf(os.Stderr, "%s --json produced %d bytes, exceeding the %d-byte machine-output limit\n", command, captured.total, maxCLIJSONOutputBytes)
@@ -90,8 +101,8 @@ func runCLICommandWithJSONContract(command string, args []string, run func() int
 	}
 
 	trimmed := bytes.TrimSpace(captured.data.Bytes())
-	var document any
-	if len(trimmed) == 0 || !utf8.Valid(trimmed) || json.Unmarshal(trimmed, &document) != nil {
+	var document map[string]any
+	if len(trimmed) == 0 || !utf8.Valid(trimmed) || json.Unmarshal(trimmed, &document) != nil || document == nil {
 		reason := "command_failed_before_json"
 		if code == 0 || len(trimmed) > 0 {
 			reason = "invalid_json_stdout"
@@ -116,7 +127,10 @@ func cliJSONRequested(args []string) bool {
 		for _, prefix := range []string{"--json=", "-json="} {
 			if strings.HasPrefix(trimmed, prefix) {
 				value, err := strconv.ParseBool(strings.TrimPrefix(trimmed, prefix))
-				return err != nil || value
+				if err != nil || value {
+					return true
+				}
+				break
 			}
 		}
 	}
@@ -138,6 +152,8 @@ func emitCLIJSONContractFailure(writer io.Writer, command string, exitCode int, 
 		message = "command exceeded the bounded machine-readable stdout contract; see stderr for diagnostics"
 	} else if errorCode == "stdout_capture_failed" {
 		message = "Hive could not enforce the machine-readable stdout contract"
+	} else if errorCode == "command_panicked" {
+		message = "command stopped after an internal failure; see stderr for diagnostics"
 	}
 	if cause != nil {
 		fmt.Fprintln(os.Stderr, message+":", cause)

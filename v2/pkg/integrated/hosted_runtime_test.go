@@ -2,6 +2,8 @@ package integrated
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,19 +11,33 @@ import (
 	"time"
 )
 
-func hostedRuntimeConfigFixture(root string, release HostedReleaseIdentity) Config {
-	return Config{
+func hostedRuntimeConfigFixture(t *testing.T, root string, release HostedReleaseIdentity) Config {
+	t.Helper()
+	config := Config{
 		Repository: "owner/repository", RepositoryID: "42", DefaultBranch: "main",
 		Coverage: CoverageComprehensive, Automation: AutomationIssues, Provider: "codex", ProviderCommand: "codex",
 		ExecutionMode: ExecutionHosted, RunIntervalSeconds: 900, HostedSchedule: "*/15 * * * *", HostedStateBranch: "hive/state-42",
 		HiveReleaseRepository: "DavidDiaz0317/hive", HiveReleaseVersion: release.Version, HiveCommit: release.HiveCommit,
 		DistributionManifestSHA256: release.DistributionManifestSHA256,
+		HostedControllerProtocol:   release.HostedControllerProtocol,
 		ACMMLevel:                  3, MaxActiveIssues: 5, MaxRepairAttempts: 4, VisualHive: true,
 		VisualHiveRepo: "DavidDiaz0317/visual-hive", VisualHiveRef: release.VisualHiveCommit, VisualHiveConfigDigest: strings.Repeat("d", 64),
 		TestCommands: [][]string{{"npm", "test"}}, AllowedRepairPaths: []string{"tests/**"},
 		AllowedAutoMergePaths: []string{"tests/**"}, CheckoutDir: filepath.Join(root, "old-checkout"), StateDir: root,
 		Paused: false, SetupAuthorizationActorID: 99, InstalledAt: time.Now().UTC(),
 	}
+	return bindHostedWorkflowDigest(t, config)
+}
+
+func bindHostedWorkflowDigest(t *testing.T, config Config) Config {
+	t.Helper()
+	workflow, err := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
+	if err != nil {
+		t.Fatalf("generate hosted workflow fixture: %v", err)
+	}
+	digest := sha256.Sum256([]byte(workflow))
+	config.HostedWorkflowSHA256 = hex.EncodeToString(digest[:])
+	return config
 }
 
 func TestPrepareHostedRuntimeTransitionsOnlyFromExactManagedPredecessor(t *testing.T) {
@@ -31,9 +47,9 @@ func TestPrepareHostedRuntimeTransitionsOnlyFromExactManagedPredecessor(t *testi
 	if err := os.MkdirAll(checkout, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	previous := HostedReleaseIdentity{Version: "v0.4.1-integrated.18", HiveCommit: strings.Repeat("a", 40), VisualHiveCommit: strings.Repeat("b", 40), DistributionManifestSHA256: strings.Repeat("c", 64)}
-	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64)}
-	durable := hostedRuntimeConfigFixture(stateDir, previous)
+	previous := HostedReleaseIdentity{Version: "v0.4.1-integrated.18", HiveCommit: strings.Repeat("a", 40), VisualHiveCommit: strings.Repeat("b", 40), DistributionManifestSHA256: strings.Repeat("c", 64), HostedControllerProtocol: HostedControllerProtocol}
+	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64), HostedControllerProtocol: HostedControllerProtocol}
+	durable := hostedRuntimeConfigFixture(t, stateDir, previous)
 	store, err := NewStore(filepath.Join(stateDir, "integrated"))
 	if err != nil {
 		t.Fatal(err)
@@ -41,8 +57,9 @@ func TestPrepareHostedRuntimeTransitionsOnlyFromExactManagedPredecessor(t *testi
 	if err := store.Save(durable); err != nil {
 		t.Fatal(err)
 	}
-	candidate := hostedRuntimeConfigFixture(stateDir, current)
+	candidate := hostedRuntimeConfigFixture(t, stateDir, current)
 	candidate.PreviousHostedRelease = &previous
+	candidate = bindHostedWorkflowDigest(t, candidate)
 	if err := writeManagedFiles(checkout, candidate, RepositoryInspection{}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +90,8 @@ func TestPrepareHostedRuntimeRejectsTamperedManagedController(t *testing.T) {
 	if err := os.MkdirAll(checkout, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64)}
-	config := hostedRuntimeConfigFixture(stateDir, current)
+	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64), HostedControllerProtocol: HostedControllerProtocol}
+	config := hostedRuntimeConfigFixture(t, stateDir, current)
 	store, err := NewStore(filepath.Join(stateDir, "integrated"))
 	if err != nil {
 		t.Fatal(err)
@@ -100,9 +117,10 @@ func TestPrepareHostedRuntimeRequiresProviderOnlyForRepairExecution(t *testing.T
 	if err := os.MkdirAll(checkout, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64)}
-	config := hostedRuntimeConfigFixture(stateDir, current)
+	current := HostedReleaseIdentity{Version: "v0.4.1-integrated.19", HiveCommit: strings.Repeat("d", 40), VisualHiveCommit: strings.Repeat("e", 40), DistributionManifestSHA256: strings.Repeat("f", 64), HostedControllerProtocol: HostedControllerProtocol}
+	config := hostedRuntimeConfigFixture(t, stateDir, current)
 	config.Automation, config.ACMMLevel = AutomationRepairPR, 5
+	config = bindHostedWorkflowDigest(t, config)
 	store, err := NewStore(filepath.Join(stateDir, "integrated"))
 	if err != nil {
 		t.Fatal(err)

@@ -89,15 +89,16 @@ type DistributionFile struct {
 }
 
 type DistributionManifest struct {
-	SchemaVersion     string             `json:"schema_version"`
-	HiveVersion       string             `json:"hive_version"`
-	HiveCommit        string             `json:"hive_commit"`
-	VisualHiveCommit  string             `json:"visual_hive_commit"`
-	VisualHiveVersion string             `json:"visual_hive_version"`
-	NodeVersion       string             `json:"node_version"`
-	OS                string             `json:"os"`
-	Architecture      string             `json:"architecture"`
-	Files             []DistributionFile `json:"files"`
+	SchemaVersion            string             `json:"schema_version"`
+	HiveVersion              string             `json:"hive_version"`
+	HiveCommit               string             `json:"hive_commit"`
+	VisualHiveCommit         string             `json:"visual_hive_commit"`
+	VisualHiveVersion        string             `json:"visual_hive_version"`
+	HostedControllerProtocol int                `json:"hosted_controller_protocol"`
+	NodeVersion              string             `json:"node_version"`
+	OS                       string             `json:"os"`
+	Architecture             string             `json:"architecture"`
+	Files                    []DistributionFile `json:"files"`
 }
 
 // BuildDistribution creates an atomic, self-contained Hive + Visual Hive tree.
@@ -223,7 +224,7 @@ func BuildDistribution(ctx context.Context, options DistributionOptions) (Distri
 	}
 	manifest := DistributionManifest{
 		SchemaVersion: DistributionSchema, HiveVersion: hiveVersion, HiveCommit: options.HiveCommit, VisualHiveCommit: options.VisualCommit,
-		VisualHiveVersion: visualManifest.Version, NodeVersion: nodeVersion, OS: targetOS, Architecture: targetArch, Files: files,
+		VisualHiveVersion: visualManifest.Version, HostedControllerProtocol: HostedControllerProtocol, NodeVersion: nodeVersion, OS: targetOS, Architecture: targetArch, Files: files,
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

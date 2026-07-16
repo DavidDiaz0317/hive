@@ -580,7 +580,7 @@ const manifestStat = fs.lstatSync(manifestPath);
 if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.size > 64 * 1024 * 1024) throw new Error("distribution manifest is not a bounded regular file");
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 if (manifest.schema_version !== "hive.integrated-distribution.v1" || manifest.os !== expectedOS || manifest.architecture !== expectedArchitecture) throw new Error("distribution platform mismatch");
-if (!/^[a-f0-9]{40}$/u.test(manifest.hive_commit || "") || !/^[a-f0-9]{40}$/u.test(manifest.visual_hive_commit || "") || !/^v22\./u.test(manifest.node_version || "") || !Array.isArray(manifest.files) || manifest.files.length < 1 || manifest.files.length > 50000) throw new Error("distribution identity is incomplete or excessive");
+if (!/^[a-f0-9]{40}$/u.test(manifest.hive_commit || "") || !/^[a-f0-9]{40}$/u.test(manifest.visual_hive_commit || "") || manifest.hosted_controller_protocol !== 1 || !/^v22\./u.test(manifest.node_version || "") || !Array.isArray(manifest.files) || manifest.files.length < 1 || manifest.files.length > 50000) throw new Error("distribution identity is incomplete or excessive");
 if (expectedVersion && manifest.hive_version !== expectedVersion) throw new Error(`distribution Hive version ${manifest.hive_version || "<missing>"} does not match requested release ${expectedVersion}`);
 if (manifest.hive_version && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(manifest.hive_version)) throw new Error("distribution Hive version is unsafe");
 const inventoried = new Map();

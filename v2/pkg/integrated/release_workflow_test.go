@@ -71,6 +71,40 @@ func TestIntegratedReleaseSmokesPublicInstallerDefaultsAndPersistentSchedulerHar
 	}
 }
 
+func TestIntegratedReleaseRequiresHostedControllerProtocolInPackagedInstallerProofs(t *testing.T) {
+	checks := map[string][]string{
+		"../../../.github/workflows/integrated-release.yml": {
+			`if ($manifest.hosted_controller_protocol -ne 1) { throw "Packaged hosted controller protocol mismatch." }`,
+			`.hosted_controller_protocol == 1 and .node_version == "v22.23.1"`,
+		},
+		"../../test/integrated-installer-windows-smoke.ps1": {
+			`$installedManifest.hosted_controller_protocol -ne 1`,
+		},
+		"../../test/integrated-installer-windows-failure-smoke.ps1": {
+			`ValidateSet("missing", "wrong")`,
+			`$manifest.PSObject.Properties.Remove("hosted_controller_protocol")`,
+			`$manifest.hosted_controller_protocol = 2`,
+		},
+		"../../test/integrated-installer-linux-smoke.sh": {
+			`manifest.hosted_controller_protocol !== 1`,
+		},
+		"../../test/integrated-installer-linux-release-smoke.sh": {
+			`manifest.hosted_controller_protocol !== 1`,
+		},
+	}
+	for path, invariants := range checks {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, invariant := range invariants {
+			if !strings.Contains(string(data), invariant) {
+				t.Fatalf("packaged installer proof %s lost hosted controller protocol invariant %q", path, invariant)
+			}
+		}
+	}
+}
+
 func TestIntegratedReleaseInstallsBrowserBeforeVisualBrowserGates(t *testing.T) {
 	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
 	if err != nil {
@@ -161,6 +195,36 @@ func TestIntegratedReleaseGatesOnCredentialFreeProviderContainmentForEveryShippe
 	publish := workflow[publishStart:]
 	if strings.Contains(publish, "needs: [build, windows-smoke, provider-containment, provider-authenticated-supplemental]") {
 		t.Fatal("optional authenticated provider coverage must not block publication")
+	}
+}
+
+func TestIntegratedReleaseScopesOptionalProviderAuthorizationToDetectionAndInstallSteps(t *testing.T) {
+	data, err := os.ReadFile("../../../.github/workflows/integrated-release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	jobStart := strings.Index(workflow, "  provider-authenticated-supplemental:")
+	publishStart := strings.Index(workflow, "  publish:")
+	if jobStart < 0 || publishStart <= jobStart {
+		t.Fatal("optional authenticated provider job is missing or misplaced")
+	}
+	job := workflow[jobStart:publishStart]
+	if strings.Contains(job, "    env:\n      HIVE_RELEASE_CODEX_AUTH_JSON_B64:") {
+		t.Fatal("optional Codex authorization must not be exposed at job scope")
+	}
+	if count := strings.Count(job, "HIVE_RELEASE_CODEX_AUTH_JSON_B64: ${{ secrets.HIVE_RELEASE_CODEX_AUTH_JSON_B64 }}"); count != 3 {
+		t.Fatalf("optional authorization must be exposed only to detection and the two OS-specific install steps, got %d scopes", count)
+	}
+	for _, invariant := range []string{
+		"id: auth-config",
+		"if: steps.auth-config.outputs.configured != 'true'",
+		"if: runner.os == 'Linux' && steps.auth-config.outputs.configured == 'true'",
+		"if: runner.os == 'Windows' && steps.auth-config.outputs.configured == 'true'",
+	} {
+		if !strings.Contains(job, invariant) {
+			t.Fatalf("optional authorization scoping lost %q", invariant)
+		}
 	}
 }
 

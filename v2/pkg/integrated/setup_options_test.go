@@ -1,12 +1,73 @@
 package integrated
 
 import (
+	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/automation"
 )
+
+func TestExistingHostedSetupCannotReplaceActiveReleaseIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir,
+		ExecutionMode: ExecutionHosted, HiveReleaseRepository: "owner/hive", HiveReleaseVersion: "v0.4.1-integrated.19",
+		HiveCommit: strings.Repeat("a", 40), VisualHiveRef: strings.Repeat("b", 40),
+		DistributionManifestSHA256: strings.Repeat("c", 64), HostedControllerProtocol: HostedControllerProtocol,
+	}
+	if err := store.Save(active); err != nil {
+		t.Fatal(err)
+	}
+	_, err = RunSetup(context.Background(), SetupOptions{
+		Repository: "owner/repo", Coverage: CoverageStandard, Automation: AutomationAdvisory,
+		Provider: "codex", StateDir: stateDir, MaxActiveIssues: 5, MaxRepairAttempts: 4,
+		ExecutionMode: ExecutionHosted, RunInterval: 15 * time.Minute, HostedSchedule: "*/15 * * * *",
+		HiveReleaseRepository: "owner/hive", HiveReleaseVersion: "v0.4.1-integrated.20",
+		HiveCommit: strings.Repeat("d", 40), DistributionManifestSHA256: strings.Repeat("e", 64), HostedControllerProtocol: HostedControllerProtocol,
+		VisualHive: true, VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("f", 40),
+	})
+	if err == nil || !strings.Contains(err.Error(), "use hive upgrade or hive rollback") {
+		t.Fatalf("hosted setup release replacement was not rejected: %v", err)
+	}
+	persisted, loadErr := store.Load()
+	if loadErr != nil || persisted.HiveReleaseVersion != active.HiveReleaseVersion || persisted.HiveCommit != active.HiveCommit || persisted.VisualHiveRef != active.VisualHiveRef {
+		t.Fatalf("rejected setup changed active release: %+v, err=%v", persisted, loadErr)
+	}
+}
+
+func TestExistingHostedSetupCannotBypassTransitionThroughLocalRuntime(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir,
+		ExecutionMode: ExecutionHosted, HiveReleaseRepository: "owner/hive", HiveReleaseVersion: "v0.4.1-integrated.19",
+		HiveCommit: strings.Repeat("a", 40), VisualHiveRef: strings.Repeat("b", 40),
+		DistributionManifestSHA256: strings.Repeat("c", 64), HostedControllerProtocol: HostedControllerProtocol,
+	}
+	if err := store.Save(active); err != nil {
+		t.Fatal(err)
+	}
+	_, err = RunSetup(context.Background(), SetupOptions{
+		Repository: "owner/repo", Coverage: CoverageStandard, Automation: AutomationAdvisory,
+		Provider: "codex", StateDir: stateDir, MaxActiveIssues: 5, MaxRepairAttempts: 4,
+		ExecutionMode: ExecutionLocal, RunInterval: 15 * time.Minute,
+		VisualHive: true, VisualHiveRepo: "owner/visual-hive", VisualHiveRef: active.VisualHiveRef,
+	})
+	if err == nil || !strings.Contains(err.Error(), "explicit hosted-to-local migration") {
+		t.Fatalf("hosted-to-local setup bypass was not rejected: %v", err)
+	}
+}
 
 func TestSetupAuthorizationIdentityStaysStableWhileOperationBranchChanges(t *testing.T) {
 	config := Config{SetupBranch: "hive/upgrade-123", SetupAuthorizationActorID: 456}

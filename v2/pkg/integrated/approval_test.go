@@ -244,7 +244,7 @@ func TestApproveMergeBindsAuthenticatedActorAndRawDiff(t *testing.T) {
 		case request.URL.Path == "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case request.URL.Path == "/user":
-			_, _ = io.WriteString(writer, `{"login":"authenticated-reviewer"}`)
+			_, _ = io.WriteString(writer, `{"login":"authenticated-reviewer","id":9001,"type":"User"}`)
 		case request.URL.Path == "/repos/owner/repo/pulls/7" && strings.Contains(request.Header.Get("Accept"), "diff"):
 			writer.Header().Set("Content-Type", "application/vnd.github.v3.diff")
 			_, _ = io.WriteString(writer, rawDiff)

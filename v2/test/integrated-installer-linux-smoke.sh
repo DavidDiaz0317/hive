@@ -52,6 +52,9 @@ export HIVE_INSTALL_DIR="$work_root/installed"
 mkdir -p "$HOME"
 sh "$hive_root/install-integrated.sh"
 test "$(readlink "$HOME/.local/bin/visual-hive")" = "$HIVE_INSTALL_DIR/bin/visual-hive"
+"$HIVE_INSTALL_DIR/runtime/node" -e \
+  'const manifest=require(process.argv[1]); if (manifest.hosted_controller_protocol !== 1) process.exit(1)' \
+  "$HIVE_INSTALL_DIR/distribution-manifest.json"
 launcher_path="$work_root/launcher-path"
 mkdir -p "$launcher_path"
 ln -s "$(command -v dirname)" "$launcher_path/dirname"

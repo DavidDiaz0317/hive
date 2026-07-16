@@ -355,7 +355,9 @@ func providerEnvironment() []string {
 	result := make([]string, 0, len(os.Environ()))
 	for _, pair := range os.Environ() {
 		name, _, _ := strings.Cut(pair, "=")
-		if blockedEnvironmentName.MatchString(name) || strings.EqualFold(name, "GH_TOKEN") || strings.EqualFold(name, "GITHUB_TOKEN") {
+		upperName := strings.ToUpper(strings.TrimSpace(name))
+		if blockedEnvironmentName.MatchString(name) || strings.EqualFold(name, "GH_TOKEN") || strings.EqualFold(name, "GITHUB_TOKEN") ||
+			strings.HasPrefix(upperName, "HIVE_HOSTED_") || strings.EqualFold(name, "HIVE_RELEASE_CODEX_AUTH_JSON_B64") {
 			continue
 		}
 		result = append(result, pair)

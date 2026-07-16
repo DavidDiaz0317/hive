@@ -9,14 +9,15 @@ import (
 
 const (
 	PlanSchema                    = "hive.setup-plan.v2"
-	ConfigSchema                  = "hive.integrated-config.v3"
-	previousConfigSchema          = "hive.integrated-config.v2"
+	ConfigSchema                  = "hive.integrated-config.v4"
+	previousConfigSchema          = "hive.integrated-config.v3"
+	olderConfigSchema             = "hive.integrated-config.v2"
 	legacyConfigSchema            = "hive.integrated-config.v1"
-	managedRepositoryConfigSchema = "hive.integrated-repository-config.v2"
+	managedRepositoryConfigSchema = "hive.integrated-repository-config.v3"
 )
 
 func supportedDurableConfigSchema(schema string) bool {
-	return schema == ConfigSchema || schema == previousConfigSchema || schema == legacyConfigSchema
+	return schema == ConfigSchema || schema == previousConfigSchema || schema == olderConfigSchema || schema == legacyConfigSchema
 }
 
 type ExecutionMode string
@@ -75,6 +76,8 @@ type SetupPlan struct {
 	HiveReleaseVersion         string                `json:"hive_release_version,omitempty"`
 	HiveCommit                 string                `json:"hive_commit,omitempty"`
 	DistributionManifestSHA256 string                `json:"distribution_manifest_sha256,omitempty"`
+	HostedControllerProtocol   int                   `json:"hosted_controller_protocol,omitempty"`
+	HostedWorkflowSHA256       string                `json:"hosted_workflow_sha256,omitempty"`
 	Coverage                   Coverage              `json:"coverage"`
 	Automation                 Automation            `json:"automation"`
 	Provider                   string                `json:"provider"`
@@ -122,6 +125,8 @@ type Config struct {
 	HiveReleaseVersion                string                         `json:"hive_release_version,omitempty"`
 	HiveCommit                        string                         `json:"hive_commit,omitempty"`
 	DistributionManifestSHA256        string                         `json:"distribution_manifest_sha256,omitempty"`
+	HostedControllerProtocol          int                            `json:"hosted_controller_protocol,omitempty"`
+	HostedWorkflowSHA256              string                         `json:"hosted_workflow_sha256,omitempty"`
 	PreviousHostedRelease             *HostedReleaseIdentity         `json:"previous_hosted_release,omitempty"`
 	ACMMLevel                         int                            `json:"acmm_level"`
 	MaxActiveIssues                   int                            `json:"max_active_issues"`
@@ -164,6 +169,7 @@ type HostedReleaseIdentity struct {
 	HiveCommit                 string `json:"hive_commit"`
 	VisualHiveCommit           string `json:"visual_hive_commit"`
 	DistributionManifestSHA256 string `json:"distribution_manifest_sha256"`
+	HostedControllerProtocol   int    `json:"hosted_controller_protocol"`
 }
 
 // MarshalJSON keeps repository preimage bytes out of CLI/status/API output.

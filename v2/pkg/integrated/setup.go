@@ -63,6 +63,7 @@ type SetupOptions struct {
 	HiveReleaseVersion         string
 	HiveCommit                 string
 	DistributionManifestSHA256 string
+	HostedControllerProtocol   int
 	VisualHive                 bool
 	StateDir                   string
 	Apply                      bool
@@ -121,6 +122,25 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	if hasPrior && !strings.EqualFold(prior.Repository, options.Repository) {
 		return SetupResult{}, fmt.Errorf("state directory %s is already bound to %s; use a different --state-dir for %s", options.StateDir, prior.Repository, options.Repository)
+	}
+	existingHosted := hasPrior && normalizedExecutionMode(prior.ExecutionMode) == ExecutionHosted
+	if existingHosted && options.ExecutionMode != ExecutionHosted {
+		return SetupResult{}, fmt.Errorf("setup cannot replace an active hosted installation with local runtime state; use an explicit hosted-to-local migration operation")
+	}
+	if existingHosted && options.ExecutionMode == ExecutionHosted {
+		activeRelease := hostedReleaseIdentity(prior)
+		requestedRelease := HostedReleaseIdentity{
+			Version: options.HiveReleaseVersion, HiveCommit: strings.ToLower(strings.TrimSpace(options.HiveCommit)),
+			VisualHiveCommit:           strings.ToLower(strings.TrimSpace(options.VisualHiveRef)),
+			DistributionManifestSHA256: strings.ToLower(strings.TrimSpace(options.DistributionManifestSHA256)),
+			HostedControllerProtocol:   options.HostedControllerProtocol,
+		}
+		if !validHostedReleaseIdentity(activeRelease) {
+			return SetupResult{}, fmt.Errorf("existing hosted installation does not have a supported immutable controller identity; use hive upgrade or an explicit migration path before rerunning setup")
+		}
+		if !equalHostedReleaseIdentity(activeRelease, requestedRelease) {
+			return SetupResult{}, fmt.Errorf("setup cannot replace the active hosted release before an exact managed transition; use hive upgrade or hive rollback")
+		}
 	}
 	if options.Apply {
 		if transfer, exists, transferErr := store.LoadAuthorizerTransferIntent(); transferErr != nil {
@@ -229,7 +249,8 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		HostedStateBranch:     hostedStateBranch(inspection.RepositoryID),
 		HiveReleaseRepository: options.HiveReleaseRepository, HiveReleaseVersion: options.HiveReleaseVersion,
 		HiveCommit: options.HiveCommit, DistributionManifestSHA256: options.DistributionManifestSHA256,
-		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
+		HostedControllerProtocol: options.HostedControllerProtocol,
+		ACMMLevel:                acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
 		SetupBaselineRequired:       setupBaselineRequired,
 		SetupBaselineContractDigest: setupBaselineContractDigest,
 		MaxActiveIssues:             options.MaxActiveIssues,
@@ -274,10 +295,23 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 			config.SetupAuthorizationActorID = prior.SetupAuthorizationActorID
 		}
 	}
+	if config.ExecutionMode == ExecutionHosted {
+		controller, controllerErr := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
+		if controllerErr != nil {
+			return result, fmt.Errorf("generate release-bound hosted controller: %w", controllerErr)
+		}
+		digest := sha256.Sum256([]byte(controller))
+		config.HostedWorkflowSHA256 = hex.EncodeToString(digest[:])
+		result.Plan.HostedControllerProtocol = config.HostedControllerProtocol
+		result.Plan.HostedWorkflowSHA256 = config.HostedWorkflowSHA256
+	}
 	// The exact repository preimages must outlive any branch push or setup PR.
 	// Persist them before the first remote mutation so an interrupted setup can
 	// resume without reclassifying already-managed bytes as repository-owned.
 	if preimagesUpdated {
+		if existingHosted {
+			return result, fmt.Errorf("setup cannot replace the active hosted managed-path ownership ledger; use a dedicated hosted policy transition")
+		}
 		if err := store.Save(config); err != nil {
 			return result, fmt.Errorf("persist managed path preimages before setup publication: %w", err)
 		}
@@ -315,6 +349,9 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		if err != nil {
 			return result, err
 		}
+	}
+	if existingHosted && strings.TrimSpace(diff) != "" {
+		return result, fmt.Errorf("setup cannot publish a changed hosted policy while the active configuration still owns the controller; use a dedicated managed policy or release transition command")
 	}
 	idempotent := strings.TrimSpace(diff) == ""
 	reuseRemoteSetup := false
@@ -555,6 +592,8 @@ type installedRepositoryConfig struct {
 	HiveReleaseVersion                string                 `json:"hive_release_version,omitempty"`
 	HiveCommit                        string                 `json:"hive_commit,omitempty"`
 	DistributionManifestSHA256        string                 `json:"distribution_manifest_sha256,omitempty"`
+	HostedControllerProtocol          int                    `json:"hosted_controller_protocol,omitempty"`
+	HostedWorkflowSHA256              string                 `json:"hosted_workflow_sha256,omitempty"`
 	PreviousHostedRelease             *HostedReleaseIdentity `json:"previous_hosted_release,omitempty"`
 	ACMMLevel                         int                    `json:"acmm_level"`
 	MaxActiveIssues                   int                    `json:"max_active_issues"`
@@ -618,6 +657,8 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 		HostedStateBranch: config.HostedStateBranch, HiveReleaseRepository: config.HiveReleaseRepository,
 		HiveReleaseVersion: config.HiveReleaseVersion, HiveCommit: config.HiveCommit,
 		DistributionManifestSHA256: config.DistributionManifestSHA256,
+		HostedControllerProtocol:   config.HostedControllerProtocol,
+		HostedWorkflowSHA256:       config.HostedWorkflowSHA256,
 		PreviousHostedRelease:      cloneHostedReleaseIdentity(config.PreviousHostedRelease),
 		MaxActiveIssues:            config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
 		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, VisualHiveConfigDigest: config.VisualHiveConfigDigest, TestCommands: config.TestCommands,
@@ -644,6 +685,9 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 		}
 	}
 	if config.ExecutionMode == ExecutionHosted {
+		if config.HostedControllerProtocol != HostedControllerProtocol || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(config.HostedWorkflowSHA256) {
+			return fmt.Errorf("durable hosted controller protocol or workflow digest is invalid")
+		}
 		expected, workflowErr := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
 		if workflowErr != nil {
 			return fmt.Errorf("generate expected hosted controller workflow: %w", workflowErr)
@@ -651,6 +695,11 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 		actual, readErr := readTargetFile(ctx, client, owner, repo, ref, HostedControllerWorkflowPath)
 		if readErr != nil {
 			return fmt.Errorf("verify managed hosted controller workflow: %w", readErr)
+		}
+		expectedDigest := sha256.Sum256([]byte(expected))
+		actualDigest := sha256.Sum256([]byte(actual))
+		if hex.EncodeToString(expectedDigest[:]) != config.HostedWorkflowSHA256 || hex.EncodeToString(actualDigest[:]) != config.HostedWorkflowSHA256 {
+			return fmt.Errorf("managed hosted controller workflow does not match its durable content digest")
 		}
 		if normalizeManagedText(actual) != normalizeManagedText(expected) {
 			return fmt.Errorf("managed hosted controller workflow does not match the durable immutable release and policy; rerun setup and merge its exact reviewed PR")
@@ -839,6 +888,9 @@ func validateSetupOptions(options SetupOptions) error {
 			!regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(strings.ToLower(options.DistributionManifestSHA256)) {
 			return fmt.Errorf("hosted setup requires an immutable integrated release repository, tag, Hive commit, and distribution manifest digest")
 		}
+		if options.HostedControllerProtocol != HostedControllerProtocol {
+			return fmt.Errorf("hosted setup requires controller protocol %d", HostedControllerProtocol)
+		}
 	}
 	if options.MaxActiveIssues < 1 || options.MaxActiveIssues > 100 {
 		return fmt.Errorf("maximum active issues must be from 1 through 100")
@@ -894,7 +946,8 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		HostedSchedule: options.HostedSchedule, HostedStateBranch: hostedStateBranch(inspection.RepositoryID),
 		HiveReleaseRepository: options.HiveReleaseRepository, HiveReleaseVersion: options.HiveReleaseVersion,
 		HiveCommit: options.HiveCommit, DistributionManifestSHA256: options.DistributionManifestSHA256,
-		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
+		HostedControllerProtocol: options.HostedControllerProtocol,
+		Coverage:                 options.Coverage, Automation: options.Automation, Provider: options.Provider,
 		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
 		VisualHiveRepository: options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef, Inspection: inspection,
 		MaxActiveIssues:       options.MaxActiveIssues,
@@ -965,6 +1018,7 @@ func hostedWorkflowConfig(config Config) HostedWorkflowConfig {
 		ReleaseRepository: config.HiveReleaseRepository, ReleaseTag: config.HiveReleaseVersion,
 		HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef,
 		DistributionManifestSHA256: config.DistributionManifestSHA256,
+		ProviderRequired:           config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge,
 		PreviousRelease:            cloneHostedReleaseIdentity(config.PreviousHostedRelease),
 	}
 }
@@ -973,6 +1027,7 @@ func hostedReleaseIdentity(config Config) HostedReleaseIdentity {
 	return HostedReleaseIdentity{
 		Version: config.HiveReleaseVersion, HiveCommit: strings.ToLower(config.HiveCommit),
 		VisualHiveCommit: strings.ToLower(config.VisualHiveRef), DistributionManifestSHA256: strings.ToLower(config.DistributionManifestSHA256),
+		HostedControllerProtocol: config.HostedControllerProtocol,
 	}
 }
 
@@ -987,7 +1042,7 @@ func cloneHostedReleaseIdentity(identity *HostedReleaseIdentity) *HostedReleaseI
 func equalHostedReleaseIdentity(left, right HostedReleaseIdentity) bool {
 	return left.Version == right.Version && strings.EqualFold(left.HiveCommit, right.HiveCommit) &&
 		strings.EqualFold(left.VisualHiveCommit, right.VisualHiveCommit) &&
-		strings.EqualFold(left.DistributionManifestSHA256, right.DistributionManifestSHA256)
+		strings.EqualFold(left.DistributionManifestSHA256, right.DistributionManifestSHA256) && left.HostedControllerProtocol == right.HostedControllerProtocol
 }
 
 func standaloneVisualHiveWriterWorkflowPaths() []string {
@@ -1759,6 +1814,7 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 		"hosted_schedule": config.HostedSchedule, "hosted_state_branch": config.HostedStateBranch,
 		"hive_release_repository": config.HiveReleaseRepository, "hive_release_version": config.HiveReleaseVersion,
 		"hive_commit": config.HiveCommit, "distribution_manifest_sha256": config.DistributionManifestSHA256,
+		"hosted_controller_protocol": config.HostedControllerProtocol, "hosted_workflow_sha256": config.HostedWorkflowSHA256,
 		"visual_hive_repository": config.VisualHiveRepo, "visual_hive_ref": config.VisualHiveRef,
 		"visual_hive_config_digest": config.VisualHiveConfigDigest,
 		"test_commands":             config.TestCommands, "allowed_repair_paths": config.AllowedRepairPaths,
@@ -1784,9 +1840,16 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 		files[".github/workflows/visual-hive-pr.yml"] = pullRequestWorkflow(config)
 	}
 	if config.ExecutionMode == ExecutionHosted {
+		if config.HostedControllerProtocol != HostedControllerProtocol || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(config.HostedWorkflowSHA256) {
+			return fmt.Errorf("hosted controller protocol or workflow digest is invalid")
+		}
 		controller, controllerErr := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
 		if controllerErr != nil {
 			return controllerErr
+		}
+		digest := sha256.Sum256([]byte(controller))
+		if hex.EncodeToString(digest[:]) != config.HostedWorkflowSHA256 {
+			return fmt.Errorf("generated hosted controller does not match its durable content digest")
 		}
 		files[HostedControllerWorkflowPath] = controller
 	}
