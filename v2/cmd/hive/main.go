@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -577,11 +578,23 @@ func main() {
 			})
 			normalVisualWorkService = service
 			logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
-			if runner, runnerErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, agentMgr, ghClient, logger); runnerErr != nil {
-				logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
-			} else if runner != nil {
+			ownership, runnerErr := claimNormalVisualWorkOwnership(installed.StateDir, agentMgr, func(ordinaryManager *agent.Manager) (bool, error) {
+				runner, configureErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, ordinaryManager, ghClient, logger)
+				if configureErr != nil || runner == nil {
+					return false, configureErr
+				}
 				normalVisualWorkRunner = runner
-				logger.Info("normal Visual Hive governed repair service initialized", "repository", installed.Repository)
+				return true, nil
+			})
+			if runnerErr != nil {
+				if errors.Is(runnerErr, errDaemonLeaseHeld) {
+					logger.Warn("normal Visual Hive governed repair service held because the legacy scheduler owns this repository; stop it and restart normal Hive for a controlled transition", "repository", installed.Repository)
+				} else {
+					logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
+				}
+			} else if ownership != nil {
+				defer releaseDaemonLease(ownership)
+				logger.Info("normal Visual Hive governed repair service initialized with exclusive ordinary-Manager ownership", "repository", installed.Repository)
 			}
 		}
 	}

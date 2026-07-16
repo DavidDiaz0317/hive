@@ -212,15 +212,15 @@ func stopIntegratedDaemon(stateDir string) (integratedDaemonStatus, error) {
 
 func terminateIntegratedDaemonRuntime(stateDir string) (integratedDaemonStatus, error) {
 	status := readIntegratedDaemonRuntimeStatus(stateDir)
-	if status.Running {
-		if err := terminateProcess(status.PID); err != nil && processIsAlive(status.PID) {
+	if pid, targeted := integratedDaemonTerminationTarget(status); targeted {
+		if err := terminateProcess(pid); err != nil && processIsAlive(pid) {
 			return status, err
 		}
 		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) && processIsAlive(status.PID) {
+		for time.Now().Before(deadline) && processIsAlive(pid) {
 			time.Sleep(100 * time.Millisecond)
 		}
-		if processIsAlive(status.PID) {
+		if processIsAlive(pid) {
 			return status, fmt.Errorf("scheduler did not exit within 10 seconds")
 		}
 	}
@@ -231,6 +231,13 @@ func terminateIntegratedDaemonRuntime(stateDir string) (integratedDaemonStatus, 
 	}
 	_ = writeIntegratedDaemonStatus(stateDir, status)
 	return status, nil
+}
+
+func integratedDaemonTerminationTarget(status integratedDaemonStatus) (int, bool) {
+	if !status.Running || status.PID <= 0 {
+		return 0, false
+	}
+	return status.PID, true
 }
 
 func runIntegratedDaemon(args []string) int {
@@ -284,26 +291,21 @@ func runIntegratedDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "hosted installations are owned by the repository controller and cannot start a local daemon")
 		return 1
 	}
-	lease, err := claimDaemonLease(stateDirAbs)
+	runtimeState, err := claimIntegratedDaemonRuntime(stateDirAbs, config, newIntegratedSpecialistRuntime)
 	if errors.Is(err, errDaemonLeaseHeld) {
 		// Concurrent and repeated starts are idempotent. The caller that spawned
-		// this process will observe the scheduler which won the lease.
+		// this process will observe the scheduler or normal Hive runtime which
+		// won the lease. The specialist factory has not run at this point.
 		return 0
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	defer releaseDaemonLease(lease)
-	specialists, err := newIntegratedSpecialistRuntime(stateDirAbs, config)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "initialize persistent Hive specialists:", err)
-		return 1
-	}
-	specialistsClosed := false
+	runtimeClosed := false
 	defer func() {
-		if !specialistsClosed {
-			_ = specialists.Close()
+		if !runtimeClosed {
+			_ = runtimeState.Close()
 		}
 	}()
 	started := time.Now().UTC()
@@ -327,7 +329,7 @@ func runIntegratedDaemon(args []string) int {
 		status.LastError = ""
 		_ = writeIntegratedDaemonStatus(stateDirAbs, status)
 		cycleCtx, cancel := context.WithTimeout(ctx, *runTimeout+time.Minute)
-		result, cycleErr := runIntegratedDaemonCycle(cycleCtx, stateDirAbs, *runTimeout, specialists)
+		result, cycleErr := runtimeState.RunCycle(cycleCtx, stateDirAbs, *runTimeout, runIntegratedDaemonCycle)
 		cancel()
 		now := time.Now().UTC()
 		wait := *interval
@@ -354,15 +356,68 @@ func runIntegratedDaemon(args []string) int {
 			if !timer.Stop() {
 				<-timer.C
 			}
-			if err := specialists.Close(); err != nil {
+			if err := runtimeState.Close(); err != nil {
 				fmt.Fprintln(os.Stderr, "shutdown persistent Hive specialists:", err)
 				return 1
 			}
-			specialistsClosed = true
+			runtimeClosed = true
 			return 0
 		case <-timer.C:
 		}
 	}
+}
+
+type integratedDaemonSpecialistFactory func(string, integrated.Config) (*integratedSpecialistRuntime, error)
+
+type integratedDaemonCycleRunner func(context.Context, string, time.Duration, *integratedSpecialistRuntime) (integrated.RunResult, error)
+
+// claimedIntegratedDaemonRuntime binds the legacy specialist runtime and its
+// cycles to the scheduler ownership lease. The normal Hive process claims the
+// same lease before enabling its ordinary-Manager service, so these two paths
+// cannot construct managers or run cycles concurrently.
+type claimedIntegratedDaemonRuntime struct {
+	lease       *os.File
+	specialists *integratedSpecialistRuntime
+}
+
+func claimIntegratedDaemonRuntime(stateDir string, config integrated.Config, factory integratedDaemonSpecialistFactory) (*claimedIntegratedDaemonRuntime, error) {
+	if factory == nil {
+		return nil, errors.New("integrated daemon specialist factory is required")
+	}
+	lease, err := claimDaemonLease(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	specialists, err := factory(stateDir, config)
+	if err != nil {
+		releaseDaemonLease(lease)
+		return nil, fmt.Errorf("initialize persistent Hive specialists: %w", err)
+	}
+	return &claimedIntegratedDaemonRuntime{lease: lease, specialists: specialists}, nil
+}
+
+func (runtimeState *claimedIntegratedDaemonRuntime) RunCycle(ctx context.Context, stateDir string, timeout time.Duration, runner integratedDaemonCycleRunner) (integrated.RunResult, error) {
+	if runtimeState == nil || runtimeState.lease == nil {
+		return integrated.RunResult{}, errors.New("integrated daemon cycle requires exclusive runtime ownership")
+	}
+	if runner == nil {
+		return integrated.RunResult{}, errors.New("integrated daemon cycle runner is required")
+	}
+	return runner(ctx, stateDir, timeout, runtimeState.specialists)
+}
+
+func (runtimeState *claimedIntegratedDaemonRuntime) Close() error {
+	if runtimeState == nil {
+		return nil
+	}
+	var err error
+	if runtimeState.specialists != nil {
+		err = runtimeState.specialists.Close()
+		runtimeState.specialists = nil
+	}
+	releaseDaemonLease(runtimeState.lease)
+	runtimeState.lease = nil
+	return err
 }
 
 func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time.Duration, specialists *integratedSpecialistRuntime) (integrated.RunResult, error) {
@@ -469,6 +524,17 @@ func daemonProtectionActivationRunnable(automation integrated.Automation, protec
 }
 
 func claimDaemonLease(stateDir string) (*os.File, error) {
+	return claimDaemonOwnershipLease(stateDir, true)
+}
+
+// claimNormalVisualDaemonLease uses the scheduler's authoritative OS lock but
+// deliberately leaves no daemon identity record. Status and stop operations
+// must never mistake the ordinary Hive/dashboard process for a legacy daemon.
+func claimNormalVisualDaemonLease(stateDir string) (*os.File, error) {
+	return claimDaemonOwnershipLease(stateDir, false)
+}
+
+func claimDaemonOwnershipLease(stateDir string, persistDaemonIdentity bool) (*os.File, error) {
 	dir := filepath.Join(stateDir, "integrated")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -486,6 +552,19 @@ func claimDaemonLease(stateDir string) (*os.File, error) {
 	if !locked {
 		_ = file.Close()
 		return nil, errDaemonLeaseHeld
+	}
+	if !persistDaemonIdentity {
+		if err := file.Truncate(0); err == nil {
+			_, err = file.Seek(0, 0)
+		}
+		if err == nil {
+			err = file.Sync()
+		}
+		if err != nil {
+			releaseDaemonLease(file)
+			return nil, fmt.Errorf("clear legacy scheduler identity for normal Hive ownership: %w", err)
+		}
+		return file, nil
 	}
 	executable, err := os.Executable()
 	if err != nil {
