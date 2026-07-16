@@ -209,6 +209,23 @@ drift, ACMM drift, installed path-policy drift, manual review, expiry, WIP,
 budget, runtime-config reload, immutable-envelope tamper, and terminal WIP
 retirement.
 
+## Current one-dispatch scope boundary
+
+The runnable vertical currently selects the first launchable controller dispatch
+(ordered by source ref), creates or recovers one specialist work order and one
+Worker PR, records that PR's exact-head verdict, and then consumes the source
+workflow intent. Controller intake may preserve more findings and pending
+dispatches from the same verified packet, but this service does not yet iterate
+them. Consequently, the current implementation must not be described as
+processing every launchable finding in a multi-finding packet.
+
+That limit is acceptable for the one-defect disposable-repository proof and the
+one-defect Console-fork P0 scenario. General packet fan-out needs a later
+controller-owned selection/completion contract and a ledger that binds every
+selected dispatch without becoming another queue or Manager. It is not safe to
+add an ad hoc service loop that consumes the packet after only some work or that
+bypasses the existing Governor, Scheduler, Manager, mailbox, or Worker owners.
+
 Focused commands passing at this checkpoint:
 
 ```text
