@@ -55,6 +55,25 @@ func TestNormalServiceAmbiguousConsumeRecoversWithoutNewWorkflowOrPR(t *testing.
 	}
 }
 
+func TestNormalServiceRepairResponseLossRevalidatesWithoutRefetchOrReimport(t *testing.T) {
+	fixture := newServiceFixture(t)
+	fixture.repairer.failAfterSideEffect = true
+	service := fixture.service(t, fixture.verifier)
+	if err := service.RunCycle(context.Background()); err == nil || !strings.Contains(err.Error(), "Worker response lost") {
+		t.Fatalf("ambiguous Worker response error = %v", err)
+	}
+	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.repairer.sideEffects != 1 || fixture.verifier.calls != 0 {
+		t.Fatalf("first ambiguous Worker cycle = source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatalf("ambiguous Worker recovery: %v", err)
+	}
+	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.intake.revalidates != 2 ||
+		fixture.repairer.runs != 2 || fixture.repairer.sideEffects != 1 || fixture.verifier.calls != 1 || fixture.source.consumeSideEffects != 1 {
+		t.Fatalf("Worker recovery refetched, reimported, or repeated a side effect: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+}
+
 func TestNormalServiceLeavesWorkerPROpenUntilExactHeadVerifierExists(t *testing.T) {
 	fixture := newServiceFixture(t)
 	service := fixture.service(t, nil)
@@ -67,8 +86,8 @@ func TestNormalServiceLeavesWorkerPROpenUntilExactHeadVerifierExists(t *testing.
 	if err := service.RunCycle(context.Background()); !errors.Is(err, ErrFinalVerdictPending) {
 		t.Fatalf("replay error = %v, want pending verdict", err)
 	}
-	if fixture.repairer.runs != 1 || fixture.source.consumes != 0 {
-		t.Fatalf("pending exact PR was duplicated or consumed")
+	if fixture.repairer.runs != 1 || fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.intake.revalidates != 1 || fixture.source.consumes != 0 {
+		t.Fatalf("pending exact PR was refetched, reimported, duplicated, or consumed")
 	}
 }
 
@@ -200,6 +219,7 @@ func (source *fakeArtifactSource) Consume(_ integrated.WorkflowRunEvidence, allo
 type fakeIntake struct {
 	dispatch       []visualcontroller.DispatchEnvelope
 	imports        int
+	revalidates    int
 	completes      int
 	failCompletion bool
 	completion     visualcontroller.SpecialistPullRequestCompletion
@@ -208,6 +228,16 @@ type fakeIntake struct {
 func (intake *fakeIntake) Import(context.Context, hivegithub.VerifiedVisualHiveArtifact) (visualcontroller.Result, error) {
 	intake.imports++
 	return visualcontroller.Result{DispatchPending: append([]visualcontroller.DispatchEnvelope(nil), intake.dispatch...)}, nil
+}
+
+func (intake *fakeIntake) RevalidateSpecialistBoundary(sourceExternalRef, _, _ string) (visualcontroller.DispatchEnvelope, error) {
+	intake.revalidates++
+	for _, envelope := range intake.dispatch {
+		if envelope.SourceExternalRef == sourceExternalRef {
+			return envelope, nil
+		}
+	}
+	return visualcontroller.DispatchEnvelope{}, errors.New("exact durable dispatch is unavailable")
 }
 
 func (intake *fakeIntake) CompleteSpecialistPullRequest(_ string, completion visualcontroller.SpecialistPullRequestCompletion) error {
@@ -221,12 +251,21 @@ func (intake *fakeIntake) CompleteSpecialistPullRequest(_ string, completion vis
 }
 
 type fakeRepairer struct {
-	runs    int
-	outcome RepairOutcome
+	runs                int
+	sideEffects         int
+	failAfterSideEffect bool
+	outcome             RepairOutcome
 }
 
 func (repairer *fakeRepairer) Run(context.Context, visualcontroller.DispatchEnvelope) (RepairOutcome, error) {
 	repairer.runs++
+	if repairer.sideEffects == 0 {
+		repairer.sideEffects++
+		if repairer.failAfterSideEffect {
+			repairer.failAfterSideEffect = false
+			return RepairOutcome{}, errors.New("Worker response lost after one durable proposal and PR")
+		}
+	}
 	return repairer.outcome, nil
 }
 

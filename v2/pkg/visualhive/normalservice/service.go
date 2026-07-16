@@ -35,6 +35,7 @@ type ArtifactSource interface {
 
 type Intake interface {
 	Import(context.Context, hivegithub.VerifiedVisualHiveArtifact) (visualcontroller.Result, error)
+	RevalidateSpecialistBoundary(string, string, string) (visualcontroller.DispatchEnvelope, error)
 	CompleteSpecialistPullRequest(string, visualcontroller.SpecialistPullRequestCompletion) error
 }
 
@@ -179,47 +180,54 @@ func (service *Service) RunCycle(ctx context.Context) error {
 	if exists && ledger.VerdictReceiptSHA256 != "" {
 		return service.finish(ctx, ledger)
 	}
-	work, err := service.options.Source.Fetch(ctx)
-	if err != nil {
-		return err
-	}
-	key, err := workflowKey(work)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		ledger = workLedger{
-			SchemaVersion: ledgerSchema, WorkflowKey: key, Workflow: work.Workflow,
-			Repository: work.Config.Repository, BaseBranch: work.Config.DefaultBranch, PacketDigest: work.Artifact.BundleSHA256,
-		}
-		if err := service.saveLedger(ledger); err != nil {
+	var envelope visualcontroller.DispatchEnvelope
+	if exists && ledger.SourceExternalRef != "" {
+		envelope, err = service.options.Intake.RevalidateSpecialistBoundary(ledger.SourceExternalRef, ledger.WorkOrderID, ledger.RequestSHA256)
+		if err != nil {
 			return err
 		}
-	} else if ledger.WorkflowKey != key || ledger.Repository != work.Config.Repository || ledger.PacketDigest != work.Artifact.BundleSHA256 {
-		return errors.New("fetched Visual Hive artifact differs from the one active durable service binding")
-	}
-	result, err := service.options.Intake.Import(ctx, work.Artifact)
-	if err != nil {
-		return err
-	}
-	if len(result.Errors) > 0 {
-		return fmt.Errorf("native Visual Hive intake held: %s", strings.Join(result.Errors, "; "))
-	}
-	envelope, found := selectDispatch(result.DispatchPending, ledger.SourceExternalRef)
-	if !found {
-		// A green report or a current pause/WIP/policy hold creates no model or
-		// PR. Retire this exact workflow and let the ordinary cadence produce a
-		// fresh report after state changes.
-		if err := service.options.Source.Consume(work.Workflow, false); err != nil {
-			return err
+	} else {
+		work, fetchErr := service.options.Source.Fetch(ctx)
+		if fetchErr != nil {
+			return fetchErr
 		}
-		ledger.Consumed = true
-		if err := service.saveLedger(ledger); err != nil {
-			return err
+		key, keyErr := workflowKey(work)
+		if keyErr != nil {
+			return keyErr
 		}
-		return ErrNoDispatch
-	}
-	if ledger.SourceExternalRef == "" {
+		if !exists {
+			ledger = workLedger{
+				SchemaVersion: ledgerSchema, WorkflowKey: key, Workflow: work.Workflow,
+				Repository: work.Config.Repository, BaseBranch: work.Config.DefaultBranch, PacketDigest: work.Artifact.BundleSHA256,
+			}
+			if err := service.saveLedger(ledger); err != nil {
+				return err
+			}
+		} else if ledger.WorkflowKey != key || ledger.Repository != work.Config.Repository || ledger.PacketDigest != work.Artifact.BundleSHA256 {
+			return errors.New("fetched Visual Hive artifact differs from the one active durable service binding")
+		}
+		result, importErr := service.options.Intake.Import(ctx, work.Artifact)
+		if importErr != nil {
+			return importErr
+		}
+		if len(result.Errors) > 0 {
+			return fmt.Errorf("native Visual Hive intake held: %s", strings.Join(result.Errors, "; "))
+		}
+		var found bool
+		envelope, found = selectDispatch(result.DispatchPending, "")
+		if !found {
+			// A green report or a current pause/WIP/policy hold creates no model or
+			// PR. Retire this exact workflow and let the ordinary cadence produce a
+			// fresh report after state changes.
+			if err := service.options.Source.Consume(work.Workflow, false); err != nil {
+				return err
+			}
+			ledger.Consumed = true
+			if err := service.saveLedger(ledger); err != nil {
+				return err
+			}
+			return ErrNoDispatch
+		}
 		ledger.SourceExternalRef = envelope.SourceExternalRef
 		if err := service.saveLedger(ledger); err != nil {
 			return err
@@ -242,6 +250,9 @@ func (service *Service) RunCycle(ctx context.Context) error {
 	}
 	if service.options.Verdict == nil {
 		return ErrFinalVerdictPending
+	}
+	if _, err := service.options.Intake.RevalidateSpecialistBoundary(ledger.SourceExternalRef, ledger.WorkOrderID, ledger.RequestSHA256); err != nil {
+		return err
 	}
 	receipt, err := service.options.Verdict.VerifyPullRequest(ctx, PullRequestVerdictRequest{
 		IdempotencyKey: ledger.WorkflowKey + ":" + ledger.WorkOrderID, Repository: ledger.Repository,
