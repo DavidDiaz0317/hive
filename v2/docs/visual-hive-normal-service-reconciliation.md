@@ -1,280 +1,252 @@
 # Visual Hive normal-service reconciliation
 
-Status: implementation checkpoint, 2026-07-16. This branch is not a working
-product. It has not passed the required local Governor-to-PR vertical test.
+Status: fork-local working vertical through one Worker-owned pull request,
+2026-07-16. Production activation is deliberately held at the exact-head
+verdict boundary until the producer isolation and verifier requirements below
+are implemented and reviewed.
 
-The binding contract is `docs/visual-hive-integration-contract.md` from
-coordinator commit `3f9ddac558fe2e8911fcf0ce4b91a88d8e5508f7`.
+The normative product contract is
+`docs/visual-hive-integration-contract.md`. This document records the actual
+implementation and remaining proof; it does not grant additional authority.
 
-## Source ledger
+## Safety and source boundary
 
-| Input | Audited state | Use on this branch |
-| --- | --- | --- |
-| Coordinator | `3f9ddac5`, clean | Branch base and binding documentation |
-| Execution | `8c18fcf0`, then `49d835ef`, clean | Cherry-picked as `07dd2f65`, then `78b3db04` |
-| Intake | Uncommitted at base `728ce71b` | Read-only design input; no code copied |
-| Secure dispatcher | Uncommitted at base `844cb9e4` | Read-only design input; no code copied |
-| PR v3 verifier | Separately owned at `codex/vh-pr-verifier` | Do not duplicate; accept only an audited commit later |
+All implementation and tests in this checkpoint ran only in the isolated Hive
+fork worktree:
 
-No remote was read or mutated from this worktree. No upstream Hive,
-KubeStellar Console, hosted GitHub object, or production Hive state was
-changed.
+`C:\Users\david\OneDrive\Documents\vh-worktrees\hive-normal-service-integration`
 
-## Exact final composition
+Branch: `codex/vh-normal-service-integration`.
 
-| Stage | Existing owner that must remain authoritative | Reconciliation |
-| --- | --- | --- |
-| Production transport | `integrated.Config`, durable `WorkflowDispatchIntent`, `dispatchAndWait`, and `FetchAndVerifyVisualHiveBundle` | Extract a fetch-only cycle. Do not create an inbox, API, queue, or generic kick. Return the validated v3 bundle, exact workflow binding, and `VerifiedVisualHiveArtifact`; do not call legacy lifecycle, bead, manager, or repair paths. |
-| Import | Intake `Controller.Import` | The verified v3 artifact is the only import input. Intake's sealed plan/cache must retain the full typed work and artifact receipts needed after lifecycle replay. |
-| Admission | The same normal `Governor` | Intake constructs the live admission request. Paused, budget, WIP, role-enabled, cadence, and safe-execution denials are re-evaluated when their bound inputs change. No second role registry. |
-| Scheduler input | Intake `DispatchEnvelope` | Add one intake-owned adapter from a revalidated envelope to `scheduler.AdmittedWork` plus the canonical intake v3 receipt. No other constructor is permitted. |
-| Prompt composition | The same normal `Scheduler` | Compose normal role policy, project context, and knowledge primer with a separately injected Codex proposal-executor profile. Normal role backend/model/launch/tools/connections remain inert. |
-| Evidence content | Controller/Worker-owned bounded reader | Read only declared digest-bound regular JSON/UTF-8 artifacts below the sealed evidence root. The child receives bytes in the prompt, never a path or filesystem authority. Binary screenshots remain receipts only. |
-| Durable proposal | Existing `SpecialistMailbox` | Call `PrepareGoverned` once, reserve its exact `swo-*` ID and request SHA in the intake envelope, then persist both in repair state before launch. Recovery uses only `LoadWorkOrder(ID)`. |
-| Proposal execution | Existing ordinary `agent.Manager` facade | Dispatch one isolated, one-shot child through the audited dispatcher. Do not create a persistent second specialist manager. The child has no checkout, raw repository path, GitHub, Hive, wiki, graph, MCP, or filesystem-write authority. |
-| Repair | Existing `repair.Worker` | Worker alone validates the proposal, applies it, validates the result, commits, branches, pushes, and creates the PR. Visual Hive supplies evidence and final verdict only. |
-| Audit/UI | Existing lifecycle, normal role bead stores, Governor state, and dashboard audit | Project exact present work into the normal routed store and use existing `/api/audit`; do not add a dashboard or queue. |
-| PR rerun | Separately audited PR-v3 producer/verifier commit | Cherry-pick later behind a narrow verifier interface. Never substitute the review-only verifier and never accept `pull_request_target`. No merge behavior. |
+No upstream/real Hive or KubeStellar Console checkout, remote, workflow, issue,
+pull request, or production state was changed. The immutable Visual Hive
+producer reference currently under review is
+`e201aae4c0011f62a87962a507b3abd32f284395` in the separate
+`vis-proof-harness` worktree. It is a producer input, not a Hive commit, and
+must not be cherry-picked into Hive.
 
-## Intake envelope to Scheduler mapping
+## Product topology
 
-The adapter belongs with intake because only intake can prove that its durable
-envelope is canonical. It must perform these operations in order:
+There is no Visual-specific manager, role registry, queue, dashboard, wiki, or
+graph. The normal service is a serial reconciler around existing Hive owners:
 
-1. Revalidate the complete `DispatchEnvelope` and its canonical v3 receipt.
-2. Preserve the exact immutable admitted-work JSON as Scheduler `Work`, the
-   exact packet JSON as `Packet`, and the exact finding JSON as `Finding`, each
-   with its own digest. Do not hash a mutable envelope after mailbox reservation
-   fields are added.
-3. Do not equate the v3 aggregate `PacketDigest` with the SHA-256 of the
-   Scheduler's canonical packet projection. Preserve and bind both identities.
-4. Map repository, repository fingerprint, source ref, base commit/tree,
-   recurrence, attempt, deadline, role, routing reason, issue kind, severity,
-   title, body, labels, allowed paths, affected contracts, validation command,
-   reproduction source, proposal-only authority, and provenance without
-   projection through a lifecycle title/body.
-5. Map every artifact receipt in canonical order with exact path, SHA-256,
-   bytes, kind, and content type. The recurrence key is
-   `<repository-fingerprint>:r<recurrence>`.
-6. Use intake's complete v3 `SpecialistEvidenceIdentity` and exact stored
-   verification-receipt JSON. Those types replace the private legacy execution
-   and dispatcher shapes; compatibility must not weaken validation.
+```text
+existing production workflow intent and verified bundle transport
+    -> native Visual Hive intake Controller
+    -> existing Governor admission and normal routed bead store
+    -> existing Scheduler (role policy + project + knowledge)
+    -> existing SpecialistMailbox: one content-derived swo-*
+    -> existing ordinary agent.Manager facade
+    -> isolated one-shot Codex proposal child
+    -> existing repair.Worker
+    -> one branch/commit/pull request, never merge
+    -> exact-head Visual Hive verifier [P0 HELD]
+    -> receipt-only controller completion, never resolution
+```
 
-`scheduler.AdmittedWork`, `EvidenceArtifact`, and
-`WorkerEvidenceArtifactReader` are in `pkg/scheduler/governed_proposal.go`.
-The current checkpoint binds raw work, packet, finding, and receipt bytes and
-cross-checks their typed fields before composition.
+Visual Hive owns deterministic findings and verdict evidence. Hive owns
+admission, policy, work state, proposal dispatch, patch validation, Git,
+GitHub, lifecycle, and audit. The one-shot proposal child owns none of those
+capabilities.
 
-## No-strength-loss evidence path
+## Implemented path
 
-Implemented in commits `64b6abed`, `78b3db04`, and `07dd2f65`:
+### Service ownership and transport
 
-- `pkg/repair/governed_evidence_reader.go` opens a rooted filesystem handle,
-  rejects absolute/traversing paths, links, reparse points, non-regular files,
-  size drift, and digest drift, and rechecks file identity around the bounded
-  read.
-- Selection is deterministic: at most 16 artifacts, 32 KiB each, and 96 KiB
-  total. Only declared JSON/UTF-8 evidence can be embedded.
-- Mutation-survivor and test-adequacy observations fail closed when no declared
-  receipt is safely embeddable. Screenshots and other binary evidence retain
-  their receipts but are never decoded into the prompt.
-- Artifact bytes appear as explicitly untrusted evidence data alongside the
-  complete admitted-work and typed finding JSON.
-- `TestGovernedQualityPromptPreservesMutationEvidenceAcrossMailboxReplay`
-  proves distinctive mutation operator/survivor, missing-test, selector, and
-  flow bytes reach the normal quality prompt. After the evidence file changes,
-  recovery through `LoadWorkOrder` returns byte-identical request bytes without
-  recomposition or reread.
+- `integrated.AcquireNormalVisualWorkLease` retains the same OS-backed
+  production-run lock used by the legacy integrated runtime for the complete
+  service lifetime. The legacy and normal runtimes therefore cannot consume
+  the same workflow concurrently.
+- Lease contention is an idle retry in a dedicated goroutine. The normal
+  Governor loop, persistent agents, and dashboard remain independent.
+- `integrated.FetchNormalVisualWork` reuses installed setup verification,
+  exact correlated workflow dispatch/resume, job/run/artifact verification,
+  full v3 source fetch, producer pin, and live installed-workflow head check.
+  It calls no legacy lifecycle, manager, repair, baseline, or merge path.
+- `integrated.ConsumeNormalVisualWork` deletes only the exact durable workflow
+  intent. An already-absent intent is accepted only after the service has
+  durably recorded that consumption began.
 
-## Worker and mailbox seam
+### Intake, Governor, and Scheduler
 
-The production call must be inserted at the existing sealed context boundary,
-not in a parallel repair implementation:
+- `visualhive/controller.Controller.Import` is the only bundle-to-Hive intake.
+  It routes to existing normal role stores and calls the existing Governor.
+- `BuildSchedulerAdmittedWork` is the only intake-envelope projection into
+  `scheduler.AdmittedWork`. It preserves canonical work, packet, finding,
+  evidence receipts, exact base/tree, recurrence, role, paths, contracts,
+  validation, and deadline.
+- The existing Scheduler composes the governed request with the current normal
+  role snapshot, project context, knowledge primer, capability/policy digests,
+  and a separately injected contained-Codex executor profile.
+- Worker owns the source composer. It reads the admitted exact Git tree through
+  Git object IDs and reads only receipt-bound bounded JSON below the verified
+  evidence root. The child receives bytes, not a checkout or evidence path.
+- `PrepareGoverned` creates one canonical `swo-<request-sha256>`. Intake
+  durably reserves that exact ID and digest before a fresh model launch.
 
-- `pkg/repair/worker.go`: the base tree is sealed and verified before source
-  context is constructed; replace the subsequent direct provider preparation
-  with governed Scheduler composition and `PrepareGoverned`.
-- Persist the returned work-order ID and request SHA in both the intake
-  reservation and repair attempt before setting `StageModelRunning`.
-- On `StageModelRunning`, accept only the persisted exact ID and call
-  `LoadWorkOrder`. Never read live role policy, project config, primer, evidence
-  files, or mutable provider config on replay.
-- Preserve the existing Worker-only mutation sequence: diff/path validation,
-  authorization, apply, sealed-tree verification, validation, commit, push, PR,
-  and `MarkPROpen`.
+### Existing Manager and Worker
 
-The current repair state persists `ModelInvocationID` but not the request SHA.
-The audited intake/dispatcher reconciliation must add that binding rather than
-reconstruct it.
+- `configureNormalVisualWorkRunner` installs the contained child dispatcher on
+  the already existing ordinary `agent.Manager`; it does not construct another
+  Manager.
+- The proposal executor is one-shot Codex in a private contained directory.
+  Normal role backend, launch command, tools, connections, and persistent pane
+  remain unchanged and inert with respect to the child.
+- `repair.Worker` remains the sole component allowed to validate/apply the
+  diff, re-run installed argv commands, commit, push, and create/reuse a pull
+  request.
+- The Worker policy is forced to `repair-pr` even when the installed repository
+  is configured for `auto-merge`. This vertical cannot merge.
 
-## Legacy-runtime coexistence and activation
+## Revalidation boundaries
 
-The legacy specialist lease at
-`<stateDir>/integrated/specialists/runtime.lease` has no TTL or session
-identity. PID and `AcquiredAt` are not liveness proof. The OS lock is the
-authority.
-
-The normal service must acquire and retain the exact same exclusive lock for
-its entire ownership period. A probe followed by release has a restart race.
-While another process holds the lock, including during malformed/partial lease
-JSON initialization, the service must:
-
-- durably audit `legacy_runtime_active` with `Allowed:false` through
-  `integrated.Store.AuditStrict` and the normal dashboard audit sink;
-- perform zero Visual admission, composition, mailbox preparation, Manager
-  inspection/dispatch, or Worker execution; and
-- leave the unrelated normal Governor, agents, and dashboard cadence running.
-
-An unlocked lease is stale, not expired. After acquiring the lifetime fence,
-unsafe or repository-mismatched lease state fails closed. The service then
-reconciles in this order:
-
-1. Load repair state by stable repository fingerprint.
-2. For `StageModelRunning`, use only the persisted `ModelInvocationID` to load
-   the old mailbox order. Cross-check repository, fingerprint, recurrence,
-   attempt, role, base/tree, paths, validation, request SHA, order, lease,
-   receipt, and proposal digests.
-3. If a complete durable response exists, adopt it without Manager inspection,
-   launch, or a second model call. An order/lease without a provable completion
-   is held as `legacy_model_ambiguous`.
-4. Search all normal routed stores by stable external ref. Reject zero/multiple
-   conflicting matches and validate controller metadata before accepting an
-   existing bead.
-5. Project the exact sealed present work into exactly one normal routed store
-   without calling lifecycle apply, outbox, or GitHub. Legacy and normal bead
-   UUIDs may differ; external ref is the cross-store identity.
-6. Reopen-verify a durable adoption record linking both bead IDs and all
-   order/request/lease/receipt/proposal digests, update the lifecycle finding to
-   the normal bead ID, and attach repair state to normal ownership.
-7. Only after that proof may the legacy bead be marked migrated/retired. Never
-   delete it. On any partial failure or ambiguity, durably hold both beads.
-
-The replay defect to avoid is in `pkg/visualhive/lifecycle.go`: an existing
-replay key returns before `beads.ImportBatch`. Activation therefore cannot be
-implemented as another `ApplyBundle` call. Intake's sealed import plan/cache is
-also required because lifecycle state alone cannot reconstruct the full v3
-work and artifact receipts.
-
-## Fetch-only normal-service driver
-
-This remains deliberately unwired until the audited intake commit provides the
-import/activation transaction boundary.
-
-The implementation must extract, rather than duplicate, the exact production
-workflow path from `pkg/integrated/run.go`:
-
-1. Load installed `integrated.Config` and use its repository ID, repository,
-   default branch, Visual Hive ref, state directory, and
-   `RunIntervalSeconds`.
-2. Gate on installed pause/pause request, the retained legacy-runtime fence,
-   setup validity, and the exact durable production `WorkflowDispatchIntent`.
-   `dispatchAndWait` must resume a correlated intent and must not redispatch it.
-3. Reuse exact workflow/run/artifact discovery, then call
-   `FetchAndVerifyVisualHiveBundle` with full source-artifact fetch. Reverify the
-   live installed workflow head before returning.
-4. Return a sealed value containing `WorkflowRunEvidence`, the validated
-   bundle, and `VerifiedVisualHiveArtifact`. Do not invoke legacy lifecycle,
-   beads, outbox, specialist manager, or repair.
-5. Call intake `Controller.Import`, admission, activation, and durable dispatch.
-   Consume the workflow intent only after the exact import/activation boundary
-   reports durable success. Exact replay is a no-op; conflicts fail closed.
-6. Run one background serial cycle with a per-cycle context deadline. Ticks
-   coalesce while a cycle is active; failures are audited and retried on the
-   next installed interval. The normal Governor loop never waits on this
-   goroutine.
-
-Tests must inject the fetch cycle/fake GitHub transport, block or fail it, and
-prove multiple unrelated normal evaluations and dashboard reads still occur,
-with maximum Visual concurrency of one.
-
-## Config reload
-
-Implemented in `00391727` and hardened in `610f6474`:
-
-- the existing watcher calls `Governor.UpdateConfigAndAgents` with
-  `cfg.EnabledAgents()`;
-- Governor policy and enabled agents swap under one lock;
-- removed agents lose stale cadences and can no longer be kicked; and
-- construction and reload deeply clone every nested mutable `AgentConfig`
-  pointer, slice, and map, including channels, tools/rules, connections/auth,
-  options, and display/routing collections.
-
-The intake admission commit must read this same locked snapshot. It must not
-introduce a role registry. Pending or transiently denied work is then
-re-evaluated against the new role/policy digest, while prepared work continues
-only from its persisted order.
-
-### Runtime config transaction checkpoint
-
-The current compatibility checkpoint extends reload safety to normal dashboard
-and pack writes without introducing a Visual-specific registry:
-
-- `ConfigCoordinator` is the one staged mutation/persistence/publication
-  boundary. It deep-clones the complete config, persists the candidate before
-  publication, prepares every newly-enabled ordinary Manager entry, publishes
-  Governor policy plus enabled agents under the Governor's one lock, and only
-  then removes deleted Manager entries.
-- Agent nested edits, create/import/delete, ACMM pack application, Governor
-  edits, and the heartbeat-owned persisted config fields use that boundary.
-  A persistence error causes the coordinator itself to publish none of the
-  candidate Config, Manager, or Governor state. If the underlying filesystem
-  reports an error only after bytes reached disk, the ordinary watcher remains
-  unsuppressed and reconciles the actual authoritative file.
-- Programmatic watcher suppression binds the digest of the intended YAML bytes,
-  not an unqualified "next event" flag or a post-write fingerprint. Failed
-  saves install no suppression, and an external edit that wins during or after
-  the save window is reloaded.
-- ACMM pack policy, agent registry, stale timeouts, and level are one runtime
-  publication. The Governor cannot admit a pack-created agent before that
-  agent is addressable by the ordinary Manager.
-
-This checkpoint deliberately does **not** claim the following later
-reconciliations: atomic/authoritative precedence between base YAML and per-agent
-overlay files; dynamic creation/removal of bead stores and other config-driven
-subsystems; import of portable-definition cadence maps; conversion of every
-long-lived direct config reader to coordinator snapshots; or live refresh of
-the Manager's project-wide `ProjectContext`. Those must be handled explicitly
-after this compatibility boundary, not hidden inside the Visual integration.
-
-## Acceptance matrix
-
-| Proof | Status on this branch |
+| Boundary | Current state rechecked |
 | --- | --- |
-| Typed mutation/test-adequacy artifact reaches normal quality prompt and mailbox replay is byte-identical | Implemented and passing |
-| Unsafe path/link, size/SHA drift, binary non-embedding, and required-JSON fail-closed behavior | Implemented and passing |
-| Role/executor separation and immutable governed mailbox request | Execution commits integrated; focused tests passing |
-| Governor agent enable/disable/role snapshot updates on reload and staged dashboard/pack writes, including nested caller mutation and failed-save isolation | Implemented and passing |
-| Intake packet tamper/malformed, policy drift after prepare, pause/budget/WIP re-evaluation, and no duplicate bead/work | Blocked on audited intake commit |
-| One-shot child containment and rejection of legacy completion for new governed work | Blocked on audited dispatcher commit |
-| Worker request-SHA persistence, crash recovery with one model call, and one branch/PR maximum | Blocked on intake/dispatcher reconciliation |
-| Live legacy lease hold, completed legacy order adoption, ambiguous hold, and cross-store activation migration | Blocked on intake sealed cache plus dispatcher recovery seam |
-| Non-overlapping fetch-only ticker while unrelated normal cadence/dashboard continue | Design complete; production wiring blocked on intake transaction boundary |
-| Exact `pull_request` v3 producer/verifier adversarial matrix | Owned by separate `codex/vh-pr-verifier` task; no duplicate work here |
-| Full local normal-service Governor-to-PR vertical | Not run; product claim prohibited |
+| Fetch | Installed repository identity, setup, pause request, workflow/ref/producer |
+| Intake/admission | Governor mode, role enablement/config, budget, WIP, pause, installed policy |
+| Scheduler preparation | Exact intake envelope, Worker base/tree, contained executor readiness |
+| `swo-*` reservation | Current Governor/role/budget/WIP/pause/policy and immutable envelope |
+| Fresh child launch | Same current controller checks immediately before dispatch |
+| Worker side effects | Dynamic installed policy plus controller guard before apply, validation, commit, push, and PR |
+| Exact-head verdict | Exact order, request, PR, head, and current controller policy immediately before verifier |
+| Receipt completion | Exact open Worker PR and exact-head receipt; no merge/baseline/resolution authority |
 
-## Worklog and verification
+Already leased work is not redispatched when a later fresh-launch guard denies.
+Recovery observes only the exact persisted order, lease, Manager completion
+spool, receipt, and proposal. This prevents a pause or policy change from
+turning an ambiguous model call into a second call while still denying new side
+effects.
 
-- Created local worktree
-  `C:\Users\david\OneDrive\Documents\vh-worktrees\hive-normal-service-integration`
-  on `codex/vh-normal-service-integration` from the coordinator commit.
-- Cherry-picked the ordered execution pair as `07dd2f65` and `78b3db04`.
-- Added exact typed evidence preservation and bounded reading in `64b6abed`.
-- Added atomic Governor config/agent refresh in `00391727` and complete nested
-  snapshot isolation in `610f6474`.
-- Added the staged runtime config coordinator, Manager-before-Governor
-  reconciliation, intended-digest watcher suppression, and pack/import/delete
-  compatibility tests in the current checkpoint.
-- Passing focused commands:
-  - `go test ./pkg/agent -count=1 -timeout 2m`
-  - `go test ./pkg/scheduler -count=1 -timeout 2m`
-  - `go test ./pkg/repair -run '^TestGovernedEvidenceArtifactReader' -count=1 -timeout 2m`
-  - `go test ./pkg/governor -count=1 -timeout 2m`
-  - `go test ./cmd/hive -run '^$' -count=1 -timeout 2m`
-  - `go test ./pkg/config ./pkg/governor ./pkg/dashboard ./cmd/hive -count=1`
-- A combined `go test ./pkg/scheduler ./pkg/repair -timeout 4m` run passed
-  Scheduler but timed out in the unrelated existing Windows Git subprocess
-  `TestSealedTreeGuardCannotBeTransplantedAcrossAttempts`. The full repair
-  suite is therefore not claimed green.
+The contained provider executable/configuration is fixed for the process
+lifetime because the existing Manager dispatcher cannot be safely hot-swapped.
+A change requires a controlled Hive restart. Normal role, Governor, ACMM, and
+installed repository policy continue to reload through their existing owners.
 
-Next integration is intentionally gated on audited intake and dispatcher commit
-IDs. The separate PR-v3 commit is a third modular dependency.
+## Crash and replay model
+
+The service ledger is
+`<state-dir>/visual-hive/normal-service/active.json`. It is a small exact-binding
+checkpoint, not a queue. It records the workflow, packet digest, source ref,
+one work-order/request identity, Worker PR, verdict receipt, completion, and
+intent-consumption checkpoints using durable atomic replacement.
+
+Ordering is:
+
+1. bind exact workflow and packet;
+2. import once and persist the controller-owned source ref;
+3. prepare/reserve one `swo-*` and let Worker create/recover one PR;
+4. persist the exact-head verdict receipt;
+5. atomically close the routed bead with the exact completion receipt;
+6. persist `consume_started`;
+7. consume the exact workflow intent;
+8. persist `consumed` and clear on the next cadence.
+
+After the source ref is persisted, restart reopens and revalidates the
+controller-owned dispatch. It does not refetch or reimport the artifact.
+Worker response loss may re-enter `Worker.Run`, but Worker/mailbox state returns
+the same durable order/proposal/PR; it cannot create a second model side effect.
+Controller completion is exact-byte idempotent, including the crash window
+after bead close but before the service saved `completion_recorded`.
+
+## Exact-head verdict: deliberate P0 hold
+
+The production `PullRequestVerdictVerifier` is intentionally `nil`. The one
+Worker PR remains open and the source workflow intent remains unconsumed until
+all of the following are true:
+
+1. The PR evidence producer runs under a distinct evidence UID and writes to a
+   protected evidence root that the untrusted target service cannot modify.
+   The current shared `hive-target` UID allows forged evidence before root
+   sealing and is not acceptable.
+2. The producer emits an authenticated/cryptographically bound root receipt,
+   and a hostile target-service overwrite test proves pre-seal and post-seal
+   forgery fails.
+3. The Hive verifier accepts only independently knowable repository, PR,
+   exact head/base, workflow, artifact-name, and pinned producer facts. It
+   discovers the exact run attempt and artifact IDs through authenticated
+   GitHub metadata.
+4. Internal workflow/plan/report/config/changed/contracts/scopes/runtime/
+   execution/baseline digests are derived inside the verifier as untrusted
+   artifact claims and cross-bound to the index, exact head Git blobs, and root
+   receipt. A caller must never fabricate or pre-parse these pins.
+5. The adapter uses the reviewed
+   `FetchAndVerifyVisualHivePullRequestBundle` primitive and applies evidence
+   with `verified.ApplyCheckEvidence(store, fingerprint)`. It must not call the
+   generic `MarkChecksWithEvidence`, add a second poller, merge, update a
+   baseline, or mark a finding resolved.
+
+Both red and green deterministic receipts are recorded as observations. A
+green receipt does not itself grant merge or lifecycle-resolution authority.
+
+## Fake/no-GitHub proof currently passing
+
+- lifetime ownership contention performs no fetch/import/Worker work;
+- a no-dispatch pause/WIP/green path runs no proposal or PR;
+- crash after one Worker PR side effect recovers through the same controller
+  dispatch without another fetch/import or side effect;
+- crash after verdict persistence performs no second fetch, import, proposal,
+  PR, or verdict;
+- ambiguous workflow-intent consumption produces one deletion side effect;
+- missing exact-head verifier leaves the one PR open and unconsumed;
+- identical controller completion replay succeeds and an altered receipt fails;
+- Scheduler composition produces and reserves one canonical `swo-*`;
+- fresh-launch pause denial occurs before model dispatch;
+- exact leased recovery performs no recomposition, second reservation,
+  readiness restart, guard rerun, or redispatch;
+- source composition uses a real temporary Git repository and returns bytes
+  from the sealed tree even after the checkout changes.
+
+Existing controller tests additionally cover live pause, automation downgrade,
+role disable/re-enable, nested role-capability drift, Governor mode/cadence
+drift, ACMM drift, installed path-policy drift, manual review, expiry, WIP,
+budget, runtime-config reload, immutable-envelope tamper, and terminal WIP
+retirement.
+
+Focused commands passing at this checkpoint:
+
+```text
+go test ./pkg/visualhive/normalservice -count=1
+go test ./pkg/visualhive/controller
+go test ./pkg/repair -run '^TestGovernedSourceComposerBindsSchedulerToWorkerSealedTree$' -count=1
+go test ./pkg/repair -run '^(TestSpecialistProviderProposalIsBrokeredAndCompletedReplayDoesNotRedispatch|TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompose)$' -count=1
+go test -run '^$' ./cmd/hive ./pkg/repair ./pkg/visualhive/controller ./pkg/visualhive/normalservice ./pkg/integrated
+```
+
+A broader source-context selection run exceeded its 180-second Windows timeout
+without producing a test failure. It is not claimed as a passing full repair
+suite.
+
+## Remaining path to a working demo
+
+1. Cherry-pick the independently reviewed Hive verifier commit only after both
+   P0 producer isolation and callable-verifier requirements pass.
+2. Add the narrow production verdict adapter and adversarial exact-head tests.
+3. Run all bounded local Hive gates and a fake end-to-end normal-service test.
+4. Use a disposable fork/private real-code repository with `repair-pr`, a
+   dedicated state root/dashboard port, reviewed healthy baseline, and no
+   merge. Record exact SHAs, run/artifact IDs, admission, `swo-*`, Worker PR,
+   verdict receipt, replay counts, and unrelated normal cadence.
+5. Only after that succeeds, repeat against a KubeStellar Console fork with a
+   dedicated namespaced Hive built from this Hive fork. Preserve Console's
+   Auto-QA, test generation, visual regression, trust workflows, existing
+   checks, and production Hive. Leave every demo PR unmerged.
+
+Release packaging, new roles, new dashboards, baseline automation, broad tool
+creation, direct Visual Hive writes, and Console `kc-agent`/MCP integration are
+not on this critical path.
+
+## Checkpoint ledger
+
+| Commit | Result |
+| --- | --- |
+| `15a4560b` | atomic runtime-config compatibility base |
+| `39527e5c` | native Visual Hive intake foundation |
+| `f34a9085` | governed contained Codex dispatcher hardening |
+| `65bd48f6` | normal-service fetch/intake/Scheduler/Manager/Worker vertical |
+| `c8058fbe` | service replay/lease/idle fake proof |
+| `a89e22d2` | exact completion replay and sealed-tree binding |
+| `0a5f95ab` | one reservation/fresh guard/leased recovery proof |
+| `102c4d94` | controller-owned resume without refetch/reimport |
+
+These commits are checkpoints in the isolated fork branch, not release or
+upstream claims.
