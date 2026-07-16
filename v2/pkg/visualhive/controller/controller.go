@@ -427,7 +427,8 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 		return errors.New("completed specialist PR identity or exact-head verdict receipt is invalid")
 	}
 	finding, exists := controller.lifecycle.Finding(envelope.Work.RepositoryFingerprint)
-	if !exists || finding.Status != visualhive.StatusPROpen || finding.PRNumber != completion.PullRequestNumber || finding.Branch != completion.Branch ||
+	lifecycleMatchesVerdict := exists && finding.Status == visualhive.StatusReady && readyFindingMatchesSpecialistCompletion(finding, envelope, completion)
+	if !lifecycleMatchesVerdict || finding.PRNumber != completion.PullRequestNumber || finding.Branch != completion.Branch ||
 		!strings.EqualFold(finding.RepairCommitSHA, completion.CommitSHA) || finding.PRURL != completion.PullRequestURL {
 		return errors.New("completed specialist PR does not match the existing repair lifecycle")
 	}
@@ -443,6 +444,24 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 		value.Metadata["visual_hive_stage_detail"] = "exact-head PR verdict recorded; no merge or resolution authority granted"
 		value.Metadata["visual_hive_pr_completion_json"] = string(encoded)
 	})
+}
+
+func readyFindingMatchesSpecialistCompletion(finding visualhive.FindingLifecycle, envelope DispatchEnvelope, completion SpecialistPullRequestCompletion) bool {
+	receipt := finding.LastPullRequestCheckReceipt
+	if receipt == nil {
+		return false
+	}
+	identity := receipt.Identity
+	return receipt.ReceiptSHA256 == completion.VerdictReceiptSHA256 &&
+		identity.Authority == (visualhive.PullRequestCheckAuthority{CheckEvidenceOnly: true}) &&
+		strings.EqualFold(identity.Source.Repository, finding.Repository) && identity.Source.RepositoryID == finding.RepositoryID &&
+		identity.Source.PullRequest == completion.PullRequestNumber && strings.EqualFold(identity.Source.Base.Repository, finding.Repository) &&
+		identity.Source.Base.RepositoryID == finding.RepositoryID && identity.Source.Base.Ref == strings.TrimPrefix(envelope.Work.Packet.SourceRef, "refs/heads/") &&
+		identity.Source.Base.SHA == envelope.BaseSHA && strings.EqualFold(identity.Source.Head.Repository, finding.Repository) && identity.Source.Head.RepositoryID == finding.RepositoryID &&
+		identity.Source.Head.Ref == completion.Branch && identity.Source.Head.SHA == completion.CommitSHA &&
+		identity.Workflow.Name == "Visual Hive PR" && identity.Workflow.Path == ".github/workflows/visual-hive-pr.yml" && identity.Workflow.Event == "pull_request" &&
+		identity.Producer.GitCommit == hivegithub.VisualHivePullRequestProducerCommit && identity.Check.State == "success" &&
+		identity.Check.Conclusion == completion.VerdictStatus
 }
 
 func normalizeSpecialistPullRequestCompletion(completion SpecialistPullRequestCompletion) SpecialistPullRequestCompletion {

@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,6 +22,7 @@ import (
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/governor"
 	"github.com/kubestellar/hive/v2/pkg/integrated"
+	"github.com/kubestellar/hive/v2/pkg/internal/visualhivepr"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
@@ -355,10 +358,22 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 	if err := lifecycle.MarkPROpen(repositoryFingerprint, commitSHA, 37, prURL); err != nil {
 		t.Fatal(err)
 	}
+	unsealedCompletion := SpecialistPullRequestCompletion{
+		WorkOrderID: workOrderID, RequestSHA256: requestDigest, Branch: branch, CommitSHA: commitSHA,
+		PullRequestNumber: 37, PullRequestURL: prURL, VerdictHeadSHA: commitSHA,
+		VerdictReceiptSHA256: strings.Repeat("1", 64), VerdictStatus: "success",
+	}
+	if err := controller.CompleteSpecialistPullRequest(visualRef, unsealedCompletion); err == nil {
+		t.Fatal("controller accepted caller-asserted verdict before opaque check evidence was applied")
+	}
+	checkReceipt, sealedReceipt := controllerPullRequestCheckReceipt(t, reserved, commitSHA, branch, 37)
+	if _, err := lifecycle.ApplySealedPullRequestCheckReceipt(repositoryFingerprint, sealedReceipt); err != nil {
+		t.Fatalf("apply exact check evidence before controller completion: %v", err)
+	}
 	completion := SpecialistPullRequestCompletion{
 		WorkOrderID: workOrderID, RequestSHA256: requestDigest, Branch: branch, CommitSHA: commitSHA,
 		PullRequestNumber: 37, PullRequestURL: prURL, VerdictHeadSHA: commitSHA,
-		VerdictReceiptSHA256: strings.Repeat("4", 64), VerdictStatus: "fail",
+		VerdictReceiptSHA256: checkReceipt.ReceiptSHA256, VerdictStatus: "success",
 	}
 	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
 		t.Fatalf("complete specialist PR: %v", err)
@@ -1032,6 +1047,71 @@ func testVisualBatchInput(sourceID, externalRef, role string, dependencies []str
 		Actor: role, ExternalRef: externalRef, DependsOn: dependencies,
 		Metadata: map[string]interface{}{"visual_hive_controller_owned": true, "visual_hive_admission_state": "pending"},
 	}
+}
+
+func controllerPullRequestCheckReceipt(t *testing.T, envelope DispatchEnvelope, headSHA, headBranch string, pullRequest int) (visualhive.PullRequestCheckReceiptSnapshot, visualhivepr.SealedReceipt) {
+	t.Helper()
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	file := func(path, value string) visualhive.PullRequestFileIdentity {
+		return visualhive.PullRequestFileIdentity{Path: path, SHA256: digest(value), Bytes: 100}
+	}
+	baseBranch := strings.TrimPrefix(envelope.Work.Packet.SourceRef, "refs/heads/")
+	producerCommit := hivegithub.VisualHivePullRequestProducerCommit
+	identity := visualhive.PullRequestCheckReceiptIdentity{
+		SchemaVersion: visualhive.PullRequestCheckReceiptSchema,
+		Source: visualhive.PullRequestSourceBinding{
+			SchemaVersion: visualhive.PullRequestSourceBindingSchema,
+			Repository:    "owner/repo", RepositoryID: "123", PullRequest: pullRequest,
+			Base: visualhive.PullRequestRevisionIdentity{Repository: "owner/repo", RepositoryID: "123", Ref: baseBranch, SHA: envelope.BaseSHA},
+			Head: visualhive.PullRequestRevisionIdentity{Repository: "owner/repo", RepositoryID: "123", Ref: headBranch, SHA: headSHA},
+			Workflow: visualhive.PullRequestWorkflowIdentity{
+				Name: "Visual Hive PR", Path: ".github/workflows/visual-hive-pr.yml", Event: "pull_request", RunID: "77", RunAttempt: "2",
+				Definition: file(visualhive.PullRequestWorkflowPath, "c"), ProducerCommit: producerCommit,
+				SourceName: "visual-hive-pr-source-77-2", BundleName: "visual-hive-pr-bundle-77-2",
+			},
+			Plan: file(visualhive.PullRequestPlanPath, "1"), Report: file(visualhive.PullRequestReportPath, "2"), Config: file(visualhive.PullRequestConfigPath, "3"),
+			ChangedFiles: file(visualhive.PullRequestChangedFilesPath, "4"), PlanContracts: file(visualhive.PullRequestPlanContractsPath, "b"),
+			EvaluationScopes: file(visualhive.PullRequestEvaluationScopesPath, "c"), RunnerAttestation: file(visualhive.PullRequestRunnerAttestationPath, "d"),
+			Runtime: visualhive.PullRequestRuntimeIdentity{
+				Receipt: file(visualhive.PullRequestRuntimePath, "5"), GeneratedSpec: file(".visual-hive/generated/visual-hive.generated.spec.cjs", "0"),
+				GeneratedConfig: file(".visual-hive/generated/visual-hive.generated.config.cjs", "e"), StableSHA256: digest("6"), ExecutionBindingSHA256: digest("7"),
+			},
+			Baselines: visualhive.PullRequestBaselineIdentity{SHA256: digest("8"), Files: []visualhive.PullRequestFileIdentity{
+				file(".visual-hive/proof/pr/baselines/desktop.png", "9"),
+				file(".visual-hive/proof/pr/baselines/mobile.png", "a"),
+			}},
+		},
+		Workflow: visualhive.PullRequestCheckWorkflowIdentity{
+			ID: "12", Name: "Visual Hive PR", Path: ".github/workflows/visual-hive-pr.yml", Event: "pull_request", RunID: "77", RunAttempt: "2",
+			CheckSuiteID: "501", JobID: "701", CheckRunID: "801", AppID: "15368", Definition: file(visualhive.PullRequestWorkflowPath, "c"),
+		},
+		SourceArtifact: visualhive.PullRequestCheckArtifactIdentity{ID: "98", Name: "visual-hive-pr-source-77-2"},
+		BundleArtifact: visualhive.PullRequestCheckArtifactIdentity{ID: "99", Name: "visual-hive-pr-bundle-77-2"},
+		Producer:       visualhive.Producer{Name: "visual-hive", Version: "test", GitCommit: producerCommit},
+		Bundle: visualhive.PullRequestCheckBundleIdentity{
+			SchemaVersion: visualhive.ManifestSchemaV3, BundleID: "pr-bundle-77", OverallSHA256: digest("b"), ManifestSHA256: digest("c"),
+			ArtifactIndex: visualhive.ArtifactIndexBinding{
+				Path: "files/.visual-hive/artifacts-index.json", SourcePath: ".visual-hive/artifacts-index.json", SHA256: digest("d"),
+				SchemaVersion: 1, ContentAddressed: true, Complete: true, ArtifactCount: 11, TotalBytes: 1100,
+			},
+		},
+		Check: visualhive.PullRequestCheckResultIdentity{
+			State: "success", Conclusion: "success", Summary: "Visual Hive exact PR rerun passed", RunURL: "https://github.test/owner/repo/actions/runs/77",
+		},
+		Authority: visualhive.PullRequestCheckAuthority{CheckEvidenceOnly: true},
+	}
+	identity.ReplayKey = visualhive.PullRequestCheckReplayKey(identity)
+	data, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	snapshot := visualhive.PullRequestCheckReceiptSnapshot{Identity: identity, ReceiptSHA256: hex.EncodeToString(sum[:])}
+	sealed, err := visualhivepr.SealVerifiedReceipt(data, snapshot.ReceiptSHA256, identity.ReplayKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot, sealed
 }
 
 func cloneDispatchEnvelope(t *testing.T, envelope DispatchEnvelope) DispatchEnvelope {

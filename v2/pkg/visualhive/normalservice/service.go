@@ -21,7 +21,7 @@ import (
 	visualcontroller "github.com/kubestellar/hive/v2/pkg/visualhive/controller"
 )
 
-const ledgerSchema = "hive.normal-visual-work.v3"
+const ledgerSchema = "hive.normal-visual-work.v4"
 
 var (
 	ErrFinalVerdictPending = errors.New("exact-head pull-request verdict is pending")
@@ -51,12 +51,14 @@ type Repairer interface {
 }
 
 type PullRequestVerdictRequest struct {
-	IdempotencyKey    string
-	Repository        string
-	PullRequestNumber int
-	HeadBranch        string
-	HeadSHA           string
-	BaseBranch        string
+	IdempotencyKey        string
+	Repository            string
+	RepositoryFingerprint string
+	PullRequestNumber     int
+	HeadBranch            string
+	HeadSHA               string
+	BaseBranch            string
+	BaseSHA               string
 }
 
 // PullRequestVerdictReceipt is observation-only. Status and Receipt are
@@ -248,6 +250,8 @@ func (service *Service) RunCycle(ctx context.Context) error {
 			return ErrNoDispatch
 		}
 		ledger.SourceExternalRef = envelope.SourceExternalRef
+		ledger.RepositoryFingerprint = envelope.Work.RepositoryFingerprint
+		ledger.BaseSHA = strings.ToLower(strings.TrimSpace(envelope.BaseSHA))
 		ledger.DeferredSourceExternalRefs = deferred
 		ledger.DeferralsRecorded = len(deferred) == 0
 		if err := service.saveLedger(ledger); err != nil {
@@ -286,7 +290,8 @@ func (service *Service) RunCycle(ctx context.Context) error {
 	}
 	receipt, err := service.options.Verdict.VerifyPullRequest(ctx, PullRequestVerdictRequest{
 		IdempotencyKey: ledger.WorkflowKey + ":" + ledger.WorkOrderID, Repository: ledger.Repository,
-		PullRequestNumber: ledger.PullRequestNumber, HeadBranch: ledger.Branch, HeadSHA: ledger.CommitSHA, BaseBranch: ledger.BaseBranch,
+		RepositoryFingerprint: ledger.RepositoryFingerprint, PullRequestNumber: ledger.PullRequestNumber,
+		HeadBranch: ledger.Branch, HeadSHA: ledger.CommitSHA, BaseBranch: ledger.BaseBranch, BaseSHA: ledger.BaseSHA,
 	})
 	if err != nil {
 		return err
@@ -401,6 +406,8 @@ type workLedger struct {
 	BaseBranch                 string                         `json:"base_branch"`
 	PacketDigest               string                         `json:"packet_digest"`
 	SourceExternalRef          string                         `json:"source_external_ref,omitempty"`
+	RepositoryFingerprint      string                         `json:"repository_fingerprint,omitempty"`
+	BaseSHA                    string                         `json:"base_sha,omitempty"`
 	DeferredSourceExternalRefs []string                       `json:"deferred_source_external_refs,omitempty"`
 	DeferralsRecorded          bool                           `json:"deferrals_recorded,omitempty"`
 	WorkOrderID                string                         `json:"work_order_id,omitempty"`
@@ -501,6 +508,12 @@ func validateWorkLedger(ledger workLedger) error {
 	}
 	if ledger.SourceExternalRef == "" && (len(ledger.DeferredSourceExternalRefs) != 0 || ledger.DeferralsRecorded) {
 		return errors.New("unselected dispatch state exists without a selected source ref")
+	}
+	if ledger.SourceExternalRef == "" && (ledger.RepositoryFingerprint != "" || ledger.BaseSHA != "") {
+		return errors.New("selected repair identity exists without a selected source ref")
+	}
+	if ledger.SourceExternalRef != "" && (!validSHA256Value(ledger.RepositoryFingerprint) || ledger.BaseSHA != strings.ToLower(strings.TrimSpace(ledger.BaseSHA)) || !validGitObject(ledger.BaseSHA)) {
+		return errors.New("selected repair fingerprint or exact base SHA is invalid")
 	}
 	if ledger.SourceExternalRef != "" && !ledger.DeferralsRecorded && len(ledger.DeferredSourceExternalRefs) == 0 {
 		return errors.New("selected dispatch has an incomplete empty deferral checkpoint")

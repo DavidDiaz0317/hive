@@ -273,15 +273,16 @@ func configureNormalVisualWorkRunner(
 		scheduler: sched, manager: manager, controller: controller, lifecycle: lifecycle, github: github,
 		providerCommand: installed.ProviderCommand, providerArgs: append([]string(nil), installed.ProviderArgs...), loadConfig: loader,
 	}
+	verdict := &normalVisualPullRequestVerifier{github: github, lifecycle: lifecycle, loadConfig: loader}
 	poll := time.Duration(installed.RunIntervalSeconds) * time.Second
 	service, err := normalservice.New(normalservice.Options{
 		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, LeaseRetry: 30 * time.Second,
 		AcquireLease: func() (func(), error) { return integrated.AcquireNormalVisualWorkLease(installed.StateDir) },
 		Source:       source, Intake: controller, Repairer: repairer,
-		// The exact-head verifier is injected after its independently reviewed
-		// primitive is composed. A nil verifier leaves the one Worker PR safely
-		// pending and never consumes, merges, or resolves it.
-		Verdict: nil, Logger: logger,
+		// The verifier applies only its opaque check-evidence capability. The
+		// service/controller still own completion and workflow consumption; no
+		// merge, baseline, issue-resolution, or repository-write authority exists.
+		Verdict: verdict, Logger: logger,
 	})
 	return service, err
 }

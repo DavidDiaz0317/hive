@@ -89,9 +89,9 @@ func TestNormalServiceMultiFindingReplayDefersEveryUnselectedFindingBeforeOneWor
 		"visual-hive://owner/repo/m-middle",
 	}
 	fixture.intake.dispatch = []visualcontroller.DispatchEnvelope{
-		{SourceExternalRef: refs[0], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("1", 64)}},
-		{SourceExternalRef: refs[1], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("2", 64)}},
-		{SourceExternalRef: refs[2], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("3", 64)}},
+		{SourceExternalRef: refs[0], BaseSHA: strings.Repeat("9", 40), Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("1", 64)}},
+		{SourceExternalRef: refs[1], BaseSHA: strings.Repeat("9", 40), Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("2", 64)}},
+		{SourceExternalRef: refs[2], BaseSHA: strings.Repeat("9", 40), Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("3", 64)}},
 	}
 	fixture.repairer.outcome.Result.RepositoryFingerprint = strings.Repeat("2", 64)
 	fixture.intake.failDeferralAfterSideEffect = true
@@ -293,6 +293,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	}
 	envelope := visualcontroller.DispatchEnvelope{
 		SourceExternalRef: "visual-hive://owner/repo/finding",
+		BaseSHA:           strings.Repeat("9", 40),
 		Work:              visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("d", 64)},
 	}
 	outcome := RepairOutcome{
@@ -456,7 +457,8 @@ type fakeVerdictVerifier struct {
 
 func (verifier *fakeVerdictVerifier) VerifyPullRequest(_ context.Context, request PullRequestVerdictRequest) (PullRequestVerdictReceipt, error) {
 	verifier.calls++
-	if request.PullRequestNumber <= 0 || request.HeadSHA != verifier.receipt.HeadSHA || request.IdempotencyKey == "" {
+	if request.PullRequestNumber <= 0 || request.HeadSHA != verifier.receipt.HeadSHA || request.IdempotencyKey == "" ||
+		request.RepositoryFingerprint == "" || request.BaseSHA != strings.Repeat("9", 40) {
 		return PullRequestVerdictReceipt{}, errors.New("verifier received an inexact PR request")
 	}
 	return verifier.receipt, nil
