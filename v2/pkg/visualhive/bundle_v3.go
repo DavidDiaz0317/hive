@@ -1004,7 +1004,7 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 	if err != nil {
 		return err
 	}
-	if bundle.provenanceVerified {
+	if bundle.provenanceVerified && bundle.validationProfile != bundleValidationPullRequestLocal {
 		bundle.Validation.Trusted = true
 		bundle.Validation.Authoritative = manifest.Scan.AuthoritativeForResolution
 	}
@@ -1126,6 +1126,67 @@ func (bundle *ValidatedBundle) VerifiedEvidenceRoot() (string, error) {
 		return "", fmt.Errorf("verified Visual Hive evidence root is not an ordinary directory")
 	}
 	return evidenceRoot, nil
+}
+
+// VerifiedSourceFileIdentity re-hashes one fixed file from a completely
+// verified source artifact. It never grants lifecycle authority; callers use
+// it to cross-bind source-only receipts that are intentionally absent from the
+// compact bundle.
+func (bundle *ValidatedBundle) VerifiedSourceFileIdentity(relative string) (string, int64, string, error) {
+	if bundle == nil || !bundle.sourceVerified || bundle.verifiedSourceRoot == "" || bundle.artifactIndex == nil {
+		return "", 0, "", fmt.Errorf("Visual Hive source artifact has not been completely verified")
+	}
+	var indexed *ArtifactIndexEntry
+	for index := range bundle.artifactIndex.Artifacts {
+		entry := &bundle.artifactIndex.Artifacts[index]
+		if entry.Path == relative {
+			indexed = entry
+			break
+		}
+	}
+	if indexed == nil {
+		return "", 0, "", fmt.Errorf("source artifact file %q is not present in the immutable index", relative)
+	}
+	target, err := safeSourceTarget(bundle.verifiedSourceRoot, relative)
+	if err != nil {
+		return "", 0, "", err
+	}
+	if err := verifyIndexedFile(target, indexed.Bytes, indexed.SHA256); err != nil {
+		return "", 0, "", fmt.Errorf("source artifact file %q changed after verification: %w", relative, err)
+	}
+	return target, indexed.Bytes, indexed.SHA256, nil
+}
+
+func (bundle *ValidatedBundle) readVerifiedSourceFile(relative string) ([]byte, int64, string, error) {
+	target, size, sha, err := bundle.VerifiedSourceFileIdentity(relative)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if int64(len(data)) != size || digest(data) != sha {
+		return nil, 0, "", fmt.Errorf("source artifact file %q changed while being read", relative)
+	}
+	return data, size, sha, nil
+}
+
+// VerifiedManifestSHA256 rechecks the exact manifest bytes that produced this
+// validation result. A caller cannot substitute a same-sized manifest between
+// parsing and receipt sealing.
+func (bundle *ValidatedBundle) VerifiedManifestSHA256() (string, error) {
+	if bundle == nil || bundle.validationProfile != bundleValidationPullRequestLocal || bundle.manifestPath == "" || !hexDigest.MatchString(bundle.manifestSHA256) {
+		return "", fmt.Errorf("validated PR bundle manifest identity is unavailable")
+	}
+	data, err := os.ReadFile(bundle.manifestPath)
+	if err != nil {
+		return "", fmt.Errorf("read validated PR bundle manifest: %w", err)
+	}
+	if len(data) == 0 || len(data) > maxManifestSize || digest(data) != bundle.manifestSHA256 {
+		return "", fmt.Errorf("validated PR bundle manifest changed before receipt sealing")
+	}
+	return bundle.manifestSHA256, nil
 }
 
 func safeSourceTarget(root, relative string) (string, error) {

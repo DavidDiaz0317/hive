@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/beads"
+	"github.com/kubestellar/hive/v2/pkg/internal/visualhivepr"
 )
 
 const (
@@ -48,62 +50,74 @@ const (
 )
 
 type FindingLifecycle struct {
-	Repository                     string          `json:"repository"`
-	RepositoryID                   string          `json:"repository_id,omitempty"`
-	Fingerprint                    string          `json:"fingerprint"`
-	RepositoryFingerprint          string          `json:"repository_fingerprint"`
-	PublicationRole                string          `json:"publication_role,omitempty"`
-	RootCauseKey                   string          `json:"root_cause_key,omitempty"`
-	BlockedByRootKeys              []string        `json:"blocked_by_root_keys,omitempty"`
-	PublicationFingerprint         string          `json:"publication_fingerprint,omitempty"`
-	PendingMarkerMigrationFrom     string          `json:"pending_marker_migration_from,omitempty"`
-	Status                         LifecycleStatus `json:"status"`
-	IssueKind                      string          `json:"issue_kind"`
-	Severity                       string          `json:"severity"`
-	OwningAgentHint                string          `json:"owning_agent_hint"`
-	Title                          string          `json:"title"`
-	Body                           string          `json:"body"`
-	Labels                         []string        `json:"labels"`
-	AffectedContracts              []string        `json:"affected_contracts"`
-	ValidationCommand              string          `json:"validation_command"`
-	HumanReviewRequired            bool            `json:"human_review_required"`
-	ObservationHumanReviewRequired bool            `json:"observation_human_review_required"`
-	ManualReviewKind               string          `json:"manual_review_kind,omitempty"`
-	ManualReviewReason             string          `json:"manual_review_reason,omitempty"`
-	BeadID                         string          `json:"bead_id,omitempty"`
-	IssueNumber                    int             `json:"issue_number,omitempty"`
-	IssueURL                       string          `json:"issue_url,omitempty"`
-	IssueWriterID                  int64           `json:"issue_writer_id,omitempty"`
-	IssueWriterLogin               string          `json:"issue_writer_login,omitempty"`
-	Branch                         string          `json:"branch,omitempty"`
-	RepairCommitSHA                string          `json:"repair_commit_sha,omitempty"`
-	PRNumber                       int             `json:"pr_number,omitempty"`
-	PRURL                          string          `json:"pr_url,omitempty"`
-	MergeSHA                       string          `json:"merge_sha,omitempty"`
-	ValidationRunID                string          `json:"validation_run_id,omitempty"`
-	ValidationRunURL               string          `json:"validation_run_url,omitempty"`
-	LastCheckSummary               string          `json:"last_check_summary,omitempty"`
-	LastCheckRuns                  []CheckEvidence `json:"last_check_runs,omitempty"`
-	FirstSeenAt                    time.Time       `json:"first_seen_at"`
-	LastSeenAt                     time.Time       `json:"last_seen_at"`
-	ResolvedAt                     *time.Time      `json:"resolved_at,omitempty"`
-	ClosedAt                       *time.Time      `json:"closed_at,omitempty"`
-	LastBundleID                   string          `json:"last_bundle_id"`
-	LastBundleDigest               string          `json:"last_bundle_digest"`
-	LastWorkflowRunID              string          `json:"last_workflow_run_id,omitempty"`
-	RepairAttempts                 int             `json:"repair_attempts"`
-	Recurrences                    int             `json:"recurrences"`
-	PendingIssueAction             OutboxAction    `json:"pending_issue_action,omitempty"`
+	Repository                     string                           `json:"repository"`
+	RepositoryID                   string                           `json:"repository_id,omitempty"`
+	Fingerprint                    string                           `json:"fingerprint"`
+	RepositoryFingerprint          string                           `json:"repository_fingerprint"`
+	PublicationRole                string                           `json:"publication_role,omitempty"`
+	RootCauseKey                   string                           `json:"root_cause_key,omitempty"`
+	BlockedByRootKeys              []string                         `json:"blocked_by_root_keys,omitempty"`
+	PublicationFingerprint         string                           `json:"publication_fingerprint,omitempty"`
+	PendingMarkerMigrationFrom     string                           `json:"pending_marker_migration_from,omitempty"`
+	Status                         LifecycleStatus                  `json:"status"`
+	IssueKind                      string                           `json:"issue_kind"`
+	Severity                       string                           `json:"severity"`
+	OwningAgentHint                string                           `json:"owning_agent_hint"`
+	Title                          string                           `json:"title"`
+	Body                           string                           `json:"body"`
+	Labels                         []string                         `json:"labels"`
+	AffectedContracts              []string                         `json:"affected_contracts"`
+	ValidationCommand              string                           `json:"validation_command"`
+	HumanReviewRequired            bool                             `json:"human_review_required"`
+	ObservationHumanReviewRequired bool                             `json:"observation_human_review_required"`
+	ManualReviewKind               string                           `json:"manual_review_kind,omitempty"`
+	ManualReviewReason             string                           `json:"manual_review_reason,omitempty"`
+	BeadID                         string                           `json:"bead_id,omitempty"`
+	IssueNumber                    int                              `json:"issue_number,omitempty"`
+	IssueURL                       string                           `json:"issue_url,omitempty"`
+	IssueWriterID                  int64                            `json:"issue_writer_id,omitempty"`
+	IssueWriterLogin               string                           `json:"issue_writer_login,omitempty"`
+	Branch                         string                           `json:"branch,omitempty"`
+	RepairCommitSHA                string                           `json:"repair_commit_sha,omitempty"`
+	PRNumber                       int                              `json:"pr_number,omitempty"`
+	PRURL                          string                           `json:"pr_url,omitempty"`
+	MergeSHA                       string                           `json:"merge_sha,omitempty"`
+	ValidationRunID                string                           `json:"validation_run_id,omitempty"`
+	ValidationRunURL               string                           `json:"validation_run_url,omitempty"`
+	LastCheckSummary               string                           `json:"last_check_summary,omitempty"`
+	LastCheckRuns                  []CheckEvidence                  `json:"last_check_runs,omitempty"`
+	LastPullRequestCheckReceipt    *PullRequestCheckReceiptSnapshot `json:"last_pull_request_check_receipt,omitempty"`
+	FirstSeenAt                    time.Time                        `json:"first_seen_at"`
+	LastSeenAt                     time.Time                        `json:"last_seen_at"`
+	ResolvedAt                     *time.Time                       `json:"resolved_at,omitempty"`
+	ClosedAt                       *time.Time                       `json:"closed_at,omitempty"`
+	LastBundleID                   string                           `json:"last_bundle_id"`
+	LastBundleDigest               string                           `json:"last_bundle_digest"`
+	LastWorkflowRunID              string                           `json:"last_workflow_run_id,omitempty"`
+	RepairAttempts                 int                              `json:"repair_attempts"`
+	Recurrences                    int                              `json:"recurrences"`
+	PendingIssueAction             OutboxAction                     `json:"pending_issue_action,omitempty"`
 }
 
 type CheckEvidence struct {
-	Name               string `json:"name"`
-	State              string `json:"state"`
-	URL                string `json:"url,omitempty"`
-	ProvenanceVerified bool   `json:"provenance_verified,omitempty"`
-	WorkflowRunID      int64  `json:"workflow_run_id,omitempty"`
-	WorkflowPath       string `json:"workflow_path,omitempty"`
-	WorkflowEvent      string `json:"workflow_event,omitempty"`
+	Name                     string `json:"name"`
+	State                    string `json:"state"`
+	URL                      string `json:"url,omitempty"`
+	ProvenanceVerified       bool   `json:"provenance_verified,omitempty"`
+	WorkflowID               int64  `json:"workflow_id,omitempty"`
+	WorkflowRunID            int64  `json:"workflow_run_id,omitempty"`
+	WorkflowRunAttempt       int    `json:"workflow_run_attempt,omitempty"`
+	WorkflowPath             string `json:"workflow_path,omitempty"`
+	WorkflowEvent            string `json:"workflow_event,omitempty"`
+	WorkflowDefinitionSHA256 string `json:"workflow_definition_sha256,omitempty"`
+	PullRequestNumber        int    `json:"pull_request_number,omitempty"`
+	CommitSHA                string `json:"commit_sha,omitempty"`
+	SourceArtifactID         int64  `json:"source_artifact_id,omitempty"`
+	SourceArtifactName       string `json:"source_artifact_name,omitempty"`
+	BundleArtifactID         int64  `json:"bundle_artifact_id,omitempty"`
+	BundleArtifactName       string `json:"bundle_artifact_name,omitempty"`
+	ReceiptReplayKey         string `json:"receipt_replay_key,omitempty"`
+	ReceiptSHA256            string `json:"receipt_sha256,omitempty"`
 }
 
 type OutboxEntry struct {
@@ -193,6 +207,12 @@ type ApplyLifecycleResult struct {
 	FindingIDs    []string `json:"finding_ids"`
 }
 
+type ApplyPullRequestCheckUpdateResult struct {
+	ReceiptSHA256 string `json:"receipt_sha256"`
+	ReplayKey     string `json:"replay_key"`
+	Idempotent    bool   `json:"idempotent"`
+}
+
 type LifecycleStore struct {
 	mu            sync.Mutex
 	dir           string
@@ -251,6 +271,9 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore Lifecycl
 func (s *LifecycleStore) applyBundle(bundle *ValidatedBundle, beadStore LifecycleBeadSink, options ApplyLifecycleOptions, controllerOwned bool) (ApplyLifecycleResult, error) {
 	if bundle == nil {
 		return ApplyLifecycleResult{}, fmt.Errorf("validated Visual Hive bundle is required")
+	}
+	if bundle.validationProfile == bundleValidationPullRequestLocal {
+		return ApplyLifecycleResult{}, fmt.Errorf("pull_request bundles are check evidence only and cannot enter the authoritative lifecycle bundle path")
 	}
 	if !bundle.Validation.Trusted {
 		return ApplyLifecycleResult{}, fmt.Errorf("trusted Visual Hive bundle validation is required before lifecycle application")
@@ -1596,6 +1619,7 @@ func (s *LifecycleStore) MarkPROpen(repositoryFingerprint, commitSHA string, num
 			return fmt.Errorf("repair commit, PR number, and PR URL are required")
 		}
 		finding.RepairCommitSHA, finding.PRNumber, finding.PRURL, finding.Status = commitSHA, number, prURL, StatusPROpen
+		finding.LastCheckSummary, finding.LastCheckRuns, finding.LastPullRequestCheckReceipt = "", nil, nil
 		return nil
 	})
 }
@@ -1636,12 +1660,139 @@ func (s *LifecycleStore) MarkPRHeadUpdated(repositoryFingerprint, commitSHA stri
 		finding.RepairCommitSHA, finding.Status = strings.TrimSpace(commitSHA), StatusPROpen
 		finding.LastCheckSummary = ""
 		finding.LastCheckRuns = nil
+		finding.LastPullRequestCheckReceipt = nil
 		return nil
 	})
 }
 
 func (s *LifecycleStore) MarkChecks(repositoryFingerprint, testedSHA string, allGreen bool) error {
 	return s.MarkChecksWithEvidence(repositoryFingerprint, testedSHA, allGreen, "", nil)
+}
+
+// ApplySealedPullRequestCheckReceipt is the replay-aware check update seam.
+// Its parameter is an internal opaque capability minted only after live GitHub
+// verification; a persisted or caller-built snapshot cannot be supplied here.
+func (s *LifecycleStore) ApplySealedPullRequestCheckReceipt(repositoryFingerprint string, sealed visualhivepr.SealedReceipt) (ApplyPullRequestCheckUpdateResult, error) {
+	identityBytes, receiptSHA256, sealedReplayKey, err := sealed.Open()
+	if err != nil {
+		return ApplyPullRequestCheckUpdateResult{}, err
+	}
+	var identity PullRequestCheckReceiptIdentity
+	if err := json.Unmarshal(identityBytes, &identity); err != nil {
+		return ApplyPullRequestCheckUpdateResult{}, fmt.Errorf("decode sealed PR check receipt identity: %w", err)
+	}
+	snapshot := PullRequestCheckReceiptSnapshot{Identity: identity, ReceiptSHA256: receiptSHA256}
+	if err := validatePullRequestCheckIdentity(snapshot.Identity); err != nil {
+		return ApplyPullRequestCheckUpdateResult{}, err
+	}
+	if snapshot.Identity.ReplayKey != sealedReplayKey {
+		return ApplyPullRequestCheckUpdateResult{}, fmt.Errorf("sealed PR check receipt replay identity does not match its content")
+	}
+	stableIdentity, err := clonePullRequestCheckIdentity(snapshot.Identity)
+	if err != nil {
+		return ApplyPullRequestCheckUpdateResult{}, err
+	}
+	snapshot.Identity = stableIdentity
+	repositoryFingerprint = strings.TrimSpace(repositoryFingerprint)
+	if repositoryFingerprint == "" {
+		return ApplyPullRequestCheckUpdateResult{}, fmt.Errorf("repository fingerprint is required for PR check receipt application")
+	}
+	identity = snapshot.Identity
+	result := ApplyPullRequestCheckUpdateResult{ReceiptSHA256: snapshot.ReceiptSHA256, ReplayKey: identity.ReplayKey}
+	replayStateKey := pullRequestCheckReplayNamespace + repositoryFingerprint + ":" + identity.ReplayKey
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Replay intentionally precedes finding/status checks. The lifecycle may
+	// already be Ready on an exact retry, while a conflicting re-seal for the
+	// same run/artifact tuple must fail regardless of its current status.
+	if prior, exists := s.state.ReplayKeys[replayStateKey]; exists {
+		if prior != snapshot.ReceiptSHA256 {
+			if auditErr := s.auditLockedStrict(LifecycleAuditEntry{
+				Action: "pull_request_check_receipt_replay", Allowed: false, Repository: identity.Source.Repository,
+				RepositoryFingerprint: repositoryFingerprint, BundleID: identity.Bundle.BundleID,
+				Detail: "PR check receipt replay key reused with a different sealed receipt",
+			}); auditErr != nil {
+				return result, auditErr
+			}
+			return result, fmt.Errorf("PR check receipt replay key was reused with a different sealed receipt")
+		}
+		result.Idempotent = true
+		if auditErr := s.auditLockedStrict(LifecycleAuditEntry{
+			Action: "pull_request_check_receipt_replay", Allowed: true, Repository: identity.Source.Repository,
+			RepositoryFingerprint: repositoryFingerprint, BundleID: identity.Bundle.BundleID, Detail: "idempotent sealed receipt retry",
+		}); auditErr != nil {
+			return result, auditErr
+		}
+		return result, nil
+	}
+
+	finding := s.state.Findings[repositoryFingerprint]
+	if finding == nil {
+		return result, fmt.Errorf("finding %s not found", repositoryFingerprint)
+	}
+	headBranch := identity.Source.Head.Ref
+	if !strings.EqualFold(finding.Repository, identity.Source.Repository) || finding.RepositoryID != identity.Source.RepositoryID ||
+		finding.PRNumber != identity.Source.PullRequest || finding.RepairCommitSHA != identity.Source.Head.SHA || finding.Branch != headBranch {
+		detail := "receipt repository, pull request, branch, or repair SHA does not match the exact finding"
+		if auditErr := s.auditLockedStrict(LifecycleAuditEntry{
+			Action: "pull_request_check_receipt_applied", Allowed: false, Repository: finding.Repository,
+			RepositoryFingerprint: repositoryFingerprint, BundleID: identity.Bundle.BundleID, Detail: detail,
+		}); auditErr != nil {
+			return result, auditErr
+		}
+		return result, fmt.Errorf("%s", detail)
+	}
+	if finding.Status != StatusPROpen && finding.Status != StatusChecksRunning && finding.Status != StatusNeedsRevision {
+		detail := fmt.Sprintf("cannot apply PR check receipt from %s", finding.Status)
+		if auditErr := s.auditLockedStrict(LifecycleAuditEntry{
+			Action: "pull_request_check_receipt_applied", Allowed: false, Repository: finding.Repository,
+			RepositoryFingerprint: repositoryFingerprint, BundleID: identity.Bundle.BundleID, Detail: detail,
+		}); auditErr != nil {
+			return result, auditErr
+		}
+		return result, fmt.Errorf("%s", detail)
+	}
+	if identity.Authority != (PullRequestCheckAuthority{CheckEvidenceOnly: true}) {
+		return result, fmt.Errorf("PR receipt authority is not restricted to check evidence")
+	}
+
+	workflowID, _ := strconv.ParseInt(identity.Workflow.ID, 10, 64)
+	workflowRunID, _ := strconv.ParseInt(identity.Workflow.RunID, 10, 64)
+	workflowRunAttempt, _ := strconv.Atoi(identity.Workflow.RunAttempt)
+	sourceArtifactID, _ := strconv.ParseInt(identity.SourceArtifact.ID, 10, 64)
+	bundleArtifactID, _ := strconv.ParseInt(identity.BundleArtifact.ID, 10, 64)
+	backup := cloneLifecycleState(s.state)
+	finding.Status = StatusReady
+	finding.LastCheckSummary = identity.Check.Summary
+	finding.LastCheckRuns = []CheckEvidence{{
+		Name: identity.Workflow.Name, State: identity.Check.State, URL: identity.Check.RunURL, ProvenanceVerified: true,
+		WorkflowID: workflowID, WorkflowRunID: workflowRunID, WorkflowRunAttempt: workflowRunAttempt,
+		WorkflowPath: identity.Workflow.Path, WorkflowEvent: identity.Workflow.Event, WorkflowDefinitionSHA256: identity.Workflow.Definition.SHA256,
+		PullRequestNumber: identity.Source.PullRequest, CommitSHA: identity.Source.Head.SHA,
+		SourceArtifactID: sourceArtifactID, SourceArtifactName: identity.SourceArtifact.Name,
+		BundleArtifactID: bundleArtifactID, BundleArtifactName: identity.BundleArtifact.Name,
+		ReceiptReplayKey: identity.ReplayKey, ReceiptSHA256: snapshot.ReceiptSHA256,
+	}}
+	storedSnapshot := snapshot
+	finding.LastPullRequestCheckReceipt = &storedSnapshot
+	s.state.ReplayKeys[replayStateKey] = snapshot.ReceiptSHA256
+	s.state.UpdatedAt = time.Now().UTC()
+	s.sortStateLocked()
+	if auditErr := s.auditLockedStrict(LifecycleAuditEntry{
+		Action: "pull_request_check_receipt_applied", Allowed: true, Repository: finding.Repository,
+		RepositoryFingerprint: repositoryFingerprint, BundleID: identity.Bundle.BundleID,
+		Detail: fmt.Sprintf("status=%s pr=%d repair=%s run=%s attempt=%s receipt=%s", finding.Status, finding.PRNumber, finding.RepairCommitSHA, identity.Workflow.RunID, identity.Workflow.RunAttempt, snapshot.ReceiptSHA256),
+	}); auditErr != nil {
+		s.state = backup
+		return result, auditErr
+	}
+	if err := s.persistLocked(); err != nil {
+		s.state = backup
+		return result, err
+	}
+	return result, nil
 }
 
 func (s *LifecycleStore) MarkChecksWithEvidence(repositoryFingerprint, testedSHA string, allGreen bool, summary string, runs []CheckEvidence) error {
@@ -2116,6 +2267,7 @@ func resetRepairCycle(finding *FindingLifecycle) {
 	finding.ValidationRunURL = ""
 	finding.LastCheckSummary = ""
 	finding.LastCheckRuns = nil
+	finding.LastPullRequestCheckReceipt = nil
 	finding.ManualReviewKind = ""
 	finding.ManualReviewReason = ""
 	finding.HumanReviewRequired = false

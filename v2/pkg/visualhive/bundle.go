@@ -171,7 +171,15 @@ type ValidationOptions struct {
 	ExpectedRepositoryID       string
 	ExpectedWorkflowRunID      string
 	ExpectedWorkflowRunAttempt string
+	profile                    bundleValidationProfile
 }
+
+type bundleValidationProfile uint8
+
+const (
+	bundleValidationDefault bundleValidationProfile = iota
+	bundleValidationPullRequestLocal
+)
 
 type Validation struct {
 	SchemaVersion string `json:"schemaVersion"`
@@ -207,11 +215,14 @@ type ValidatedBundle struct {
 	Manifest           Manifest
 	Validation         Validation
 	Beads              []Projection
+	manifestPath       string
+	manifestSHA256     string
 	artifactIndex      *ArtifactIndexReport
 	validatedManifest  *Manifest
 	provenanceVerified bool
 	sourceVerified     bool
 	verifiedSourceRoot string
+	validationProfile  bundleValidationProfile
 }
 
 var (
@@ -237,6 +248,7 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	if err := decodeStrict(io.LimitReader(manifestFile, maxManifestSize+1), &manifest); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
+	manifestSHA256 := ""
 	if manifest.SchemaVersion == ManifestSchemaV3 {
 		manifestData, err := os.ReadFile(manifestPath)
 		if err != nil {
@@ -248,6 +260,7 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 		if err := validateV3ManifestJSONPresence(manifestData); err != nil {
 			return nil, err
 		}
+		manifestSHA256 = digest(manifestData)
 	}
 	if err := validateManifest(manifest, options); err != nil {
 		return nil, err
@@ -309,7 +322,7 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	}
 	var artifactIndex *ArtifactIndexReport
 	if manifest.SchemaVersion == ManifestSchemaV3 {
-		artifactIndex, err = validateV3BoundEvidence(manifest, boundEvidence, options.VerifiedProvenance)
+		artifactIndex, err = validateV3BoundEvidence(manifest, boundEvidence, options.VerifiedProvenance || options.profile == bundleValidationPullRequestLocal)
 		if err != nil {
 			return nil, err
 		}
@@ -320,11 +333,15 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	if err := validateProjections(projections); err != nil {
 		return nil, err
 	}
-	canonicalManifest, err := cloneCanonicalManifest(manifest)
+	validatedManifest, err := cloneValidatedManifest(manifest)
 	if err != nil {
-		return nil, fmt.Errorf("preserve validated manifest: %w", err)
+		return nil, err
 	}
-	return &ValidatedBundle{Manifest: manifest, Beads: projections, artifactIndex: artifactIndex, validatedManifest: &canonicalManifest, provenanceVerified: options.VerifiedProvenance, Validation: Validation{
+	absoluteManifestPath, err := filepath.Abs(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve validated manifest path: %w", err)
+	}
+	return &ValidatedBundle{Manifest: manifest, validatedManifest: &validatedManifest, manifestPath: absoluteManifestPath, manifestSHA256: manifestSHA256, Beads: projections, artifactIndex: artifactIndex, provenanceVerified: options.VerifiedProvenance, validationProfile: options.profile, Validation: Validation{
 		SchemaVersion: "hive.visual-hive-validation.v1", Status: "passed", BundleID: manifest.BundleID,
 		Project: manifest.Project, Digest: overall, Files: len(manifest.Files), Bytes: total,
 		Beads: len(projections), Trusted: options.AllowLocal,
@@ -332,7 +349,25 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	}}, nil
 }
 
+func cloneValidatedManifest(manifest Manifest) (Manifest, error) {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("clone validated bundle manifest: %w", err)
+	}
+	var cloned Manifest
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return Manifest{}, fmt.Errorf("clone validated bundle manifest: %w", err)
+	}
+	return cloned, nil
+}
+
 func (bundle *ValidatedBundle) Import(store *beads.Store) (beads.BatchResult, error) {
+	if bundle == nil || bundle.validationProfile == bundleValidationPullRequestLocal {
+		return beads.BatchResult{}, fmt.Errorf("pull_request bundle parsing never grants bead import authority")
+	}
+	if store == nil {
+		return beads.BatchResult{}, fmt.Errorf("persistent Hive bead store is required")
+	}
 	items := make([]beads.BatchInput, 0, len(bundle.Beads))
 	for _, projection := range bundle.Beads {
 		metadata := make(map[string]interface{}, len(projection.Metadata)+4)
@@ -414,7 +449,7 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 			return fmt.Errorf("unsupported provenance kind %q", m.Provenance.Kind)
 		}
 	} else {
-		if !options.VerifiedProvenance {
+		if !options.VerifiedProvenance && options.profile != bundleValidationPullRequestLocal {
 			return fmt.Errorf("bundle provenance was not independently verified by Hive")
 		}
 		if m.SchemaVersion != ManifestSchemaV3 {
@@ -427,7 +462,17 @@ func validateManifest(m Manifest, options ValidationOptions) error {
 		if m.Producer.GitCommit != expectedProducerCommit {
 			return fmt.Errorf("Visual Hive producer commit does not match the independently pinned release commit")
 		}
-		if m.Source.Event == "pull_request" || m.Source.Event == "pull_request_target" || m.Source.Conclusion != "success" || m.Provenance.Kind != "github-actions" || !m.Provenance.AttestationRequired {
+		if options.profile == bundleValidationPullRequestLocal {
+			if m.Source.Event != "pull_request" || m.Source.Conclusion != "success" || m.Provenance.Kind != "github-actions" || !m.Provenance.AttestationRequired || m.Source.Trusted {
+				return fmt.Errorf("bundle is not from a successful attested untrusted pull_request workflow")
+			}
+			if m.Scan.Scope != "changed-files" || m.Scan.AuthoritativeForResolution || len(m.Scan.EvaluatedContracts) == 0 || len(m.Scan.EvaluatedFiles) == 0 {
+				return fmt.Errorf("pull request bundle requires a non-authoritative changed-files scan with an actual evaluated contract and file")
+			}
+			if !exactCommit.MatchString(m.Source.CommitSHA) || !strings.HasPrefix(m.Source.Ref, "refs/heads/") || strings.HasPrefix(m.Source.Ref, "refs/pull/") {
+				return fmt.Errorf("pull request bundle source is not an exact non-merge head")
+			}
+		} else if m.Source.Event == "pull_request" || m.Source.Event == "pull_request_target" || m.Source.Conclusion != "success" || m.Provenance.Kind != "github-actions" || !m.Provenance.AttestationRequired {
 			return fmt.Errorf("bundle is not from a successful attested non-PR workflow")
 		}
 		if options.ExpectedRepository != "" && !strings.EqualFold(options.ExpectedRepository, m.Source.Repository) {

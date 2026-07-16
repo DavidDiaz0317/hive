@@ -666,7 +666,7 @@ func TestPullRequestWorkflowIsReadOnlyPinnedAndVerdictEnforcing(t *testing.T) {
 	if proof, upload := strings.Index(value, "setup-bootstrap-repository-failure.json"), strings.Index(value, "- name: Upload review evidence"); proof < 0 || upload < 0 || proof > upload {
 		t.Fatal("setup bootstrap proof must be written before the always-run review artifact upload")
 	}
-	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `git diff --no-ext-diff --no-textconv --no-renames --name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA"`, "needs: setup-authorization", "if: ${{ always() && github.event_name == 'pull_request' }}"} {
+	for _, required := range []string{"HIVE_BASE_SHA: ${{ github.event.pull_request.base.sha }}", "HIVE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", `["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", base, head]`, "needs: setup-authorization", "if: ${{ always() && github.event_name == 'pull_request' }}"} {
 		if !containsString(value, required) {
 			t.Fatalf("pull request workflow does not pass untrusted event data through quoted environment variables: missing %q", required)
 		}

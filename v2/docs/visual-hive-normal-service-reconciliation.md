@@ -21,7 +21,7 @@ Branch: `codex/vh-normal-service-integration`.
 No upstream/real Hive or KubeStellar Console checkout, remote, workflow, issue,
 pull request, or production state was changed. The immutable Visual Hive
 producer reference currently under review is
-`97bd5cc5d0d1e37405d2a91cb1995d4fac0c676a` (tree prefix `e53af25b`) in the separate
+`3c900c4a57552a3e51b1ce0a90a2a874513ffdab` (tree prefix `f00a44c7`) in the separate
 `vis-proof-harness` worktree. It is a producer input, not a Hive commit, and
 must not be cherry-picked into Hive.
 

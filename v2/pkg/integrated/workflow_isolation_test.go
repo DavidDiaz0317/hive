@@ -1,9 +1,13 @@
 package integrated
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/visualhive"
 	"gopkg.in/yaml.v3"
 )
 
@@ -202,7 +207,7 @@ func (value *workflowNeedsList) UnmarshalYAML(node *yaml.Node) error {
 func isolationWorkflowConfig() Config {
 	return Config{
 		RepositoryID: "123", DefaultBranch: "main", SetupBranch: "hive/setup-123", SetupAuthorizationActorID: 456,
-		VisualHive: true, VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("a", 40), ACMMLevel: 4,
+		VisualHive: true, VisualHiveRepo: "owner/visual-hive", VisualHiveRef: visualHivePullRequestProducerCommit, ACMMLevel: 4,
 		TestCommands: [][]string{{"node", "--test"}, {"python", "-m", "pytest", "-q"}},
 	}
 }
@@ -382,12 +387,146 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 		if step.Name == "Enforce deterministic verdict" || strings.TrimSpace(step.Run) == "" && strings.TrimSpace(step.Uses) == "" {
 			continue
 		}
-		if (step.Uses != "" || step.Run != "") && !strings.Contains(step.If, "operation != 'uninstall'") {
+		if (step.Uses != "" || step.Run != "") && !strings.Contains(step.If, "operation != 'uninstall'") && !strings.Contains(step.If, "operation == ''") {
 			t.Fatalf("aggregator step %q could execute proposed code during pull_request_target: if=%q", step.Name, step.If)
 		}
 	}
 	if strings.Count(pullRequest, "visual-hive-pr-raw-${{ github.run_id }}") != 2 || strings.Count(pullRequest, "name: visual-hive-pr\n") != 1 {
 		t.Fatal("PR raw and final artifacts are not separated into one producer/consumer boundary")
+	}
+	for _, required := range []string{
+		`--mode pr --changed-files "$HIVE_CHANGED_FILES" --runtime-sidecar .visual-hive/proof/pr/runtime.json`,
+		`GITHUB_ACTIONS=true GITHUB_REPOSITORY="$HIVE_TARGET_REPOSITORY" GITHUB_HEAD_REF="$HIVE_TARGET_HEAD_REF" GITHUB_BASE_REF="$HIVE_TARGET_BASE_REF" GITHUB_SHA="$HIVE_TARGET_HEAD_SHA" GITHUB_EVENT_NAME=pull_request`,
+		`GITHUB_RUN_ID="$HIVE_TARGET_RUN_ID" GITHUB_RUN_ATTEMPT="$HIVE_TARGET_RUN_ATTEMPT" GITHUB_WORKFLOW="$HIVE_TARGET_WORKFLOW"`,
+		`node "$VISUAL_HIVE_CLI" plan --config visual-hive.config.yaml --mode pr --changed-files .visual-hive/changed-files.pr.txt`,
+		`schemaVersion: "hive.visual-hive-pr-source.v2"`,
+		`GITHUB_SHA="$HIVE_HEAD_SHA" GITHUB_REF="refs/heads/$HIVE_HEAD_REF" GITHUB_EVENT_NAME=pull_request`,
+		`--scan-scope changed-files "${contract_args[@]}" "${file_args[@]}"`,
+		`--issues .visual-hive/proof/pr/issues.present.json`,
+		`issue.status === "open_candidate" || issue.status === "update_candidate"`,
+		`name: visual-hive-pr-source-${{ github.run_id }}-${{ github.run_attempt }}`,
+		`name: visual-hive-pr-bundle-${{ github.run_id }}-${{ github.run_attempt }}`,
+		`.visual-hive/proof/pr/inputs/visual-hive.config.yaml`,
+		`.visual-hive/proof/pr/inputs/visual-hive-pr.yml`,
+		`git show "$HIVE_BASE_SHA:.github/workflows/visual-hive-pr.yml" > "$workflow_snapshot"`,
+		`export HIVE_BASE_WORKFLOW_SHA256="$base_workflow_sha256"`,
+		`.visual-hive/proof/pr/baselines/`,
+		`test ! -e .visual-hive/proof/pr/source-binding.json`,
+		`["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", base, head]`,
+		`Changed-file path cannot be represented exactly in the Visual Hive scope`,
+		`review_stage="$RUNNER_TEMP/hive-visual-hive-pr-review-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"`,
+		`path: ${{ runner.temp }}/hive-visual-hive-pr-review-${{ github.run_id }}-${{ github.run_attempt }}/.visual-hive`,
+	} {
+		if !strings.Contains(pullRequest, required) {
+			t.Fatalf("PR source/bundle lane is missing %q", required)
+		}
+	}
+	if strings.Contains(workflowJobText(pullAggregator), "--trusted-source") || strings.Contains(workflowJobText(pullAggregator), "--authoritative-for-resolution") ||
+		strings.Contains(workflowJobText(pullAggregator), "${{ github.sha }}") || strings.Contains(workflowJobText(pullAggregator), `copySealed(workflowPath`) ||
+		strings.Contains(workflowJobText(pullAggregator), `hive bundle --config visual-hive.config.yaml --issues .visual-hive/issues.json`) {
+		t.Fatal("PR source/bundle lane acquired trust, resolution authority, or merge-SHA input")
+	}
+	if strings.Count(pullRequest, `"--name-only", "-z"`) != 2 || strings.Contains(pullRequest, `--name-only "$HIVE_BASE_SHA" "$HIVE_HEAD_SHA" >`) {
+		t.Fatal("PR changed-file scope is not captured twice from exact NUL-delimited Git paths")
+	}
+	ordered := []string{
+		"name: Enforce deterministic verdict", "name: Stage immutable legacy pull request review evidence", "name: Prepare admissible pull request source binding", "name: Stage content-addressed pull request source",
+		"name: Upload independently verifiable pull request source", "name: Build non-authoritative pull request bundle",
+		"name: Upload pull request bundle", "name: Upload review evidence",
+	}
+	previous := -1
+	for _, marker := range ordered {
+		index := strings.Index(pullRequest, marker)
+		if index <= previous {
+			t.Fatalf("PR source/bundle/review order is unsafe at %q: prior=%d current=%d", marker, previous, index)
+		}
+		previous = index
+	}
+	for _, stepName := range []string{"Prepare admissible pull request source binding", "Stage content-addressed pull request source", "Upload independently verifiable pull request source", "Build non-authoritative pull request bundle", "Upload pull request bundle"} {
+		found := false
+		for _, step := range pullAggregator.Steps {
+			if step.Name != stepName {
+				continue
+			}
+			found = true
+			expected := "${{ github.event_name == 'pull_request' && needs.setup-authorization.outputs.operation == ''"
+			if stepName != "Prepare admissible pull request source binding" {
+				expected += " && steps.pr_source.outputs.admissible == 'true'"
+			}
+			expected += " }}"
+			if step.If != expected || strings.Contains(step.If, "pull_request_target") || strings.Contains(step.If, "operation != 'uninstall'") {
+				t.Fatalf("PR bundle step %q is not strictly admissibility/event gated: %q", stepName, step.If)
+			}
+		}
+		if !found {
+			t.Fatalf("PR bundle step %q is missing", stepName)
+		}
+	}
+	for _, operation := range []string{"setup", "upgrade", "rollback", "authorizer-transfer", "uninstall"} {
+		if operation == "" {
+			t.Fatalf("hostile managed operation fixture unexpectedly empty")
+		}
+		if strings.Contains(workflowJobText(pullAggregator), fmt.Sprintf("outputs.operation == %q", operation)) {
+			t.Fatalf("managed operation %q can select the PR v3 lane", operation)
+		}
+	}
+	if !strings.Contains(pullRequest, `HIVE_SETUP_OPERATION: ${{ needs.setup-authorization.outputs.operation }}`) ||
+		!strings.Contains(workflowJobText(pullAggregator), `test -z "$HIVE_SETUP_OPERATION"`) {
+		t.Fatal("PR source preflight does not independently reject every managed setup operation")
+	}
+}
+
+func TestGeneratedPullRequestExecutionUsesDistinctEvidenceAuthority(t *testing.T) {
+	generated := pullRequestWorkflow(isolationWorkflowConfig())
+	execution := parseIsolatedWorkflow(t, generated).Jobs[visualExecutionJobName]
+	executionText := workflowJobText(execution)
+	for _, required := range []string{
+		"sudo useradd --create-home --shell /usr/sbin/nologin hive-evidence",
+		`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`,
+		"Target principal can access the protected evidence root",
+		"/usr/bin/unshare --mount --fork /opt/hive-target/trusted/run-visual-hive-evidence",
+		"mount --bind /opt/hive-target/trusted/visual-hive-tooling/node_modules \"$runtime_modules\"",
+		"exec /usr/bin/sudo -n -u hive-target -- /usr/bin/env -i",
+		"exec /usr/bin/sudo -n -u hive-evidence -- /usr/bin/env -i",
+		"hive-visual-target-child-shell",
+		`test "$(sudo stat -c '%u:%g:%a:%s' "$execution_key")" = "0:0:400:32"`,
+		"Execution authority key is readable outside the runner root principal",
+		"protected evidence contains an entry from another principal",
+		"An isolated execution principal remained live before evidence authentication",
+		"hive.visual-hive-runner-attestation.v1",
+		"hive.visual-hive-runner-execution.v1",
+		"crypto.createHmac(\"sha256\", key).update(payloadBytes)",
+	} {
+		if !strings.Contains(executionText, required) {
+			t.Fatalf("PR execution does not enforce the distinct evidence authority invariant %q", required)
+		}
+	}
+	var pipeline string
+	for _, step := range execution.Steps {
+		if step.Name == "Run target-facing Visual Hive collection" {
+			pipeline = step.Run
+			break
+		}
+	}
+	if !strings.Contains(pipeline, "/usr/bin/unshare --mount --fork "+isolatedEvidenceLauncher+` "$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`) ||
+		strings.Contains(pipeline, isolatedVisualPullRequestTargetEnvPrefix()+` "$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`) {
+		t.Fatalf("Visual Hive collection is not launched by the evidence principal boundary:\n%s", pipeline)
+	}
+	source := pullRequestSourceBindingScript()
+	for _, required := range []string{
+		`schemaVersion: "hive.visual-hive-pr-source.v2"`,
+		`readJSON(".visual-hive/proof/pr/runner-execution-attestation.json", "runner execution attestation")`,
+		`crypto.timingSafeEqual(providedMac, expectedMac)`,
+		`authenticatedPayloadBytes.equals(Buffer.from(JSON.stringify(authenticatedPayload), "utf8"))`,
+		`runnerAttestation: attestationIdentity`,
+		`fs.readFileSync(path.join(root, ".visual-hive/pipeline-exit-code.txt"), "utf8") !== "0\n"`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("PR source binding does not cryptographically verify %q", required)
+		}
+	}
+	if strings.Index(executionText, "An isolated execution principal remained live before evidence authentication") > strings.Index(executionText, "hive.visual-hive-runner-attestation.v1") {
+		t.Fatal("runner authentication occurs before both untrusted execution principals are quiesced")
 	}
 }
 
@@ -416,6 +555,523 @@ func TestTrustedCollectorNodeCannotBeShadowedByTargetPath(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err != nil || strings.TrimSpace(string(output)) != "trusted" {
 		t.Fatalf("target PATH shadow replaced the absolute trusted node: err=%v output=%q", err, output)
+	}
+}
+
+func TestGeneratedPullRequestSourceBindingRoundTripsStrictGoSchema(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node is required to execute the generated PR source-binding producer")
+	}
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("Git is required to freeze the base-side PR workflow definition")
+	}
+	bash := workflowBash(t)
+	workflow := pullRequestWorkflow(isolationWorkflowConfig())
+	aggregator := parseIsolatedWorkflow(t, workflow).Jobs["visual-hive"]
+	var preparation string
+	for _, step := range aggregator.Steps {
+		if step.Name == "Prepare admissible pull request source binding" {
+			preparation = step.Run
+			break
+		}
+	}
+	const startMarker = "node <<'NODE'\n"
+	start := strings.Index(preparation, startMarker)
+	end := -1
+	if start >= 0 {
+		start += len(startMarker)
+		end = strings.Index(preparation[start:], "\nNODE")
+	}
+	if start < len(startMarker) || end < 0 {
+		t.Fatalf("generated admissibility step does not contain one extractable source-binding producer:\n%s", preparation)
+	}
+	producer := preparation[start : start+end]
+	if producer != pullRequestSourceBindingScript() {
+		t.Fatal("generated workflow source-binding producer diverges from its tested implementation")
+	}
+	if !strings.Contains(preparation, pullRequestBaseWorkflowSnapshotShell()) {
+		t.Fatal("generated workflow does not freeze the tested base-side workflow definition")
+	}
+
+	const baseWorkflowDefinition = "name: Trusted Base Visual Hive PR\non:\n  pull_request:\n"
+	const hostileHeadWorkflowDefinition = "name: Head Must Not Authorize Itself\non:\n  pull_request_target:\n"
+	const generatedSpecPath = ".visual-hive/generated/visual-hive.generated.spec.mjs"
+	const generatedConfigPath = ".visual-hive/generated/visual-hive.generated.config.cjs"
+	const generatedSpec = "// exact generated Playwright spec\n"
+	const generatedConfig = "module.exports = { reporter: 'json' };\n"
+	const specialUserAgent = "fixture-agent&separator\u2028"
+	const specialFont = "A<B>"
+	const goCanonicalStableRuntime = `{"browser":{"name":"chromium","version":"123.0.0"},"environment":{"os":"linux","architecture":"x64","nodeVersion":"v22.23.1","playwrightVersion":"1.58.2","locale":"en-US","timezone":"UTC","userAgent":"fixture-agent\u0026separator\u2028","deviceScaleFactor":1,"fonts":[{"name":"A\u003cB\u003e","available":true}]}}`
+
+	type fixtureOptions struct {
+		noOp             bool
+		omitRuntime      bool
+		mismatchRuntime  bool
+		generatedDrift   bool
+		workflowDrift    bool
+		invalidBaseline  bool
+		baselinePath     string
+		missingPRNumber  bool
+		reportPRNumber   int
+		failedReport     bool
+		outsideSpecPath  bool
+		spacedChanged    bool
+		mixedIgnored     bool
+		omittedIgnored   bool
+		extraIgnored     bool
+		planContracts    string
+		evaluationScopes string
+		resultTarget     string
+		headRef          string
+		producerCommit   string
+		tamperAttested   bool
+		tamperMAC        bool
+	}
+	run := func(t *testing.T, options fixtureOptions) (string, string, []byte, error) {
+		t.Helper()
+		root := t.TempDir()
+		runnerTemp := filepath.Join(root, "runner-temp")
+		if err := os.MkdirAll(runnerTemp, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		runGit := func(args ...string) string {
+			t.Helper()
+			command := exec.Command(git, args...)
+			command.Dir = root
+			output, commandErr := command.CombinedOutput()
+			if commandErr != nil {
+				t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), commandErr, output)
+			}
+			return strings.TrimSpace(string(output))
+		}
+		runGit("init", "-q")
+		runGit("config", "core.autocrlf", "false")
+		writeFixture(t, root, ".github/workflows/visual-hive-pr.yml", baseWorkflowDefinition)
+		runGit("add", ".github/workflows/visual-hive-pr.yml")
+		runGit("-c", "user.name=Hive Test", "-c", "user.email=hive@example.invalid", "commit", "-q", "-m", "trusted base workflow")
+		baseSHA := runGit("rev-parse", "HEAD")
+		writeFixture(t, root, ".github/workflows/visual-hive-pr.yml", hostileHeadWorkflowDefinition)
+		runGit("add", ".github/workflows/visual-hive-pr.yml")
+		runGit("-c", "user.name=Hive Test", "-c", "user.email=hive@example.invalid", "commit", "-q", "-m", "hostile head workflow")
+		headSHA := runGit("rev-parse", "HEAD")
+
+		writeFixture(t, root, "visual-hive.config.yaml", "schemaVersion: 1\nproject:\n  name: fixture\n")
+		changedFileContents := "web/app.ts\n"
+		if options.mixedIgnored || options.omittedIgnored {
+			changedFileContents = "docs/guide.md\nweb/app.ts\n"
+		}
+		if options.spacedChanged {
+			changedFileContents = " web/app.ts\n"
+		}
+		writeFixture(t, root, ".visual-hive/changed-files.pr.txt", changedFileContents)
+		writeFixture(t, root, "testdata/baseline.png", "\x89PNG\r\n\x1a\nfixed-baseline-bytes\n")
+		writeFixture(t, root, "testdata/Z-baseline.png", "\x89PNG\r\n\x1a\nsecond-fixed-baseline-bytes\n")
+		if options.invalidBaseline {
+			writeFixture(t, root, "testdata/baseline.png", "not-a-png\n")
+		}
+		writeFixture(t, root, generatedSpecPath, generatedSpec)
+		writeFixture(t, root, generatedConfigPath, generatedConfig)
+		binding := map[string]string{
+			"bindingMacSha256":      strings.Repeat("a", 64),
+			"generatedConfigSha256": fmt.Sprintf("%x", sha256.Sum256([]byte(generatedConfig))),
+			"generatedSpecSha256":   fmt.Sprintf("%x", sha256.Sum256([]byte(generatedSpec))),
+			"nonceSha256":           strings.Repeat("d", 64),
+			"payloadSha256":         strings.Repeat("e", 64),
+		}
+		planItems := []any{map[string]any{"contractId": "contract-a", "targetId": "target-a"}}
+		selected := []string{"contract-a"}
+		results := []any{map[string]any{
+			"contractId": "contract-a", "targetId": "target-a", "status": "passed",
+			"screenshotAssertions": []any{
+				map[string]any{"baselinePath": "testdata/baseline.png", "status": "passed"},
+				map[string]any{"baselinePath": "testdata/Z-baseline.png", "status": "passed"},
+			},
+		}}
+		if options.baselinePath != "" {
+			results[0].(map[string]any)["screenshotAssertions"].([]any)[0].(map[string]any)["baselinePath"] = options.baselinePath
+		}
+		evaluated := "contract-a\n"
+		reportBinding := any(binding)
+		if options.noOp {
+			planItems, selected, results, evaluated, reportBinding = []any{}, []string{}, []any{}, "", nil
+		}
+		planContractReceipt := evaluated
+		if options.planContracts != "" {
+			planContractReceipt = options.planContracts
+		}
+		evaluationScopeReceipt := evaluated
+		if evaluated != "" {
+			evaluationScopeReceipt += "provider-governance\nworkflow-safety\n"
+		}
+		if options.evaluationScopes != "" {
+			evaluationScopeReceipt = options.evaluationScopes
+		}
+		if options.resultTarget != "" && len(results) > 0 {
+			results[0].(map[string]any)["targetId"] = options.resultTarget
+		}
+		planChangedFiles := []string{"web/app.ts"}
+		reportChangedFiles := []string{"web/app.ts"}
+		effectiveChangedFiles := []string{"web/app.ts"}
+		ignoredChangedFiles := []any{}
+		if options.mixedIgnored || options.omittedIgnored {
+			planChangedFiles = []string{"docs/guide.md", "web/app.ts"}
+			reportChangedFiles = []string{"docs/guide.md", "web/app.ts"}
+			if options.mixedIgnored {
+				ignoredChangedFiles = []any{map[string]any{"file": "docs/guide.md", "pattern": "docs/**", "reason": "documentation-only change"}}
+			}
+		}
+		if options.extraIgnored {
+			ignoredChangedFiles = []any{map[string]any{"file": "docs/guide.md", "pattern": "docs/**", "reason": "documentation-only change"}}
+		}
+		plan := map[string]any{
+			"schemaVersion": 1, "mode": "pr", "changedFiles": planChangedFiles, "effectiveChangedFiles": effectiveChangedFiles,
+			"ignoredChangedFiles": ignoredChangedFiles, "items": planItems, "excluded": []any{},
+		}
+		reportedSpecPath := generatedSpecPath
+		if options.outsideSpecPath {
+			reportedSpecPath = ".visual-hive/proof/pr/runtime.json"
+		}
+		reportStatus := "passed"
+		if options.failedReport {
+			reportStatus = "failed"
+		}
+		reportRepository := map[string]any{
+			"provider": "github-actions", "repository": "owner/repo", "branch": "feature/exact-head", "baseBranch": "main",
+			"commitSha": headSHA, "pullRequestNumber": 7, "runId": "77", "runAttempt": "2", "workflow": "Visual Hive PR",
+		}
+		if options.missingPRNumber {
+			delete(reportRepository, "pullRequestNumber")
+		} else if options.reportPRNumber != 0 {
+			reportRepository["pullRequestNumber"] = options.reportPRNumber
+		}
+		report := map[string]any{
+			"schemaVersion": 2, "mode": "pr", "status": reportStatus, "changedFiles": reportChangedFiles, "selectedContracts": selected, "results": results,
+			"generatedSpecPath": reportedSpecPath,
+			"repository":        reportRepository,
+		}
+		if reportBinding != nil {
+			report["executionBinding"] = reportBinding
+		}
+		writeJSON := func(relative string, value any) {
+			data, marshalErr := json.Marshal(value)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			writeFixture(t, root, relative, string(data)+"\n")
+		}
+		writeJSON(".visual-hive/plan.json", plan)
+		writeJSON(".visual-hive/report.json", report)
+		writeFixture(t, root, ".visual-hive/evaluated-plan-contracts.txt", planContractReceipt)
+		writeFixture(t, root, ".visual-hive/evaluated-contracts.txt", evaluationScopeReceipt)
+		if !options.noOp && !options.omitRuntime {
+			runtimeBinding := maps.Clone(binding)
+			if options.mismatchRuntime {
+				runtimeBinding["bindingMacSha256"] = strings.Repeat("f", 64)
+			}
+			writeJSON(".visual-hive/proof/pr/runtime.json", map[string]any{
+				"schemaVersion": "visual-hive.playwright-runtime.v1", "capturedAt": "2026-07-16T12:00:00.000Z", "executionBinding": runtimeBinding,
+				"browser": map[string]any{"name": "chromium", "version": "123.0.0"},
+				"environment": map[string]any{
+					"os": "linux", "architecture": "x64", "nodeVersion": "v22.23.1", "playwrightVersion": "1.58.2",
+					"locale": "en-US", "timezone": "UTC", "userAgent": specialUserAgent, "deviceScaleFactor": 1,
+					"fonts": []any{map[string]any{"name": specialFont, "available": true}},
+				},
+			})
+		}
+		writeFixture(t, root, ".visual-hive/pipeline-exit-code.txt", "0\n")
+		writeJSON(".visual-hive/hive-runner-outcome.json", map[string]any{
+			"schemaVersion": "hive.visual-runner-outcome.v1", "outcome": "success", "conclusion": "success",
+		})
+		attestationRelative := runnerAttestationPath
+		if !options.noOp && !options.omitRuntime && !options.mismatchRuntime && !options.outsideSpecPath {
+			key := []byte("0123456789abcdef0123456789abcdef")
+			keyPath := filepath.Join(runnerTemp, "execution-authority.key")
+			if err := os.WriteFile(keyPath, key, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			attestation := exec.Command(node, "-e", runnerExecutionAttestationScript())
+			attestation.Dir = root
+			attestation.Env = append(os.Environ(),
+				"HIVE_EXECUTION_AUTHORITY_KEY="+keyPath,
+				fmt.Sprintf("HIVE_EXECUTION_AUTHORITY_KEY_COMMITMENT=%x", sha256.Sum256(key)),
+				"HIVE_RUNNER_ATTESTATION_OUTPUT="+filepath.Join(root, filepath.FromSlash(attestationRelative)),
+				"HIVE_TARGET_REPOSITORY=owner/repo", "HIVE_TARGET_PULL_REQUEST=7", "HIVE_TARGET_BASE_REF=main",
+				"HIVE_TARGET_HEAD_REF=feature/exact-head", "HIVE_TARGET_HEAD_SHA="+headSHA,
+				"HIVE_TARGET_RUN_ID=77", "HIVE_TARGET_RUN_ATTEMPT=2", "HIVE_TARGET_WORKFLOW=Visual Hive PR",
+				"HIVE_PRODUCER_COMMIT="+visualHivePullRequestProducerCommit,
+			)
+			if output, attestationErr := attestation.CombinedOutput(); attestationErr != nil {
+				t.Fatalf("runner execution attestation fixture failed: %v\n%s", attestationErr, output)
+			}
+			if options.tamperMAC {
+				data, readErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(attestationRelative)))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				var document map[string]any
+				if err := json.Unmarshal(data, &document); err != nil {
+					t.Fatal(err)
+				}
+				document["macSha256"] = strings.Repeat("0", 64)
+				writeJSON(attestationRelative, document)
+			}
+		}
+		artifactIdentity := func(relative string) map[string]any {
+			data, readErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			return map[string]any{"path": relative, "bytes": len(data), "sha256": fmt.Sprintf("%x", sha256.Sum256(data))}
+		}
+		artifacts := []any{
+			artifactIdentity(generatedSpecPath), artifactIdentity(generatedConfigPath),
+			artifactIdentity(".visual-hive/pipeline-exit-code.txt"), artifactIdentity(".visual-hive/hive-runner-outcome.json"),
+		}
+		if _, statErr := os.Stat(filepath.Join(root, filepath.FromSlash(attestationRelative))); statErr == nil {
+			artifacts = append(artifacts, artifactIdentity(attestationRelative))
+		}
+		writeJSON(".visual-hive/artifacts-index.json", map[string]any{
+			"schemaVersion": 1, "contentAddressed": true, "complete": true, "artifacts": artifacts,
+		})
+		if options.generatedDrift {
+			writeFixture(t, root, generatedSpecPath, "// drifted after artifact indexing\n")
+		}
+		if options.tamperAttested {
+			reportPath := filepath.Join(root, ".visual-hive", "report.json")
+			handle, openErr := os.OpenFile(reportPath, os.O_APPEND|os.O_WRONLY, 0)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			if _, appendErr := handle.WriteString(" \n"); appendErr != nil {
+				_ = handle.Close()
+				t.Fatal(appendErr)
+			}
+			if closeErr := handle.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+		}
+		snapshot := exec.Command(bash, "-c", pullRequestBaseWorkflowSnapshotShell())
+		snapshot.Dir = root
+		snapshot.Env = append(os.Environ(),
+			"HIVE_BASE_SHA="+baseSHA,
+			"HIVE_WORKFLOW_PATH=.github/workflows/visual-hive-pr.yml",
+		)
+		if output, snapshotErr := snapshot.CombinedOutput(); snapshotErr != nil {
+			t.Fatalf("base-side workflow freeze failed: %v\n%s", snapshotErr, output)
+		}
+		if options.workflowDrift {
+			writeFixture(t, root, visualhive.PullRequestWorkflowPath, hostileHeadWorkflowDefinition)
+		}
+		statePath := filepath.Join(runnerTemp, "admissible.txt")
+		headRef := options.headRef
+		if headRef == "" {
+			headRef = "feature/exact-head"
+		}
+		producerCommit := options.producerCommit
+		if producerCommit == "" {
+			producerCommit = visualHivePullRequestProducerCommit
+		}
+		command := exec.Command(node, "-e", producer)
+		command.Dir = root
+		command.Env = append(os.Environ(),
+			"RUNNER_TEMP="+runnerTemp, "HIVE_PR_ADMISSIBILITY_PATH="+statePath,
+			"HIVE_EVENT_NAME=pull_request", "HIVE_REPOSITORY=owner/repo", "HIVE_PULL_REQUEST_NUMBER=7",
+			"HIVE_BASE_REPOSITORY=owner/repo", "HIVE_BASE_REPOSITORY_ID=123", "HIVE_BASE_REF=main", "HIVE_BASE_SHA="+baseSHA,
+			"HIVE_HEAD_REPOSITORY=fork/repo", "HIVE_HEAD_REPOSITORY_ID=456", "HIVE_HEAD_REF="+headRef, "HIVE_HEAD_SHA="+headSHA,
+			"HIVE_WORKFLOW_RUN_ID=77", "HIVE_WORKFLOW_RUN_ATTEMPT=2", "HIVE_WORKFLOW_NAME=Visual Hive PR", "HIVE_WORKFLOW_PATH=.github/workflows/visual-hive-pr.yml",
+			fmt.Sprintf("HIVE_BASE_WORKFLOW_SHA256=%x", sha256.Sum256([]byte(baseWorkflowDefinition))),
+			"HIVE_PRODUCER_COMMIT="+producerCommit, "HIVE_SOURCE_ARTIFACT_NAME=visual-hive-pr-source-77-2", "HIVE_BUNDLE_ARTIFACT_NAME=visual-hive-pr-bundle-77-2",
+		)
+		output, runErr := command.CombinedOutput()
+		state, _ := os.ReadFile(statePath)
+		return root, strings.TrimSpace(string(state)), output, runErr
+	}
+
+	t.Run("hostile head workflow cannot self-authorize strict round trip", func(t *testing.T) {
+		root, state, output, runErr := run(t, fixtureOptions{})
+		if runErr != nil || state != "true" {
+			t.Fatalf("generated source binding failed: %v state=%q\n%s", runErr, state, output)
+		}
+		data, readErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(visualhive.PullRequestSourceBindingPath)))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		binding, parseErr := visualhive.ParsePullRequestSourceBinding(data)
+		if parseErr != nil {
+			t.Fatalf("generated binding does not round-trip through the normative strict Go parser: %v\n%s", parseErr, data)
+		}
+		if binding.SchemaVersion != visualhive.PullRequestSourceBindingSchema || binding.RepositoryID != "123" || binding.PullRequest != 7 ||
+			binding.Workflow.Definition.Path != visualhive.PullRequestWorkflowPath || binding.Config.Path != visualhive.PullRequestConfigPath ||
+			binding.Runtime.Receipt.Path != visualhive.PullRequestRuntimePath || binding.Runtime.GeneratedSpec.Path != generatedSpecPath ||
+			binding.Runtime.GeneratedConfig.Path != generatedConfigPath || binding.Runtime.GeneratedSpec.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(generatedSpec))) ||
+			binding.Runtime.GeneratedConfig.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(generatedConfig))) || len(binding.Baselines.Files) != 2 ||
+			binding.PlanContracts.Path != visualhive.PullRequestPlanContractsPath || binding.EvaluationScopes.Path != visualhive.PullRequestEvaluationScopesPath ||
+			binding.Runtime.StableSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(goCanonicalStableRuntime))) ||
+			!strings.HasPrefix(binding.Baselines.Files[0].Path, ".visual-hive/proof/pr/baselines/") || binding.Baselines.Files[0].Path >= binding.Baselines.Files[1].Path {
+			t.Fatalf("generated binding identity is incomplete: %+v", binding)
+		}
+		workflowSnapshot, snapshotErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(visualhive.PullRequestWorkflowPath)))
+		if snapshotErr != nil || string(workflowSnapshot) != baseWorkflowDefinition || string(workflowSnapshot) == hostileHeadWorkflowDefinition ||
+			binding.Workflow.Definition.SHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(baseWorkflowDefinition))) {
+			t.Fatalf("workflow identity was not frozen from the trusted base commit: err=%v identity=%+v bytes=%q", snapshotErr, binding.Workflow.Definition, workflowSnapshot)
+		}
+		for source, snapshot := range map[string]string{
+			"visual-hive.config.yaml": visualhive.PullRequestConfigPath,
+			"testdata/baseline.png":   ".visual-hive/proof/pr/baselines/testdata/baseline.png",
+			"testdata/Z-baseline.png": ".visual-hive/proof/pr/baselines/testdata/Z-baseline.png",
+		} {
+			original, originalErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(source)))
+			copied, copiedErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(snapshot)))
+			if originalErr != nil || copiedErr != nil || !bytes.Equal(original, copied) {
+				t.Fatalf("sealed source snapshot %q does not exactly match %q: original=%v copied=%v", snapshot, source, originalErr, copiedErr)
+			}
+		}
+	})
+
+	t.Run("empty plan emits no source binding", func(t *testing.T) {
+		root, state, output, runErr := run(t, fixtureOptions{noOp: true, omitRuntime: true})
+		if runErr != nil || state != "false" {
+			t.Fatalf("no-op plan did not stop before v3 source binding: %v state=%q\n%s", runErr, state, output)
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(visualhive.PullRequestSourceBindingPath))); !os.IsNotExist(err) {
+			t.Fatalf("no-op plan wrote an admissible source binding: %v", err)
+		}
+	})
+
+	t.Run("producer report may omit PR number without using a merge ref", func(t *testing.T) {
+		root, state, output, runErr := run(t, fixtureOptions{missingPRNumber: true})
+		if runErr != nil || state != "true" {
+			t.Fatalf("real-producer-compatible report was rejected: %v state=%q\n%s", runErr, state, output)
+		}
+		data, readErr := os.ReadFile(filepath.Join(root, filepath.FromSlash(visualhive.PullRequestSourceBindingPath)))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		binding, parseErr := visualhive.ParsePullRequestSourceBinding(data)
+		if parseErr != nil || binding.PullRequest != 7 || binding.Head.Ref != "feature/exact-head" {
+			t.Fatalf("root-owned source binding lost exact PR/head identity: binding=%+v err=%v", binding, parseErr)
+		}
+	})
+
+	t.Run("mixed ignored and relevant changes preserve the exact producer partition", func(t *testing.T) {
+		_, state, output, runErr := run(t, fixtureOptions{mixedIgnored: true})
+		if runErr != nil || state != "true" {
+			t.Fatalf("real producer ignored-file partition was rejected: %v state=%q\n%s", runErr, state, output)
+		}
+	})
+
+	for _, test := range []struct {
+		name    string
+		options fixtureOptions
+		want    string
+	}{
+		{name: "missing runtime", options: fixtureOptions{omitRuntime: true}, want: "runtime"},
+		{name: "runtime execution mismatch", options: fixtureOptions{mismatchRuntime: true}, want: "not bound"},
+		{name: "generated spec index drift", options: fixtureOptions{generatedDrift: true}, want: "artifact-index entry"},
+		{name: "base workflow snapshot drift", options: fixtureOptions{workflowDrift: true}, want: "identity drifted"},
+		{name: "invalid baseline bytes", options: fixtureOptions{invalidBaseline: true}, want: "exact PNG"},
+		{name: "noncanonical baseline path", options: fixtureOptions{baselinePath: " testdata/baseline.png"}, want: "exact passing baseline"},
+		{name: "failed report status", options: fixtureOptions{failedReport: true}, want: "report is malformed"},
+		{name: "mismatched present report PR number", options: fixtureOptions{reportPRNumber: 8}, want: "exact allowlisted"},
+		{name: "generated spec outside canonical directory", options: fixtureOptions{outsideSpecPath: true}, want: "canonical generated directory"},
+		{name: "noncanonical changed-file line", options: fixtureOptions{spacedChanged: true}, want: "non-canonical line"},
+		{name: "omitted ignored changed file", options: fixtureOptions{omittedIgnored: true}, want: "do not exactly partition"},
+		{name: "extra ignored changed file", options: fixtureOptions{extraIgnored: true}, want: "outside the runner-owned diff"},
+		{name: "missing evaluated plan contract", options: fixtureOptions{planContracts: "other-contract\n"}, want: "evaluated plan contracts"},
+		{name: "duplicated evaluated plan contract", options: fixtureOptions{planContracts: "contract-a\ncontract-a\n"}, want: "duplicates"},
+		{name: "full scopes omit plan contract", options: fixtureOptions{evaluationScopes: "provider-governance\n"}, want: "Full evaluation scopes"},
+		{name: "full scopes contain arbitrary extra", options: fixtureOptions{evaluationScopes: "attacker-scope\ncontract-a\n"}, want: "deterministic lifecycle scopes"},
+		{name: "unaudited producer", options: fixtureOptions{producerCommit: strings.Repeat("f", 40)}, want: "exact audited"},
+		{name: "target contract mismatch", options: fixtureOptions{resultTarget: "target-b"}, want: "exactly bound"},
+		{name: "merge ref", options: fixtureOptions{headRef: "refs/pull/7/merge"}, want: "merge-derived"},
+		{name: "report changed after root authentication", options: fixtureOptions{tamperAttested: true}, want: "authenticate the exact execution artifacts"},
+		{name: "forged runner HMAC", options: fixtureOptions{tamperMAC: true}, want: "HMAC verification failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, state, output, runErr := run(t, test.options)
+			if runErr == nil || state != "" || !strings.Contains(string(output), test.want) {
+				t.Fatalf("unsafe PR source was not rejected: err=%v state=%q want=%q\n%s", runErr, state, test.want, output)
+			}
+		})
+	}
+}
+
+func TestPullRequestPresentIssuesFilterPreservesMetadataAndRejectsAbsence(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node is required to execute the generated present-only issue filter")
+	}
+	run := func(t *testing.T, issues any) (string, map[string]any, error) {
+		t.Helper()
+		root := t.TempDir()
+		report := map[string]any{
+			"schemaVersion": "visual-hive.issues.v1",
+			"generatedAt":   "2026-07-16T12:00:00.000Z",
+			"project":       "fixture",
+			"summary":       map[string]any{"openCandidates": 1, "updateCandidates": 1, "resolvedCandidates": 1},
+			"issues":        issues,
+		}
+		data, marshalErr := json.Marshal(report)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		writeFixture(t, root, ".visual-hive/issues.json", string(data)+"\n")
+		command := exec.Command(node, "-e", pullRequestPresentIssuesScript())
+		command.Dir = root
+		output, runErr := command.CombinedOutput()
+		var filtered map[string]any
+		if filteredData, readErr := os.ReadFile(filepath.Join(root, ".visual-hive", "proof", "pr", "issues.present.json")); readErr == nil {
+			if decodeErr := json.Unmarshal(filteredData, &filtered); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+		}
+		return string(output), filtered, runErr
+	}
+
+	t.Run("preserves metadata and retains only present candidates", func(t *testing.T) {
+		output, filtered, runErr := run(t, []any{
+			map[string]any{"id": "open", "status": "open_candidate", "issueKind": "screenshot_diff", "severity": "high"},
+			map[string]any{"id": "update", "status": "update_candidate", "issueKind": "screenshot_diff", "severity": "medium"},
+			map[string]any{"id": "resolved", "status": "resolved_candidate", "issueKind": "stale_baseline", "severity": "low"},
+			map[string]any{"id": "suppressed", "status": "suppressed", "issueKind": "workflow_safety", "severity": "critical"},
+			map[string]any{"id": "blocked", "status": "blocked", "issueKind": "provider_governance", "severity": "high"},
+		})
+		if runErr != nil {
+			t.Fatalf("present-only issue filter failed: %v\n%s", runErr, output)
+		}
+		issues, ok := filtered["issues"].([]any)
+		if !ok || len(issues) != 2 || filtered["schemaVersion"] != "visual-hive.issues.v1" || filtered["project"] != "fixture" || filtered["generatedAt"] != "2026-07-16T12:00:00.000Z" {
+			t.Fatalf("present-only issue report lost metadata or retained absence: %#v", filtered)
+		}
+		for _, value := range issues {
+			status := value.(map[string]any)["status"]
+			if status != "open_candidate" && status != "update_candidate" {
+				t.Fatalf("present-only issue report retained %q", status)
+			}
+		}
+		summary, ok := filtered["summary"].(map[string]any)
+		if !ok || summary["total"] != float64(2) || summary["openCandidates"] != float64(1) || summary["updateCandidates"] != float64(1) ||
+			summary["resolvedCandidates"] != float64(0) || summary["suppressed"] != float64(0) || summary["blocked"] != float64(0) {
+			t.Fatalf("present-only issue summary retained absence claims: %#v", summary)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		issues any
+		want   string
+	}{
+		{name: "unknown status", issues: []any{map[string]any{"status": "mystery_candidate", "issueKind": "screenshot_diff", "severity": "high"}}, want: "unknown or malformed status"},
+		{name: "malformed issue array", issues: map[string]any{"status": "open_candidate"}, want: "malformed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, filtered, runErr := run(t, test.issues)
+			if runErr == nil || filtered != nil || !strings.Contains(output, test.want) {
+				t.Fatalf("unsafe issue report was not rejected: err=%v filtered=%#v want=%q\n%s", runErr, filtered, test.want, output)
+			}
+		})
 	}
 }
 
@@ -620,6 +1276,10 @@ func TestRunnerOwnedEvaluationScopeUsesCompletedReportRowsAndFailsClosed(t *test
 			if readErr != nil || string(evaluated) != test.wantEvaluated {
 				t.Fatalf("evaluated contracts = %q, err=%v; want %q", evaluated, readErr, test.wantEvaluated)
 			}
+			planContracts, readErr := os.ReadFile(filepath.Join(root, ".visual-hive", "evaluated-plan-contracts.txt"))
+			if readErr != nil || string(planContracts) != test.wantEvaluated {
+				t.Fatalf("evaluated plan contracts = %q, err=%v; want %q", planContracts, readErr, test.wantEvaluated)
+			}
 			authority, readErr := os.ReadFile(filepath.Join(root, ".visual-hive", "authoritative-resolution.txt"))
 			if readErr != nil || string(authority) != test.wantAuthoritative {
 				t.Fatalf("resolution authority = %q, err=%v; want %q", authority, readErr, test.wantAuthoritative)
@@ -649,7 +1309,7 @@ const output = args[args.indexOf("--output") + 1];
 fs.writeFileSync(output, JSON.stringify({mode:"full",items:[{contractId:"contract-a"}],excluded:[]}) + "\n");`)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		command := exec.CommandContext(ctx, bash, "-e", "-o", "pipefail", "-c", runnerOwnedPlanRegenerationAndEvaluationShell())
+		command := exec.CommandContext(ctx, bash, "-e", "-o", "pipefail", "-c", runnerOwnedPlanRegenerationAndEvaluationShell(false))
 		command.Dir = root
 		command.Env = append(os.Environ(), "VISUAL_HIVE_CLI=fake-visual-hive.js")
 		output, runErr := command.CombinedOutput()
@@ -814,6 +1474,84 @@ func TestSealIsolatedVisualEvidenceCrossPrincipal(t *testing.T) {
 				t.Fatal("runner can write sealed target evidence")
 			}
 		})
+	}
+}
+
+func TestProtectedEvidenceDeniesContinuousTargetOverwriteAndPostAuthenticationForgery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cross-principal hostile overwrite proof requires the hosted Linux privilege boundary")
+	}
+	bash, bashErr := exec.LookPath("bash")
+	sudo, sudoErr := exec.LookPath("sudo")
+	if bashErr != nil || sudoErr != nil {
+		t.Skip("bash and sudo are required for the hostile overwrite proof")
+	}
+	if output, err := exec.Command(sudo, "-n", "true").CombinedOutput(); err != nil {
+		t.Skipf("passwordless sudo is unavailable: %v: %s", err, output)
+	}
+	if uid, err := exec.Command("id", "-u").Output(); err != nil || strings.TrimSpace(string(uid)) == "0" {
+		t.Skip("the proof requires a non-root evidence principal")
+	}
+	if output, err := exec.Command("id", "-u", "nobody").CombinedOutput(); err != nil {
+		t.Skipf("the distinct nobody target account is unavailable: %v: %s", err, output)
+	}
+
+	workspace := t.TempDir()
+	if err := os.Chmod(workspace, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	evidence := filepath.Join(workspace, ".visual-hive")
+	if err := os.Mkdir(evidence, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(evidence, "report.json")
+	legitimate := []byte("{\"schemaVersion\":2,\"status\":\"passed\"}\n")
+	if err := os.WriteFile(reportPath, legitimate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authorityRoot := filepath.Join(workspace, "runner-authority")
+	if err := os.Mkdir(authorityRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authorityKey := []byte("0123456789abcdef0123456789abcdef")
+	keyPath := filepath.Join(authorityRoot, "execution.key")
+	if err := os.WriteFile(keyPath, authorityKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	message := sha256.Sum256(legitimate)
+	mac := hmac.New(sha256.New, authorityKey)
+	_, _ = mac.Write(message[:])
+	authenticatedMAC := mac.Sum(nil)
+
+	if command := exec.Command(sudo, "-n", "-u", "nobody", "test", "-r", keyPath); command.Run() == nil {
+		t.Fatal("target principal can read the evidence authentication key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hostile := exec.CommandContext(ctx, sudo, "-n", "-u", "nobody", "env", "HIVE_EVIDENCE_REPORT="+reportPath, bash, "-c", `deadline=$((SECONDS + 2)); while [ "$SECONDS" -lt "$deadline" ]; do { printf '%s\n' '{"status":"passed","forged":true}' > "$HIVE_EVIDENCE_REPORT"; } 2>/dev/null || :; done`)
+	if output, err := hostile.CombinedOutput(); err != nil {
+		t.Fatalf("hostile target loop did not complete cleanly: %v: %s", err, output)
+	}
+	observed, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(observed, legitimate) {
+		t.Fatalf("hostile target overwrote protected evidence: %q", observed)
+	}
+	observedDigest := sha256.Sum256(observed)
+	verified := hmac.New(sha256.New, authorityKey)
+	_, _ = verified.Write(observedDigest[:])
+	if !hmac.Equal(authenticatedMAC, verified.Sum(nil)) {
+		t.Fatal("unchanged protected evidence failed runner authentication")
+	}
+
+	forged := append(bytes.Clone(observed), byte(' '))
+	forgedDigest := sha256.Sum256(forged)
+	forgedMAC := hmac.New(sha256.New, authorityKey)
+	_, _ = forgedMAC.Write(forgedDigest[:])
+	if hmac.Equal(authenticatedMAC, forgedMAC.Sum(nil)) {
+		t.Fatal("post-authentication evidence forgery retained Ready authority")
 	}
 }
 
