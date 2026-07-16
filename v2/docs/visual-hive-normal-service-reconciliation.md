@@ -128,7 +128,10 @@ The service ledger is
 `<state-dir>/visual-hive/normal-service/active.json`. It is a small exact-binding
 checkpoint, not a queue. It records the workflow, packet digest, source ref,
 one work-order/request identity, Worker PR, verdict receipt, completion, and
-intent-consumption checkpoints using durable atomic replacement.
+intent-consumption checkpoints using durable atomic replacement. Canonical
+verdict JSON is stored as opaque encoded bytes, never re-indented, and its
+SHA-256 is rechecked after every disk load. The complete ledger state machine
+is validated before fetch, import, Worker, verifier, completion, or consume.
 
 Ordering is:
 
@@ -190,6 +193,8 @@ green receipt does not itself grant merge or lifecycle-resolution authority.
   including the no-dispatch path without starting another workflow;
 - missing exact-head verifier leaves the one PR open and unconsumed;
 - identical controller completion replay succeeds and an altered receipt fails;
+- malformed workflow/order/PR/verdict/consume ledger transitions fail before
+  any source, intake, Worker, or verifier call;
 - Scheduler composition produces and reserves one canonical `swo-*`;
 - fresh-launch pause denial occurs before model dispatch;
 - exact leased recovery performs no recomposition, second reservation,
@@ -248,7 +253,7 @@ not on this critical path.
 | `a89e22d2` | exact completion replay and sealed-tree binding |
 | `0a5f95ab` | one reservation/fresh guard/leased recovery proof |
 | `102c4d94` | controller-owned resume without refetch/reimport |
-| `f6c74027` | crash-safe no-dispatch workflow consumption |
+| `1d15ab47` | crash-safe no-dispatch workflow consumption |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.

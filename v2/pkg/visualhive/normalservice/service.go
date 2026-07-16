@@ -21,7 +21,7 @@ import (
 	visualcontroller "github.com/kubestellar/hive/v2/pkg/visualhive/controller"
 )
 
-const ledgerSchema = "hive.normal-visual-work.v1"
+const ledgerSchema = "hive.normal-visual-work.v2"
 
 var (
 	ErrFinalVerdictPending = errors.New("exact-head pull-request verdict is pending")
@@ -280,7 +280,7 @@ func (service *Service) RunCycle(ctx context.Context) error {
 	}
 	ledger.VerdictHeadSHA = strings.ToLower(receipt.HeadSHA)
 	ledger.VerdictStatus = strings.TrimSpace(receipt.Status)
-	ledger.VerdictReceipt = append(json.RawMessage(nil), receipt.Receipt...)
+	ledger.VerdictReceipt = append([]byte(nil), receipt.Receipt...)
 	ledger.VerdictReceiptSHA256 = strings.ToLower(receipt.ReceiptSHA256)
 	if err := service.saveLedger(ledger); err != nil {
 		return err
@@ -386,7 +386,7 @@ type workLedger struct {
 	PullRequestURL       string                         `json:"pull_request_url,omitempty"`
 	VerdictHeadSHA       string                         `json:"verdict_head_sha,omitempty"`
 	VerdictStatus        string                         `json:"verdict_status,omitempty"`
-	VerdictReceipt       json.RawMessage                `json:"verdict_receipt,omitempty"`
+	VerdictReceipt       []byte                         `json:"verdict_receipt_bytes,omitempty"`
 	VerdictReceiptSHA256 string                         `json:"verdict_receipt_sha256,omitempty"`
 	CompletionRecorded   bool                           `json:"completion_recorded,omitempty"`
 	ConsumeStarted       bool                           `json:"consume_started,omitempty"`
@@ -406,14 +406,20 @@ func (service *Service) loadLedger() (workLedger, bool, error) {
 		return workLedger{}, false, err
 	}
 	var ledger workLedger
-	if json.Unmarshal(data, &ledger) != nil || ledger.SchemaVersion != ledgerSchema || ledger.WorkflowKey == "" || ledger.Repository == "" {
+	if err := json.Unmarshal(data, &ledger); err != nil {
 		return workLedger{}, false, errors.New("normal Visual Hive service ledger is corrupt")
+	}
+	if err := validateWorkLedger(ledger); err != nil {
+		return workLedger{}, false, fmt.Errorf("normal Visual Hive service ledger is corrupt: %w", err)
 	}
 	return ledger, true, nil
 }
 
 func (service *Service) saveLedger(ledger workLedger) error {
 	ledger.SchemaVersion = ledgerSchema
+	if err := validateWorkLedger(ledger); err != nil {
+		return fmt.Errorf("refuse invalid normal Visual Hive service ledger: %w", err)
+	}
 	encoded, err := json.MarshalIndent(ledger, "", "  ")
 	if err != nil {
 		return err
@@ -441,6 +447,61 @@ func (service *Service) saveLedger(ledger workLedger) error {
 		return err
 	}
 	return durableReplaceLedger(temporaryPath, path)
+}
+
+func validateWorkLedger(ledger workLedger) error {
+	if ledger.SchemaVersion != ledgerSchema || !validSHA256Value(ledger.WorkflowKey) || strings.TrimSpace(ledger.Repository) == "" ||
+		strings.TrimSpace(ledger.BaseBranch) == "" || !validSHA256Value(ledger.PacketDigest) || !validSHA256Value(ledger.Workflow.CorrelationID) ||
+		ledger.Workflow.RunID <= 0 || ledger.Workflow.BundleArtifact <= 0 || ledger.Workflow.EvidenceArtifact <= 0 || !validGitObject(ledger.Workflow.HeadSHA) {
+		return errors.New("workflow and packet binding is incomplete")
+	}
+	expectedKey, err := workflowKey(integrated.NormalVisualWork{
+		Config:   integrated.Config{Repository: ledger.Repository, DefaultBranch: ledger.BaseBranch},
+		Workflow: ledger.Workflow, Artifact: hivegithub.VerifiedVisualHiveArtifact{BundleSHA256: ledger.PacketDigest},
+	})
+	if err != nil || expectedKey != ledger.WorkflowKey {
+		return errors.New("workflow key does not match the stored workflow and packet")
+	}
+	if (ledger.WorkOrderID == "") != (ledger.RequestSHA256 == "") {
+		return errors.New("specialist work-order identity is partial")
+	}
+	if ledger.WorkOrderID != "" && (!validSHA256Value(ledger.RequestSHA256) || ledger.WorkOrderID != "swo-"+ledger.RequestSHA256) {
+		return errors.New("specialist work-order identity is invalid")
+	}
+	prPresent := ledger.PullRequestNumber != 0 || ledger.PullRequestURL != "" || ledger.Branch != "" || ledger.CommitSHA != ""
+	if prPresent && (ledger.SourceExternalRef == "" || ledger.WorkOrderID == "" || ledger.PullRequestNumber <= 0 || strings.TrimSpace(ledger.PullRequestURL) == "" ||
+		strings.TrimSpace(ledger.Branch) == "" || ledger.CommitSHA != strings.ToLower(strings.TrimSpace(ledger.CommitSHA)) || !validGitObject(ledger.CommitSHA)) {
+		return errors.New("Worker pull-request identity is partial or invalid")
+	}
+	verdictPresent := ledger.VerdictReceiptSHA256 != "" || ledger.VerdictHeadSHA != "" || ledger.VerdictStatus != "" || len(ledger.VerdictReceipt) != 0
+	if verdictPresent {
+		if !prPresent || validateVerdictReceipt(ledger, PullRequestVerdictReceipt{
+			HeadSHA: ledger.VerdictHeadSHA, Status: ledger.VerdictStatus, Receipt: json.RawMessage(ledger.VerdictReceipt), ReceiptSHA256: ledger.VerdictReceiptSHA256,
+		}) != nil {
+			return errors.New("exact-head verdict binding is partial or invalid")
+		}
+	}
+	if ledger.SourceExternalRef == "" && (ledger.WorkOrderID != "" || prPresent || verdictPresent || ledger.CompletionRecorded) {
+		return errors.New("unimported workflow carries specialist or pull-request state")
+	}
+	if ledger.CompletionRecorded && !verdictPresent {
+		return errors.New("controller completion has no exact-head verdict")
+	}
+	if ledger.ConsumeStarted && ledger.SourceExternalRef != "" && !ledger.CompletionRecorded {
+		return errors.New("admitted workflow consumption started before controller completion")
+	}
+	if ledger.Consumed && !ledger.ConsumeStarted {
+		return errors.New("workflow is consumed without a durable consume checkpoint")
+	}
+	return nil
+}
+
+func validSHA256Value(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(strings.TrimSpace(value)) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func (service *Service) clearLedger() error {

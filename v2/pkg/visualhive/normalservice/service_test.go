@@ -1,11 +1,13 @@
 package normalservice
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +30,10 @@ func TestNormalServiceCrashReplayKeepsOneImportProposalPRAndVerdict(t *testing.T
 	}
 	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.repairer.runs != 1 || fixture.verifier.calls != 1 || fixture.source.consumes != 0 {
 		t.Fatalf("first cycle duplicated or skipped work: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+	ledger, exists, err := service.loadLedger()
+	if err != nil || !exists || !bytes.Equal(ledger.VerdictReceipt, fixture.verifier.receipt.Receipt) {
+		t.Fatalf("durable exact verdict bytes changed across JSON persistence: exists=%t err=%v receipt=%q", exists, err, ledger.VerdictReceipt)
 	}
 	if err := service.RunCycle(context.Background()); err != nil {
 		t.Fatalf("replay cycle: %v", err)
@@ -148,6 +154,57 @@ func TestNormalServiceLeaseContentionDoesNotRunCycleUntilOwnership(t *testing.T)
 	service.Run(ctx)
 	if claims != 2 || !released || fixture.source.fetches != 1 {
 		t.Fatalf("lease reconciliation = claims=%d released=%t fetches=%d", claims, released, fixture.source.fetches)
+	}
+}
+
+func TestNormalServiceRejectsCorruptLedgerStateMachineBeforeSideEffects(t *testing.T) {
+	fixture := newServiceFixture(t)
+	key, err := workflowKey(fixture.work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := workLedger{
+		SchemaVersion: ledgerSchema, WorkflowKey: key, Workflow: fixture.work.Workflow,
+		Repository: fixture.work.Config.Repository, BaseBranch: fixture.work.Config.DefaultBranch, PacketDigest: fixture.work.Artifact.BundleSHA256,
+	}
+	for name, mutate := range map[string]func(*workLedger){
+		"workflow key": func(ledger *workLedger) { ledger.WorkflowKey = strings.Repeat("0", 64) },
+		"consumed without checkpoint": func(ledger *workLedger) {
+			ledger.Consumed = true
+		},
+		"PR without order": func(ledger *workLedger) {
+			ledger.SourceExternalRef = "visual-hive://owner/repo/finding"
+			ledger.Branch, ledger.CommitSHA = "hive/repair-one", strings.Repeat("f", 40)
+			ledger.PullRequestNumber, ledger.PullRequestURL = 9, "https://example.test/pr/9"
+		},
+		"verdict digest": func(ledger *workLedger) {
+			ledger.SourceExternalRef = "visual-hive://owner/repo/finding"
+			ledger.WorkOrderID, ledger.RequestSHA256 = "swo-"+strings.Repeat("e", 64), strings.Repeat("e", 64)
+			ledger.Branch, ledger.CommitSHA = "hive/repair-one", strings.Repeat("f", 40)
+			ledger.PullRequestNumber, ledger.PullRequestURL = 9, "https://example.test/pr/9"
+			ledger.VerdictHeadSHA, ledger.VerdictStatus = ledger.CommitSHA, "failed"
+			ledger.VerdictReceipt = []byte(`{"status":"failed"}`)
+			ledger.VerdictReceiptSHA256 = strings.Repeat("1", 64)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := fixture.service(t, fixture.verifier)
+			corrupt := base
+			mutate(&corrupt)
+			encoded, marshalErr := json.Marshal(corrupt)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if err := os.WriteFile(service.ledgerPath(), encoded, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.RunCycle(context.Background()); err == nil || !strings.Contains(err.Error(), "ledger is corrupt") {
+				t.Fatalf("corrupt ledger was accepted: %v", err)
+			}
+			if fixture.source.fetches != 0 || fixture.intake.imports != 0 || fixture.repairer.runs != 0 || fixture.verifier.calls != 0 {
+				t.Fatalf("corrupt ledger reached side effects: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+			}
+		})
 	}
 }
 
