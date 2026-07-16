@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
 const testSpecialistDiff = "diff --git a/tests/widget_test.go b/tests/widget_test.go\n--- a/tests/widget_test.go\n+++ b/tests/widget_test.go\n@@ -1 +1 @@\n-old\n+new\n"
@@ -265,6 +267,172 @@ func TestSpecialistMailboxPrepareGovernedBindsAndRequiresSecurityContext(t *test
 	nonCodex.ExecutorProfileSHA256 = specialistExecutorProfileDigest(*nonCodex.ExecutorProfile)
 	if _, err := mailbox.PrepareGoverned(nonCodex); err == nil || !strings.Contains(err.Error(), "must be codex") {
 		t.Fatalf("PrepareGoverned did not fail closed on a non-Codex executor profile: %v", err)
+	}
+}
+
+func TestSpecialistMailboxReadsLegacyV1WithoutDigestMigration(t *testing.T) {
+	now := time.Date(2026, 7, 16, 1, 2, 3, 0, time.UTC)
+	root := filepath.Join(t.TempDir(), "specialist-mailbox")
+	mailbox, err := NewSpecialistMailbox(root, SpecialistMailboxOptions{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpecialistRequest(now, "legacy-revision:7", now.Add(time.Hour))
+	request.Evidence.ManifestSHA256 = ""
+	request.Evidence.ArtifactIndexSHA256 = ""
+	request.Evidence.RepositoryID = ""
+	request.Evidence.WorkflowName, request.Evidence.WorkflowRunName, request.Evidence.WorkflowPath = "", "", ""
+	request.Evidence.WorkflowEvent, request.Evidence.HeadBranch, request.Evidence.SourceArtifactID = "", "", 0
+	order, err := mailbox.Prepare(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, _ := mailbox.Paths(order.ID)
+	encoded, err := os.ReadFile(paths.Order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"\"variant\"", "\"manifest_sha256\"", "\"verification_receipt\""} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("legacy v1 bytes gained %s: %s", forbidden, encoded)
+		}
+	}
+	reopened, err := NewSpecialistMailbox(root, SpecialistMailboxOptions{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := reopened.ListPending()
+	if err != nil || len(pending) != 1 || pending[0].ID != order.ID || pending[0].RequestSHA256 != order.RequestSHA256 {
+		t.Fatalf("legacy v1 digest changed on read: pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestSpecialistMailboxRecoversPreUpgradeOrderWithoutRecomposition(t *testing.T) {
+	now := time.Date(2026, 7, 16, 1, 30, 0, 0, time.UTC)
+	mailbox := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
+	current := testSpecialistRequest(now, "legacy-running:r2", now.Add(time.Hour))
+	legacy := cloneSpecialistRequest(current)
+	legacy.Evidence.Variant = ""
+	legacy.Evidence.ManifestSHA256 = ""
+	legacy.Evidence.ArtifactIndexSHA256 = ""
+	legacy.Evidence.RepositoryID = ""
+	legacy.Evidence.WorkflowName, legacy.Evidence.WorkflowRunName, legacy.Evidence.WorkflowPath = "", "", ""
+	legacy.Evidence.WorkflowEvent, legacy.Evidence.HeadBranch, legacy.Evidence.SourceArtifactID = "", "", 0
+	legacy.Evidence.VerificationReceipt = nil
+	order, err := mailbox.Prepare(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Evidence.Variant = visualhive.SpecialistEvidenceVariantVisualHiveV3
+	receipt := visualhive.SpecialistEvidenceReceipt{
+		RepositoryID: current.Evidence.RepositoryID, WorkflowRunID: "12345", WorkflowRunAttempt: "2",
+		ArtifactID: "67890", SourceArtifactID: "67891", ArtifactName: current.Evidence.ArtifactName,
+		CommitSHA: current.Evidence.WorkflowRunHeadSHA, HeadBranch: current.Evidence.HeadBranch, Event: current.Evidence.WorkflowEvent,
+		WorkflowName: current.Evidence.WorkflowName, WorkflowRunName: current.Evidence.WorkflowRunName, WorkflowPath: current.Evidence.WorkflowPath,
+		BundleSchema: current.Evidence.BundleSchemaVersion, BundleSHA256: current.Evidence.BundleSHA256,
+		ManifestSHA256: current.Evidence.ManifestSHA256, ArtifactIndexSHA: current.Evidence.ArtifactIndexSHA256,
+	}
+	current.Evidence.VerificationReceipt = &receipt
+	current.Evidence.VerificationReceiptSHA256, _ = receipt.SHA256()
+	if err := mailbox.ValidateRequestForOrder(order, current); err == nil {
+		t.Fatal("strict request validation unexpectedly recomposed the pre-upgrade order")
+	}
+	if err := mailbox.ValidateRecoveryRequestForOrder(order, current); err != nil {
+		t.Fatalf("pre-upgrade running order was not accepted as recovery authority: %v", err)
+	}
+	authoritative := cloneSpecialistRequest(current)
+	authoritative.RouteReason = "new controller wording that must not rewrite launched bytes"
+	authoritative.Deadline = authoritative.Deadline.Add(time.Hour)
+	if err := mailbox.ValidateRecoveryRequestForOrder(order, authoritative); err != nil {
+		t.Fatalf("persisted route/deadline authority was recomposed: %v", err)
+	}
+	mutations := map[string]func(*SpecialistWorkOrderRequest){
+		"repository":  func(value *SpecialistWorkOrderRequest) { value.Repository = "acme/other" },
+		"fingerprint": func(value *SpecialistWorkOrderRequest) { value.RepositoryFingerprint = strings.Repeat("9", 64) },
+		"recurrence":  func(value *SpecialistWorkOrderRequest) { value.RecurrenceKey = "other:r2" },
+		"attempt":     func(value *SpecialistWorkOrderRequest) { value.Attempt++ },
+		"base":        func(value *SpecialistWorkOrderRequest) { value.BaseSHA = strings.Repeat("8", 40) },
+		"tree":        func(value *SpecialistWorkOrderRequest) { value.BaseTreeSHA = strings.Repeat("7", 40) },
+		"bundle":      func(value *SpecialistWorkOrderRequest) { value.Evidence.BundleSHA256 = strings.Repeat("6", 64) },
+		"run":         func(value *SpecialistWorkOrderRequest) { value.Evidence.WorkflowRunID++ },
+		"head":        func(value *SpecialistWorkOrderRequest) { value.Evidence.WorkflowRunHeadSHA = strings.Repeat("5", 40) },
+		"artifact":    func(value *SpecialistWorkOrderRequest) { value.Evidence.ArtifactID++ },
+		"artifact name": func(value *SpecialistWorkOrderRequest) {
+			value.Evidence.ArtifactName = "other-artifact"
+		},
+		"artifact digest": func(value *SpecialistWorkOrderRequest) { value.Evidence.ArtifactSHA256 = strings.Repeat("4", 64) },
+		"role":            func(value *SpecialistWorkOrderRequest) { value.Specialist = SpecialistScanner },
+		"paths":           func(value *SpecialistWorkOrderRequest) { value.AllowedPaths = []string{"README.md"} },
+		"validation":      func(value *SpecialistWorkOrderRequest) { value.Validation = []string{"false"} },
+		"prompt": func(value *SpecialistWorkOrderRequest) {
+			value.TaskPrompt = "different work"
+			value.TaskPromptSHA256 = sha256HexString(value.TaskPrompt)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run("reject "+name, func(t *testing.T) {
+			changed := cloneSpecialistRequest(current)
+			mutate(&changed)
+			if err := mailbox.ValidateRecoveryRequestForOrder(order, changed); err == nil {
+				t.Fatal("recovery accepted safety-critical work drift")
+			}
+		})
+	}
+}
+
+func TestSpecialistMailboxRecoversPreUpgradeRevisionOrderAfterVariantDiscriminant(t *testing.T) {
+	now := time.Date(2026, 7, 16, 1, 45, 0, 0, time.UTC)
+	mailbox := newTestSpecialistMailbox(t, &now, SpecialistMailboxOptions{})
+	legacy := testSpecialistRequest(now, "legacy-pr-revision:r3", now.Add(time.Hour))
+	legacy.Evidence.BundleSchemaVersion = "visual-hive.pr-review.v1"
+	legacy.Evidence.ManifestSHA256, legacy.Evidence.ArtifactIndexSHA256, legacy.Evidence.RepositoryID = "", "", ""
+	legacy.Evidence.WorkflowName, legacy.Evidence.WorkflowRunName, legacy.Evidence.WorkflowPath = "", "", ""
+	legacy.Evidence.WorkflowEvent, legacy.Evidence.HeadBranch, legacy.Evidence.SourceArtifactID = "", "", 0
+	order, err := mailbox.Prepare(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := cloneSpecialistRequest(legacy)
+	current.Evidence.Variant = visualhive.SpecialistEvidenceVariantRevision
+	if err := mailbox.ValidateRequestForOrder(order, current); err == nil {
+		t.Fatal("strict validation unexpectedly rewrote a pre-upgrade revision order")
+	}
+	if err := mailbox.ValidateRecoveryRequestForOrder(order, current); err != nil {
+		t.Fatalf("revision variant addition interrupted the running persisted order: %v", err)
+	}
+}
+
+func TestVisualHiveEvidenceCrossBindsCanonicalReceipt(t *testing.T) {
+	evidence := testSpecialistRequest(time.Now(), "visual:1", time.Now().Add(time.Hour)).Evidence
+	evidence.Variant = visualhive.SpecialistEvidenceVariantVisualHiveV3
+	receipt := visualhive.SpecialistEvidenceReceipt{
+		RepositoryID: evidence.RepositoryID, WorkflowRunID: "12345", WorkflowRunAttempt: "2", ArtifactID: "67890", SourceArtifactID: "67891",
+		ArtifactName: evidence.ArtifactName, CommitSHA: evidence.WorkflowRunHeadSHA, HeadBranch: evidence.HeadBranch,
+		Event: evidence.WorkflowEvent, WorkflowName: evidence.WorkflowName, WorkflowRunName: evidence.WorkflowRunName, WorkflowPath: evidence.WorkflowPath,
+		BundleSchema: evidence.BundleSchemaVersion, BundleSHA256: evidence.BundleSHA256, ManifestSHA256: evidence.ManifestSHA256, ArtifactIndexSHA: evidence.ArtifactIndexSHA256,
+	}
+	evidence.VerificationReceipt = &receipt
+	evidence.VerificationReceiptSHA256, _ = receipt.SHA256()
+	if err := validateEvidence(evidence); err != nil {
+		t.Fatalf("valid Visual Hive receipt rejected: %v", err)
+	}
+	mutations := map[string]func(*SpecialistEvidenceIdentity){
+		"schema":     func(value *SpecialistEvidenceIdentity) { value.BundleSchemaVersion = "other" },
+		"repository": func(value *SpecialistEvidenceIdentity) { value.RepositoryID = "999" },
+		"run":        func(value *SpecialistEvidenceIdentity) { value.WorkflowRunAttempt++ },
+		"artifact":   func(value *SpecialistEvidenceIdentity) { value.SourceArtifactID++ },
+		"workflow":   func(value *SpecialistEvidenceIdentity) { value.WorkflowPath = ".github/workflows/other.yml" },
+		"head":       func(value *SpecialistEvidenceIdentity) { value.HeadBranch = "other" },
+		"content":    func(value *SpecialistEvidenceIdentity) { value.BundleSHA256 = strings.Repeat("9", 64) },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := evidence
+			mutate(&changed)
+			if err := validateEvidence(changed); err == nil {
+				t.Fatal("outer identity drift was accepted")
+			}
+		})
 	}
 }
 
@@ -751,11 +919,20 @@ func testSpecialistRequest(now time.Time, recurrence string, deadline time.Time)
 		Evidence: SpecialistEvidenceIdentity{
 			BundleSchemaVersion:       "visual-hive.hive-bundle.v3",
 			BundleSHA256:              strings.Repeat("d", 64),
+			ManifestSHA256:            strings.Repeat("f", 64),
+			ArtifactIndexSHA256:       strings.Repeat("1", 64),
 			VerificationReceiptSHA256: strings.Repeat("e", 64),
+			RepositoryID:              "123",
 			WorkflowRunID:             12345,
 			WorkflowRunAttempt:        2,
 			WorkflowRunHeadSHA:        strings.Repeat("b", 40),
+			WorkflowName:              "Hive Visual Hive Production",
+			WorkflowRunName:           "Hive Visual Hive Production [test]",
+			WorkflowPath:              ".github/workflows/hive-visual-hive.yml",
+			WorkflowEvent:             "workflow_dispatch",
+			HeadBranch:                "main",
 			ArtifactID:                67890,
+			SourceArtifactID:          67891,
 			ArtifactName:              "visual-hive-evidence",
 			ArtifactSHA256:            strings.Repeat("f", 64),
 		},

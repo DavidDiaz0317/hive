@@ -93,6 +93,7 @@ type FindingLifecycle struct {
 	LastWorkflowRunID              string          `json:"last_workflow_run_id,omitempty"`
 	RepairAttempts                 int             `json:"repair_attempts"`
 	Recurrences                    int             `json:"recurrences"`
+	PendingIssueAction             OutboxAction    `json:"pending_issue_action,omitempty"`
 }
 
 type CheckEvidence struct {
@@ -130,6 +131,27 @@ type LifecycleState struct {
 	Findings      map[string]*FindingLifecycle `json:"findings"`
 	ReplayKeys    map[string]string            `json:"replay_keys"`
 	Outbox        []*OutboxEntry               `json:"outbox"`
+	LastImport    *VisualImportRunReceipt      `json:"last_import,omitempty"`
+}
+
+type VisualImportRunReceipt struct {
+	PacketID            string    `json:"packet_id"`
+	PacketDigest        string    `json:"packet_digest"`
+	ReplayKey           string    `json:"replay_key"`
+	Repository          string    `json:"repository"`
+	RepositoryID        string    `json:"repository_id"`
+	BaseSHA             string    `json:"base_sha"`
+	WorkflowName        string    `json:"workflow_name"`
+	WorkflowEvent       string    `json:"workflow_event"`
+	WorkflowRunID       string    `json:"workflow_run_id"`
+	WorkflowRunAttempt  string    `json:"workflow_run_attempt"`
+	WorkflowArtifactID  string    `json:"workflow_artifact_id"`
+	ProducerName        string    `json:"producer_name"`
+	ProducerGitCommit   string    `json:"producer_git_commit"`
+	ArtifactIndexSHA256 string    `json:"artifact_index_sha256,omitempty"`
+	Verdict             string    `json:"verdict"`
+	Observations        int       `json:"observations"`
+	ImportedAt          time.Time `json:"imported_at"`
 }
 
 type LifecycleAuditEntry struct {
@@ -180,6 +202,17 @@ type LifecycleStore struct {
 	auditReceipts map[string]bool
 }
 
+// LifecycleBeadSink is the narrow existing-bead-store surface used while
+// applying verified Visual Hive observations. A single *beads.Store remains
+// the compatibility adapter; the normal service supplies a role-aware router
+// backed by its already-open per-role stores.
+type LifecycleBeadSink interface {
+	ImportBatch([]beads.BatchInput) (beads.BatchResult, error)
+	FindByExternalRef(string) *beads.Bead
+	Update(string, func(*beads.Bead)) error
+	Close(string) error
+}
+
 func NewLifecycleStore(dir string) (*LifecycleStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("lifecycle store directory is required")
@@ -211,7 +244,11 @@ func NewLifecycleStore(dir string) (*LifecycleStore, error) {
 	return store, nil
 }
 
-func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.Store, options ApplyLifecycleOptions) (ApplyLifecycleResult, error) {
+func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore LifecycleBeadSink, options ApplyLifecycleOptions) (ApplyLifecycleResult, error) {
+	return s.applyBundle(bundle, beadStore, options, false)
+}
+
+func (s *LifecycleStore) applyBundle(bundle *ValidatedBundle, beadStore LifecycleBeadSink, options ApplyLifecycleOptions, controllerOwned bool) (ApplyLifecycleResult, error) {
 	if bundle == nil {
 		return ApplyLifecycleResult{}, fmt.Errorf("validated Visual Hive bundle is required")
 	}
@@ -226,6 +263,24 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 
 	manifest := bundle.Manifest
 	validatedAuthoritative := bundle.Validation.Authoritative
+	importInputs, err := buildObservationImportInputs(manifest, bundle.artifactIndex)
+	if err != nil {
+		return ApplyLifecycleResult{}, fmt.Errorf("build verified Visual Hive import plan: %w", err)
+	}
+	if !controllerOwned {
+		for fingerprint, input := range importInputs {
+			input.Status = beads.StatusOpen
+			input.Metadata["visual_hive_controller_owned"] = false
+			delete(input.Metadata, "visual_hive_admission_state")
+			importInputs[fingerprint] = input
+		}
+	} else {
+		identities := controllerImportIdentityMap(manifest, s.state.Findings)
+		rekeyControllerImportInputs(manifest.Source.Repository, importInputs, identities)
+		for key, input := range controllerAbsenceImportInputs(manifest, s.state.Findings, identities, options, validatedAuthoritative) {
+			importInputs[key] = input
+		}
+	}
 	result := ApplyLifecycleResult{BundleID: manifest.BundleID}
 	if priorDigest, exists := s.state.ReplayKeys[manifest.ReplayProtection.Key]; exists {
 		if priorDigest != manifest.OverallDigest {
@@ -235,12 +290,35 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			return result, fmt.Errorf("bundle replay key was reused with a different digest")
 		}
 		result.Idempotent = true
-		if err := s.auditLockedStrict(LifecycleAuditEntry{Action: "bundle_replay", Allowed: true, Repository: manifest.Source.Repository, BundleID: manifest.BundleID, Detail: "idempotent retry"}); err != nil {
-			return result, err
+		if controllerOwned {
+			return s.projectControllerReplayLocked(manifest, importInputs, beadStore, result)
 		}
 		return result, nil
 	}
 	backup := cloneLifecycleState(s.state)
+	holdControllerBead := func(finding *FindingLifecycle) error {
+		if !controllerOwned || finding == nil {
+			return nil
+		}
+		bead := beadStore.FindByExternalRef(beadExternalRef(finding.Repository, finding.RepositoryFingerprint))
+		if bead == nil {
+			return nil
+		}
+		if finding.BeadID == "" {
+			finding.BeadID = bead.ID
+		}
+		return beadStore.Update(bead.ID, func(value *beads.Bead) {
+			value.Status = beads.StatusBlocked
+			value.ClosedAt = nil
+			if value.Metadata == nil {
+				value.Metadata = map[string]interface{}{}
+			}
+			value.Metadata["visual_hive_controller_owned"] = true
+			value.Metadata["visual_hive_admission_state"] = "pending"
+			delete(value.Metadata, "visual_hive_admission_decision_json")
+			delete(value.Metadata, "visual_hive_dispatch_envelope_json")
+		})
+	}
 	audit := func(entry LifecycleAuditEntry) error {
 		if err := s.auditLockedStrict(entry); err != nil {
 			s.state = backup
@@ -280,18 +358,26 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		canonicalOwners[observation.RepositoryFingerprint] = legacy
 		newLegacyMigrations[observation.RepositoryFingerprint] = legacy
 	}
-	beadInputs := make([]beads.BatchInput, 0, len(manifest.Observations))
-	for _, observation := range manifest.Observations {
-		if observation.State != "present" {
-			continue
+	beadInputs := make([]beads.BatchInput, 0, len(importInputs))
+	if controllerOwned {
+		for _, input := range importInputs {
+			if beadStore.FindByExternalRef(input.ExternalRef) == nil {
+				beadInputs = append(beadInputs, input)
+			}
 		}
-		if canonicalOwners[observation.RepositoryFingerprint] != nil {
-			continue
-		}
-		if existing := s.state.Findings[observation.RepositoryFingerprint]; existing == nil || existing.BeadID == "" {
-			beadInputs = append(beadInputs, beadInputForObservation(manifest, observation))
+	} else {
+		for _, observation := range manifest.Observations {
+			if observation.State != "present" || canonicalOwners[observation.RepositoryFingerprint] != nil {
+				continue
+			}
+			if existing := s.state.Findings[observation.RepositoryFingerprint]; existing == nil || existing.BeadID == "" {
+				if input, exists := importInputs[observation.RepositoryFingerprint]; exists {
+					beadInputs = append(beadInputs, input)
+				}
+			}
 		}
 	}
+	sort.Slice(beadInputs, func(i, j int) bool { return beadInputs[i].ExternalRef < beadInputs[j].ExternalRef })
 	if len(beadInputs) > 0 {
 		beadResult, err := beadStore.ImportBatch(beadInputs)
 		if err != nil {
@@ -344,6 +430,10 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				}
 				continue
 			}
+			if err := holdControllerBead(finding); err != nil {
+				s.state = backup
+				return result, fmt.Errorf("hold resolved Visual Hive bead for admission: %w", err)
+			}
 			updateFindingFromObservation(finding, manifest, observation)
 			if finding.Status == StatusIssueClosed {
 				result.Updated++
@@ -351,6 +441,10 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				continue
 			}
 			finding.Status = StatusResolved
+			finding.PendingIssueAction = ""
+			if finding.IssueNumber > 0 {
+				finding.PendingIssueAction = OutboxCloseIssue
+			}
 			finding.ResolvedAt = &now
 			finding.ClosedAt = nil
 			setVerificationEvidence(finding, manifest, options)
@@ -414,14 +508,37 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			beadFingerprint = finding.RepositoryFingerprint
 		}
 		if bead := beadStore.FindByExternalRef(beadExternalRef(manifest.Source.Repository, beadFingerprint)); bead != nil {
-			if finding.BeadID == "" {
+			if finding.BeadID == "" || controllerOwned {
 				finding.BeadID = bead.ID
 			}
 			if wasReopened && (bead.Status == beads.StatusClosed || bead.Status == beads.StatusDone) {
-				_ = beadStore.Update(bead.ID, func(value *beads.Bead) {
-					value.Status = beads.StatusOpen
+				if err := beadStore.Update(bead.ID, func(value *beads.Bead) {
+					if controllerOwned {
+						value.Status = beads.StatusBlocked
+					} else {
+						value.Status = beads.StatusOpen
+					}
 					value.ClosedAt = nil
-				})
+				}); err != nil {
+					s.state = backup
+					return result, fmt.Errorf("reopen Visual Hive bead: %w", err)
+				}
+			}
+			if controllerOwned {
+				if err := beadStore.Update(bead.ID, func(value *beads.Bead) {
+					value.Status = beads.StatusBlocked
+					value.ClosedAt = nil
+					if value.Metadata == nil {
+						value.Metadata = map[string]interface{}{}
+					}
+					value.Metadata["visual_hive_controller_owned"] = true
+					value.Metadata["visual_hive_admission_state"] = "pending"
+					delete(value.Metadata, "visual_hive_admission_decision_json")
+					delete(value.Metadata, "visual_hive_dispatch_envelope_json")
+				}); err != nil {
+					s.state = backup
+					return result, fmt.Errorf("hold updated Visual Hive bead for admission: %w", err)
+				}
 			}
 		}
 		if deferredReason != "" {
@@ -447,6 +564,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 			result.FindingIDs = append(result.FindingIDs, observation.RepositoryFingerprint)
 			continue
 		}
+		finding.PendingIssueAction = action
 		if publicationSet[observation.RepositoryFingerprint] && observation.RootCauseKey != "" {
 			if owner := publicationOwner(manifest.Source.Repository, s.state.Findings, observation); owner != nil && owner.RepositoryFingerprint != finding.RepositoryFingerprint {
 				ownerReopened := owner.Status == StatusIssueClosed || owner.Status == StatusResolved
@@ -456,10 +574,17 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 					owner.Recurrences++
 					resetRepairCycle(owner)
 					if owner.BeadID != "" {
-						_ = beadStore.Update(owner.BeadID, func(value *beads.Bead) {
-							value.Status = beads.StatusOpen
+						if err := beadStore.Update(owner.BeadID, func(value *beads.Bead) {
+							if controllerOwned {
+								value.Status = beads.StatusBlocked
+							} else {
+								value.Status = beads.StatusOpen
+							}
 							value.ClosedAt = nil
-						})
+						}); err != nil {
+							s.state = backup
+							return result, fmt.Errorf("reopen Visual Hive publication owner bead: %w", err)
+						}
 					}
 					result.Reopened++
 				}
@@ -468,6 +593,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				if ownerReopened {
 					ownerAction = OutboxReopenIssue
 				}
+				owner.PendingIssueAction = ownerAction
 				if !options.DisableIssuePublication && s.enqueueLocked(outboxForFinding(ownerAction, owner, manifest, now)) {
 					result.OutboxCreated++
 				}
@@ -511,7 +637,15 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 				}
 				continue
 			}
+			if err := holdControllerBead(finding); err != nil {
+				s.state = backup
+				return result, fmt.Errorf("hold inferred-absence Visual Hive bead for admission: %w", err)
+			}
 			finding.Status = StatusResolved
+			finding.PendingIssueAction = ""
+			if finding.IssueNumber > 0 {
+				finding.PendingIssueAction = OutboxCloseIssue
+			}
 			finding.ResolvedAt = &now
 			finding.ClosedAt = nil
 			finding.LastBundleID = manifest.BundleID
@@ -531,6 +665,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	}
 
 	s.state.ReplayKeys[manifest.ReplayProtection.Key] = manifest.OverallDigest
+	s.state.LastImport = visualImportRunReceipt(manifest, now)
 	s.state.UpdatedAt = now
 	s.sortStateLocked()
 	if err := s.persistLocked(); err != nil {
@@ -539,6 +674,335 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	}
 	sort.Strings(result.FindingIDs)
 	return result, nil
+}
+
+// ApplyImportPlan accepts only a sealed plan built from complete private
+// verification and applies its canonical manifest through the same lifecycle,
+// replay, outbox, and recovery code as the compatibility path.
+func (s *LifecycleStore) ApplyImportPlan(plan VerifiedImportPlan, beadStore LifecycleBeadSink, options ApplyLifecycleOptions) (ApplyLifecycleResult, error) {
+	if err := plan.validate(); err != nil {
+		return ApplyLifecycleResult{}, err
+	}
+	return s.applyBundle(plan.seal.bundle, beadStore, options, true)
+}
+
+// ResolveImportPlanWorks preserves the verified observation identity while
+// mapping source work onto an existing durable canonical publication owner.
+// The mapping is derived only from the sealed plan and this lifecycle store.
+func (s *LifecycleStore) ResolveImportPlanWorks(plan VerifiedImportPlan, options ApplyLifecycleOptions) ([]AdmittedVisualWork, error) {
+	if err := plan.validate(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	works := plan.Works()
+	manifest := plan.seal.bundle.Manifest
+	identities := controllerImportIdentityMap(manifest, s.state.Findings)
+	observed := make(map[string]bool, len(works))
+	for index := range works {
+		original := works[index].RepositoryFingerprint
+		observed[original] = true
+		if works[index].ObservationFingerprint == "" {
+			works[index].ObservationFingerprint = original
+		}
+		owner := identities[original]
+		if owner == "" || owner == original {
+			continue
+		}
+		works[index].RepositoryFingerprint = owner
+		works[index].SourceExternalRef = beadExternalRef(works[index].Packet.Repository, owner)
+		works[index].Bead.SourceID = owner
+		works[index].Bead.ExternalRef = works[index].SourceExternalRef
+		if works[index].Bead.Metadata == nil {
+			works[index].Bead.Metadata = map[string]interface{}{}
+		}
+		works[index].Bead.Metadata["visual_hive_observation_repository_fingerprint"] = original
+		works[index].Bead.Metadata["visual_hive_repository_fingerprint"] = owner
+	}
+	for index := range works {
+		finding := s.state.Findings[works[index].RepositoryFingerprint]
+		if works[index].ObservationState == "absent" && finding != nil && works[index].Bead.ExternalRef == "" {
+			works[index].Bead = controllerFindingBatchInput(manifest, finding, works[index].Role, works[index].RoutingReason, works[index].RoutingAllowed, works[index].ObservationFingerprint)
+		}
+	}
+	presentRoots := map[string]bool{}
+	for _, observation := range manifest.Observations {
+		if observation.State == "present" && observation.RootCauseKey != "" {
+			presentRoots[observation.RootCauseKey] = true
+		}
+	}
+	if plan.seal.bundle.Validation.Authoritative && manifest.Scan.Scope == "full" && refsEquivalent(manifest.Source.Ref, options.TargetRef) {
+		keys := make([]string, 0, len(s.state.Findings))
+		for key := range s.state.Findings {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			finding := s.state.Findings[key]
+			if finding == nil || observed[key] || !strings.EqualFold(finding.Repository, manifest.Source.Repository) {
+				continue
+			}
+			samePacketRecovery := finding.LastBundleID == plan.packet.PacketID && finding.LastBundleDigest == plan.packet.PacketDigest &&
+				(finding.Status == StatusResolved || finding.Status == StatusIssueClosed)
+			if !samePacketRecovery {
+				if finding.Status == StatusIssueClosed {
+					continue
+				}
+				if allowed, _ := s.rootResolutionAllowedLocked(finding, manifest, true, options.TargetRef, options, presentRoots); !allowed {
+					continue
+				}
+			}
+			route := ResolveSpecialist(SpecialistRoutingInput{IssueKind: finding.IssueKind, OwningAgentHint: finding.OwningAgentHint,
+				GroundedRepairScope: strings.TrimSpace(finding.ValidationCommand) != "" && validAffectedContracts(finding.AffectedContracts), BaselineChangesForbidden: true})
+			validation := []string{}
+			if command := strings.TrimSpace(finding.ValidationCommand); command != "" {
+				validation = append(validation, command)
+			}
+			work := AdmittedVisualWork{
+				SourceExternalRef: beadExternalRef(finding.Repository, finding.RepositoryFingerprint), Packet: plan.packet,
+				FindingFingerprint: finding.Fingerprint, ObservationFingerprint: finding.RepositoryFingerprint, RepositoryFingerprint: finding.RepositoryFingerprint,
+				ObservationState: "absent", PublicationRole: finding.PublicationRole, RootCauseKey: finding.RootCauseKey,
+				BlockedByRootKeys: append([]string(nil), finding.BlockedByRootKeys...), IssueKind: finding.IssueKind, Severity: finding.Severity,
+				Title: finding.Title, Body: finding.Body, Labels: append([]string(nil), finding.Labels...), Role: route.Role,
+				RoutingReason: "persisted lifecycle owner omitted from exhaustive verified inventory: " + route.Reason, RoutingAllowed: route.DispatchAllowed,
+				AffectedContracts: append([]string(nil), finding.AffectedContracts...), KnowledgeKeywordState: "unavailable_no_verified_facts",
+				ValidationCommands: validation, ReproductionCommands: append([]string(nil), validation...), ReproductionSource: "persisted_verified_observation_validation_command",
+				Authority: VisualWorkAuthority{ProposalOnly: true},
+			}
+			work.Bead = controllerFindingBatchInput(manifest, finding, work.Role, work.RoutingReason, work.RoutingAllowed, work.ObservationFingerprint)
+			works = append(works, work)
+		}
+	}
+	for index := range works {
+		for dependencyIndex, dependency := range works[index].Bead.DependsOn {
+			if owner := identities[dependency]; owner != "" {
+				works[index].Bead.DependsOn[dependencyIndex] = owner
+			}
+		}
+		sort.Strings(works[index].Bead.DependsOn)
+	}
+	sort.Slice(works, func(i, j int) bool { return works[i].RepositoryFingerprint < works[j].RepositoryFingerprint })
+	return works, nil
+}
+
+func controllerImportIdentityMap(manifest Manifest, findings map[string]*FindingLifecycle) map[string]string {
+	identities := make(map[string]string, len(manifest.Observations))
+	for _, observation := range manifest.Observations {
+		identity := observation.RepositoryFingerprint
+		if observation.PublicationRole == "canonical" {
+			if owner := exactMigratedCanonicalOwner(manifest.Source.Repository, findings, observation); owner != nil {
+				identity = owner.RepositoryFingerprint
+			} else if matches := exactLegacyCanonicalMigrationMatches(manifest.Source.Repository, findings, observation); len(matches) == 1 {
+				identity = matches[0].finding.RepositoryFingerprint
+			}
+		}
+		identities[observation.RepositoryFingerprint] = identity
+	}
+	return identities
+}
+
+func controllerAbsenceImportInputs(manifest Manifest, findings map[string]*FindingLifecycle, identities map[string]string, options ApplyLifecycleOptions, authoritative bool) map[string]beads.BatchInput {
+	inputs := map[string]beads.BatchInput{}
+	observed := make(map[string]bool, len(manifest.Observations))
+	presentRoots := map[string]bool{}
+	for _, observation := range manifest.Observations {
+		observed[observation.RepositoryFingerprint] = true
+		if observation.State == "present" && observation.RootCauseKey != "" {
+			presentRoots[observation.RootCauseKey] = true
+		}
+		if observation.State != "absent" {
+			continue
+		}
+		identity := identities[observation.RepositoryFingerprint]
+		if identity == "" {
+			identity = observation.RepositoryFingerprint
+		}
+		finding := findings[identity]
+		if finding == nil {
+			continue
+		}
+		route := ResolveSpecialist(SpecialistRoutingInput{IssueKind: observation.IssueKind, OwningAgentHint: observation.OwningAgentHint,
+			GroundedRepairScope: strings.TrimSpace(observation.ValidationCommand) != "" && validAffectedContracts(observation.AffectedContracts), BaselineChangesForbidden: true})
+		inputs[observation.RepositoryFingerprint] = controllerFindingBatchInput(manifest, finding, route.Role, route.Reason, route.DispatchAllowed, observation.RepositoryFingerprint)
+	}
+	if !authoritative || manifest.Scan.Scope != "full" || !refsEquivalent(manifest.Source.Ref, options.TargetRef) {
+		return inputs
+	}
+	keys := make([]string, 0, len(findings))
+	for key := range findings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	store := &LifecycleStore{state: LifecycleState{Findings: findings}}
+	for _, key := range keys {
+		finding := findings[key]
+		if finding == nil || observed[key] || !strings.EqualFold(finding.Repository, manifest.Source.Repository) {
+			continue
+		}
+		samePacketRecovery := finding.LastBundleID == manifest.BundleID && finding.LastBundleDigest == manifest.OverallDigest &&
+			(finding.Status == StatusResolved || finding.Status == StatusIssueClosed)
+		if !samePacketRecovery {
+			if finding.Status == StatusIssueClosed {
+				continue
+			}
+			if allowed, _ := store.rootResolutionAllowedLocked(finding, manifest, authoritative, options.TargetRef, options, presentRoots); !allowed {
+				continue
+			}
+		}
+		route := ResolveSpecialist(SpecialistRoutingInput{IssueKind: finding.IssueKind, OwningAgentHint: finding.OwningAgentHint,
+			GroundedRepairScope: strings.TrimSpace(finding.ValidationCommand) != "" && validAffectedContracts(finding.AffectedContracts), BaselineChangesForbidden: true})
+		inputs[key] = controllerFindingBatchInput(manifest, finding, route.Role, "persisted lifecycle owner omitted from exhaustive verified inventory: "+route.Reason, route.DispatchAllowed, key)
+	}
+	return inputs
+}
+
+func controllerFindingBatchInput(manifest Manifest, finding *FindingLifecycle, role, routingReason string, routingAllowed bool, observationFingerprint string) beads.BatchInput {
+	validation := []string{}
+	if command := strings.TrimSpace(finding.ValidationCommand); command != "" {
+		validation = append(validation, command)
+	}
+	return beads.BatchInput{
+		SourceID: finding.RepositoryFingerprint, Title: finding.Title, Type: beadTypeForObservation(finding.IssueKind), Status: beads.StatusBlocked,
+		Priority: priorityForSeverity(finding.Severity), Actor: role, ExternalRef: beadExternalRef(finding.Repository, finding.RepositoryFingerprint), Notes: finding.Body,
+		Metadata: map[string]interface{}{
+			"visual_hive_controller_owned": true, "visual_hive_admission_state": "pending", "visual_hive_tombstone": true,
+			"visual_hive_fingerprint": finding.Fingerprint, "visual_hive_repository_fingerprint": finding.RepositoryFingerprint,
+			"visual_hive_observation_repository_fingerprint": observationFingerprint, "visual_hive_packet_id": manifest.BundleID,
+			"visual_hive_packet_digest": manifest.OverallDigest, "visual_hive_replay_key": manifest.ReplayProtection.Key,
+			"visual_hive_repository": finding.Repository, "visual_hive_repository_id": manifest.Source.RepositoryID,
+			"visual_hive_source_ref": manifest.Source.Ref, "visual_hive_base_sha": manifest.Source.CommitSHA,
+			"visual_hive_workflow_name": manifest.Source.WorkflowName, "visual_hive_workflow_event": manifest.Source.Event,
+			"visual_hive_workflow_run_id": manifest.Source.WorkflowRunID, "visual_hive_workflow_run_attempt": manifest.Source.WorkflowRunAttempt,
+			"visual_hive_workflow_artifact_id": manifest.Source.WorkflowArtifactID, "visual_hive_producer": manifest.Producer.Name,
+			"visual_hive_producer_version": manifest.Producer.Version, "visual_hive_producer_git_commit": manifest.Producer.GitCommit,
+			"visual_hive_issue_kind": finding.IssueKind, "visual_hive_severity": finding.Severity,
+			"visual_hive_publication_role": finding.PublicationRole, "visual_hive_root_cause_key": finding.RootCauseKey,
+			"visual_hive_blocked_by_root_keys": append([]string(nil), finding.BlockedByRootKeys...),
+			"visual_hive_affected_contracts":   append([]string(nil), finding.AffectedContracts...), "visual_hive_validation_commands": validation,
+			"visual_hive_route_role": role, "visual_hive_route_reason": routingReason, "visual_hive_route_allowed": routingAllowed,
+			"hive_proposal_only": true, "hive_github_write_allowed": false, "hive_merge_allowed": false,
+			"hive_baseline_changes_allowed": false, "hive_baseline_approval_allowed": false,
+		},
+	}
+}
+
+func rekeyControllerImportInputs(repository string, inputs map[string]beads.BatchInput, identities map[string]string) {
+	for observationFingerprint, input := range inputs {
+		owner := identities[observationFingerprint]
+		if owner == "" || owner == observationFingerprint {
+			continue
+		}
+		input = cloneBatchInput(input)
+		input.SourceID = owner
+		input.ExternalRef = beadExternalRef(repository, owner)
+		input.Metadata["visual_hive_observation_repository_fingerprint"] = observationFingerprint
+		input.Metadata["visual_hive_repository_fingerprint"] = owner
+		for index, dependency := range input.DependsOn {
+			if dependencyOwner := identities[dependency]; dependencyOwner != "" {
+				input.DependsOn[index] = dependencyOwner
+			}
+		}
+		sort.Strings(input.DependsOn)
+		inputs[observationFingerprint] = input
+	}
+}
+
+func (s *LifecycleStore) projectControllerReplayLocked(manifest Manifest, inputs map[string]beads.BatchInput, beadStore LifecycleBeadSink, result ApplyLifecycleResult) (ApplyLifecycleResult, error) {
+	ordered := make([]beads.BatchInput, 0, len(inputs))
+	createdRefs := make([]string, 0, len(inputs))
+	identities := controllerImportIdentityMap(manifest, s.state.Findings)
+	eligibleInputs := map[string]beads.BatchInput{}
+	for observationFingerprint, input := range inputs {
+		identity := identities[observationFingerprint]
+		if identity == "" {
+			identity = observationFingerprint
+		}
+		finding := s.state.Findings[identity]
+		if finding == nil || finding.LastBundleID != manifest.BundleID || finding.LastBundleDigest != manifest.OverallDigest {
+			continue
+		}
+		eligibleInputs[observationFingerprint] = input
+		ordered = append(ordered, input)
+		if beadStore.FindByExternalRef(input.ExternalRef) == nil {
+			createdRefs = append(createdRefs, input.ExternalRef)
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ExternalRef < ordered[j].ExternalRef })
+	if len(ordered) == 0 {
+		return result, nil
+	}
+	rollbackSink, rollbackAvailable := beadStore.(interface{ RollbackImportedExternalRefs([]string) error })
+	if len(createdRefs) > 0 && !rollbackAvailable {
+		return result, fmt.Errorf("normal role bead sink does not support transactional replay projection rollback")
+	}
+	imported, err := beadStore.ImportBatch(ordered)
+	if err != nil {
+		return result, fmt.Errorf("project replayed Visual Hive work into normal role stores: %w", err)
+	}
+	rollback := func(cause error) (ApplyLifecycleResult, error) {
+		if len(createdRefs) > 0 {
+			if rollbackErr := rollbackSink.RollbackImportedExternalRefs(createdRefs); rollbackErr != nil {
+				return result, fmt.Errorf("%w; replay projection rollback failed: %v", cause, rollbackErr)
+			}
+		}
+		return result, cause
+	}
+	backup := cloneLifecycleState(s.state)
+	changed := false
+	for observationFingerprint, input := range eligibleInputs {
+		bead := beadStore.FindByExternalRef(input.ExternalRef)
+		if bead == nil {
+			s.state = backup
+			return rollback(fmt.Errorf("replayed Visual Hive bead %s was not durably projected", input.ExternalRef))
+		}
+		identity := identities[observationFingerprint]
+		if identity == "" {
+			identity = observationFingerprint
+		}
+		if finding := s.state.Findings[identity]; finding != nil && finding.BeadID != bead.ID {
+			finding.BeadID = bead.ID
+			changed = true
+		}
+	}
+	if changed {
+		s.state.UpdatedAt = time.Now().UTC()
+		if err := s.persistLocked(); err != nil {
+			s.state = backup
+			return rollback(fmt.Errorf("persist replayed Visual Hive normal-store projection: %w", err))
+		}
+	}
+	result.BeadsCreated, result.BeadsSkipped = imported.Created, imported.Skipped
+	return result, nil
+}
+
+// RecordControllerImportHold durably records a fail-closed intake routing
+// failure in the existing lifecycle audit ledger. It does not create work,
+// consume the packet replay key, or introduce another queue.
+func (s *LifecycleStore) RecordControllerImportHold(packet VerifiedPacketIdentity, detail string) error {
+	if strings.TrimSpace(packet.PacketID) == "" || strings.TrimSpace(packet.PacketDigest) == "" || strings.TrimSpace(packet.Repository) == "" || strings.TrimSpace(detail) == "" {
+		return fmt.Errorf("verified packet identity and hold detail are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auditLockedStrict(LifecycleAuditEntry{
+		Action: "controller_import_hold", Allowed: false, Repository: packet.Repository,
+		BundleID: packet.PacketID, Detail: truncate(detail, 4096),
+	})
+}
+
+func visualImportRunReceipt(manifest Manifest, importedAt time.Time) *VisualImportRunReceipt {
+	receipt := &VisualImportRunReceipt{
+		PacketID: manifest.BundleID, PacketDigest: manifest.OverallDigest, ReplayKey: manifest.ReplayProtection.Key,
+		Repository: manifest.Source.Repository, RepositoryID: manifest.Source.RepositoryID, BaseSHA: manifest.Source.CommitSHA,
+		WorkflowName: manifest.Source.WorkflowName, WorkflowEvent: manifest.Source.Event, WorkflowRunID: manifest.Source.WorkflowRunID,
+		WorkflowRunAttempt: manifest.Source.WorkflowRunAttempt, WorkflowArtifactID: manifest.Source.WorkflowArtifactID,
+		ProducerName: manifest.Producer.Name, ProducerGitCommit: manifest.Producer.GitCommit,
+		Verdict: manifest.Verdict, Observations: len(manifest.Observations), ImportedAt: importedAt.UTC(),
+	}
+	if manifest.ArtifactIndex != nil {
+		receipt.ArtifactIndexSHA256 = manifest.ArtifactIndex.SHA256
+	}
+	return receipt
 }
 
 func selectIssuePublications(repository string, observations []Observation, findings map[string]*FindingLifecycle, pendingIssueReservations, maxActive int, preferRepairable bool) map[string]bool {
@@ -845,6 +1309,53 @@ func (s *LifecycleStore) PendingOutbox() []OutboxEntry {
 	return entries
 }
 
+// QueueAdmittedIssueAction creates the existing Hive-owned issue outbox intent
+// only after the normal Governor has durably admitted the controller bead.
+// Replays are idempotent by the existing content-addressed outbox ID.
+func (s *LifecycleStore) QueueAdmittedIssueAction(repositoryFingerprint string, packet VerifiedPacketIdentity) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	finding := s.state.Findings[repositoryFingerprint]
+	if finding == nil {
+		return false, fmt.Errorf("finding %s is not present", repositoryFingerprint)
+	}
+	if finding.LastBundleDigest != packet.PacketDigest || finding.LastBundleID != packet.PacketID {
+		return false, fmt.Errorf("finding does not match the admitted verified packet")
+	}
+	action := finding.PendingIssueAction
+	if action == "" {
+		return false, nil
+	}
+	if action != OutboxOpenIssue && finding.IssueNumber <= 0 {
+		return false, fmt.Errorf("%s action requires an existing issue identity", action)
+	}
+	manifest := Manifest{
+		BundleID: packet.PacketID, OverallDigest: packet.PacketDigest,
+		Source: Source{CommitSHA: packet.BaseSHA, WorkflowRunID: packet.WorkflowRunID},
+	}
+	now := time.Now().UTC()
+	entry := outboxForFinding(action, finding, manifest, now)
+	backup := cloneLifecycleState(s.state)
+	if !s.enqueueLocked(entry) {
+		return false, nil
+	}
+	if err := s.auditLockedStrict(LifecycleAuditEntry{
+		Action: "queue_admitted_issue", Allowed: true, Repository: finding.Repository,
+		RepositoryFingerprint: repositoryFingerprint, BundleID: packet.PacketID,
+		Detail: "normal Governor admission durably preceded issue intent",
+	}); err != nil {
+		s.state = backup
+		return false, err
+	}
+	s.state.UpdatedAt = now
+	s.sortStateLocked()
+	if err := s.persistLocked(); err != nil {
+		s.state = backup
+		return false, err
+	}
+	return true, nil
+}
+
 // CancelPendingIssuePublication durably consumes issue side effects when an
 // operator downgrades the installation to advisory authority. Findings and
 // beads remain intact; no GitHub mutation is attempted or implied.
@@ -914,6 +1425,9 @@ func (s *LifecycleStore) MarkOutboxAttempt(id string, actionErr error) error {
 		now := time.Now().UTC()
 		entry.LastError = ""
 		entry.CompletedAt = &now
+		if finding := s.state.Findings[entry.RepositoryFingerprint]; finding != nil && finding.PendingIssueAction == entry.Action {
+			finding.PendingIssueAction = ""
+		}
 	}
 	detail := fmt.Sprintf("outbox=%s action=%s attempt=%d completed=%t", entry.ID, entry.Action, entry.Attempts, actionErr == nil)
 	if actionErr != nil {
@@ -1277,7 +1791,7 @@ func (s *LifecycleStore) MarkPostMergeFailed(repositoryFingerprint, summary stri
 	})
 }
 
-func (s *LifecycleStore) MarkIssueClosed(repositoryFingerprint string, beadStore *beads.Store) error {
+func (s *LifecycleStore) MarkIssueClosed(repositoryFingerprint string, beadStore LifecycleBeadSink) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	backup := cloneLifecycleState(s.state)
@@ -1606,28 +2120,6 @@ func resetRepairCycle(finding *FindingLifecycle) {
 	finding.ManualReviewReason = ""
 	finding.HumanReviewRequired = false
 	finding.RepairAttempts = 0
-}
-
-func beadInputForObservation(manifest Manifest, observation Observation) beads.BatchInput {
-	return beads.BatchInput{
-		SourceID:    observation.RepositoryFingerprint,
-		Title:       observation.Title,
-		Type:        beads.TypeBug,
-		Status:      beads.StatusOpen,
-		Priority:    priorityForSeverity(observation.Severity),
-		Actor:       actorForHint(observation.OwningAgentHint),
-		ExternalRef: beadExternalRef(manifest.Source.Repository, observation.RepositoryFingerprint),
-		Metadata: map[string]interface{}{
-			"visual_hive_fingerprint":            observation.Fingerprint,
-			"visual_hive_repository_fingerprint": observation.RepositoryFingerprint,
-			"visual_hive_bundle_id":              manifest.BundleID,
-			"visual_hive_digest":                 manifest.OverallDigest,
-			"visual_hive_repository":             manifest.Source.Repository,
-			"visual_hive_commit":                 manifest.Source.CommitSHA,
-		},
-		Notes:     observation.Body,
-		DependsOn: []string{},
-	}
 }
 
 func outboxForFinding(action OutboxAction, finding *FindingLifecycle, manifest Manifest, now time.Time) OutboxEntry {

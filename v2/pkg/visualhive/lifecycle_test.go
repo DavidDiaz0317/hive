@@ -67,6 +67,10 @@ func TestAdvisoryLifecyclePersistsFindingAndBeadWithoutIssueOutbox(t *testing.T)
 	if result.Created != 1 || result.BeadsCreated != 1 || result.OutboxCreated != 0 || len(lifecycle.PendingOutbox()) != 0 || beadStore.Count() != 1 || !exists || finding.Status != StatusDetected {
 		t.Fatalf("advisory evidence was not durable and publication-free: result=%+v finding=%+v beads=%d pending=%+v", result, finding, beadStore.Count(), lifecycle.PendingOutbox())
 	}
+	legacy := beadStore.FindByExternalRef(beadExternalRef(bundle.Manifest.Source.Repository, bundle.Manifest.Observations[0].RepositoryFingerprint))
+	if legacy == nil || legacy.Status != beads.StatusOpen || legacy.Metadata["visual_hive_controller_owned"] != false {
+		t.Fatalf("legacy ApplyBundle compatibility semantics changed: %+v", legacy)
+	}
 }
 
 func TestAdvisoryLifecycleResolvesLocallyWithoutCloseOutbox(t *testing.T) {
@@ -1048,6 +1052,215 @@ func TestCanonicalObservationUpdatesUncoveredDerivativeRootOwnerWithoutDuplicate
 	if owner.Title != canonicalV3.Title || owner.Fingerprint != canonicalV3.Fingerprint || owner.IssueNumber != 17 {
 		t.Fatalf("canonical wording/fingerprint update did not refresh exact root owner: %+v", owner)
 	}
+}
+
+func TestPublicationOwnerReopenPreservesLegacyAndControllerBeadStates(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		controller bool
+		wantStatus beads.Status
+	}{
+		{name: "ordinary ApplyBundle", wantStatus: beads.StatusOpen},
+		{name: "sealed ApplyImportPlan", controller: true, wantStatus: beads.StatusBlocked},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootKey := "mutation/api-500/localPreview/dashboard-shell"
+			firstBundle, firstPlan := verifiedPublicationOwnerPlan(t, "publication-owner-first-"+strings.ReplaceAll(test.name, " ", "-"), "derivative/source", "derivative", rootKey)
+			secondBundle, secondPlan := verifiedPublicationOwnerPlan(t, "publication-owner-second-"+strings.ReplaceAll(test.name, " ", "-"), "canonical/source", "canonical", rootKey)
+			lifecycle, err := NewLifecycleStore(filepath.Join(t.TempDir(), "lifecycle"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := newTestBeadStore(t, filepath.Join(t.TempDir(), "beads"))
+			if test.controller {
+				_, err = lifecycle.ApplyImportPlan(firstPlan, store, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4})
+			} else {
+				_, err = lifecycle.ApplyBundle(firstBundle, store, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownerID := firstPlan.Works()[0].RepositoryFingerprint
+			if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://example.invalid/issues/17"); err != nil {
+				t.Fatal(err)
+			}
+			owner, exists := lifecycle.Finding(ownerID)
+			if !exists || owner.BeadID == "" {
+				t.Fatalf("publication owner was not established: %+v", owner)
+			}
+			markFindingResolvedForReopen(t, lifecycle, ownerID)
+			if err := store.Close(owner.BeadID); err != nil {
+				t.Fatal(err)
+			}
+			var result ApplyLifecycleResult
+			if test.controller {
+				result, err = lifecycle.ApplyImportPlan(secondPlan, store, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4})
+			} else {
+				result, err = lifecycle.ApplyBundle(secondBundle, store, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4})
+			}
+			if err != nil || result.Reopened != 1 {
+				t.Fatalf("publication owner reopen = %+v err=%v", result, err)
+			}
+			reopened, err := store.Get(owner.BeadID)
+			if err != nil || reopened.Status != test.wantStatus || reopened.ClosedAt != nil {
+				t.Fatalf("reopened publication owner bead = %+v err=%v, want status %s", reopened, err, test.wantStatus)
+			}
+		})
+	}
+
+	t.Run("owner update failure rolls lifecycle back", func(t *testing.T) {
+		rootKey := "mutation/api-500/localPreview/dashboard-shell"
+		firstBundle, firstPlan := verifiedPublicationOwnerPlan(t, "publication-owner-rollback-first", "derivative/rollback", "derivative", rootKey)
+		secondBundle, secondPlan := verifiedPublicationOwnerPlan(t, "publication-owner-rollback-second", "canonical/rollback", "canonical", rootKey)
+		lifecycle, err := NewLifecycleStore(filepath.Join(t.TempDir(), "lifecycle"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := newTestBeadStore(t, filepath.Join(t.TempDir(), "beads"))
+		if _, err := lifecycle.ApplyBundle(firstBundle, store, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4}); err != nil {
+			t.Fatal(err)
+		}
+		ownerID := firstPlan.Works()[0].RepositoryFingerprint
+		if err := lifecycle.MarkIssueOpened(ownerID, 17, "https://example.invalid/issues/17"); err != nil {
+			t.Fatal(err)
+		}
+		owner, _ := lifecycle.Finding(ownerID)
+		markFindingResolvedForReopen(t, lifecycle, ownerID)
+		if err := store.Close(owner.BeadID); err != nil {
+			t.Fatal(err)
+		}
+		canonicalWork := secondPlan.Works()[0]
+		if _, err := store.Create(canonicalWork.Title, canonicalWork.Bead.Type, canonicalWork.Bead.Priority, "quality", canonicalWork.SourceExternalRef); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := json.Marshal(lifecycle.Snapshot())
+		failing := &failingLifecycleBeadUpdate{Store: store, failID: owner.BeadID}
+		if _, err := lifecycle.ApplyBundle(secondBundle, failing, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4}); err == nil || !strings.Contains(err.Error(), "publication owner") {
+			t.Fatalf("publication owner update failure = %v", err)
+		}
+		after, _ := json.Marshal(lifecycle.Snapshot())
+		ownerBead, _ := store.Get(owner.BeadID)
+		if string(after) != string(before) || ownerBead.Status != beads.StatusClosed || ownerBead.ClosedAt == nil {
+			t.Fatalf("failed owner reopen changed lifecycle or bead: before=%s after=%s bead=%+v", before, after, ownerBead)
+		}
+	})
+}
+
+func verifiedPublicationOwnerPlan(t *testing.T, packetID, fingerprint, publicationRole, rootKey string) (*ValidatedBundle, VerifiedImportPlan) {
+	t.Helper()
+	manifestPath, sourceRoot := writeTestV3ObservationBundle(t)
+	manifest := readManifest(t, manifestPath)
+	observation := manifest.Observations[0]
+	observation.Fingerprint = fingerprint
+	observation.PublicationRole = publicationRole
+	observation.RootCauseKey = rootKey
+	fingerprintSource := fingerprint
+	if publicationRole == "canonical" {
+		fingerprintSource = rootKey
+	}
+	observation.RepositoryFingerprint = digest([]byte("owner/repo\x00" + fingerprintSource))
+	observation.Title = publicationRole + " exact-root publication"
+	if publicationRole == "derivative" {
+		observation.IssueKind = "missing_visual_coverage"
+		observation.OwningAgentHint = "visual-hive/test-creator"
+	} else {
+		observation.IssueKind = "mutation_survivor"
+		observation.OwningAgentHint = "visual-hive/mutation"
+	}
+	manifest.Observations = []Observation{observation}
+	manifest.BundleID = packetID
+	manifest.ReplayProtection.Nonce = packetID
+	manifest.ReplayProtection.Key = replayKeyForManifest(manifest)
+	manifest.OverallDigest = digestV3BundleContent(manifest)
+	manifest.Provenance.SubjectDigest = manifest.OverallDigest
+	writeManifest(t, manifestPath, manifest)
+	bundle, err := ValidateBundle(manifestPath, ValidationOptions{
+		Now: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC), MaxACMM: 6, VerifiedProvenance: true,
+		ExpectedProducerGitCommit: testV3ProducerCommit, ExpectedRepository: "owner/repo", ExpectedRepositoryID: "123",
+		ExpectedWorkflowRunID: "42", ExpectedWorkflowRunAttempt: "2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.VerifySourceArtifact(sourceRoot); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := bundle.BuildImportPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle, plan
+}
+
+func TestResolveImportPlanWorksRemapsCanonicalObservationToDurableLegacyOwner(t *testing.T) {
+	canonicalBundle, canonicalPlan := verifiedPublicationOwnerPlan(t, "canonical-owner-new", "shared/source", "canonical", "shared/root")
+	legacyManifest, err := cloneCanonicalManifest(canonicalBundle.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyManifest.BundleID = "canonical-owner-legacy"
+	legacyManifest.Observations[0].PublicationRole = ""
+	legacyManifest.Observations[0].RootCauseKey = ""
+	legacyManifest.Observations[0].RepositoryFingerprint = digest([]byte("owner/repo\x00" + legacyManifest.Observations[0].Fingerprint))
+	legacyManifest.ReplayProtection.Nonce = legacyManifest.BundleID
+	legacyManifest.ReplayProtection.Key = replayKeyForManifest(legacyManifest)
+	legacyManifest.OverallDigest = digestV3BundleContent(legacyManifest)
+	legacyManifest.Provenance.SubjectDigest = legacyManifest.OverallDigest
+	legacyBundle := *canonicalBundle
+	legacyBundle.Manifest = legacyManifest
+	legacyBundle.validatedManifest = &legacyManifest
+	lifecycle, _ := NewLifecycleStore(filepath.Join(t.TempDir(), "lifecycle"))
+	legacyStore := newTestBeadStore(t, filepath.Join(t.TempDir(), "legacy"))
+	normalStore := newTestBeadStore(t, filepath.Join(t.TempDir(), "normal"))
+	if _, err := lifecycle.ApplyBundle(&legacyBundle, legacyStore, ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 4}); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := legacyManifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(legacyID, 27, "https://example.invalid/issues/27"); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := lifecycle.ResolveImportPlanWorks(canonicalPlan, ApplyLifecycleOptions{TargetRef: "main", DisableIssuePublication: true, MaxActiveIssues: 4})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolved canonical works = %+v err=%v", resolved, err)
+	}
+	sealed := canonicalPlan.Works()[0]
+	if resolved[0].RepositoryFingerprint != legacyID || resolved[0].ObservationFingerprint != sealed.RepositoryFingerprint || resolved[0].FindingFingerprint != sealed.FindingFingerprint || resolved[0].Title != sealed.Title || resolved[0].SourceExternalRef != beadExternalRef("owner/repo", legacyID) {
+		t.Fatalf("canonical observation was not safely mapped to durable owner: sealed=%+v resolved=%+v", sealed, resolved[0])
+	}
+	if _, err := lifecycle.ApplyImportPlan(canonicalPlan, normalStore, ApplyLifecycleOptions{TargetRef: "main", DisableIssuePublication: true, MaxActiveIssues: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if normalStore.Count() != 1 || normalStore.FindByExternalRef(resolved[0].SourceExternalRef) == nil || normalStore.FindByExternalRef(sealed.SourceExternalRef) != nil {
+		t.Fatalf("canonical owner projection duplicated identity: normal=%+v", normalStore.List(beads.ListFilter{}))
+	}
+}
+
+func markFindingResolvedForReopen(t *testing.T, lifecycle *LifecycleStore, repositoryFingerprint string) {
+	t.Helper()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	finding := lifecycle.state.Findings[repositoryFingerprint]
+	if finding == nil {
+		t.Fatalf("finding %s is missing", repositoryFingerprint)
+	}
+	now := time.Now().UTC()
+	finding.Status = StatusResolved
+	finding.ResolvedAt = &now
+	if err := lifecycle.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type failingLifecycleBeadUpdate struct {
+	*beads.Store
+	failID string
+}
+
+func (sink *failingLifecycleBeadUpdate) Update(id string, update func(*beads.Bead)) error {
+	if id == sink.failID {
+		return fmt.Errorf("injected publication owner update failure")
+	}
+	return sink.Store.Update(id, update)
 }
 
 func TestExplicitMetadataNeverSilentlyRebindsOrClosesLegacyDerivativeIssue(t *testing.T) {

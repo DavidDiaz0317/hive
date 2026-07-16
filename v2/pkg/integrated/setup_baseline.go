@@ -738,7 +738,7 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 		bundle, _, err := client.FetchAndVerifyVisualHiveBundle(ctx, hivegithub.VisualHiveArtifactRequest{
 			Repository: config.Repository, WorkflowRunID: workflow.RunID, ArtifactID: workflow.BundleArtifact, SourceArtifactID: workflow.EvidenceArtifact,
 			DestinationDir: filepath.Join(config.StateDir, "setup-baseline", "production-verification"), TargetRef: config.DefaultBranch,
-			MaxACMM: config.ACMMLevel, ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath,
+			MaxACMM: config.ACMMLevel, ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath, ExpectedEvent: visualHiveProductionWorkflowEvent,
 			ExpectedRunName: workflowDispatchDisplayTitle(workflow.CorrelationID), ExpectedProducerGitCommit: config.VisualHiveRef, FetchSourceArtifact: true,
 		})
 		if err != nil {

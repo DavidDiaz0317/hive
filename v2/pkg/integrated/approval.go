@@ -394,6 +394,12 @@ func integratedPolicy(config Config) automation.Policy {
 	}
 }
 
+// PolicyForConfig returns the existing durable automation authority for reuse
+// by the normal Visual Hive intake seam.
+func PolicyForConfig(config Config) automation.Policy {
+	return integratedPolicy(config)
+}
+
 func mergePolicyForFinding(policy automation.Policy, finding visualhive.FindingLifecycle) automation.Policy {
 	if strings.EqualFold(strings.TrimSpace(finding.IssueKind), visualhive.RepositoryTestFailureKind) {
 		// Repository-test repairs can touch test files that are globally safe for

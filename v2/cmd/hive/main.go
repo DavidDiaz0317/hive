@@ -35,6 +35,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/governor"
 	"github.com/kubestellar/hive/v2/pkg/hub"
+	"github.com/kubestellar/hive/v2/pkg/integrated"
 	"github.com/kubestellar/hive/v2/pkg/knowledge"
 	"github.com/kubestellar/hive/v2/pkg/logscrub"
 	"github.com/kubestellar/hive/v2/pkg/notify"
@@ -44,6 +45,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/scheduler"
 	"github.com/kubestellar/hive/v2/pkg/snapshot"
 	"github.com/kubestellar/hive/v2/pkg/tokens"
+	visualcontroller "github.com/kubestellar/hive/v2/pkg/visualhive/controller"
 )
 
 var (
@@ -490,6 +492,7 @@ func main() {
 				logger.Error("failed to re-save state after migration", "error", err)
 			}
 		}
+		gov.UpdateConfigAndAgents(cfg.Governor, cfg.EnabledAgents())
 	}
 	configCoordinator.PublishCurrent()
 
@@ -549,6 +552,31 @@ func main() {
 			store.SetHiveID(cfg.HiveID)
 			beadStores[name] = store
 			logger.Info("orphan beads store loaded from disk", "agent", name, "count", store.Count())
+		}
+	}
+
+	if installed, exists, err := loadCurrentVisualWorkContract(cfg); err != nil {
+		logger.Warn("normal Visual Hive contract unavailable", "error", err)
+	} else if exists {
+		lifecycle, lifecycleErr := visualLifecycleForInstalledContract(installed)
+		if lifecycleErr != nil {
+			logger.Warn("normal Visual Hive lifecycle unavailable", "error", lifecycleErr)
+		} else if service, serviceErr := visualcontroller.New(gov, lifecycle, beadStores, agentMgr, ghClient, installed, inferACMMLevel(cfg)); serviceErr != nil {
+			logger.Warn("normal Visual Hive intake unavailable", "error", serviceErr)
+		} else {
+			service.SetAuditSink(dashboardVisualWorkAudit{server: dashSrv})
+			service.SetRuntimeConfigLoader(func() (integrated.Config, int, error) {
+				current, currentExists, currentErr := loadAuthoritativeVisualWorkContract()
+				if currentErr != nil {
+					return integrated.Config{}, 0, currentErr
+				}
+				if !currentExists {
+					return integrated.Config{}, 0, fmt.Errorf("authoritative installed Visual Hive contract is unavailable")
+				}
+				return current, agentMgr.GetACMMLevel(), nil
+			})
+			normalVisualWorkService = service
+			logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
 		}
 	}
 

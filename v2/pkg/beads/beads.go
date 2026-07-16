@@ -109,10 +109,12 @@ func (b *Bead) Meta(key string) string {
 const maxBeadCount = 5000
 
 type Store struct {
-	dir    string
-	hiveID string
-	beads  map[string]*Bead
-	mu     sync.RWMutex
+	dir       string
+	hiveID    string
+	beads     map[string]*Bead
+	writeFile func(string, []byte, os.FileMode) error
+	rename    func(string, string) error
+	mu        sync.RWMutex
 }
 
 // BatchInput is a fully validated work item prepared by an external evidence
@@ -145,8 +147,10 @@ func NewStore(dir string) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:   dir,
-		beads: make(map[string]*Bead),
+		dir:       dir,
+		beads:     make(map[string]*Bead),
+		writeFile: os.WriteFile,
+		rename:    os.Rename,
 	}
 
 	if err := s.load(); err != nil {
@@ -294,6 +298,37 @@ func (s *Store) ImportBatch(items []BatchInput) (BatchResult, error) {
 	return result, nil
 }
 
+// RollbackImportedExternalRefs removes only the exact external references
+// created by a coordinated multi-store batch. Callers must preflight that the
+// references did not exist before import; this is not a general delete API.
+func (s *Store) RollbackImportedExternalRefs(refs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wanted := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		if strings.TrimSpace(ref) != "" {
+			wanted[ref] = true
+		}
+	}
+	removed := map[string]*Bead{}
+	for id, bead := range s.beads {
+		if bead != nil && wanted[bead.ExternalRef] {
+			removed[id] = bead
+			delete(s.beads, id)
+		}
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	if err := s.persist(nil); err != nil {
+		for id, bead := range removed {
+			s.beads[id] = bead
+		}
+		return err
+	}
+	return nil
+}
+
 func validStatus(status Status) bool {
 	return status == StatusOpen || status == StatusInProgress || status == StatusBlocked || status == StatusDone || status == StatusClosed
 }
@@ -336,11 +371,19 @@ func (s *Store) Update(id string, fn func(b *Bead)) error {
 	if !ok {
 		return fmt.Errorf("bead %s not found", id)
 	}
-
-	fn(b)
-	b.UpdatedAt = flexTime{time.Now().UTC()}
-
-	return s.persist(b)
+	next, err := cloneBead(b)
+	if err != nil {
+		return fmt.Errorf("copy bead %s for update: %w", id, err)
+	}
+	fn(next)
+	next.UpdatedAt = flexTime{time.Now().UTC()}
+	candidate := cloneBeadMap(s.beads)
+	candidate[id] = next
+	if err := s.persistMap(candidate); err != nil {
+		return err
+	}
+	*b = *next
+	return nil
 }
 
 func (s *Store) Claim(id string) error {
@@ -355,6 +398,34 @@ func (s *Store) Close(id string) error {
 		b.Status = StatusClosed
 		b.ClosedAt = &now
 	})
+}
+
+// CloseWithUpdate atomically persists terminal status together with caller
+// metadata. It is used by controller-owned lifecycle projections so a crash
+// cannot leave a terminal bead reopened or missing its terminal receipt.
+func (s *Store) CloseWithUpdate(id string, fn func(b *Bead)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.beads[id]
+	if !ok {
+		return fmt.Errorf("bead %s not found", id)
+	}
+	next, err := cloneBead(b)
+	if err != nil {
+		return fmt.Errorf("copy bead %s for close: %w", id, err)
+	}
+	fn(next)
+	now := flexTime{time.Now().UTC()}
+	next.Status = StatusClosed
+	next.ClosedAt = &now
+	next.UpdatedAt = now
+	candidate := cloneBeadMap(s.beads)
+	candidate[id] = next
+	if err := s.persistMap(candidate); err != nil {
+		return err
+	}
+	*b = *next
+	return nil
 }
 
 func (s *Store) Get(id string) (*Bead, error) {
@@ -481,8 +552,12 @@ func (s *Store) load() error {
 }
 
 func (s *Store) persist(_ *Bead) error {
+	return s.persistMap(s.beads)
+}
+
+func (s *Store) persistMap(source map[string]*Bead) error {
 	var all []*Bead
-	for _, b := range s.beads {
+	for _, b := range source {
 		all = append(all, b)
 	}
 
@@ -497,10 +572,30 @@ func (s *Store) persist(_ *Bead) error {
 
 	path := filepath.Join(s.dir, beadsFileName)
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+	if err := s.writeFile(tmpPath, data, 0o600); err != nil {
 		return fmt.Errorf("writing tmp beads: %w", err)
 	}
-	return os.Rename(tmpPath, path)
+	return s.rename(tmpPath, path)
+}
+
+func cloneBeadMap(source map[string]*Bead) map[string]*Bead {
+	clone := make(map[string]*Bead, len(source))
+	for id, bead := range source {
+		clone[id] = bead
+	}
+	return clone
+}
+
+func cloneBead(source *Bead) (*Bead, error) {
+	data, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	var clone Bead
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return &clone, nil
 }
 
 func (s *Store) CloseAll(reason string) (int, error) {

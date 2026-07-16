@@ -130,10 +130,11 @@ type Governor struct {
 	mu     sync.RWMutex
 	logger *slog.Logger
 
-	modeHistory []ModeChange
-	evalHistory []EvalSnapshot
-	kickHistory []KickRecord
-	budget      BudgetInfo
+	modeHistory      []ModeChange
+	evalHistory      []EvalSnapshot
+	kickHistory      []KickRecord
+	admissionHistory []WorkAdmissionDecision
+	budget           BudgetInfo
 
 	// One-shot alert flags for the current budget window; reset when the
 	// window rolls so each window alerts at most once per threshold.
@@ -185,6 +186,15 @@ func (g *Governor) UpdateConfigAndAgents(cfg config.GovernorConfig, agents map[s
 	defer g.mu.Unlock()
 
 	g.cfg = config.CloneGovernorConfig(cfg)
+	g.agents = config.CloneAgentConfigs(agents)
+	g.updateCadences()
+}
+
+// UpdateAgents atomically replaces the normal role configuration snapshot
+// used by both cadence evaluation and explicit work admission.
+func (g *Governor) UpdateAgents(agents map[string]config.AgentConfig) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.agents = config.CloneAgentConfigs(agents)
 	g.updateCadences()
 }

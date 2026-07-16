@@ -262,6 +262,7 @@ func runVisualLifecycleCommand(args []string) int {
 			ExpectedProducerGitCommit: *visualHiveRef,
 			ExpectedWorkflowName:      trustedVisualHiveWorkflowName,
 			ExpectedWorkflowPath:      trustedVisualHiveWorkflowPath,
+			ExpectedEvent:             "workflow_dispatch",
 		})
 		if fetchErr != nil {
 			fmt.Fprintln(os.Stderr, "trusted visual evidence rejected:", fetchErr)

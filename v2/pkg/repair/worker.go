@@ -149,7 +149,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 				modelTimeout = 20 * time.Minute
 			}
 			modelCtx, cancelModel := context.WithTimeout(ctx, modelTimeout)
-			providerResult, runErr := specialist.runPreparedInvocation(modelCtx, attempt.Worktree, attempt.ModelInvocationID)
+			providerResult, runErr := specialist.recoverPreparedInvocation(modelCtx, attempt.Worktree, attempt.ModelInvocationID)
 			cancelModel()
 			if resultErr := w.checkpointProviderInvocationResult(finding, &attempt, providerResult, runErr); resultErr != nil {
 				return Result{}, resultErr

@@ -970,7 +970,22 @@ func VerifyReviewEvidenceArtifact(root string, artifactID int64) (VerifiedReview
 // VerifySourceArtifact verifies the full source artifact against the v3
 // content-addressed index. V2 bundles remain source-compatible and are a no-op.
 func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
-	if bundle.Manifest.SchemaVersion != ManifestSchemaV3 {
+	if bundle == nil || bundle.validatedManifest == nil {
+		return fmt.Errorf("validated Visual Hive manifest snapshot is required")
+	}
+	currentManifest, err := json.Marshal(bundle.Manifest)
+	if err != nil {
+		return fmt.Errorf("encode current Visual Hive manifest: %w", err)
+	}
+	validatedManifest, err := json.Marshal(bundle.validatedManifest)
+	if err != nil {
+		return fmt.Errorf("encode validated Visual Hive manifest: %w", err)
+	}
+	if !bytes.Equal(currentManifest, validatedManifest) {
+		return fmt.Errorf("Visual Hive manifest changed after validation")
+	}
+	manifest := *bundle.validatedManifest
+	if manifest.SchemaVersion != ManifestSchemaV3 {
 		return nil
 	}
 	bundle.sourceVerified = false
@@ -981,17 +996,17 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 		bundle.Validation.Trusted = false
 		bundle.Validation.Authoritative = false
 	}
-	if bundle.artifactIndex == nil || bundle.Manifest.ArtifactIndex == nil {
+	if bundle.artifactIndex == nil || manifest.ArtifactIndex == nil {
 		return fmt.Errorf("bundle v3 has no validated artifact index")
 	}
 	index := *bundle.artifactIndex
-	absoluteRoot, _, err := verifyCompleteArtifactIndex(root, index, bundle.Manifest.ArtifactIndex.SourcePath, bundle.Manifest.ArtifactIndex.SHA256, bundle.Manifest.Source.WorkflowArtifactID)
+	absoluteRoot, _, err := verifyCompleteArtifactIndex(root, index, manifest.ArtifactIndex.SourcePath, manifest.ArtifactIndex.SHA256, manifest.Source.WorkflowArtifactID)
 	if err != nil {
 		return err
 	}
 	if bundle.provenanceVerified {
 		bundle.Validation.Trusted = true
-		bundle.Validation.Authoritative = bundle.Manifest.Scan.AuthoritativeForResolution
+		bundle.Validation.Authoritative = manifest.Scan.AuthoritativeForResolution
 	}
 	bundle.sourceVerified = true
 	bundle.verifiedSourceRoot = absoluteRoot

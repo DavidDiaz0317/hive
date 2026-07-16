@@ -208,6 +208,7 @@ type ValidatedBundle struct {
 	Validation         Validation
 	Beads              []Projection
 	artifactIndex      *ArtifactIndexReport
+	validatedManifest  *Manifest
 	provenanceVerified bool
 	sourceVerified     bool
 	verifiedSourceRoot string
@@ -319,7 +320,11 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 	if err := validateProjections(projections); err != nil {
 		return nil, err
 	}
-	return &ValidatedBundle{Manifest: manifest, Beads: projections, artifactIndex: artifactIndex, provenanceVerified: options.VerifiedProvenance, Validation: Validation{
+	canonicalManifest, err := cloneCanonicalManifest(manifest)
+	if err != nil {
+		return nil, fmt.Errorf("preserve validated manifest: %w", err)
+	}
+	return &ValidatedBundle{Manifest: manifest, Beads: projections, artifactIndex: artifactIndex, validatedManifest: &canonicalManifest, provenanceVerified: options.VerifiedProvenance, Validation: Validation{
 		SchemaVersion: "hive.visual-hive-validation.v1", Status: "passed", BundleID: manifest.BundleID,
 		Project: manifest.Project, Digest: overall, Files: len(manifest.Files), Bytes: total,
 		Beads: len(projections), Trusted: options.AllowLocal,

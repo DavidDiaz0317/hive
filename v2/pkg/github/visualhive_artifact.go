@@ -43,6 +43,7 @@ type VisualHiveArtifactRequest struct {
 	ExpectedProducerGitCommit string
 	ExpectedWorkflowName      string
 	ExpectedWorkflowPath      string
+	ExpectedEvent             string
 	ExpectedRunName           string
 	AllowFailedWorkflowRun    bool
 }
@@ -68,6 +69,7 @@ type VerifiedVisualHiveArtifact struct {
 	BundleSHA256        string `json:"bundle_sha256"`
 	ManifestSHA256      string `json:"manifest_sha256"`
 	ArtifactIndexSHA256 string `json:"artifact_index_sha256,omitempty"`
+	seal                *verifiedVisualHiveArtifactSeal
 }
 
 type PullRequestArtifactRequest struct {
@@ -215,8 +217,9 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	}
 	expectedWorkflowName := strings.TrimSpace(request.ExpectedWorkflowName)
 	expectedWorkflowPath := strings.TrimSpace(request.ExpectedWorkflowPath)
-	if expectedWorkflowName == "" || expectedWorkflowPath == "" {
-		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("trusted Visual Hive ingestion requires an exact approved workflow name and path")
+	expectedEvent := strings.TrimSpace(request.ExpectedEvent)
+	if expectedWorkflowName == "" || expectedWorkflowPath == "" || expectedEvent == "" {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("trusted Visual Hive ingestion requires an exact approved workflow name and path plus event")
 	}
 	repository, _, err := c.client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
@@ -229,6 +232,9 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 	allowedConclusion := run.GetConclusion() == "success" || (request.AllowFailedWorkflowRun && run.GetConclusion() == "failure")
 	if run.GetID() != request.WorkflowRunID || run.GetStatus() != "completed" || !allowedConclusion || run.GetEvent() == "pull_request" || run.GetEvent() == "pull_request_target" || strings.TrimSpace(run.GetHeadSHA()) == "" {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run is not an allowed completed non-PR run")
+	}
+	if run.GetEvent() != expectedEvent {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow event does not match the exact approved event")
 	}
 	if targetRef := strings.TrimPrefix(strings.TrimSpace(request.TargetRef), "refs/heads/"); targetRef != "" && run.GetHeadBranch() != targetRef {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive workflow run branch %q does not match target branch %q", run.GetHeadBranch(), targetRef)
@@ -347,6 +353,9 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("resolve verified Visual Hive evidence root: %w", err)
 	}
 	verified.EvidenceRootPath = evidenceRootPath
+	if err := sealVerifiedVisualHiveArtifact(&verified, bundle); err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("seal verified Visual Hive intake: %w", err)
+	}
 	return bundle, verified, nil
 }
 

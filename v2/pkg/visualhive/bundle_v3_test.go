@@ -497,6 +497,14 @@ func TestV3SchemaPresenceRejectsNullRequiredValues(t *testing.T) {
 }
 
 func writeTestV3Bundle(t *testing.T, mutate func(*ArtifactIndexReport, *capabilityParityReport)) (string, string) {
+	return writeTestV3BundleFixture(t, mutate, false)
+}
+
+func writeTestV3ObservationBundle(t *testing.T) (string, string) {
+	return writeTestV3BundleFixture(t, nil, true)
+}
+
+func writeTestV3BundleFixture(t *testing.T, mutate func(*ArtifactIndexReport, *capabilityParityReport), includeObservation bool) (string, string) {
 	t.Helper()
 	root, sourceRoot := t.TempDir(), t.TempDir()
 	beads := []Projection{{ID: "vh-v3", Title: "Fix visual regression", Type: "bug", Status: "open", Priority: 1, Actor: "quality", ExternalRef: "visual-hive:demo:v3", Metadata: map[string]string{}, Notes: "deterministic", CreatedAt: "2026-07-09T12:00:00Z", UpdatedAt: "2026-07-09T12:00:00Z", DependsOn: []string{}}}
@@ -527,6 +535,19 @@ func writeTestV3Bundle(t *testing.T, mutate func(*ArtifactIndexReport, *capabili
 			{Path: beadsPath, Kind: "json", ContentType: "application/json", Bytes: int64(len(beadsData)), SHA256: digest(beadsData), SafeToRender: true, Labels: []string{}},
 		}, Warnings: []string{},
 	}
+	evidencePath := ".visual-hive/evidence/visual-regression.json"
+	if includeObservation {
+		evidenceData := []byte(`{"regression":true}`)
+		writeTestData(t, filepath.Join(sourceRoot, filepath.FromSlash(evidencePath)), evidenceData)
+		index.Artifacts = append(index.Artifacts, ArtifactIndexEntry{
+			Path: evidencePath, Kind: "json", ContentType: "application/json", Bytes: int64(len(evidenceData)),
+			SHA256: digest(evidenceData), SafeToRender: true, Labels: []string{},
+		})
+		index.Summary.DiscoveredArtifactCount++
+		index.Summary.ArtifactCount++
+		index.Summary.TotalBytes += int64(len(evidenceData))
+		index.Summary.JSON++
+	}
 	if mutate != nil {
 		mutate(&index, &parity)
 		parityData, _ = json.Marshal(parity)
@@ -547,6 +568,18 @@ func writeTestV3Bundle(t *testing.T, mutate func(*ArtifactIndexReport, *capabili
 		writeTestData(t, target, source.data)
 		files = append(files, File{Path: "files/" + source.path, SourcePath: source.path, SHA256: digest(source.data), Size: int64(len(source.data)), MediaType: "application/json"})
 	}
+	observations := []Observation{}
+	if includeObservation {
+		observations = []Observation{{
+			Fingerprint: "visual-regression/source", RepositoryFingerprint: digest([]byte("owner/repo\x00visual-regression/source")),
+			PublicationRole: "canonical", RootCauseKey: "visual-regression/source", BlockedByRootKeys: []string{},
+			State: "present", IssueKind: "visual_regression", Severity: "high", OwningAgentHint: "hive/quality",
+			Title: "Manifest-owned visual regression", Body: "Verified observation body", Labels: []string{"visual-hive"},
+			SourceArtifacts: []string{evidencePath}, AffectedContracts: []string{"contract/app-shell"},
+			ValidationCommand: "go test ./...", ObservedAt: "2026-07-09T12:00:00.000Z", FirstSeenAt: "2026-07-09T12:00:00.000Z",
+			SourceArtifact: ".visual-hive/issues.json",
+		}}
+	}
 	manifest := Manifest{
 		SchemaVersion: ManifestSchemaV3, DigestAlgorithm: ContentAddressedDigestAlgorithm, BundleID: "test-v3",
 		GeneratedAt: time.Date(2026, 7, 9, 12, 0, 0, int(time.Millisecond), time.UTC), ExpiresAt: time.Date(2026, 7, 10, 12, 0, 0, int(time.Millisecond), time.UTC),
@@ -554,7 +587,7 @@ func writeTestV3Bundle(t *testing.T, mutate func(*ArtifactIndexReport, *capabili
 		Source:   Source{Repository: "owner/repo", RepositoryID: "123", Ref: "refs/heads/main", CommitSHA: "abc123", Event: "workflow_dispatch", WorkflowName: "Visual Hive", WorkflowRunID: "42", WorkflowRunAttempt: "2", WorkflowArtifactID: "99", Conclusion: "success"},
 		Project:  "demo", Mode: "measured", Verdict: "ready", ACMMRequest: 3,
 		Scan:         Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{}, EvaluatedFiles: []string{}, TestPlanVersion: "plan-v3", ToolRegistryVersion: "tools-v3"},
-		Observations: []Observation{}, Files: files,
+		Observations: observations, Files: files,
 		ArtifactIndex:    &ArtifactIndexBinding{Path: "files/" + indexPath, SourcePath: indexPath, SHA256: digest(indexData), SchemaVersion: 1, ContentAddressed: true, Complete: index.Complete, ArtifactCount: index.Summary.ArtifactCount, TotalBytes: index.Summary.TotalBytes},
 		CapabilityParity: &CapabilityParityBinding{Path: "files/" + parityPath, SourcePath: parityPath, SHA256: digest(parityData), SchemaVersion: parity.SchemaVersion, BaselineVersion: parity.BaselineVersion, Status: parity.Status, RuntimeStatus: parity.RuntimeStatus, Summary: parity.Summary},
 		ReplayProtection: ReplayProtection{Nonce: "test-v3"}, Provenance: Provenance{Kind: "github-actions", AttestationRequired: true},

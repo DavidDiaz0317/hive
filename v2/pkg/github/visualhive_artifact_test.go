@@ -26,6 +26,7 @@ import (
 )
 
 const testVisualHiveProducerCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testVisualHiveHeadSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	zipData, evidenceZip := buildVerifiedV3Artifacts(t)
@@ -36,11 +37,11 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
 		case "/repos/owner/repo/actions/runs/42":
-			_, _ = io.WriteString(writer, `{"id":42,"run_attempt":2,"workflow_id":12,"name":"Visual Hive Scheduled [correlation]","display_title":"Visual Hive Scheduled [correlation]","path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"abc123","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
+			_, _ = io.WriteString(writer, `{"id":42,"run_attempt":2,"workflow_id":12,"name":"Visual Hive Scheduled [correlation]","display_title":"Visual Hive Scheduled [correlation]","path":".github/workflows/visual-hive.yml","head_branch":"main","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event":"schedule","status":"completed","conclusion":"success","html_url":"https://github.test/owner/repo/actions/runs/42"}`)
 		case "/repos/owner/repo/actions/workflows/12":
 			_, _ = io.WriteString(writer, `{"id":12,"name":"Visual Hive Scheduled","path":".github/workflows/visual-hive.yml","state":"active"}`)
 		case "/repos/owner/repo/actions/runs/42/artifacts":
-			_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":2,"artifacts":[{"id":98,"name":"visual-hive-evidence","size_in_bytes":%d,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"abc123"}},{"id":99,"name":"visual-hive-bundle","size_in_bytes":%d,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"abc123"}}]}`, len(evidenceZip), len(zipData)))
+			_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":2,"artifacts":[{"id":98,"name":"visual-hive-evidence","size_in_bytes":%d,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},{"id":99,"name":"visual-hive-bundle","size_in_bytes":%d,"expired":false,"workflow_run":{"id":42,"repository_id":123,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}`, len(evidenceZip), len(zipData)))
 		case "/repos/owner/repo/actions/artifacts/99/zip":
 			writer.Header().Set("Location", server.URL+"/signed-artifact")
 			writer.WriteHeader(http.StatusFound)
@@ -68,14 +69,14 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	request := VisualHiveArtifactRequest{
 		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, SourceArtifactID: 98, FetchSourceArtifact: true, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
 		ExpectedProducerGitCommit: testVisualHiveProducerCommit,
-		ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedRunName: "Visual Hive Scheduled [correlation]",
+		ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedEvent: "schedule", ExpectedRunName: "Visual Hive Scheduled [correlation]",
 	}
 	bundle, verified, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, manifestDigestErr := hex.DecodeString(verified.ManifestSHA256)
-	if !bundle.Validation.Trusted || !bundle.Validation.Authoritative || verified.RepositoryID != "123" || verified.WorkflowRunAttempt != "2" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" || verified.EvidenceRootPath == "" ||
+	if !bundle.Validation.Trusted || !bundle.Validation.Authoritative || verified.RepositoryID != "123" || verified.WorkflowRunAttempt != "2" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != testVisualHiveHeadSHA || verified.SourceArtifactPath == "" || verified.EvidenceRootPath == "" ||
 		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled [correlation]" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" ||
 		verified.BundleSchemaVersion != bundle.Manifest.SchemaVersion || verified.BundleSHA256 != bundle.Manifest.OverallDigest || len(verified.ManifestSHA256) != 64 || manifestDigestErr != nil ||
 		bundle.Manifest.ArtifactIndex == nil || verified.ArtifactIndexSHA256 != bundle.Manifest.ArtifactIndex.SHA256 {
@@ -86,6 +87,17 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(verified.EvidenceRootPath, "verdict.json")); err != nil || !strings.Contains(string(data), "allContributions") {
 		t.Fatalf("verified source evidence was not extracted: %q err=%v", data, err)
+	}
+	plan, err := verified.ImportPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := verified.SpecialistEvidenceIdentity(visualhive.FindingLifecycle{LastBundleDigest: verified.BundleSHA256, LastWorkflowRunID: verified.WorkflowRunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Packet().WorkflowArtifactID != "98" || evidence.ArtifactID != 99 || evidence.SourceArtifactID != 98 || evidence.VerificationReceipt == nil || evidence.VerificationReceipt.ArtifactID != "99" || evidence.VerificationReceipt.SourceArtifactID != "98" {
+		t.Fatalf("fetch did not preserve distinct bundle/source artifact identities: packet=%+v evidence=%+v", plan.Packet(), evidence)
 	}
 	request.ExpectedWorkflowPath = ".github/workflows/hive-visual-hive.yml"
 	request.DestinationDir = t.TempDir()
@@ -149,7 +161,7 @@ func TestFetchAndVerifyVisualHiveBundleRejectsPullRequestTarget(t *testing.T) {
 	_, _, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
 		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, SourceArtifactID: 98, FetchSourceArtifact: true, DestinationDir: t.TempDir(),
 		ExpectedProducerGitCommit: testVisualHiveProducerCommit,
-		ExpectedWorkflowName:      "Visual Hive", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml",
+		ExpectedWorkflowName:      "Visual Hive", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedEvent: "pull_request_target",
 	})
 	if err == nil || !strings.Contains(err.Error(), "non-PR run") {
 		t.Fatalf("pull_request_target evidence was accepted as trusted: %v", err)
@@ -174,7 +186,7 @@ func TestFetchAndVerifyVisualHiveBundleRejectsWrongTargetBranch(t *testing.T) {
 	_, _, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
 		Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, FetchSourceArtifact: true, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
 		ExpectedProducerGitCommit: testVisualHiveProducerCommit,
-		ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml",
+		ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedEvent: "schedule",
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match target branch") {
 		t.Fatalf("expected target branch rejection, got %v", err)
@@ -211,7 +223,7 @@ func TestFetchAndVerifyVisualHiveBundleSeparatesStaticNameFromCorrelatedTitle(t 
 			_, _, err := client.FetchAndVerifyVisualHiveBundle(context.Background(), VisualHiveArtifactRequest{
 				Repository: "owner/repo", WorkflowRunID: 42, ArtifactID: 99, FetchSourceArtifact: true, DestinationDir: t.TempDir(), TargetRef: "main", MaxACMM: 6,
 				ExpectedProducerGitCommit: testVisualHiveProducerCommit,
-				ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedRunName: "Visual Hive Scheduled [correlation]",
+				ExpectedWorkflowName:      "Visual Hive Scheduled", ExpectedWorkflowPath: ".github/workflows/visual-hive.yml", ExpectedEvent: "schedule", ExpectedRunName: "Visual Hive Scheduled [correlation]",
 			})
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("spoofed workflow identity was accepted: %v", err)
@@ -370,7 +382,7 @@ func buildVerifiedV3Artifacts(t *testing.T) ([]byte, []byte) {
 	manifest := visualhive.Manifest{
 		SchemaVersion: visualhive.ManifestSchemaV3, DigestAlgorithm: visualhive.ContentAddressedDigestAlgorithm, BundleID: "verified-bundle", GeneratedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
 		Producer: visualhive.Producer{Name: "visual-hive", Version: "0.4.0", GitCommit: testVisualHiveProducerCommit},
-		Source:   visualhive.Source{Repository: "owner/repo", RepositoryID: "123", Ref: "refs/heads/main", CommitSHA: "abc123", Event: "schedule", WorkflowName: "Visual Hive Scheduled", WorkflowRunID: "42", WorkflowRunAttempt: "2", WorkflowArtifactID: "98", Conclusion: "success", Trusted: false},
+		Source:   visualhive.Source{Repository: "owner/repo", RepositoryID: "123", Ref: "refs/heads/main", CommitSHA: testVisualHiveHeadSHA, Event: "schedule", WorkflowName: "Visual Hive Scheduled", WorkflowRunID: "42", WorkflowRunAttempt: "2", WorkflowArtifactID: "98", Conclusion: "success", Trusted: false},
 		Project:  "demo", Mode: "measured", Verdict: "ready", ACMMRequest: 4,
 		Scan:         visualhive.Scan{Scope: "full", AuthoritativeForResolution: true, EvaluatedContracts: []string{}, EvaluatedFiles: []string{}, TestPlanVersion: "plan-1", ToolRegistryVersion: "tools-1"},
 		Observations: []visualhive.Observation{},
@@ -385,7 +397,7 @@ func buildVerifiedV3Artifacts(t *testing.T) ([]byte, []byte) {
 		Provenance:       visualhive.Provenance{Kind: "github-actions", AttestationRequired: true},
 		Safety:           visualhive.Safety{AtomicWrite: true, PathsAreRelative: true, DigestsRequired: true, ProducerCountersAreAdvisory: true, ProducerTrustClaimIsAdvisory: true, AbsenceRequiresAuthoritativeScan: true},
 	}
-	manifest.ReplayProtection.Key = testDigest([]byte("visual-hive.bundle.replay.v3\x00owner/repo\x00123\x00abc123\x0042\x002\x0098\x00verified-bundle"))
+	manifest.ReplayProtection.Key = testDigest([]byte("visual-hive.bundle.replay.v3\x00owner/repo\x00123\x00" + testVisualHiveHeadSHA + "\x0042\x002\x0098\x00verified-bundle"))
 	manifest.OverallDigest = testV3BundleDigest(manifest)
 	manifest.Provenance.SubjectDigest = manifest.OverallDigest
 	manifestData, err := json.Marshal(manifest)

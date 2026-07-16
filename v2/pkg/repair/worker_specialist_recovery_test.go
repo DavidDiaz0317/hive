@@ -14,7 +14,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
-func TestWorkerRecoversOneSpecialistInvocationIntoOnePullRequest(t *testing.T) {
+func TestWorkerRecoversPreUpgradeStageModelRunningOrderWithoutRecomposition(t *testing.T) {
 	repository, remote := seedGitRepository(t)
 	baseSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
 	baseTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD^{tree}"))
@@ -41,13 +41,33 @@ func TestWorkerRecoversOneSpecialistInvocationIntoOnePullRequest(t *testing.T) {
 		ExpectedBaseSHA: baseSHA, ExpectedBaseTreeSHA: baseTree,
 		Evidence: agent.SpecialistEvidenceIdentity{
 			BundleSchemaVersion: "visual-hive.hive-bundle.v3", BundleSHA256: strings.Repeat("b", 64),
-			VerificationReceiptSHA256: strings.Repeat("c", 64), WorkflowRunID: 41, WorkflowRunAttempt: 1,
-			WorkflowRunHeadSHA: baseSHA, ArtifactID: 73, ArtifactName: "visual-hive-evidence", ArtifactSHA256: strings.Repeat("d", 64),
+			ManifestSHA256: strings.Repeat("d", 64), ArtifactIndexSHA256: strings.Repeat("e", 64),
+			VerificationReceiptSHA256: strings.Repeat("c", 64), RepositoryID: "123", WorkflowRunID: 41, WorkflowRunAttempt: 1,
+			WorkflowRunHeadSHA: baseSHA, WorkflowName: "Hive Visual Hive Production", WorkflowRunName: "Hive Visual Hive Production [test]",
+			WorkflowPath: ".github/workflows/hive-visual-hive.yml", WorkflowEvent: "workflow_dispatch", HeadBranch: "main",
+			ArtifactID: 73, SourceArtifactID: 74, ArtifactName: "visual-hive-evidence", ArtifactSHA256: strings.Repeat("d", 64),
 		},
 		Specialist: agent.SpecialistQuality, RouteReason: "test adequacy routes to quality",
 		AllowedPaths: []string{"src/**"}, Validation: []string{"git diff --check"},
 		Deadline: anchor.Add(25 * time.Minute), PollInterval: 5 * time.Millisecond, Now: func() time.Time { return clock },
 	}
+	currentEvidence := providerConfig.Evidence
+	currentEvidence.Variant = visualhive.SpecialistEvidenceVariantVisualHiveV3
+	evidenceReceipt := visualhive.SpecialistEvidenceReceipt{
+		RepositoryID: currentEvidence.RepositoryID, WorkflowRunID: "41", WorkflowRunAttempt: "1",
+		ArtifactID: "73", SourceArtifactID: "74", ArtifactName: currentEvidence.ArtifactName,
+		CommitSHA: currentEvidence.WorkflowRunHeadSHA, HeadBranch: currentEvidence.HeadBranch, Event: currentEvidence.WorkflowEvent,
+		WorkflowName: currentEvidence.WorkflowName, WorkflowRunName: currentEvidence.WorkflowRunName, WorkflowPath: currentEvidence.WorkflowPath,
+		BundleSchema: currentEvidence.BundleSchemaVersion, BundleSHA256: currentEvidence.BundleSHA256,
+		ManifestSHA256: currentEvidence.ManifestSHA256, ArtifactIndexSHA: currentEvidence.ArtifactIndexSHA256,
+	}
+	currentEvidence.VerificationReceipt = &evidenceReceipt
+	currentEvidence.VerificationReceiptSHA256, _ = evidenceReceipt.SHA256()
+	providerConfig.Evidence.ManifestSHA256 = ""
+	providerConfig.Evidence.ArtifactIndexSHA256 = ""
+	providerConfig.Evidence.RepositoryID = ""
+	providerConfig.Evidence.WorkflowName, providerConfig.Evidence.WorkflowRunName, providerConfig.Evidence.WorkflowPath = "", "", ""
+	providerConfig.Evidence.WorkflowEvent, providerConfig.Evidence.HeadBranch, providerConfig.Evidence.SourceArtifactID = "", "", 0
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	workerConfig := Config{
@@ -84,10 +104,25 @@ func TestWorkerRecoversOneSpecialistInvocationIntoOnePullRequest(t *testing.T) {
 	if len(firstDispatcher.dispatchCalls) != 1 || firstDispatcher.dispatchCalls[0].TaskID != attempt.ModelInvocationID {
 		t.Fatalf("first dispatch = %+v, checkpoint=%s", firstDispatcher.dispatchCalls, attempt.ModelInvocationID)
 	}
+	preUpgradeOrder, err := mailbox.LoadWorkOrder(attempt.ModelInvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preUpgradePaths, _ := mailbox.Paths(preUpgradeOrder.ID)
+	preUpgradeBytes, err := os.ReadFile(preUpgradePaths.Order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"\"variant\"", "\"manifest_sha256\"", "\"verification_receipt\""} {
+		if strings.Contains(string(preUpgradeBytes), forbidden) {
+			t.Fatalf("pre-upgrade running order contains new evidence field %s: %s", forbidden, preUpgradeBytes)
+		}
+	}
 	writeSpecialistOutput(t, mailbox, attempt.ModelInvocationID, agent.SpecialistCompletionProposed, []byte(specialistProviderTestDiff), "recovered one exact proposal")
 
 	secondDispatcher := &fakeSpecialistDispatcher{identity: identity, releaseErr: agent.ErrSpecialistTaskLeaseAbsent}
 	providerConfig.Dispatcher = secondDispatcher
+	providerConfig.Evidence = currentEvidence
 	secondProvider, err := NewSpecialistProvider(providerConfig)
 	if err != nil {
 		t.Fatal(err)

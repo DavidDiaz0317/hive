@@ -1,6 +1,8 @@
 package beads
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +13,120 @@ import (
 
 func statusPtr(s Status) *Status { return &s }
 func strPtr(s string) *string    { return &s }
+
+func TestStoreMutationsRemainInMemoryTransactionalOnPersistenceFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation func(*Store, string) error
+		fail      func(*Store)
+	}{
+		{
+			name: "update write failure",
+			operation: func(store *Store, id string) error {
+				return store.Update(id, func(bead *Bead) {
+					bead.Status = StatusInProgress
+					bead.Metadata["nested"].(map[string]interface{})["value"] = "changed"
+				})
+			},
+			fail: func(store *Store) {
+				store.writeFile = func(string, []byte, os.FileMode) error { return errors.New("injected write failure") }
+			},
+		},
+		{
+			name: "update rename failure",
+			operation: func(store *Store, id string) error {
+				return store.Update(id, func(bead *Bead) {
+					bead.Status = StatusInProgress
+					bead.Metadata["nested"].(map[string]interface{})["value"] = "changed"
+				})
+			},
+			fail: func(store *Store) {
+				store.rename = func(string, string) error { return errors.New("injected rename failure") }
+			},
+		},
+		{
+			name: "close write failure",
+			operation: func(store *Store, id string) error {
+				return store.CloseWithUpdate(id, func(bead *Bead) {
+					bead.Metadata["nested"].(map[string]interface{})["value"] = "closed"
+				})
+			},
+			fail: func(store *Store) {
+				store.writeFile = func(string, []byte, os.FileMode) error { return errors.New("injected write failure") }
+			},
+		},
+		{
+			name: "close rename failure",
+			operation: func(store *Store, id string) error {
+				return store.CloseWithUpdate(id, func(bead *Bead) {
+					bead.Metadata["nested"].(map[string]interface{})["value"] = "closed"
+				})
+			},
+			fail: func(store *Store) {
+				store.rename = func(string, string) error { return errors.New("injected rename failure") }
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := NewStore(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bead, err := store.Create("transactional", TypeTask, PriorityHigh, "quality", "test://transactional")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Update(bead.ID, func(value *Bead) {
+				if value.Metadata == nil {
+					value.Metadata = map[string]interface{}{}
+				}
+				value.Metadata["nested"] = map[string]interface{}{"value": "original"}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before := beadJSON(t, store.FindByExternalRef(bead.ExternalRef))
+			originalWrite, originalRename := store.writeFile, store.rename
+			test.fail(store)
+			if err := test.operation(store, bead.ID); err == nil {
+				t.Fatal("injected persistence failure was accepted")
+			}
+			if after := beadJSON(t, store.FindByExternalRef(bead.ExternalRef)); after != before {
+				t.Fatalf("failed mutation changed live state:\nbefore=%s\nafter=%s", before, after)
+			}
+			if err := test.operation(store, bead.ID); err == nil {
+				t.Fatal("same-process retry advanced despite the persistent failure")
+			}
+			if afterRetry := beadJSON(t, store.FindByExternalRef(bead.ExternalRef)); afterRetry != before {
+				t.Fatalf("failed retry changed live state:\nbefore=%s\nafter=%s", before, afterRetry)
+			}
+			reloaded, err := NewStore(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if disk := beadJSON(t, reloaded.FindByExternalRef(bead.ExternalRef)); disk != before {
+				t.Fatalf("failed mutation changed durable state:\nbefore=%s\ndisk=%s", before, disk)
+			}
+			store.writeFile, store.rename = originalWrite, originalRename
+			if err := test.operation(store, bead.ID); err != nil {
+				t.Fatalf("mutation did not advance after persistence recovered: %v", err)
+			}
+			if afterRecovery := beadJSON(t, store.FindByExternalRef(bead.ExternalRef)); afterRecovery == before {
+				t.Fatal("recovered mutation did not change state")
+			}
+		})
+	}
+}
+
+func beadJSON(t *testing.T, bead *Bead) string {
+	t.Helper()
+	data, err := json.Marshal(bead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
 
 // TestNewStore_CreatesDirectoryAndEmptyStore verifies that NewStore creates the
 // target directory if it does not exist and starts with an empty ledger.

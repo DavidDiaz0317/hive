@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
 const (
@@ -72,19 +74,9 @@ const (
 	SpecialistCompletionBlocked  SpecialistCompletionStatus = "blocked"
 )
 
-// SpecialistEvidenceIdentity binds a work order to evidence already verified
-// by Hive. The mailbox does not perform provenance verification itself.
-type SpecialistEvidenceIdentity struct {
-	BundleSchemaVersion       string `json:"bundle_schema_version"`
-	BundleSHA256              string `json:"bundle_sha256"`
-	VerificationReceiptSHA256 string `json:"verification_receipt_sha256"`
-	WorkflowRunID             uint64 `json:"workflow_run_id"`
-	WorkflowRunAttempt        uint64 `json:"workflow_run_attempt"`
-	WorkflowRunHeadSHA        string `json:"workflow_run_head_sha"`
-	ArtifactID                uint64 `json:"artifact_id"`
-	ArtifactName              string `json:"artifact_name"`
-	ArtifactSHA256            string `json:"artifact_sha256"`
-}
+// SpecialistEvidenceIdentity preserves the existing agent API while sharing
+// the exact verified receipt type with Visual Hive admission.
+type SpecialistEvidenceIdentity = visualhive.SpecialistEvidenceIdentity
 
 // SpecialistExecutorProfile is the controller-owned proposal executor
 // identity bound into governed work orders. It is deliberately independent
@@ -383,6 +375,39 @@ func (m *SpecialistMailbox) ValidateRequestForOrder(order SpecialistWorkOrder, r
 		return errors.New("current specialist request does not match the durable work order")
 	}
 	return nil
+}
+
+// ValidateRecoveryRequestForOrder validates current safety-critical execution
+// inputs against an already-running persisted order without recomposing that
+// order from a newer evidence serialization. The durable prompt, route reason,
+// deadline, ID, and request digest remain authoritative after launch. This is
+// intentionally narrower than Prepare/ValidateRequestForOrder and is only for
+// recovery of an exact StageModelRunning swo-* checkpoint.
+func (m *SpecialistMailbox) ValidateRecoveryRequestForOrder(order SpecialistWorkOrder, request SpecialistWorkOrderRequest) error {
+	stored, err := m.requireStoredOrder(order)
+	if err != nil {
+		return err
+	}
+	normalized, err := m.normalizeRequest(request, false)
+	if err != nil {
+		return err
+	}
+	if normalized.Repository != stored.Repository || normalized.RepositoryFingerprint != stored.RepositoryFingerprint ||
+		normalized.RecurrenceKey != stored.RecurrenceKey || normalized.Attempt != stored.Attempt ||
+		normalized.BaseSHA != stored.BaseSHA || normalized.BaseTreeSHA != stored.BaseTreeSHA ||
+		normalized.Specialist != stored.Specialist || !equalJSON(normalized.AllowedPaths, stored.AllowedPaths) ||
+		!equalJSON(normalized.Validation, stored.Validation) || normalized.TaskPrompt != stored.TaskPrompt ||
+		normalized.TaskPromptSHA256 != stored.TaskPromptSHA256 || !legacyRecoveryEvidenceMatches(stored.Evidence, normalized.Evidence) {
+		return errors.New("current specialist recovery inputs do not match the durable running work order")
+	}
+	return nil
+}
+
+func legacyRecoveryEvidenceMatches(stored, current SpecialistEvidenceIdentity) bool {
+	return stored.BundleSchemaVersion == current.BundleSchemaVersion && stored.BundleSHA256 == current.BundleSHA256 &&
+		stored.WorkflowRunID == current.WorkflowRunID && stored.WorkflowRunAttempt == current.WorkflowRunAttempt &&
+		stored.WorkflowRunHeadSHA == current.WorkflowRunHeadSHA && stored.ArtifactID == current.ArtifactID &&
+		stored.ArtifactName == current.ArtifactName && stored.ArtifactSHA256 == current.ArtifactSHA256
 }
 
 // LoadLease returns the fully validated durable lease for an exact order.
@@ -856,10 +881,19 @@ func (m *SpecialistMailbox) normalizeRequest(request SpecialistWorkOrderRequest,
 	request.ReproductionMode = strings.TrimSpace(request.ReproductionMode)
 	request.TaskPromptSHA256 = strings.ToLower(strings.TrimSpace(request.TaskPromptSHA256))
 	request.Deadline = request.Deadline.UTC()
+	request.Evidence.Variant = strings.TrimSpace(request.Evidence.Variant)
 	request.Evidence.BundleSchemaVersion = strings.TrimSpace(request.Evidence.BundleSchemaVersion)
 	request.Evidence.BundleSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.BundleSHA256))
+	request.Evidence.ManifestSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.ManifestSHA256))
+	request.Evidence.ArtifactIndexSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.ArtifactIndexSHA256))
 	request.Evidence.VerificationReceiptSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.VerificationReceiptSHA256))
+	request.Evidence.RepositoryID = strings.TrimSpace(request.Evidence.RepositoryID)
 	request.Evidence.WorkflowRunHeadSHA = strings.ToLower(strings.TrimSpace(request.Evidence.WorkflowRunHeadSHA))
+	request.Evidence.WorkflowName = strings.TrimSpace(request.Evidence.WorkflowName)
+	request.Evidence.WorkflowRunName = strings.TrimSpace(request.Evidence.WorkflowRunName)
+	request.Evidence.WorkflowPath = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(request.Evidence.WorkflowPath), `\`, "/"), "./")
+	request.Evidence.WorkflowEvent = strings.TrimSpace(request.Evidence.WorkflowEvent)
+	request.Evidence.HeadBranch = strings.TrimSpace(request.Evidence.HeadBranch)
 	request.Evidence.ArtifactName = strings.TrimSpace(request.Evidence.ArtifactName)
 	request.Evidence.ArtifactSHA256 = strings.ToLower(strings.TrimSpace(request.Evidence.ArtifactSHA256))
 	if !repositoryPattern.MatchString(request.Repository) || !digestPattern.MatchString(request.RepositoryFingerprint) {
@@ -1185,6 +1219,45 @@ func validateEvidence(evidence SpecialistEvidenceIdentity) error {
 		evidence.ArtifactID == 0 || evidence.ArtifactName == "" || len(evidence.ArtifactName) > 255 || strings.IndexByte(evidence.ArtifactName, 0) >= 0 ||
 		!digestPattern.MatchString(evidence.ArtifactSHA256) {
 		return errors.New("complete verified bundle, workflow run, and artifact identity is required")
+	}
+	if evidence.Variant == "" || evidence.Variant == visualhive.SpecialistEvidenceVariantRevision {
+		return nil
+	}
+	if evidence.Variant != visualhive.SpecialistEvidenceVariantVisualHiveV3 {
+		return errors.New("unsupported specialist evidence variant")
+	}
+	if !digestPattern.MatchString(evidence.ManifestSHA256) || !digestPattern.MatchString(evidence.ArtifactIndexSHA256) ||
+		evidence.RepositoryID == "" || len(evidence.RepositoryID) > 256 || strings.IndexByte(evidence.RepositoryID, 0) >= 0 ||
+		evidence.WorkflowName == "" || len(evidence.WorkflowName) > 255 || strings.IndexByte(evidence.WorkflowName, 0) >= 0 ||
+		evidence.WorkflowRunName == "" || len(evidence.WorkflowRunName) > 255 || strings.IndexByte(evidence.WorkflowRunName, 0) >= 0 ||
+		evidence.WorkflowPath == "" || len(evidence.WorkflowPath) > 512 || strings.IndexByte(evidence.WorkflowPath, 0) >= 0 ||
+		evidence.WorkflowEvent == "" || len(evidence.WorkflowEvent) > 128 || strings.IndexByte(evidence.WorkflowEvent, 0) >= 0 ||
+		evidence.HeadBranch == "" || len(evidence.HeadBranch) > 255 || strings.IndexByte(evidence.HeadBranch, 0) >= 0 || evidence.SourceArtifactID == 0 {
+		return errors.New("complete Visual Hive workflow and artifact pins are required")
+	}
+	if evidence.VerificationReceipt == nil {
+		return errors.New("canonical specialist verification receipt is required")
+	}
+	digest, err := evidence.VerificationReceipt.SHA256()
+	if err != nil || digest != evidence.VerificationReceiptSHA256 ||
+		evidence.VerificationReceipt.BundleSchema != evidence.BundleSchemaVersion ||
+		evidence.VerificationReceipt.RepositoryID != evidence.RepositoryID ||
+		evidence.VerificationReceipt.WorkflowRunID != strconv.FormatUint(evidence.WorkflowRunID, 10) ||
+		evidence.VerificationReceipt.WorkflowRunAttempt != strconv.FormatUint(evidence.WorkflowRunAttempt, 10) ||
+		evidence.VerificationReceipt.ArtifactID != strconv.FormatUint(evidence.ArtifactID, 10) ||
+		evidence.VerificationReceipt.SourceArtifactID != strconv.FormatUint(evidence.SourceArtifactID, 10) ||
+		evidence.VerificationReceipt.ArtifactName != evidence.ArtifactName ||
+		evidence.VerificationReceipt.CommitSHA != evidence.WorkflowRunHeadSHA ||
+		evidence.VerificationReceipt.HeadBranch != evidence.HeadBranch ||
+		evidence.VerificationReceipt.Event != evidence.WorkflowEvent ||
+		evidence.VerificationReceipt.WorkflowName != evidence.WorkflowName ||
+		evidence.VerificationReceipt.WorkflowRunName != evidence.WorkflowRunName ||
+		evidence.VerificationReceipt.WorkflowPath != evidence.WorkflowPath ||
+		evidence.VerificationReceipt.BundleSHA256 != evidence.BundleSHA256 ||
+		evidence.VerificationReceipt.ManifestSHA256 != evidence.ManifestSHA256 ||
+		evidence.VerificationReceipt.ManifestSHA256 != evidence.ArtifactSHA256 ||
+		evidence.VerificationReceipt.ArtifactIndexSHA != evidence.ArtifactIndexSHA256 {
+		return errors.New("canonical specialist verification receipt does not match its evidence identity")
 	}
 	return nil
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -123,81 +122,7 @@ func hasExactAffectedContract(contracts []string) bool {
 // contract. ArtifactSHA256 intentionally identifies the exact manifest bytes;
 // BundleSHA256 separately identifies the complete bundle content.
 func specialistEvidenceIdentity(verified hivegithub.VerifiedVisualHiveArtifact, finding visualhive.FindingLifecycle) (agent.SpecialistEvidenceIdentity, error) {
-	if verified.BundleSchemaVersion != visualhive.ManifestSchemaV3 {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("specialist dispatch requires a verified content-addressed Visual Hive bundle v3")
-	}
-	for name, digest := range map[string]string{
-		"bundle":         verified.BundleSHA256,
-		"manifest":       verified.ManifestSHA256,
-		"artifact index": verified.ArtifactIndexSHA256,
-	} {
-		if !specialistDigestPattern.MatchString(strings.ToLower(strings.TrimSpace(digest))) {
-			return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("verified Visual Hive %s digest is invalid", name)
-		}
-	}
-	if !strings.EqualFold(strings.TrimSpace(finding.LastBundleDigest), verified.BundleSHA256) {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("finding bundle digest does not match the verified Visual Hive artifact")
-	}
-	if strings.TrimSpace(verified.ArtifactName) == "" || len(verified.ArtifactName) > 255 || strings.IndexByte(verified.ArtifactName, 0) >= 0 {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("verified Visual Hive artifact name is invalid")
-	}
-	if !validSpecialistGitObject(verified.CommitSHA) {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("verified Visual Hive workflow head is invalid")
-	}
-
-	runID, err := parsePositiveSpecialistIdentity("workflow run", verified.WorkflowRunID)
-	if err != nil {
-		return agent.SpecialistEvidenceIdentity{}, err
-	}
-	runAttempt, err := parsePositiveSpecialistIdentity("workflow run attempt", verified.WorkflowRunAttempt)
-	if err != nil {
-		return agent.SpecialistEvidenceIdentity{}, err
-	}
-	artifactID, err := parsePositiveSpecialistIdentity("artifact", verified.ArtifactID)
-	if err != nil {
-		return agent.SpecialistEvidenceIdentity{}, err
-	}
-	if lastRun := strings.TrimSpace(finding.LastWorkflowRunID); lastRun != "" && lastRun != verified.WorkflowRunID {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("finding workflow run does not match the verified Visual Hive artifact")
-	}
-
-	receiptBody := struct {
-		RepositoryID       string `json:"repository_id"`
-		WorkflowRunID      string `json:"workflow_run_id"`
-		WorkflowRunAttempt string `json:"workflow_run_attempt"`
-		ArtifactID         string `json:"artifact_id"`
-		SourceArtifactID   string `json:"source_artifact_id"`
-		ArtifactName       string `json:"artifact_name"`
-		CommitSHA          string `json:"commit_sha"`
-		WorkflowName       string `json:"workflow_name"`
-		WorkflowRunName    string `json:"workflow_run_name"`
-		WorkflowPath       string `json:"workflow_path"`
-		BundleSchema       string `json:"bundle_schema"`
-		BundleSHA256       string `json:"bundle_sha256"`
-		ManifestSHA256     string `json:"manifest_sha256"`
-		ArtifactIndexSHA   string `json:"artifact_index_sha256"`
-	}{
-		RepositoryID: verified.RepositoryID, WorkflowRunID: verified.WorkflowRunID, WorkflowRunAttempt: verified.WorkflowRunAttempt,
-		ArtifactID: verified.ArtifactID, SourceArtifactID: verified.SourceArtifactID, ArtifactName: verified.ArtifactName,
-		CommitSHA: strings.ToLower(verified.CommitSHA), WorkflowName: verified.WorkflowName, WorkflowRunName: verified.WorkflowRunName, WorkflowPath: verified.WorkflowPath,
-		BundleSchema: verified.BundleSchemaVersion, BundleSHA256: strings.ToLower(verified.BundleSHA256), ManifestSHA256: strings.ToLower(verified.ManifestSHA256), ArtifactIndexSHA: strings.ToLower(verified.ArtifactIndexSHA256),
-	}
-	encoded, err := json.Marshal(receiptBody)
-	if err != nil {
-		return agent.SpecialistEvidenceIdentity{}, fmt.Errorf("encode verified Visual Hive receipt identity: %w", err)
-	}
-	receiptDigest := sha256.Sum256(encoded)
-	return agent.SpecialistEvidenceIdentity{
-		BundleSchemaVersion:       verified.BundleSchemaVersion,
-		BundleSHA256:              strings.ToLower(verified.BundleSHA256),
-		VerificationReceiptSHA256: hex.EncodeToString(receiptDigest[:]),
-		WorkflowRunID:             runID,
-		WorkflowRunAttempt:        runAttempt,
-		WorkflowRunHeadSHA:        strings.ToLower(verified.CommitSHA),
-		ArtifactID:                artifactID,
-		ArtifactName:              verified.ArtifactName,
-		ArtifactSHA256:            strings.ToLower(verified.ManifestSHA256),
-	}, nil
+	return verified.SpecialistEvidenceIdentity(finding)
 }
 
 // specialistRevisionEvidenceIdentity binds one advisory failed PR artifact to
@@ -253,6 +178,7 @@ func specialistRevisionEvidenceIdentity(verified hivegithub.VerifiedPullRequestA
 	}
 	receiptDigest := sha256.Sum256(encoded)
 	return agent.SpecialistEvidenceIdentity{
+		Variant:             visualhive.SpecialistEvidenceVariantRevision,
 		BundleSchemaVersion: verified.ReviewSchemaVersion, BundleSHA256: strings.ToLower(verified.ArtifactIndexSHA256),
 		VerificationReceiptSHA256: hex.EncodeToString(receiptDigest[:]), WorkflowRunID: uint64(verified.WorkflowRunID),
 		WorkflowRunAttempt: uint64(verified.WorkflowRunAttempt), WorkflowRunHeadSHA: strings.ToLower(verified.CommitSHA),
@@ -264,14 +190,6 @@ func workflowPathMatchesForSpecialist(actual, expected string) bool {
 	actual = strings.ReplaceAll(strings.TrimSpace(strings.Split(actual, "@")[0]), `\`, "/")
 	expected = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(expected), `\`, "/"), "./")
 	return actual == expected || strings.HasSuffix(actual, "/"+expected)
-}
-
-func parsePositiveSpecialistIdentity(name, value string) (uint64, error) {
-	parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-	if err != nil || parsed == 0 {
-		return 0, fmt.Errorf("verified Visual Hive %s identity is invalid", name)
-	}
-	return parsed, nil
 }
 
 func validSpecialistGitObject(value string) bool {

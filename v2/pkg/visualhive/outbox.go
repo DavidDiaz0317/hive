@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/kubestellar/hive/v2/pkg/automation"
-	"github.com/kubestellar/hive/v2/pkg/beads"
 )
 
 type LifecycleIssueClient interface {
@@ -26,7 +25,15 @@ type OutboxProcessorResult struct {
 	Errors       []string `json:"errors,omitempty"`
 }
 
-func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *beads.Store, policy automation.Policy, client LifecycleIssueClient) OutboxProcessorResult {
+func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore LifecycleBeadSink, policy automation.Policy, client LifecycleIssueClient) OutboxProcessorResult {
+	return processOutbox(ctx, lifecycle, beadStore, policy, client, "")
+}
+
+func ProcessOutboxForFinding(ctx context.Context, lifecycle *LifecycleStore, beadStore LifecycleBeadSink, policy automation.Policy, client LifecycleIssueClient, repositoryFingerprint string) OutboxProcessorResult {
+	return processOutbox(ctx, lifecycle, beadStore, policy, client, strings.TrimSpace(repositoryFingerprint))
+}
+
+func processOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore LifecycleBeadSink, policy automation.Policy, client LifecycleIssueClient, repositoryFingerprint string) OutboxProcessorResult {
 	result := OutboxProcessorResult{}
 	if lifecycle == nil || beadStore == nil || client == nil {
 		result.Failed = 1
@@ -34,6 +41,9 @@ func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *be
 		return result
 	}
 	for _, entry := range lifecycle.PendingOutbox() {
+		if repositoryFingerprint != "" && entry.RepositoryFingerprint != repositoryFingerprint {
+			continue
+		}
 		if ctx.Err() != nil {
 			result.Errors = append(result.Errors, ctx.Err().Error())
 			break
@@ -92,7 +102,7 @@ func ProcessOutbox(ctx context.Context, lifecycle *LifecycleStore, beadStore *be
 	return result
 }
 
-func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStore *beads.Store, client LifecycleIssueClient, finding FindingLifecycle, entry OutboxEntry) error {
+func processOutboxEntry(ctx context.Context, lifecycle *LifecycleStore, beadStore LifecycleBeadSink, client LifecycleIssueClient, finding FindingLifecycle, entry OutboxEntry) error {
 	markerFingerprint := finding.PublicationFingerprint
 	if finding.RootCauseKey != "" {
 		expected := publicationFingerprint(finding.Repository, finding.RootCauseKey, finding.RepositoryFingerprint)

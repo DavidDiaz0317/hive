@@ -139,7 +139,7 @@ func TestNextSpecialistAttemptBindingReservesOneExactRevision(t *testing.T) {
 	}
 }
 
-func TestSpecialistEvidenceIdentityBindsVerifiedArtifact(t *testing.T) {
+func TestSpecialistEvidenceIdentityRejectsUnsealedArtifact(t *testing.T) {
 	bundleDigest := strings.Repeat("a", 64)
 	verified := hivegithub.VerifiedVisualHiveArtifact{
 		RepositoryID: "123", WorkflowRunID: "42", WorkflowRunAttempt: "2", ArtifactID: "99", SourceArtifactID: "98",
@@ -149,28 +149,8 @@ func TestSpecialistEvidenceIdentityBindsVerifiedArtifact(t *testing.T) {
 	}
 	finding := visualhive.FindingLifecycle{LastBundleDigest: bundleDigest, LastWorkflowRunID: "42"}
 
-	identity, err := specialistEvidenceIdentity(verified, finding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if identity.WorkflowRunID != 42 || identity.WorkflowRunAttempt != 2 || identity.ArtifactID != 99 || identity.ArtifactSHA256 != verified.ManifestSHA256 || len(identity.VerificationReceiptSHA256) != 64 {
-		t.Fatalf("specialist evidence identity = %+v", identity)
-	}
-
-	changed := verified
-	changed.WorkflowRunName = "different"
-	changedIdentity, err := specialistEvidenceIdentity(changed, finding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if changedIdentity.VerificationReceiptSHA256 == identity.VerificationReceiptSHA256 {
-		t.Fatal("verification receipt did not bind workflow run identity")
-	}
-
-	changed = verified
-	changed.BundleSHA256 = strings.Repeat("e", 64)
-	if _, err := specialistEvidenceIdentity(changed, finding); err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("mismatched bundle digest was accepted: %v", err)
+	if _, err := specialistEvidenceIdentity(verified, finding); err == nil || !strings.Contains(err.Error(), "sealed FetchAndVerifyVisualHiveBundle") {
+		t.Fatalf("unsealed verified-artifact fields were accepted: %v", err)
 	}
 }
 

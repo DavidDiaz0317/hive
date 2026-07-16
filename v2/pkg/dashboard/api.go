@@ -279,6 +279,7 @@ func (s *Server) resolveAgentParam(nameOrID string) string {
 }
 
 func (s *Server) refreshAfterMutation() {
+	s.syncGovernorSnapshot()
 	if s.deps != nil && s.deps.RefreshFunc != nil {
 		go s.deps.RefreshFunc()
 	}
@@ -296,6 +297,7 @@ func (s *Server) refreshAndPersist() {
 }
 
 func (s *Server) refreshAndPersistSync() {
+	s.syncGovernorSnapshot()
 	if s.deps != nil && s.deps.RefreshFunc != nil {
 		s.deps.RefreshFunc()
 	}
@@ -304,7 +306,21 @@ func (s *Server) refreshAndPersistSync() {
 	}
 }
 
+// saveConfig is retained for embedded callers. Production handlers stage
+// changes through mutateConfig; this compatibility boundary still publishes
+// through the same coordinator and never uses the lossy SkipNext watcher path.
+func (s *Server) saveConfig() error {
+	if s.deps == nil || s.deps.Config == nil {
+		return nil
+	}
+	if s.deps.ConfigCoordinator == nil {
+		s.deps.ConfigCoordinator = NewConfigCoordinator(s.deps.Config, s.deps.Governor, s.deps.AgentMgr)
+	}
+	return s.deps.ConfigCoordinator.Mutate(nil)
+}
+
 func (s *Server) persistOnly() {
+	s.syncGovernorSnapshot()
 	if s.deps != nil && s.deps.PersistFunc != nil {
 		s.deps.PersistFunc()
 	}
@@ -325,6 +341,18 @@ func (s *Server) configSnapshot() *config.Config {
 		return s.deps.ConfigCoordinator.Snapshot()
 	}
 	return s.deps.Config.Clone()
+}
+
+// syncGovernorSnapshot retains legacy refresh/persist boundaries while routing
+// their publication through the coordinator's Manager-before-Governor order.
+func (s *Server) syncGovernorSnapshot() {
+	if s.deps == nil || s.deps.Config == nil {
+		return
+	}
+	if s.deps.ConfigCoordinator == nil {
+		s.deps.ConfigCoordinator = NewConfigCoordinator(s.deps.Config, s.deps.Governor, s.deps.AgentMgr)
+	}
+	s.deps.ConfigCoordinator.PublishCurrent()
 }
 
 func (s *Server) refreshAsync() {

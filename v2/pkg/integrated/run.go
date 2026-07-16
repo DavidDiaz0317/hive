@@ -428,6 +428,7 @@ func applyWorkflowEvidence(ctx context.Context, stateDir string, config Config, 
 		FetchSourceArtifact: true,
 		TargetRef:           config.DefaultBranch, MaxACMM: config.ACMMLevel,
 		ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath,
+		ExpectedEvent:             visualHiveProductionWorkflowEvent,
 		ExpectedRunName:           workflowDispatchDisplayTitle(workflow.CorrelationID),
 		ExpectedProducerGitCommit: config.VisualHiveRef,
 		AllowFailedWorkflowRun:    workflow.RepositoryTestOverall != 0,
@@ -1915,6 +1916,12 @@ func repairPathsForFinding(configured []string, finding visualhive.FindingLifecy
 		"go.mod", "**/go.mod", "go.sum", "**/go.sum",
 	)
 	return result
+}
+
+// RepairPathsForFinding exposes the installed integrated repair-path policy to
+// the normal VisualWorkController without duplicating its per-finding rules.
+func RepairPathsForFinding(configured []string, finding visualhive.FindingLifecycle) []string {
+	return repairPathsForFinding(configured, finding)
 }
 
 func availableRepairCommands(commands []repair.Command) ([]repair.Command, []string) {

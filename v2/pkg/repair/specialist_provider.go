@@ -217,6 +217,14 @@ func (p *SpecialistProvider) workOrderRequest(baseSHA, baseTreeSHA, prompt strin
 // lease may already have reached a specialist, so recovery only observes that
 // session and waits; it never calls the starting/restarting readiness path.
 func (p *SpecialistProvider) runPreparedInvocation(ctx context.Context, worktree, workOrderID string) (ProviderResult, error) {
+	return p.runPreparedInvocationMode(ctx, worktree, workOrderID, false)
+}
+
+func (p *SpecialistProvider) recoverPreparedInvocation(ctx context.Context, worktree, workOrderID string) (ProviderResult, error) {
+	return p.runPreparedInvocationMode(ctx, worktree, workOrderID, true)
+}
+
+func (p *SpecialistProvider) runPreparedInvocationMode(ctx context.Context, worktree, workOrderID string, recovering bool) (ProviderResult, error) {
 	if p == nil || p.config.Dispatcher == nil || p.config.Mailbox == nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: errors.New("specialist provider is not configured")}
 	}
@@ -231,7 +239,12 @@ func (p *SpecialistProvider) runPreparedInvocation(ctx context.Context, worktree
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
-	if err := p.config.Mailbox.ValidateRequestForOrder(order, p.workOrderRequest(baseSHA, baseTreeSHA, order.TaskPrompt)); err != nil {
+	request := p.workOrderRequest(baseSHA, baseTreeSHA, order.TaskPrompt)
+	validate := p.config.Mailbox.ValidateRequestForOrder
+	if recovering {
+		validate = p.config.Mailbox.ValidateRecoveryRequestForOrder
+	}
+	if err := validate(order, request); err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("validate recovered specialist work order: %w", err)}
 	}
 
