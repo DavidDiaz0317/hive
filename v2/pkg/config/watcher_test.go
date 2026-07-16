@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -122,5 +123,132 @@ func TestWatcher_Debounce(t *testing.T) {
 	count := reloadCount.Load()
 	if count > 2 {
 		t.Errorf("expected debouncing to reduce reloads, got %d reloads for %d writes", count, rapidWrites)
+	}
+}
+
+func TestWatcherProgrammaticSaveFailureDoesNotSuppressExternalEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hive.yaml")
+	if err := os.WriteFile(path, []byte(minimalValidYAML("original-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var reloadedOrg string
+	w := NewWatcher(path, func(cfg *Config) {
+		reloadedOrg = cfg.Project.Org
+	}, slog.Default())
+	invalid, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid.Project.Org = ""
+	if err := w.ProgrammaticSave(invalid); err == nil {
+		t.Fatal("ProgrammaticSave unexpectedly accepted invalid config")
+	}
+
+	if err := os.WriteFile(path, []byte(minimalValidYAML("external-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.reload()
+	if reloadedOrg != "external-org" {
+		t.Fatalf("external edit was suppressed after failed save: got org %q", reloadedOrg)
+	}
+}
+
+func TestWatcherProgrammaticSaveSuppressesOnlyMatchingDigest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hive.yaml")
+	if err := os.WriteFile(path, []byte(minimalValidYAML("original-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var reloadCount int
+	var reloadedOrg string
+	w := NewWatcher(path, func(cfg *Config) {
+		reloadCount++
+		reloadedOrg = cfg.Project.Org
+	}, slog.Default())
+	candidate, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Project.Org = "programmatic-org"
+	if err := w.ProgrammaticSave(candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	// The watcher may consume its own exact write without reloading it.
+	w.reload()
+	if reloadCount != 0 {
+		t.Fatalf("matching programmatic write unexpectedly reloaded %d times", reloadCount)
+	}
+
+	// Once an external editor changes the bytes, that edit must be delivered.
+	if err := os.WriteFile(path, []byte(minimalValidYAML("external-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.reload()
+	if reloadCount != 1 || reloadedOrg != "external-org" {
+		t.Fatalf("external edit not delivered: reloads=%d org=%q", reloadCount, reloadedOrg)
+	}
+}
+
+func TestWatcherProgrammaticSaveDoesNotConsumeRacingExternalDigest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hive.yaml")
+	if err := os.WriteFile(path, []byte(minimalValidYAML("original-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var reloadedOrg string
+	w := NewWatcher(path, func(cfg *Config) {
+		reloadedOrg = cfg.Project.Org
+	}, slog.Default())
+	programmatic := []byte(minimalValidYAML("programmatic-org", "ghp_tok"))
+	external := []byte(minimalValidYAML("racing-external-org", "ghp_tok"))
+	if err := w.programmaticSave(digestBytes(programmatic), func() error {
+		if err := os.WriteFile(path, programmatic, 0o600); err != nil {
+			return err
+		}
+		// Simulate an editor winning after Hive's write but before watcher
+		// bookkeeping completes.
+		return os.WriteFile(path, external, 0o600)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w.reload()
+	if reloadedOrg != "racing-external-org" {
+		t.Fatalf("racing external edit was consumed as our save: got org %q", reloadedOrg)
+	}
+}
+
+func TestWatcherProgrammaticSaveRejectsPendingExternalEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hive.yaml")
+	if err := os.WriteFile(path, []byte(minimalValidYAML("original-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var reloadedOrg string
+	w := NewWatcher(path, func(cfg *Config) {
+		reloadedOrg = cfg.Project.Org
+	}, slog.Default())
+	candidate, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Project.Org = "dashboard-org"
+
+	// The external editor writes after the candidate was staged but before
+	// Hive reaches its persistence boundary.
+	if err := os.WriteFile(path, []byte(minimalValidYAML("external-org", "ghp_tok")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.ProgrammaticSave(candidate); !errors.Is(err, ErrConcurrentConfigEdit) {
+		t.Fatalf("ProgrammaticSave error = %v, want ErrConcurrentConfigEdit", err)
+	}
+	w.reload()
+	if reloadedOrg != "external-org" {
+		t.Fatalf("pending external edit was not reloaded: got org %q", reloadedOrg)
 	}
 }

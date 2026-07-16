@@ -69,6 +69,64 @@ func TestGovernorAgentSnapshotDeepClonesAtConstructionAndReload(t *testing.T) {
 	assertAgentSnapshot(t, g, reloadedExpected)
 }
 
+func TestGovernorConfigSnapshotDeepClonesAtConstructionAndReload(t *testing.T) {
+	initialInput := richGovernorConfig("initial")
+	initialExpected := richGovernorConfig("initial")
+	g := New(initialInput, nil, slog.Default())
+	mutateRichGovernorConfig(&initialInput, "changed-after-new")
+	assertGovernorConfigSnapshot(t, g, initialExpected)
+
+	reloadedInput := richGovernorConfig("reloaded")
+	reloadedExpected := richGovernorConfig("reloaded")
+	g.UpdateConfig(reloadedInput)
+	mutateRichGovernorConfig(&reloadedInput, "changed-after-update")
+	assertGovernorConfigSnapshot(t, g, reloadedExpected)
+
+	combinedInput := richGovernorConfig("combined")
+	combinedExpected := richGovernorConfig("combined")
+	g.UpdateConfigAndAgents(combinedInput, map[string]config.AgentConfig{"quality": {Enabled: true}})
+	mutateRichGovernorConfig(&combinedInput, "changed-after-combined-update")
+	assertGovernorConfigSnapshot(t, g, combinedExpected)
+}
+
+func richGovernorConfig(marker string) config.GovernorConfig {
+	return config.GovernorConfig{
+		Modes: map[string]config.ModeConfig{
+			"idle": {
+				Threshold: 1,
+				Cadences:  map[string]string{"quality": marker + "-cadence"},
+			},
+		},
+		Labels: config.LabelsConfig{Exempt: []string{marker + "-label"}},
+		Sensing: config.SensingConfig{
+			GHRatePatterns:     []string{marker + "-rate"},
+			CLIExcludePatterns: []string{marker + "-exclude"},
+			LoginPatterns:      []string{marker + "-login"},
+		},
+	}
+}
+
+func mutateRichGovernorConfig(governorConfig *config.GovernorConfig, marker string) {
+	mode := governorConfig.Modes["idle"]
+	mode.Threshold = 99
+	mode.Cadences["quality"] = marker
+	governorConfig.Modes["idle"] = mode
+	governorConfig.Modes[marker] = config.ModeConfig{Cadences: map[string]string{marker: marker}}
+	governorConfig.Labels.Exempt[0] = marker
+	governorConfig.Sensing.GHRatePatterns[0] = marker
+	governorConfig.Sensing.CLIExcludePatterns[0] = marker
+	governorConfig.Sensing.LoginPatterns[0] = marker
+}
+
+func assertGovernorConfigSnapshot(t *testing.T, g *Governor, expected config.GovernorConfig) {
+	t.Helper()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if !reflect.DeepEqual(g.cfg, expected) {
+		t.Fatalf("Governor config snapshot changed through caller-owned nested state:\nactual:   %#v\nexpected: %#v", g.cfg, expected)
+	}
+}
+
 func richAgentConfig(marker string) config.AgentConfig {
 	includeRepos := true
 	channelEnabled := true

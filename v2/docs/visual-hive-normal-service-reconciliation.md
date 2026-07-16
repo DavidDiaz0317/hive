@@ -204,6 +204,38 @@ introduce a role registry. Pending or transiently denied work is then
 re-evaluated against the new role/policy digest, while prepared work continues
 only from its persisted order.
 
+### Runtime config transaction checkpoint
+
+The current compatibility checkpoint extends reload safety to normal dashboard
+and pack writes without introducing a Visual-specific registry:
+
+- `ConfigCoordinator` is the one staged mutation/persistence/publication
+  boundary. It deep-clones the complete config, persists the candidate before
+  publication, prepares every newly-enabled ordinary Manager entry, publishes
+  Governor policy plus enabled agents under the Governor's one lock, and only
+  then removes deleted Manager entries.
+- Agent nested edits, create/import/delete, ACMM pack application, Governor
+  edits, and the heartbeat-owned persisted config fields use that boundary.
+  A persistence error causes the coordinator itself to publish none of the
+  candidate Config, Manager, or Governor state. If the underlying filesystem
+  reports an error only after bytes reached disk, the ordinary watcher remains
+  unsuppressed and reconciles the actual authoritative file.
+- Programmatic watcher suppression binds the digest of the intended YAML bytes,
+  not an unqualified "next event" flag or a post-write fingerprint. Failed
+  saves install no suppression, and an external edit that wins during or after
+  the save window is reloaded.
+- ACMM pack policy, agent registry, stale timeouts, and level are one runtime
+  publication. The Governor cannot admit a pack-created agent before that
+  agent is addressable by the ordinary Manager.
+
+This checkpoint deliberately does **not** claim the following later
+reconciliations: atomic/authoritative precedence between base YAML and per-agent
+overlay files; dynamic creation/removal of bead stores and other config-driven
+subsystems; import of portable-definition cadence maps; conversion of every
+long-lived direct config reader to coordinator snapshots; or live refresh of
+the Manager's project-wide `ProjectContext`. Those must be handled explicitly
+after this compatibility boundary, not hidden inside the Visual integration.
+
 ## Acceptance matrix
 
 | Proof | Status on this branch |
@@ -211,7 +243,7 @@ only from its persisted order.
 | Typed mutation/test-adequacy artifact reaches normal quality prompt and mailbox replay is byte-identical | Implemented and passing |
 | Unsafe path/link, size/SHA drift, binary non-embedding, and required-JSON fail-closed behavior | Implemented and passing |
 | Role/executor separation and immutable governed mailbox request | Execution commits integrated; focused tests passing |
-| Governor agent enable/disable/role snapshot updates on normal config reload, including nested caller mutation | Implemented and passing |
+| Governor agent enable/disable/role snapshot updates on reload and staged dashboard/pack writes, including nested caller mutation and failed-save isolation | Implemented and passing |
 | Intake packet tamper/malformed, policy drift after prepare, pause/budget/WIP re-evaluation, and no duplicate bead/work | Blocked on audited intake commit |
 | One-shot child containment and rejection of legacy completion for new governed work | Blocked on audited dispatcher commit |
 | Worker request-SHA persistence, crash recovery with one model call, and one branch/PR maximum | Blocked on intake/dispatcher reconciliation |
@@ -229,12 +261,16 @@ only from its persisted order.
 - Added exact typed evidence preservation and bounded reading in `64b6abed`.
 - Added atomic Governor config/agent refresh in `00391727` and complete nested
   snapshot isolation in `610f6474`.
+- Added the staged runtime config coordinator, Manager-before-Governor
+  reconciliation, intended-digest watcher suppression, and pack/import/delete
+  compatibility tests in the current checkpoint.
 - Passing focused commands:
   - `go test ./pkg/agent -count=1 -timeout 2m`
   - `go test ./pkg/scheduler -count=1 -timeout 2m`
   - `go test ./pkg/repair -run '^TestGovernedEvidenceArtifactReader' -count=1 -timeout 2m`
   - `go test ./pkg/governor -count=1 -timeout 2m`
   - `go test ./cmd/hive -run '^$' -count=1 -timeout 2m`
+  - `go test ./pkg/config ./pkg/governor ./pkg/dashboard ./cmd/hive -count=1`
 - A combined `go test ./pkg/scheduler ./pkg/repair -timeout 4m` run passed
   Scheduler but timed out in the unrelated existing Windows Git subprocess
   `TestSealedTreeGuardCannotBeTransplantedAcrossAttempts`. The full repair

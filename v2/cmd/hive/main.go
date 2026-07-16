@@ -329,6 +329,7 @@ func main() {
 		PolicyDir:  policyDir,
 	}
 	agentMgr := agent.NewManager(cfg.EnabledAgents(), logger, projectCtx)
+	configCoordinator := dashboard.NewConfigCoordinator(cfg, gov, agentMgr)
 	if appAuth != nil {
 		agentMgr.SetAppAuth(appAuth)
 		go agentMgr.StartAgentTokenRefresh(ctx)
@@ -477,8 +478,9 @@ func main() {
 			logger.Info("migrated config overrides from state to hive.yaml",
 				"repos", cfg.Project.Repos)
 
-			// Write merged config to hive.yaml so overrides become the base config
-			if err := cfg.Save(); err != nil {
+			// Write and publish the complete merged candidate so startup never
+			// leaves Governor or Manager on the pre-migration snapshot.
+			if err := configCoordinator.Mutate(nil); err != nil {
 				logger.Error("failed to save migrated config", "error", err)
 			}
 
@@ -489,6 +491,7 @@ func main() {
 			}
 		}
 	}
+	configCoordinator.PublishCurrent()
 
 	if gov.GetBudget().WeeklyLimit == 0 && cfg.Governor.Budget.TotalTokens > 0 {
 		gov.SetBudgetLimit(cfg.Governor.Budget.TotalTokens)
@@ -898,22 +901,23 @@ func main() {
 	}
 
 	dashSrv.RegisterAPI(&dashboard.Dependencies{
-		Config:           cfg,
-		AgentMgr:         agentMgr,
-		Governor:         gov,
-		GHClient:         ghClient,
-		GHAppAuth:        appAuth,
-		Tokens:           tokenCollector,
-		Knowledge:        knowledgeAPI,
-		Inception:        inceptionEngine,
-		Nous:             nousState,
-		Scheduler:        sched,
-		MetricsCollector: metricsCollector,
-		BeadSynthesizer:  beadSynth,
-		BeadStores:       beadStores,
-		Logger:           logger,
-		Ctx:              ctx,
-		RefreshFunc:      refreshDashboard,
+		Config:            cfg,
+		AgentMgr:          agentMgr,
+		Governor:          gov,
+		GHClient:          ghClient,
+		GHAppAuth:         appAuth,
+		Tokens:            tokenCollector,
+		Knowledge:         knowledgeAPI,
+		Inception:         inceptionEngine,
+		Nous:              nousState,
+		Scheduler:         sched,
+		MetricsCollector:  metricsCollector,
+		BeadSynthesizer:   beadSynth,
+		BeadStores:        beadStores,
+		ConfigCoordinator: configCoordinator,
+		Logger:            logger,
+		Ctx:               ctx,
+		RefreshFunc:       refreshDashboard,
 		PersistFunc: func() {
 			persistState(agentMgr, gov, cfg, tokenCollector, statePath, logger, dashSrv)
 		},
@@ -1130,30 +1134,42 @@ func main() {
 	}
 
 	// Watch hive.yaml for external changes and reload config when modified
-	configWatcher := config.NewWatcher(*configPath, func(newCfg *config.Config) {
-		// Preserve runtime-only fields that are not in the YAML
-		newCfg.HiveID = cfg.HiveID
+	var configWatcher *config.Watcher
+	configWatcher = config.NewDigestWatcher(*configPath, func(newCfg *config.Config, sourceDigest string) {
+		// Preserve runtime-only fields that are not authoritative in YAML.
+		if err := configCoordinator.Replace(newCfg, func(current, candidate *config.Config) error {
+			if err := configWatcher.AcceptExternalDigest(sourceDigest); err != nil {
+				return err
+			}
+			candidate.HiveID = current.HiveID
 
-		// Preserve ACMM level from the agent manager — it is the
-		// authoritative source. The file may have a stale value if
-		// a watcher reload races with a level-switch saveConfig().
-		if cfg.ACMMLevel != nil {
-			newCfg.ACMMLevel = cfg.ACMMLevel
+			if current.ACMMLevel != nil {
+				level := *current.ACMMLevel
+				candidate.ACMMLevel = &level
+			}
+			return nil
+		}); err != nil {
+			logger.Error("failed to publish config reload", "error", err)
+			return
 		}
-
-		// Swap the in-memory config pointer contents
-		*cfg = *newCfg
 
 		// Re-sync subsystems that cache config values
 		ghClient.SetRepos(cfg.Project.Repos)
 		if uc := userGHClient.Load(); uc != nil {
 			uc.SetRepos(cfg.Project.Repos)
 		}
-		gov.UpdateConfigAndAgents(cfg.Governor, cfg.EnabledAgents())
 		initAgentConfigDrivenSystems(cfg)
 		refreshDashboard()
 	}, logger)
-	dashSrv.SetSkipReloadFunc(configWatcher.SkipNext)
+	dashSrv.SetConfigSaveFunc(func(candidate *config.Config) error {
+		if err := configWatcher.ProgrammaticSave(candidate); err != nil {
+			dashSrv.AddSystemAlert("config-save-failed", "error",
+				"Config save failed — runtime changes were not published: "+err.Error())
+			return err
+		}
+		dashSrv.ClearSystemAlert("config-save-failed")
+		return nil
+	})
 	go configWatcher.Start(ctx)
 
 	// Register custom GHE hostnames with the proxy allowlist so mode
@@ -1313,17 +1329,29 @@ func main() {
 
 	// Start hub heartbeat push if configured (env var or config)
 	hubURL := cfg.Hub.URL
-	if envHub := os.Getenv("HIVE_HUB_URL"); envHub != "" {
+	envHub := os.Getenv("HIVE_HUB_URL")
+	envCluster := os.Getenv("HIVE_CLUSTER_ID")
+	if envHub != "" || envCluster != "" {
+		if err := configCoordinator.Mutate(func(candidate *config.Config) error {
+			if envHub != "" {
+				candidate.Hub.Enabled = true
+				candidate.Hub.URL = envHub
+			}
+			if envCluster != "" {
+				candidate.Hub.ClusterID = envCluster
+			}
+			return nil
+		}); err != nil {
+			logger.Error("failed to persist hub environment config", "error", err)
+		}
+	}
+	if envHub != "" {
 		hubURL = envHub
-		cfg.Hub.Enabled = true
-		cfg.Hub.URL = envHub
 	}
-	if envCluster := os.Getenv("HIVE_CLUSTER_ID"); envCluster != "" {
-		cfg.Hub.ClusterID = envCluster
-	}
-	if cfg.Hub.Enabled && hubURL != "" {
+	hubEnabled := cfg.Hub.Enabled || envHub != ""
+	if hubEnabled && hubURL != "" {
 		go hub.StartHeartbeat(ctx, hubURL, func() *hub.HeartbeatPayload {
-			if !cfg.Hub.Enabled {
+			if !cfg.Hub.Enabled && envHub == "" {
 				return nil
 			}
 			statuses := agentMgr.AllStatuses()
@@ -1509,21 +1537,28 @@ func main() {
 				logger.Info("github app private key written via heartbeat", "path", keyPath)
 			}
 
-			cfg.GitHub.AppID = ghCfg.AppID
-			cfg.GitHub.InstallationID = ghCfg.InstallationID
-			if ghCfg.PrivateKey != "" {
-				cfg.GitHub.KeyFile = keyPath
+			if err := configCoordinator.Mutate(func(candidate *config.Config) error {
+				candidate.GitHub.AppID = ghCfg.AppID
+				candidate.GitHub.InstallationID = ghCfg.InstallationID
+				if ghCfg.PrivateKey != "" {
+					candidate.GitHub.KeyFile = keyPath
+				}
+				return nil
+			}); err != nil {
+				logger.Error("failed to persist github app config from heartbeat", "error", err)
+				return
 			}
 
-			if cfg.GitHub.AppID != 0 && cfg.GitHub.InstallationID != 0 && cfg.GitHub.KeyFile != "" {
-				newAppAuth, err := github.NewAppAuth(cfg.GitHub.AppID, cfg.GitHub.InstallationID, cfg.GitHub.KeyFile, logger, cfg.GitHub.ResolvedAPIURL())
+			committed := configCoordinator.Snapshot()
+			if committed.GitHub.AppID != 0 && committed.GitHub.InstallationID != 0 && committed.GitHub.KeyFile != "" {
+				newAppAuth, err := github.NewAppAuth(committed.GitHub.AppID, committed.GitHub.InstallationID, committed.GitHub.KeyFile, logger, committed.GitHub.ResolvedAPIURL())
 				if err != nil {
 					logger.Error("github app auth init via heartbeat failed", "error", err)
 					return
 				}
-				newClient := github.NewClientFromApp(newAppAuth, cfg.Project.Org, cfg.Project.Repos, logger)
-				if len(cfg.Governor.Labels.Exempt) > 0 {
-					newClient.SetExemptLabels(cfg.Governor.Labels.Exempt)
+				newClient := github.NewClientFromApp(newAppAuth, committed.Project.Org, committed.Project.Repos, logger)
+				if len(committed.Governor.Labels.Exempt) > 0 {
+					newClient.SetExemptLabels(committed.Governor.Labels.Exempt)
 				}
 				ghClient = newClient
 				appAuth = newAppAuth
@@ -1532,8 +1567,8 @@ func main() {
 				dashSrv.SetGitHubAppRequired(false)
 				dashSrv.ClearPendingGitHubAppInstall()
 				logger.Info("github app configured via heartbeat delivery",
-					"app_id", cfg.GitHub.AppID,
-					"installation_id", cfg.GitHub.InstallationID,
+					"app_id", committed.GitHub.AppID,
+					"installation_id", committed.GitHub.InstallationID,
 				)
 			}
 		}), hub.HubBannerCallback(func(banner *hub.HubBanner) {
@@ -1543,10 +1578,16 @@ func main() {
 			}
 			dashSrv.SetHubBanner(banner.ID, banner.Message, banner.Color)
 		}), hub.VisibilityCallback(func(isPublic bool) {
-			if cfg.Hub.IsPublic != isPublic {
+			current := configCoordinator.Snapshot()
+			if current.Hub.IsPublic != isPublic {
 				logger.Info("hub overrode visibility via heartbeat",
-					"was", cfg.Hub.IsPublic, "now", isPublic)
-				cfg.Hub.IsPublic = isPublic
+					"was", current.Hub.IsPublic, "now", isPublic)
+				if err := configCoordinator.Mutate(func(candidate *config.Config) error {
+					candidate.Hub.IsPublic = isPublic
+					return nil
+				}); err != nil {
+					logger.Error("failed to persist hub visibility override", "error", err)
+				}
 			}
 		}))
 
@@ -2317,16 +2358,6 @@ func persistState(agentMgr *agent.Manager, gov *governor.Governor, cfg *config.C
 
 	if err := snapshot.SaveState(path, state, logger); err != nil {
 		logger.Error("failed to persist state", "error", err)
-	}
-
-	if err := cfg.Save(); err != nil {
-		logger.Error("failed to persist config to yaml", "error", err)
-		if dashSrv != nil {
-			dashSrv.AddSystemAlert("config-save-failed", "error",
-				"Config save failed — runtime state (ACMM level, agent config) will be lost on restart: "+err.Error())
-		}
-	} else if dashSrv != nil {
-		dashSrv.ClearSystemAlert("config-save-failed")
 	}
 
 	history := gov.EvalHistory()

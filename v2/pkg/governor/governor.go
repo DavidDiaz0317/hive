@@ -3,8 +3,6 @@ package governor
 import (
 	"fmt"
 	"log/slog"
-	"maps"
-	"slices"
 	"sync"
 	"time"
 
@@ -34,22 +32,22 @@ type ModeChange struct {
 }
 
 type EvalSnapshot struct {
-	Timestamp     int64             `json:"t"`
-	Mode          Mode              `json:"govMode"`
-	QueueIssues   int               `json:"govIssues"`
-	QueuePRs      int               `json:"govPrs"`
-	QueueTotal    int               `json:"govTotal"`
-	QueueHold     int               `json:"govHold"`
-	QueueActive   int               `json:"govActive"`
-	SLAViolations int               `json:"sla_violations,omitempty"`
-	AgentsKicked  []string          `json:"agents_kicked,omitempty"`
-	Actionable    int               `json:"actionableCount"`
-	OpenPRs       int               `json:"openPrCount"`
-	Mergeable     int               `json:"mergeableCount"`
-	BeadsWorkers  int               `json:"beadsWorkers"`
-	BeadsSupervisor int             `json:"beadsSupervisor"`
-	Repos         map[string]RepoSnapshot `json:"repos,omitempty"`
-	AgentStats    map[string]map[string]any `json:"agentStats,omitempty"`
+	Timestamp       int64                     `json:"t"`
+	Mode            Mode                      `json:"govMode"`
+	QueueIssues     int                       `json:"govIssues"`
+	QueuePRs        int                       `json:"govPrs"`
+	QueueTotal      int                       `json:"govTotal"`
+	QueueHold       int                       `json:"govHold"`
+	QueueActive     int                       `json:"govActive"`
+	SLAViolations   int                       `json:"sla_violations,omitempty"`
+	AgentsKicked    []string                  `json:"agents_kicked,omitempty"`
+	Actionable      int                       `json:"actionableCount"`
+	OpenPRs         int                       `json:"openPrCount"`
+	Mergeable       int                       `json:"mergeableCount"`
+	BeadsWorkers    int                       `json:"beadsWorkers"`
+	BeadsSupervisor int                       `json:"beadsSupervisor"`
+	Repos           map[string]RepoSnapshot   `json:"repos,omitempty"`
+	AgentStats      map[string]map[string]any `json:"agentStats,omitempty"`
 }
 
 type RepoSnapshot struct {
@@ -153,8 +151,8 @@ func New(cfg config.GovernorConfig, agents map[string]config.AgentConfig, logger
 	}
 
 	return &Governor{
-		cfg:    cfg,
-		agents: cloneAgentConfigs(agents),
+		cfg:    config.CloneGovernorConfig(cfg),
+		agents: config.CloneAgentConfigs(agents),
 		state: State{
 			Mode:     ModeIdle,
 			Cadences: make(map[string]AgentCadence),
@@ -174,7 +172,8 @@ func New(cfg config.GovernorConfig, agents map[string]config.AgentConfig, logger
 func (g *Governor) UpdateConfig(cfg config.GovernorConfig) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.cfg = cfg
+	g.cfg = config.CloneGovernorConfig(cfg)
+	g.updateCadences()
 }
 
 // UpdateConfigAndAgents replaces the Governor configuration and its enabled
@@ -185,64 +184,9 @@ func (g *Governor) UpdateConfigAndAgents(cfg config.GovernorConfig, agents map[s
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	g.cfg = cfg
-	g.agents = cloneAgentConfigs(agents)
-	for name := range g.state.Cadences {
-		if _, enabled := g.agents[name]; !enabled {
-			delete(g.state.Cadences, name)
-		}
-	}
-}
-
-func cloneAgentConfigs(agents map[string]config.AgentConfig) map[string]config.AgentConfig {
-	cloned := make(map[string]config.AgentConfig, len(agents))
-	for name, agentConfig := range agents {
-		cloned[name] = cloneAgentConfig(agentConfig)
-	}
-	return cloned
-}
-
-func cloneAgentConfig(agentConfig config.AgentConfig) config.AgentConfig {
-	cloned := agentConfig
-	cloned.Aliases = slices.Clone(agentConfig.Aliases)
-	cloned.LaneKeywords = slices.Clone(agentConfig.LaneKeywords)
-	cloned.DetectKeywords = slices.Clone(agentConfig.DetectKeywords)
-	cloned.StatsDisplay = slices.Clone(agentConfig.StatsDisplay)
-	cloned.ACMMLevels = slices.Clone(agentConfig.ACMMLevels)
-	if agentConfig.IncludeRepos != nil {
-		includeRepos := *agentConfig.IncludeRepos
-		cloned.IncludeRepos = &includeRepos
-	}
-
-	cloned.Channels = slices.Clone(agentConfig.Channels)
-	for index := range cloned.Channels {
-		channel := &cloned.Channels[index]
-		channel.Events = slices.Clone(agentConfig.Channels[index].Events)
-		channel.Patterns = slices.Clone(agentConfig.Channels[index].Patterns)
-		channel.Match = maps.Clone(agentConfig.Channels[index].Match)
-		channel.Repos = slices.Clone(agentConfig.Channels[index].Repos)
-		if agentConfig.Channels[index].Enabled != nil {
-			enabled := *agentConfig.Channels[index].Enabled
-			channel.Enabled = &enabled
-		}
-	}
-
-	if agentConfig.Tools != nil {
-		tools := *agentConfig.Tools
-		tools.Rules = slices.Clone(agentConfig.Tools.Rules)
-		cloned.Tools = &tools
-	}
-
-	cloned.Connections = slices.Clone(agentConfig.Connections)
-	for index := range cloned.Connections {
-		connection := &cloned.Connections[index]
-		connection.Options = maps.Clone(agentConfig.Connections[index].Options)
-		if agentConfig.Connections[index].Auth != nil {
-			auth := *agentConfig.Connections[index].Auth
-			connection.Auth = &auth
-		}
-	}
-	return cloned
+	g.cfg = config.CloneGovernorConfig(cfg)
+	g.agents = config.CloneAgentConfigs(agents)
+	g.updateCadences()
 }
 
 func (g *Governor) Evaluate(queueIssues, queuePRs, queueHold, slaViolations int) []string {
@@ -357,6 +301,7 @@ func (g *Governor) thresholdFor(modeName string) int {
 }
 
 func (g *Governor) updateCadences() {
+	g.state.Cadences = make(map[string]AgentCadence, len(g.agents))
 	modeName := modeToConfigKey(g.state.Mode)
 	modeConfig, ok := g.cfg.Modes[modeName]
 	if !ok {
