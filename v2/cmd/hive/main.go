@@ -577,6 +577,12 @@ func main() {
 			})
 			normalVisualWorkService = service
 			logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
+			if runner, runnerErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, agentMgr, ghClient, logger); runnerErr != nil {
+				logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
+			} else if runner != nil {
+				normalVisualWorkRunner = runner
+				logger.Info("normal Visual Hive governed repair service initialized", "repository", installed.Repository)
+			}
 		}
 	}
 
@@ -1655,6 +1661,9 @@ func main() {
 	}
 
 	dashSrv.MarkReady()
+	if normalVisualWorkRunner != nil {
+		go normalVisualWorkRunner.Run(ctx)
+	}
 
 	const cliStartupDelay = 10 * time.Second
 	logger.Info("waiting for CLI startup before first eval", "delay", cliStartupDelay)

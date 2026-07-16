@@ -44,6 +44,8 @@ type Config struct {
 	BaseBranch          string
 	Agent               string
 	Policy              automation.Policy
+	PolicyLoader        func() (automation.Policy, error)
+	RuntimeGuard        func(visualhive.FindingLifecycle, automation.Action, []string, int) error
 	AllowedRepairPaths  []string
 	PreparationCommands []Command
 	ValidationCommands  []Command
@@ -1017,11 +1019,26 @@ func (w *Worker) validate(finding visualhive.FindingLifecycle) error {
 }
 
 func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automation.Action, files []string, attemptNumber int) error {
+	if w.Config.RuntimeGuard != nil {
+		if err := w.Config.RuntimeGuard(finding, action, append([]string(nil), files...), attemptNumber); err != nil {
+			w.Lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(action), false, err.Error())
+			return fmt.Errorf("%s runtime revalidation denied: %w", action, err)
+		}
+	}
 	actor := strings.TrimSpace(w.Config.Agent)
 	if actor == "" {
 		actor = repairActor(finding.OwningAgentHint)
 	}
-	decision := w.Config.Policy.Authorize(automation.ActionRequest{
+	policy := w.Config.Policy
+	if w.Config.PolicyLoader != nil {
+		current, err := w.Config.PolicyLoader()
+		if err != nil {
+			w.Lifecycle.RecordAuthorization(finding.RepositoryFingerprint, string(action), false, err.Error())
+			return fmt.Errorf("%s current policy unavailable: %w", action, err)
+		}
+		policy = current
+	}
+	decision := policy.Authorize(automation.ActionRequest{
 		Action: action, Agent: actor, Repository: finding.Repository,
 		RepairAttempts: attemptNumber, Risk: riskForFiles(files), ChangedFiles: files,
 	})

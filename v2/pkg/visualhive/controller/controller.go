@@ -22,6 +22,7 @@ import (
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/governor"
 	"github.com/kubestellar/hive/v2/pkg/integrated"
+	"github.com/kubestellar/hive/v2/pkg/scheduler"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
 
@@ -147,6 +148,188 @@ func (controller *Controller) ReserveSpecialistWorkOrderIdentity(sourceExternalR
 		return DispatchEnvelope{}, errors.New("specialist work-order reservation was not durably persisted")
 	}
 	return persisted, nil
+}
+
+// RevalidateSpecialistBoundary rechecks the intake-owned immutable dispatch
+// and all current Governor/role/budget/pause/installed policy before each new
+// repair side effect. Once Worker has durably started the exact repair, its
+// lifecycle status may advance; that advancement never weakens the current
+// policy checks or permits a different recurrence/order.
+func (controller *Controller) RevalidateSpecialistBoundary(sourceExternalRef, workOrderID, requestSHA256 string) (DispatchEnvelope, error) {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if err := controller.refreshRuntimeConfigLocked(context.Background()); err != nil {
+		return DispatchEnvelope{}, err
+	}
+	store, bead, envelope, decision, err := controller.findDispatchLocked(sourceExternalRef)
+	if err != nil {
+		return DispatchEnvelope{}, err
+	}
+	_ = store
+	if workOrderID != "" || requestSHA256 != "" {
+		requestSHA256 = strings.ToLower(strings.TrimSpace(requestSHA256))
+		if workOrderID != envelope.SpecialistWorkOrderID || requestSHA256 != envelope.SpecialistRequestSHA256 || workOrderID != "swo-"+requestSHA256 {
+			return DispatchEnvelope{}, errors.New("specialist boundary does not match the one reserved swo-* identity")
+		}
+	}
+	current, exists := controller.lifecycle.Finding(envelope.Work.RepositoryFingerprint)
+	if !exists || current.RepositoryFingerprint != envelope.Finding.RepositoryFingerprint || current.IssueNumber != envelope.Finding.IssueNumber || current.Recurrences != int(envelope.Recurrence) {
+		return DispatchEnvelope{}, errors.New("specialist boundary no longer matches the lifecycle finding")
+	}
+	if err := validateVisualDispatchEnvelope(envelope, bead.ID, envelope.Work.Packet, envelope.Work, envelope.Finding, envelope.Evidence, envelope.EvidenceRoot, decision); err != nil {
+		return DispatchEnvelope{}, errors.New("durable dispatch intent failed immutable boundary reconcile")
+	}
+	launchFinding := envelope.Finding
+	launchFinding.HumanReviewRequired = current.HumanReviewRequired
+	launchFinding.ObservationHumanReviewRequired = current.ObservationHumanReviewRequired
+	launchFinding.ManualReviewKind = current.ManualReviewKind
+	launchFinding.ManualReviewReason = current.ManualReviewReason
+	if err := controller.dispatchLaunchAllowed(envelope, launchFinding); err != nil {
+		return DispatchEnvelope{}, err
+	}
+	return envelope, nil
+}
+
+// BuildSchedulerAdmittedWork is the sole lossless projection from the native
+// intake envelope into Scheduler composition. Callers must obtain the envelope
+// from Import/RevalidateSpecialistBoundary and reserve the resulting swo-* via
+// ReserveSpecialistWorkOrderIdentity before launch.
+func BuildSchedulerAdmittedWork(envelope DispatchEnvelope) (scheduler.AdmittedWork, scheduler.CanonicalVerifiedReceipt, error) {
+	workJSON, err := json.Marshal(envelope.Work)
+	if err != nil {
+		return scheduler.AdmittedWork{}, nil, err
+	}
+	packetJSON, err := json.Marshal(envelope.Work.Packet)
+	if err != nil {
+		return scheduler.AdmittedWork{}, nil, err
+	}
+	findingJSON, err := json.Marshal(envelope.Finding)
+	if err != nil {
+		return scheduler.AdmittedWork{}, nil, err
+	}
+	if !json.Valid([]byte(envelope.VerificationReceiptJSON)) {
+		return scheduler.AdmittedWork{}, nil, errors.New("dispatch envelope has no canonical verification receipt")
+	}
+	artifacts := make([]scheduler.EvidenceArtifact, 0, len(envelope.Work.EvidenceArtifacts))
+	for _, artifact := range envelope.Work.EvidenceArtifacts {
+		artifacts = append(artifacts, scheduler.EvidenceArtifact{
+			Reference: artifact.Path, SHA256: artifact.SHA256, Bytes: artifact.Bytes, Kind: artifact.Kind, ContentType: artifact.ContentType,
+		})
+	}
+	digest := func(value []byte) string {
+		hash := sha256.Sum256(value)
+		return hex.EncodeToString(hash[:])
+	}
+	admitted := scheduler.AdmittedWork{
+		ExternalRef: envelope.SourceExternalRef, Work: workJSON, WorkSHA256: digest(workJSON), Packet: packetJSON, PacketSHA256: digest(packetJSON),
+		Finding: findingJSON, FindingSHA256: digest(findingJSON), Repository: envelope.Work.Packet.Repository,
+		RepositoryFingerprint: envelope.Work.RepositoryFingerprint, RecurrenceKey: fmt.Sprintf("%s:r%d", envelope.Work.RepositoryFingerprint, envelope.Recurrence),
+		Attempt: envelope.Attempt, BaseSHA: envelope.BaseSHA, BaseTreeSHA: envelope.BaseTreeSHA,
+		RoutedRole: agent.SpecialistRole(envelope.Work.Role), RoutingReason: envelope.Work.RoutingReason, ObservationKind: envelope.Work.IssueKind,
+		AllowedPaths: append([]string(nil), envelope.AllowedRepairPaths...), Validation: append([]string(nil), envelope.ValidationCommands...),
+		ValidationMayReproduce: reflect.DeepEqual(envelope.Reproduction, envelope.ValidationCommands),
+		AffectedContracts:      append([]string(nil), envelope.Work.AffectedContracts...), EvidenceArtifacts: artifacts, Deadline: envelope.CompositionDeadline.UTC(),
+	}
+	receipt := &dispatchCanonicalReceipt{evidence: envelope.Evidence, receipt: json.RawMessage(envelope.VerificationReceiptJSON)}
+	return admitted, receipt, nil
+}
+
+type dispatchCanonicalReceipt struct {
+	evidence agent.SpecialistEvidenceIdentity
+	receipt  json.RawMessage
+}
+
+func (receipt *dispatchCanonicalReceipt) EvidenceIdentity() agent.SpecialistEvidenceIdentity {
+	return receipt.evidence
+}
+
+func (receipt *dispatchCanonicalReceipt) CanonicalReceiptJSON() (json.RawMessage, error) {
+	if receipt == nil || !json.Valid(receipt.receipt) {
+		return nil, errors.New("canonical dispatch receipt is unavailable")
+	}
+	return append(json.RawMessage(nil), receipt.receipt...), nil
+}
+
+type SpecialistPullRequestCompletion struct {
+	WorkOrderID          string `json:"work_order_id"`
+	RequestSHA256        string `json:"request_sha256"`
+	Branch               string `json:"branch"`
+	CommitSHA            string `json:"commit_sha"`
+	PullRequestNumber    int    `json:"pull_request_number"`
+	PullRequestURL       string `json:"pull_request_url"`
+	VerdictHeadSHA       string `json:"verdict_head_sha"`
+	VerdictReceiptSHA256 string `json:"verdict_receipt_sha256"`
+	VerdictStatus        string `json:"verdict_status"`
+}
+
+// CompleteSpecialistPullRequest records only that the exact Worker-owned PR
+// received an exact-head deterministic receipt. It grants no merge, baseline,
+// resolution, or lifecycle-transition authority.
+func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef string, completion SpecialistPullRequestCompletion) error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if err := controller.refreshRuntimeConfigLocked(context.Background()); err != nil {
+		return err
+	}
+	store, bead, envelope, decision, err := controller.findDispatchLocked(sourceExternalRef)
+	if err != nil {
+		return err
+	}
+	if err := validateVisualDispatchEnvelope(envelope, bead.ID, envelope.Work.Packet, envelope.Work, envelope.Finding, envelope.Evidence, envelope.EvidenceRoot, decision); err != nil {
+		return errors.New("completed specialist dispatch failed immutable reconcile")
+	}
+	completion.RequestSHA256 = strings.ToLower(strings.TrimSpace(completion.RequestSHA256))
+	completion.CommitSHA = strings.ToLower(strings.TrimSpace(completion.CommitSHA))
+	completion.VerdictHeadSHA = strings.ToLower(strings.TrimSpace(completion.VerdictHeadSHA))
+	completion.VerdictReceiptSHA256 = strings.ToLower(strings.TrimSpace(completion.VerdictReceiptSHA256))
+	completion.VerdictStatus = strings.TrimSpace(completion.VerdictStatus)
+	if completion.WorkOrderID != envelope.SpecialistWorkOrderID || completion.RequestSHA256 != envelope.SpecialistRequestSHA256 ||
+		completion.WorkOrderID != "swo-"+completion.RequestSHA256 || completion.PullRequestNumber <= 0 || strings.TrimSpace(completion.Branch) == "" ||
+		!validGitObject(completion.CommitSHA) || completion.VerdictHeadSHA != completion.CommitSHA || !validSHA256(completion.VerdictReceiptSHA256) || completion.VerdictStatus == "" {
+		return errors.New("completed specialist PR identity or exact-head verdict receipt is invalid")
+	}
+	finding, exists := controller.lifecycle.Finding(envelope.Work.RepositoryFingerprint)
+	if !exists || finding.Status != visualhive.StatusPROpen || finding.PRNumber != completion.PullRequestNumber || finding.Branch != completion.Branch ||
+		!strings.EqualFold(finding.RepairCommitSHA, completion.CommitSHA) || finding.PRURL != completion.PullRequestURL {
+		return errors.New("completed specialist PR does not match the existing repair lifecycle")
+	}
+	encoded, err := json.Marshal(completion)
+	if err != nil {
+		return err
+	}
+	return store.CloseWithUpdate(bead.ID, func(value *beads.Bead) {
+		if value.Metadata == nil {
+			value.Metadata = map[string]interface{}{}
+		}
+		value.Metadata["visual_hive_admission_state"] = "admitted_pr_verdict_recorded"
+		value.Metadata["visual_hive_stage_detail"] = "exact-head PR verdict recorded; no merge or resolution authority granted"
+		value.Metadata["visual_hive_pr_completion_json"] = string(encoded)
+	})
+}
+
+func (controller *Controller) findDispatchLocked(sourceExternalRef string) (*beads.Store, *beads.Bead, DispatchEnvelope, governor.WorkAdmissionDecision, error) {
+	var store *beads.Store
+	var bead *beads.Bead
+	for _, role := range sortedStoreRoles(controller.beadStores) {
+		if candidate := controller.beadStores[role].FindByExternalRef(sourceExternalRef); candidate != nil {
+			if bead != nil {
+				return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("source external ref exists in multiple role stores")
+			}
+			store, bead = controller.beadStores[role], candidate
+		}
+	}
+	if bead == nil || visualBeadAdmissionState(bead) != "admitted_dispatch_pending" {
+		return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("durable dispatch-pending intent is unavailable")
+	}
+	envelope, ok := visualDispatchEnvelope(bead)
+	if !ok {
+		return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("durable dispatch-pending intent is corrupt")
+	}
+	decision, recorded := visualBeadAdmissionDecision(bead)
+	if !recorded {
+		return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("durable Governor decision is unavailable")
+	}
+	return store, bead, envelope, decision, nil
 }
 
 type Result struct {

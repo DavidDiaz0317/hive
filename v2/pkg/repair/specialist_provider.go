@@ -11,8 +11,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/agent"
@@ -42,6 +44,21 @@ type SpecialistDispatcher interface {
 	VerifySpecialistTaskCompletion(context.Context, agent.SpecialistTaskCompletionVerificationRequest) (agent.SpecialistTaskResponse, error)
 	ReleaseSpecialistTask(agent.SpecialistRole, string) error
 }
+
+// GovernedWorkOrderBuilder is invoked only after Worker has sealed and
+// revalidated its exact model base. It lets the normal Scheduler compose the
+// canonical governed request from current role/project/knowledge state without
+// moving any repository authority into the proposal child.
+type GovernedWorkOrderBuilder func(context.Context, string, string, string, string, agent.SpecialistSessionIdentity) (agent.SpecialistWorkOrderRequest, error)
+
+// SpecialistWorkOrderReservation binds the content-derived swo-* identity to
+// the intake-owned dispatch intent before any model call.
+type SpecialistWorkOrderReservation func(agent.SpecialistWorkOrder) error
+
+// SpecialistWorkOrderLaunchGuard revalidates current Governor, role, budget,
+// pause, WIP, and installed-policy state immediately before a fresh dispatch.
+// Recovery of an already leased order observes that exact lease instead.
+type SpecialistWorkOrderLaunchGuard func(agent.SpecialistWorkOrder) error
 
 type specialistModelResult struct {
 	SchemaVersion    string                           `json:"schema_version"`
@@ -73,6 +90,9 @@ type SpecialistProviderConfig struct {
 	Evidence              agent.SpecialistEvidenceIdentity
 	WorkOrderKind         string
 	ExecutorProfile       *agent.SpecialistProposalExecutorProfile
+	GovernedBuilder       GovernedWorkOrderBuilder
+	ReserveWorkOrder      SpecialistWorkOrderReservation
+	LaunchGuard           SpecialistWorkOrderLaunchGuard
 	Specialist            agent.SpecialistRole
 	RouteReason           string
 	AllowedPaths          []string
@@ -88,6 +108,8 @@ type SpecialistProviderConfig struct {
 // verdict authority to the proposal executor.
 type SpecialistProvider struct {
 	config SpecialistProviderConfig
+	mu     sync.Mutex
+	ready  *agent.SpecialistSessionIdentity
 }
 
 // SpecialistBlockedError is a durable, verified no-patch result. It is an
@@ -141,8 +163,15 @@ func NewSpecialistProvider(config SpecialistProviderConfig) (*SpecialistProvider
 	}
 	if config.WorkOrderKind == agent.SpecialistWorkOrderKindGovernedVisualHiveProposal {
 		if err := validateConfiguredSpecialistExecutorProfile(config.ExecutorProfile); err != nil {
-			return nil, err
+			if config.GovernedBuilder == nil {
+				return nil, err
+			}
 		}
+		if config.GovernedBuilder != nil && (config.ReserveWorkOrder == nil || config.LaunchGuard == nil) {
+			return nil, errors.New("governed Scheduler composition requires intake reservation and launch revalidation")
+		}
+	} else if config.GovernedBuilder != nil || config.ReserveWorkOrder != nil || config.LaunchGuard != nil {
+		return nil, errors.New("governed work-order hooks require the Visual Hive proposal kind")
 	}
 	if config.ExecutorProfile != nil {
 		profile := *config.ExecutorProfile
@@ -173,7 +202,16 @@ func (p *SpecialistProvider) Health(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("check %s specialist readiness: %w", p.config.Specialist, err)
 	}
-	return validateSpecialistSession(identity, p.config.Specialist)
+	if err := validateSpecialistSession(identity, p.config.Specialist); err != nil {
+		return err
+	}
+	if p.config.GovernedBuilder != nil {
+		copy := identity
+		p.mu.Lock()
+		p.ready = &copy
+		p.mu.Unlock()
+	}
+	return nil
 }
 
 func (p *SpecialistProvider) Run(ctx context.Context, worktree, prompt string) (ProviderResult, error) {
@@ -203,11 +241,65 @@ func (p *SpecialistProvider) prepareInvocation(ctx context.Context, worktree, pr
 		return agent.SpecialistWorkOrder{}, err
 	}
 	request := p.workOrderRequest(baseSHA, baseTreeSHA, prompt)
-	order, err := p.config.Mailbox.Prepare(request)
+	prepare := p.config.Mailbox.Prepare
+	if p.config.GovernedBuilder != nil {
+		readiness, readyErr := p.takeReadiness()
+		if readyErr != nil {
+			return agent.SpecialistWorkOrder{}, readyErr
+		}
+		request, err = p.config.GovernedBuilder(ctx, worktree, baseSHA, baseTreeSHA, prompt, readiness)
+		if err != nil {
+			return agent.SpecialistWorkOrder{}, fmt.Errorf("compose governed specialist work order: %w", err)
+		}
+		if err := p.validateBuiltGovernedRequest(request, baseSHA, baseTreeSHA); err != nil {
+			return agent.SpecialistWorkOrder{}, err
+		}
+		prepare = p.config.Mailbox.PrepareGoverned
+	}
+	order, err := prepare(request)
 	if err != nil {
 		return agent.SpecialistWorkOrder{}, fmt.Errorf("prepare immutable specialist work order: %w", err)
 	}
+	if p.config.ReserveWorkOrder != nil {
+		if err := p.config.ReserveWorkOrder(order); err != nil {
+			return agent.SpecialistWorkOrder{}, fmt.Errorf("reserve intake-owned specialist identity: %w", err)
+		}
+	}
 	return order, nil
+}
+
+func (p *SpecialistProvider) takeReadiness() (agent.SpecialistSessionIdentity, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ready == nil {
+		return agent.SpecialistSessionIdentity{}, errors.New("governed Scheduler composition requires the immediately preceding contained-executor readiness proof")
+	}
+	identity := *p.ready
+	p.ready = nil
+	return identity, nil
+}
+
+func (p *SpecialistProvider) validateBuiltGovernedRequest(request agent.SpecialistWorkOrderRequest, baseSHA, baseTreeSHA string) error {
+	if request.Kind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal || request.Repository != p.config.Repository ||
+		request.RepositoryFingerprint != p.config.RepositoryFingerprint || request.RecurrenceKey != p.config.RecurrenceKey || request.Attempt != p.config.Attempt ||
+		request.BaseSHA != baseSHA || request.BaseTreeSHA != baseTreeSHA || request.Specialist != p.config.Specialist || request.RouteReason != p.config.RouteReason ||
+		request.Deadline != p.config.Deadline || !reflect.DeepEqual(request.Evidence, p.config.Evidence) || !equalSpecialistStrings(request.AllowedPaths, p.config.AllowedPaths) ||
+		!equalSpecialistStrings(request.Validation, p.config.Validation) || request.ExecutorProfile == nil {
+		return errors.New("normal Scheduler request differs from the intake and Worker bindings")
+	}
+	return nil
+}
+
+func equalSpecialistStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *SpecialistProvider) workOrderRequest(baseSHA, baseTreeSHA, prompt string) agent.SpecialistWorkOrderRequest {
@@ -276,6 +368,12 @@ func (p *SpecialistProvider) runPreparedInvocationUnchecked(ctx context.Context,
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: err}
 	}
 	request := p.workOrderRequest(baseSHA, baseTreeSHA, order.TaskPrompt)
+	if p.config.GovernedBuilder != nil {
+		request = order.SpecialistWorkOrderRequest
+		if err := p.validateBuiltGovernedRequest(request, baseSHA, baseTreeSHA); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("validate persisted governed specialist work order: %w", err)}
+		}
+	}
 	validate := p.config.Mailbox.ValidateRequestForOrder
 	if recovering {
 		validate = p.config.Mailbox.ValidateRecoveryRequestForOrder
@@ -319,6 +417,11 @@ func (p *SpecialistProvider) runPreparedInvocationUnchecked(ctx context.Context,
 }
 
 func (p *SpecialistProvider) dispatchPreparedOrder(ctx context.Context, order agent.SpecialistWorkOrder) (ProviderResult, error) {
+	if p.config.LaunchGuard != nil {
+		if err := p.config.LaunchGuard(order); err != nil {
+			return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("revalidate governed specialist launch: %w", err)}
+		}
+	}
 	identity, err := p.config.Dispatcher.CheckSpecialistRole(ctx, p.config.Specialist)
 	if err != nil {
 		return ProviderResult{}, &ProviderRunError{Launched: false, Cause: fmt.Errorf("check %s specialist readiness: %w", p.config.Specialist, err)}
