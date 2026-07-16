@@ -21,7 +21,8 @@ Branch: `codex/vh-normal-service-integration`.
 No upstream/real Hive or KubeStellar Console checkout, remote, workflow, issue,
 pull request, or production state was changed. The immutable Visual Hive
 producer reference currently under review is
-`3c900c4a57552a3e51b1ce0a90a2a874513ffdab` (tree prefix `f00a44c7`) in the separate
+`3eab7d48fb36f0c84fcd72cab43a0b4fa6dbbd65` (tree
+`373a845aa7cb0b70cd9cba28189e8eda63d3d369`) in the separate
 `vis-proof-harness` worktree. It is a producer input, not a Hive commit, and
 must not be cherry-picked into Hive.
 
@@ -171,7 +172,7 @@ only the opaque `verified.ApplyCheckEvidence(store, fingerprint)` capability.
 The verifier and adapter now enforce all of the following:
 
 1. The PR evidence producer is pinned to
-   `3c900c4a57552a3e51b1ce0a90a2a874513ffdab`. The target and evidence services
+   `3eab7d48fb36f0c84fcd72cab43a0b4fa6dbbd65`. The target and evidence services
    use distinct UIDs; the evidence root is root-owned mode `0700`; and the
    authenticated root binding uses a root-only random key.
 2. Both service identities are killed and quiesced before verification. The
