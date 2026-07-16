@@ -296,6 +296,32 @@ All gates are blocking:
 8. **Coexistence:** normal Hive and Console workflows continue without lost cadence,
    replaced sessions, duplicate work, credential crossover, or dashboard outage.
 
+### Preliminary disposable-repository proof environment
+
+The preliminary private-fork proof MUST begin from a healthy, reviewed visual
+contract. Retained AI-HPC screenshots that show an API-down/loading/error state, or
+whose producing tool, repository tree, browser image, fonts, or approval provenance
+cannot be reproduced, are not accepted baselines for working-product evidence.
+
+One bounded baseline-candidate ceremony MAY occur before the proof run, solely to
+establish the healthy starting contract in the private proof fork:
+
+- generate the candidate from the exact detached repository and Visual Hive commits
+  in one disposable Linux namespace, with API and frontend health-gated in that same
+  namespace;
+- pin and record the Playwright container image digest, browser/runtime sidecar,
+  locale/timezone, viewport/DPR, font files and digests, config, and snapshot digests;
+- wait for a settled success-or-error UI state rather than only for the application
+  root to mount;
+- require explicit accountable human review of the rendered candidate and its
+  provenance; Visual Hive, Hive, models, retries, or replay MUST NOT approve it; and
+- after approval, hash-check the config and snapshots before and after every proof
+  run, forbid bootstrap/update, and retain the existing strict threshold.
+
+This ceremony establishes the test oracle; it is not a repair, does not count as a
+passing run, cannot close a finding, and cannot satisfy Console P0. Any later baseline
+change invalidates the proof lineage and requires a new human-reviewed candidate.
+
 ### Mandatory P0 real-repository scenario
 
 Before release work, run an actual KubeStellar Console fork and PR (not a fixture),
@@ -342,7 +368,8 @@ Until P0 passes, the following are explicitly deferred/non-goals:
 
 - releases/installers/distribution, providers, new dashboards/control planes/cards;
 - new/renamed roles, a Visual Hive fleet, or another work-order queue;
-- baseline capture/update/migration or standalone Visual Hive publishers;
+- baseline capture/update/migration outside the bounded preliminary private-fork
+  candidate ceremony above, or standalone Visual Hive publishers;
 - direct Visual Hive writes to Hive state, GitHub, or merges;
 - Console `kc-agent`/MCP authority, broad cleanup, or release/promotion work.
 
@@ -389,3 +416,6 @@ deferred ideas, not authority for parallel state, roles, release work, or writes
 - **2026-07-16 -- transition:** the second manager/repair path is compatibility only.
 - **2026-07-16 -- proof:** isolated disposable safety first; fork-only Console P0
   with namespaced fork-built Hive gates release; upstream and production stay read-only.
+- **2026-07-16 -- proof oracle:** failure-state/unproven AI-HPC screenshots are
+  rejected; one exact-environment, human-reviewed healthy candidate may establish the
+  private proof oracle, after which every run is strict and no-update.
