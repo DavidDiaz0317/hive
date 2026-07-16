@@ -103,6 +103,23 @@ func TestNormalServiceNoDispatchIsIdleAndNeverRunsWorker(t *testing.T) {
 	}
 }
 
+func TestNormalServiceNoDispatchAmbiguousConsumeDoesNotStartAnotherWorkflow(t *testing.T) {
+	fixture := newServiceFixture(t)
+	fixture.intake.dispatch = nil
+	fixture.source.failConsumeAfterSideEffect = true
+	service := fixture.service(t, fixture.verifier)
+	if err := service.RunCycle(context.Background()); err == nil || !strings.Contains(err.Error(), "consume response lost") {
+		t.Fatalf("ambiguous no-dispatch consume error = %v", err)
+	}
+	if err := service.RunCycle(context.Background()); !errors.Is(err, ErrNoDispatch) {
+		t.Fatalf("ambiguous no-dispatch recovery = %v", err)
+	}
+	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.source.consumeSideEffects != 1 ||
+		fixture.source.consumes != 2 || fixture.repairer.runs != 0 || fixture.verifier.calls != 0 {
+		t.Fatalf("no-dispatch recovery started new work: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+}
+
 func TestNormalServiceLeaseContentionDoesNotRunCycleUntilOwnership(t *testing.T) {
 	fixture := newServiceFixture(t)
 	fixture.intake.dispatch = nil

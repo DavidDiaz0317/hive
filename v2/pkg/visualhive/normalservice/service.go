@@ -177,6 +177,16 @@ func (service *Service) RunCycle(ctx context.Context) error {
 		}
 		exists = false
 	}
+	if exists && ledger.ConsumeStarted && ledger.SourceExternalRef == "" {
+		if err := service.options.Source.Consume(ledger.Workflow, true); err != nil {
+			return err
+		}
+		ledger.Consumed = true
+		if err := service.saveLedger(ledger); err != nil {
+			return err
+		}
+		return ErrNoDispatch
+	}
 	if exists && ledger.VerdictReceiptSHA256 != "" {
 		return service.finish(ctx, ledger)
 	}
@@ -219,7 +229,11 @@ func (service *Service) RunCycle(ctx context.Context) error {
 			// A green report or a current pause/WIP/policy hold creates no model or
 			// PR. Retire this exact workflow and let the ordinary cadence produce a
 			// fresh report after state changes.
-			if err := service.options.Source.Consume(work.Workflow, false); err != nil {
+			ledger.ConsumeStarted = true
+			if err := service.saveLedger(ledger); err != nil {
+				return err
+			}
+			if err := service.options.Source.Consume(work.Workflow, true); err != nil {
 				return err
 			}
 			ledger.Consumed = true

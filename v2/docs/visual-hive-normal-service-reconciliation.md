@@ -186,7 +186,8 @@ green receipt does not itself grant merge or lifecycle-resolution authority.
   dispatch without another fetch/import or side effect;
 - crash after verdict persistence performs no second fetch, import, proposal,
   PR, or verdict;
-- ambiguous workflow-intent consumption produces one deletion side effect;
+- ambiguous workflow-intent consumption produces one deletion side effect,
+  including the no-dispatch path without starting another workflow;
 - missing exact-head verifier leaves the one PR open and unconsumed;
 - identical controller completion replay succeeds and an altered receipt fails;
 - Scheduler composition produces and reserves one canonical `swo-*`;
@@ -247,6 +248,7 @@ not on this critical path.
 | `a89e22d2` | exact completion replay and sealed-tree binding |
 | `0a5f95ab` | one reservation/fresh guard/leased recovery proof |
 | `102c4d94` | controller-owned resume without refetch/reimport |
+| `f6c74027` | crash-safe no-dispatch workflow consumption |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.
