@@ -7,6 +7,10 @@ description: Set up, verify, and operate Hive with Visual Hive as production rep
 
 Use Hive's MCP tools as the control plane. Keep coverage depth separate from GitHub write authority and take setup through a verified hosted run when the user asks for production setup.
 
+Before changing the Hive/Visual Hive architecture, read the normative
+[`visual-hive-integration-contract.md`](../../docs/visual-hive-integration-contract.md).
+It controls ownership, packet admission, coexistence, and release-readiness gates.
+
 ## Setup workflow
 
 1. Identify the `owner/repository`. Never request a pasted token; use the user's existing GitHub authorization flow.
