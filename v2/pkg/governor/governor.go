@@ -3,6 +3,8 @@ package governor
 import (
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -195,7 +197,50 @@ func (g *Governor) UpdateConfigAndAgents(cfg config.GovernorConfig, agents map[s
 func cloneAgentConfigs(agents map[string]config.AgentConfig) map[string]config.AgentConfig {
 	cloned := make(map[string]config.AgentConfig, len(agents))
 	for name, agentConfig := range agents {
-		cloned[name] = agentConfig
+		cloned[name] = cloneAgentConfig(agentConfig)
+	}
+	return cloned
+}
+
+func cloneAgentConfig(agentConfig config.AgentConfig) config.AgentConfig {
+	cloned := agentConfig
+	cloned.Aliases = slices.Clone(agentConfig.Aliases)
+	cloned.LaneKeywords = slices.Clone(agentConfig.LaneKeywords)
+	cloned.DetectKeywords = slices.Clone(agentConfig.DetectKeywords)
+	cloned.StatsDisplay = slices.Clone(agentConfig.StatsDisplay)
+	cloned.ACMMLevels = slices.Clone(agentConfig.ACMMLevels)
+	if agentConfig.IncludeRepos != nil {
+		includeRepos := *agentConfig.IncludeRepos
+		cloned.IncludeRepos = &includeRepos
+	}
+
+	cloned.Channels = slices.Clone(agentConfig.Channels)
+	for index := range cloned.Channels {
+		channel := &cloned.Channels[index]
+		channel.Events = slices.Clone(agentConfig.Channels[index].Events)
+		channel.Patterns = slices.Clone(agentConfig.Channels[index].Patterns)
+		channel.Match = maps.Clone(agentConfig.Channels[index].Match)
+		channel.Repos = slices.Clone(agentConfig.Channels[index].Repos)
+		if agentConfig.Channels[index].Enabled != nil {
+			enabled := *agentConfig.Channels[index].Enabled
+			channel.Enabled = &enabled
+		}
+	}
+
+	if agentConfig.Tools != nil {
+		tools := *agentConfig.Tools
+		tools.Rules = slices.Clone(agentConfig.Tools.Rules)
+		cloned.Tools = &tools
+	}
+
+	cloned.Connections = slices.Clone(agentConfig.Connections)
+	for index := range cloned.Connections {
+		connection := &cloned.Connections[index]
+		connection.Options = maps.Clone(agentConfig.Connections[index].Options)
+		if agentConfig.Connections[index].Auth != nil {
+			auth := *agentConfig.Connections[index].Auth
+			connection.Auth = &auth
+		}
 	}
 	return cloned
 }

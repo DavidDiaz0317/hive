@@ -2,6 +2,7 @@ package governor
 
 import (
 	"log/slog"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -51,5 +52,80 @@ func TestUpdateConfigAndAgentsRefreshesNormalCadenceSnapshotAtomically(t *testin
 	}
 	if g.state.LastEval.Before(time.Now().Add(-time.Minute)) {
 		t.Fatal("normal Governor evaluation did not continue after agent reload")
+	}
+}
+
+func TestGovernorAgentSnapshotDeepClonesAtConstructionAndReload(t *testing.T) {
+	initialInput := map[string]config.AgentConfig{"quality": richAgentConfig("initial")}
+	initialExpected := richAgentConfig("initial")
+	g := New(config.GovernorConfig{}, initialInput, slog.Default())
+	mutateRichAgentConfig(initialInput, "quality", "changed-after-new")
+	assertAgentSnapshot(t, g, initialExpected)
+
+	reloadedInput := map[string]config.AgentConfig{"quality": richAgentConfig("reloaded")}
+	reloadedExpected := richAgentConfig("reloaded")
+	g.UpdateConfigAndAgents(config.GovernorConfig{}, reloadedInput)
+	mutateRichAgentConfig(reloadedInput, "quality", "changed-after-update")
+	assertAgentSnapshot(t, g, reloadedExpected)
+}
+
+func richAgentConfig(marker string) config.AgentConfig {
+	includeRepos := true
+	channelEnabled := true
+	return config.AgentConfig{
+		Enabled:        true,
+		Role:           marker + "-role",
+		Aliases:        []string{marker + "-alias"},
+		LaneKeywords:   []string{marker + "-lane"},
+		DetectKeywords: []string{marker + "-detect"},
+		IncludeRepos:   &includeRepos,
+		StatsDisplay:   []config.StatsDisplayEntry{{Key: marker + "-stat", Label: marker + "-label"}},
+		ACMMLevels:     []int{3},
+		Channels: []config.ChannelConfig{{
+			Type: marker + "-channel", Enabled: &channelEnabled,
+			Events: []string{marker + "-event"}, Patterns: []string{marker + "-pattern"},
+			Match: map[string]string{"key": marker + "-match"}, Repos: []string{marker + "-repo"},
+		}},
+		Tools: &config.ToolsConfig{
+			Preset: marker + "-preset",
+			Rules:  []config.ToolRule{{Pattern: marker + "-tool", Action: "allow", Reason: marker + "-reason"}},
+		},
+		Connections: []config.ConnectionConfig{{
+			Name: marker + "-connection", Type: "mcp",
+			Auth:    &config.ConnectionAuth{Type: marker + "-auth", EnvVar: marker + "-env"},
+			Options: map[string]string{"key": marker + "-option"},
+		}},
+	}
+}
+
+func mutateRichAgentConfig(agents map[string]config.AgentConfig, name, marker string) {
+	agentConfig := agents[name]
+	agentConfig.Role = marker
+	agentConfig.Aliases[0] = marker
+	agentConfig.LaneKeywords[0] = marker
+	agentConfig.DetectKeywords[0] = marker
+	*agentConfig.IncludeRepos = false
+	agentConfig.StatsDisplay[0].Key = marker
+	agentConfig.ACMMLevels[0] = 0
+	*agentConfig.Channels[0].Enabled = false
+	agentConfig.Channels[0].Events[0] = marker
+	agentConfig.Channels[0].Patterns[0] = marker
+	agentConfig.Channels[0].Match["key"] = marker
+	agentConfig.Channels[0].Repos[0] = marker
+	agentConfig.Tools.Preset = marker
+	agentConfig.Tools.Rules[0].Pattern = marker
+	agentConfig.Connections[0].Auth.Type = marker
+	agentConfig.Connections[0].Options["key"] = marker
+	agents[name] = agentConfig
+	delete(agents, name)
+}
+
+func assertAgentSnapshot(t *testing.T, g *Governor, expected config.AgentConfig) {
+	t.Helper()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	actual, exists := g.agents["quality"]
+	if !exists || !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("Governor agent snapshot changed through caller-owned nested state:\nactual:   %#v\nexpected: %#v", actual, expected)
 	}
 }
