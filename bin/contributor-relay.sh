@@ -94,7 +94,7 @@ function getCLIState() {
     } else if (BACKEND === 'bob') {
       if (/bob>|>\s*$|Bob-Shell/.test(text)) return 'ready';
     } else if (BACKEND === 'codex') {
-      if (/codex>|>\s*$|Codex CLI/.test(text)) return 'ready';
+      if (/codex>|>\s*$|›\s+Explain this codebase|model:\s+.*\/model to change|Codex CLI/.test(text)) return 'ready';
     } else if (BACKEND === 'pi') {
       if (/pi v\d|0\.0%|auto\)|\d+\.\d+%/.test(text)) return 'ready';
     } else {
@@ -314,9 +314,10 @@ function checkTmuxIdle() {
       hasCompletionMarker = /completed|done|finished|✓/i.test(text);
       isWorking = /running|executing|thinking/i.test(text);
     } else if (BACKEND === 'codex') {
-      hasIdlePrompt = /codex>|>\s*$/.test(text);
+      const lastLines = text.split('\n').slice(-20).join('\n');
+      hasIdlePrompt = /codex>|>\s*$|›\s+(Explain this codebase|Write tests for @filename)|model:\s+.*\/model to change/.test(lastLines);
       hasCompletionMarker = /completed|done|finished/i.test(text);
-      isWorking = /running|executing|thinking/i.test(text);
+      isWorking = /running|executing|thinking/i.test(lastLines);
     } else if (BACKEND === 'pi') {
       hasIdlePrompt = /pi v\d|0\.0%|auto\)|\d+\.\d+%/.test(text);
       hasCompletionMarker = /completed|done|finished|tokens\)|\d+\.\d+%/i.test(text);
