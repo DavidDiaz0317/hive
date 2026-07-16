@@ -805,6 +805,53 @@ func TestApplyBundleSequentialEvidenceApplicationsShareOnePendingWIPSlot(t *test
 	}
 }
 
+func TestApplyBundleOpenIssueIdenticalRerunIsNoopAtWIPOne(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	options := ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1, PreferRepairable: true}
+	observation := publicationTestObservation("replay", "canonical", "test-adequacy/repository/replay", "test_adequacy_gap", "Add one deterministic contract assertion")
+	bundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "bundle"), "bundle-open-issue-identical-replay", []Observation{observation}, false))
+
+	first, err := lifecycle.ApplyBundle(bundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := lifecycle.PendingOutbox()
+	if first.Created != 1 || first.OutboxCreated != 1 || first.Idempotent || len(pending) != 1 || pending[0].Action != OutboxOpenIssue {
+		t.Fatalf("first application did not create one exact issue reservation: result=%+v pending=%+v", first, pending)
+	}
+	fingerprint := bundle.Manifest.Observations[0].RepositoryFingerprint
+	if err := lifecycle.MarkIssueOpened(fingerprint, 17, "https://example.test/issues/17"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkOutboxAttempt(pending[0].ID, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, err := lifecycle.ApplyBundle(bundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := lifecycle.Snapshot()
+	finding, ok := snapshot.Findings[fingerprint]
+	if !replay.Idempotent || replay.Created != 0 || replay.Updated != 0 || replay.OutboxCreated != 0 || replay.Deferred != 0 {
+		t.Fatalf("identical evidence replay was not a true lifecycle no-op: %+v", replay)
+	}
+	if !ok || len(snapshot.Findings) != 1 || finding.IssueNumber != 17 || finding.Status != StatusIssueOpen {
+		t.Fatalf("identical evidence replay changed the one open finding: found=%t findings=%+v", ok, snapshot.Findings)
+	}
+	if len(snapshot.Outbox) != 1 || snapshot.Outbox[0].ID != pending[0].ID || snapshot.Outbox[0].Attempts != 1 || snapshot.Outbox[0].CompletedAt == nil || len(lifecycle.PendingOutbox()) != 0 {
+		t.Fatalf("identical evidence replay duplicated or reopened issue publication: outbox=%+v pending=%+v", snapshot.Outbox, lifecycle.PendingOutbox())
+	}
+	if beadStore.Count() != 1 || pendingOpenIssueReservationCount(bundle.Manifest.Source.Repository, snapshot.Findings, snapshot.Outbox) != 0 {
+		t.Fatalf("identical evidence replay changed durable cardinality: beads=%d reservations=%d", beadStore.Count(), pendingOpenIssueReservationCount(bundle.Manifest.Source.Repository, snapshot.Findings, snapshot.Outbox))
+	}
+}
+
 func TestApplyBundleManualReviewRerunDoesNotAdvanceIssueBacklog(t *testing.T) {
 	root := t.TempDir()
 	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))

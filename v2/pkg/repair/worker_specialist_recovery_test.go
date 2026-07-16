@@ -3,6 +3,7 @@ package repair
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestWorkerRecoversOneSpecialistInvocationIntoOnePullRequest(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	baseSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
 	baseTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD^{tree}"))
 	state, err := NewStore(filepath.Join(t.TempDir(), "repair-state"))
@@ -105,8 +106,86 @@ func TestWorkerRecoversOneSpecialistInvocationIntoOnePullRequest(t *testing.T) {
 	if attempt.Stage != StagePROpen || !attempt.AttemptCounted || attempt.Attempt != 1 || attempt.ModelInvocationID != firstDispatcher.dispatchCalls[0].TaskID {
 		t.Fatalf("completed recovery checkpoint = %+v", attempt)
 	}
+	order, err := mailbox.LoadWorkOrder(attempt.ModelInvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, receipt, proposal, err := mailbox.LoadCompletion(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := mailbox.Paths(order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orders, err := os.ReadDir(filepath.Dir(paths.OrderDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteRepairRefs := func() []string {
+		var refs []string
+		for _, ref := range strings.Fields(gitOutput(t, remote, "for-each-ref", "--format=%(refname)")) {
+			if strings.HasPrefix(ref, "refs/heads/hive/repair") {
+				refs = append(refs, ref)
+			}
+		}
+		return refs
+	}
+	repairRefs := remoteRepairRefs()
+	if len(orders) != 1 || orders[0].Name() != order.ID || !orders[0].IsDir() {
+		t.Fatalf("durable specialist work orders = %+v, want one exact order %s", orders, order.ID)
+	}
+	if order.RequestSHA256 == "" || lease.LeaseSHA256 == "" || receipt.ReceiptSHA256 == "" || receipt.UnifiedDiffSHA256 == "" {
+		t.Fatalf("specialist evidence was not content-bound: order=%+v lease=%+v receipt=%+v", order, lease, receipt)
+	}
+	if lease.SessionID != identity.SessionID || receipt.SessionID != identity.SessionID || receipt.WorkOrderID != order.ID || receipt.LeaseSHA256 != lease.LeaseSHA256 {
+		t.Fatalf("specialist session/receipt identity drifted: identity=%+v order=%+v lease=%+v receipt=%+v", identity, order, lease, receipt)
+	}
+	if string(proposal) != specialistProviderTestDiff {
+		t.Fatalf("durable specialist proposal = %q, want exact proposed diff", proposal)
+	}
+	if len(repairRefs) != 1 || repairRefs[0] != "refs/heads/"+result.Branch {
+		t.Fatalf("remote repair refs = %v, want only refs/heads/%s", repairRefs, result.Branch)
+	}
+	if lifecycle.prOpens != 1 || lifecycle.pr != result.PRNumber || lifecycle.sha != result.CommitSHA {
+		t.Fatalf("lifecycle PR-open transitions = %d pr=%d sha=%s, want one transition for result %+v", lifecycle.prOpens, lifecycle.pr, lifecycle.sha, result)
+	}
+
+	orderID := order.ID
+	requestSHA := order.RequestSHA256
+	leaseSHA := lease.LeaseSHA256
+	sessionID := lease.SessionID
+	receiptSHA := receipt.ReceiptSHA256
+	proposalSHA := receipt.UnifiedDiffSHA256
+	proposalBytes := string(proposal)
 	third, err := secondWorker.Run(context.Background(), finding)
-	if err != nil || !third.Resumed || pulls.calls != 1 || len(secondDispatcher.dispatchCalls) != 0 {
-		t.Fatalf("idempotent rerun = %+v, %v pulls=%d dispatch=%d", third, err, pulls.calls, len(secondDispatcher.dispatchCalls))
+	if err != nil || !third.Resumed || pulls.calls != 1 || lifecycle.prOpens != 1 || secondDispatcher.inspectCalls != 1 || len(secondDispatcher.dispatchCalls) != 0 {
+		t.Fatalf("idempotent rerun = %+v, %v pulls=%d lifecycle_pr_opens=%d inspect=%d dispatch=%d", third, err, pulls.calls, lifecycle.prOpens, secondDispatcher.inspectCalls, len(secondDispatcher.dispatchCalls))
+	}
+	replayedAttempt, ok := state.Get(fingerprint)
+	if !ok || replayedAttempt.Stage != StagePROpen || replayedAttempt.ModelInvocationID != orderID || replayedAttempt.Attempt != 1 || !replayedAttempt.AttemptCounted {
+		t.Fatalf("idempotent rerun changed the repair checkpoint: %+v", replayedAttempt)
+	}
+	replayedOrder, err := mailbox.LoadWorkOrder(orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedLease, replayedReceipt, replayedProposal, err := mailbox.LoadCompletion(replayedOrder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedOrders, err := os.ReadDir(filepath.Dir(paths.OrderDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedRefs := remoteRepairRefs()
+	if len(replayedOrders) != 1 || replayedOrders[0].Name() != orderID || !replayedOrders[0].IsDir() {
+		t.Fatalf("idempotent rerun changed specialist work-order cardinality: %+v", replayedOrders)
+	}
+	if replayedOrder.ID != orderID || replayedOrder.RequestSHA256 != requestSHA || replayedLease.LeaseSHA256 != leaseSHA || replayedLease.SessionID != sessionID || replayedReceipt.ReceiptSHA256 != receiptSHA || replayedReceipt.UnifiedDiffSHA256 != proposalSHA || string(replayedProposal) != proposalBytes {
+		t.Fatalf("idempotent rerun changed durable specialist evidence: order=%+v lease=%+v receipt=%+v", replayedOrder, replayedLease, replayedReceipt)
+	}
+	if len(replayedRefs) != 1 || replayedRefs[0] != "refs/heads/"+result.Branch {
+		t.Fatalf("idempotent rerun changed remote repair refs: %v", replayedRefs)
 	}
 }
