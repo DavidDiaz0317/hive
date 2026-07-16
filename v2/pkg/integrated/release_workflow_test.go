@@ -124,7 +124,9 @@ func TestIntegratedReleaseGatesOnCredentialFreeProviderContainmentForEveryShippe
 		"/usr/share/apparmor/extra-profiles/bwrap-userns-restrict",
 		`sudo apparmor_parser -r "$profile"`,
 		`test -x "$(command -v bwrap)"`,
-		`find "$RUNNER_TEMP/hive-codex-gate/node_modules/@openai"`,
+		"npm pack @openai/codex@0.144.1-linux-x64 --ignore-scripts --silent",
+		"npm pack @openai/codex@0.144.1-win32-x64 --ignore-scripts --silent",
+		"Exact native Codex package integrity mismatch.",
 		"hive-release-codex-empty-home",
 		"TestCodexProviderRealNoModelHealthPreflightWithoutAuthorization",
 		"provider-authenticated-supplemental:",
@@ -168,7 +170,7 @@ func TestIntegratedReleasePinsFinalVisualHiveDependency(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(data)
-	const visualRef = "03e229ad1efe8ab3e996c2ae94dbb683c73add66"
+	const visualRef = "73a99d7920e0380b9f57832a5453ef3c9c6748c1"
 	for _, invariant := range []string{
 		"repository: DavidDiaz0317/visual-hive",
 		"VISUAL_HIVE_REF: ${{ inputs.visual_hive_ref || '" + visualRef + "' }}",

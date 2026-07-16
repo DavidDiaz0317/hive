@@ -207,7 +207,7 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 	if _, err := git(ctx, config.CheckoutDir, "switch", "-C", branch, "origin/"+defaultBranch); err != nil {
 		return result, err
 	}
-	managed := managedSetupFiles(config.VisualHive)
+	managed := managedSetupFilesForConfig(config)
 	title := ""
 	marker := fmt.Sprintf("<!-- hive-%s: %s -->", options.Operation, strings.ToLower(config.Repository))
 	if options.Operation == OperationUninstall {

@@ -56,7 +56,8 @@ func runVisualCommand(args []string) int {
 	beadsDir := flags.String("beads-dir", "/data/beads/quality", "target Hive beads directory")
 	maxACMM := flags.Int("max-acmm", 3, "maximum ACMM level this Hive permits")
 	allowLocal := flags.Bool("allow-local", false, "allow explicit local proof bundles (never use for an untrusted artifact)")
-	if err := flags.Parse(args[2:]); err != nil {
+	flags.Bool("json", false, "emit machine-readable JSON")
+	if err := parseExactFlags(flags, args[2:]); err != nil {
 		return 2
 	}
 	if *bundlePath == "" {
@@ -121,13 +122,14 @@ func runVisualLifecycleCommand(args []string) int {
 	repositoryDir := flags.String("repo-dir", "", "local target repository clone used by the trusted repair worker")
 	worktreeDir := flags.String("worktree-dir", "", "isolated repair worktree root (defaults under state-dir)")
 	providerCommand := flags.String("provider-command", "codex", "model provider executable")
+	flags.Bool("json", false, "emit machine-readable JSON")
 	var providerArgs stringListFlag
 	var allowedRepairPaths stringListFlag
 	var checkJSON stringListFlag
 	flags.Var(&providerArgs, "provider-arg", "native Codex option; repeat as needed (script/package-runner wrappers are rejected)")
 	flags.Var(&allowedRepairPaths, "repair-path", "allowed repair path glob; repeatable")
 	flags.Var(&checkJSON, "check-json", `required validation command as a JSON string array, for example ["npm","test"]; repeatable`)
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := parseExactFlags(flags, args[1:]); err != nil {
 		return 2
 	}
 	lifecycle, err := visualhive.NewLifecycleStore(*stateDir)

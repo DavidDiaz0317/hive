@@ -106,6 +106,18 @@ func TestServerInitializeListAndStructuredCall(t *testing.T) {
 	if _, ok := setupProperties["auto_merge_risks"]; !ok {
 		t.Fatal("MCP setup cannot configure auto-merge risk tiers")
 	}
+	runtime, ok := setupProperties["runtime"].(map[string]any)
+	if !ok || len(runtime["enum"].([]any)) != 2 || runtime["default"] != "hosted" {
+		t.Fatalf("MCP setup does not expose hosted/local runtime parity: %+v", runtime)
+	}
+	setupRules := setup["inputSchema"].(map[string]any)["allOf"].([]any)
+	if len(setupRules) != 1 {
+		t.Fatalf("MCP setup cadence rules are missing: %+v", setupRules)
+	}
+	hostedInterval := setupRules[0].(map[string]any)["else"].(map[string]any)["properties"].(map[string]any)["run_interval_seconds"].(map[string]any)
+	if hostedInterval["minimum"] != float64(300) || hostedInterval["multipleOf"] != float64(60) {
+		t.Fatalf("MCP hosted cadence does not match CLI validation: %+v", hostedInterval)
+	}
 	uninstallProperties := uninstall["inputSchema"].(map[string]any)["properties"].(map[string]any)
 	if _, ok := uninstallProperties["delete_state"]; !ok {
 		t.Fatal("hive_uninstall cannot express --delete-state")

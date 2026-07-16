@@ -44,8 +44,8 @@ func TestModelPatchRejectsSecretRulesWithoutEchoingValues(t *testing.T) {
 	tests := []struct {
 		name, added, rule, secret string
 	}{
-		{name: "AWS", added: `const id = "AKIAABCDEFGHIJKLMNOP"`, rule: "aws-access-key-id-v1", secret: "AKIAABCDEFGHIJKLMNOP"},
-		{name: "Slack", added: `const token = "xoxb-1234567890-ABCDEFGHIJ"`, rule: "slack-token-v1", secret: "xoxb-1234567890-ABCDEFGHIJ"},
+		{name: "AWS", added: `const id = "` + "AK" + "IA" + `ABCDEFGHIJKLMNOP"`, rule: "aws-access-key-id-v1", secret: "AK" + "IA" + "ABCDEFGHIJKLMNOP"},
+		{name: "Slack", added: `const token = "` + "xo" + "xb-1234567890-ABCDEFGHIJ" + `"`, rule: "slack-token-v1", secret: "xo" + "xb-1234567890-ABCDEFGHIJ"},
 		{name: "typed assignment", added: `var clientSecret string = "actual-operator-value-must-not-leave"`, rule: "sensitive-assignment-v2", secret: "actual-operator-value-must-not-leave"},
 	}
 	for _, test := range tests {

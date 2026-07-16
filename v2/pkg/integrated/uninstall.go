@@ -776,7 +776,7 @@ func VerifyUninstalledSetupAtCommit(ctx context.Context, client *hivegithub.Clie
 		return fmt.Errorf("uninstall verification refuses an invalid managed-path preimage ledger")
 	}
 	preimagesValid := hasValidManagedPathPreimages(config)
-	for _, relative := range managedSetupFiles(config.VisualHive) {
+	for _, relative := range managedSetupFilesForConfig(config) {
 		content, directory, response, err := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, relative, &gh.RepositoryContentGetOptions{Ref: commitSHA})
 		preimage := config.ManagedPathPreimages[relative]
 		if preimagesValid && preimage.Existed {

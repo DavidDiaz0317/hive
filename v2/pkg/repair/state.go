@@ -62,18 +62,28 @@ type Attempt struct {
 	// provider. CandidateTree is the immutable tree authorized after applying
 	// that provider's bounded patch; commits are created from it, never by
 	// staging a mutable post-validation worktree.
-	ModelBaseTree             string       `json:"model_base_tree,omitempty"`
-	ModelBaseParent           string       `json:"model_base_parent,omitempty"`
-	ModelBaseGuardRef         string       `json:"model_base_guard_ref,omitempty"`
-	ModelBaseGuardCommit      string       `json:"model_base_guard_commit,omitempty"`
-	ModelBaseGuardBinding     string       `json:"model_base_guard_binding,omitempty"`
-	ModelBaseGuardKind        string       `json:"model_base_guard_kind,omitempty"`
-	CandidateTree             string       `json:"candidate_tree,omitempty"`
-	CandidateParent           string       `json:"candidate_parent,omitempty"`
-	CandidateGuardRef         string       `json:"candidate_guard_ref,omitempty"`
-	CandidateGuardCommit      string       `json:"candidate_guard_commit,omitempty"`
-	CandidateGuardBinding     string       `json:"candidate_guard_binding,omitempty"`
-	CandidateGuardKind        string       `json:"candidate_guard_kind,omitempty"`
+	ModelBaseTree         string `json:"model_base_tree,omitempty"`
+	ModelBaseParent       string `json:"model_base_parent,omitempty"`
+	ModelBaseGuardRef     string `json:"model_base_guard_ref,omitempty"`
+	ModelBaseGuardCommit  string `json:"model_base_guard_commit,omitempty"`
+	ModelBaseGuardBinding string `json:"model_base_guard_binding,omitempty"`
+	ModelBaseGuardKind    string `json:"model_base_guard_kind,omitempty"`
+	CandidateTree         string `json:"candidate_tree,omitempty"`
+	CandidateParent       string `json:"candidate_parent,omitempty"`
+	CandidateGuardRef     string `json:"candidate_guard_ref,omitempty"`
+	CandidateGuardCommit  string `json:"candidate_guard_commit,omitempty"`
+	CandidateGuardBinding string `json:"candidate_guard_binding,omitempty"`
+	CandidateGuardKind    string `json:"candidate_guard_kind,omitempty"`
+	// PortableBundle* binds the minimum Git object closure needed to resume a
+	// validated or committed repair on a fresh hosted runner. The bundle lives
+	// below the repair state directory; it never contains a source checkout or
+	// mutable worktree.
+	PortableBundlePath        string       `json:"portable_bundle_path,omitempty"`
+	PortableBundleSHA256      string       `json:"portable_bundle_sha256,omitempty"`
+	PortableBundleBytes       int64        `json:"portable_bundle_bytes,omitempty"`
+	PortableBundleStage       Stage        `json:"portable_bundle_stage,omitempty"`
+	PortableBundleBinding     string       `json:"portable_bundle_binding,omitempty"`
+	PortableBundleHeadsSHA256 string       `json:"portable_bundle_heads_sha256,omitempty"`
 	ToolSnapshotRef           string       `json:"tool_snapshot_ref,omitempty"`
 	ToolSnapshotCommit        string       `json:"tool_snapshot_commit,omitempty"`
 	ToolSnapshotHead          string       `json:"tool_snapshot_head,omitempty"`
@@ -428,6 +438,9 @@ func validatePersistedRepairState(state State) error {
 		}
 		if err := sealedTreeGuardStateError(*attempt); err != nil {
 			return fmt.Errorf("repair worker state contains invalid sealed-tree guards for %q: %w", fingerprint, err)
+		}
+		if err := portableRepairBundleStateError(*attempt); err != nil {
+			return fmt.Errorf("repair worker state contains invalid portable Git bundle for %q: %w", fingerprint, err)
 		}
 		if hasToolSnapshot(*attempt) && attempt.PreparationCleanupPending {
 			return fmt.Errorf("repair worker state mixes tool and preparation-cleanup snapshots for %q", fingerprint)

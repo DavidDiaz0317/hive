@@ -341,9 +341,14 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           %s "$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline --config visual-hive.config.yaml %s
           pipeline_exit=$?
           set -e
-          printf '%%s\n' "$pipeline_exit" > .visual-hive/pipeline-exit-code.txt
+          runner_pipeline_exit="$RUNNER_TEMP/hive-visual-pipeline-exit-${GITHUB_RUN_ID}.txt"
+          rm -f -- "$runner_pipeline_exit"
+          (umask 077 && printf '%%s\n' "$pipeline_exit" > "$runner_pipeline_exit")
+          test -f "$runner_pipeline_exit"
+          test ! -L "$runner_pipeline_exit"
           exit "$pipeline_exit"
       - name: Terminate target account and reverify immutable tooling
+        id: seal_raw_evidence
         if: always()
         shell: bash
         env:
@@ -367,6 +372,10 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           trap cleanup_target_workspace EXIT
           test -n "$target_workspace"
           sudo pkill -KILL -u %s 2>/dev/null || true
+          if pgrep -u %s >/dev/null 2>&1; then
+            echo "Isolated target account still owns a live process" >&2
+            exit 1
+          fi
           test "$(sha256sum "$VISUAL_HIVE_CLI" | cut -d ' ' -f 1)" = "$HIVE_VISUAL_HIVE_CLI_SHA"
           test ! -w "$VISUAL_HIVE_CLI"
           test "$(sha256sum "$HIVE_TRUSTED_NODE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_NODE_SHA"
@@ -385,21 +394,27 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           fi
           test "$(git rev-parse HEAD)" = "%s"
           git diff --no-ext-diff --no-textconv --exit-code -- .
-          if find .visual-hive -type l -print -quit | grep -q .; then
-            echo "Raw target evidence contains a symbolic link" >&2
-            exit 1
-          fi
-          test "$(find .visual-hive -type f | wc -l)" -le 5000
-          test "$(du -sb .visual-hive | cut -f 1)" -le 1073741824
           sudo umount "$target_workspace"
           cleanup_trusted_browser
-          trap - EXIT
           if mountpoint -q "$target_workspace"; then
             echo "Isolated target workspace remained mounted" >&2
             exit 1
           fi
           test ! -e "$expected_browser_path"
           test ! -e "$expected_browser_manifest"
+%s
+          runner_pipeline_exit="$RUNNER_TEMP/hive-visual-pipeline-exit-${GITHUB_RUN_ID}.txt"
+          test -f "$runner_pipeline_exit"
+          test ! -L "$runner_pipeline_exit"
+          pipeline_exit="$(cat "$runner_pipeline_exit")"
+          case "$pipeline_exit" in
+            0) test "$HIVE_TARGET_PIPELINE_OUTCOME" = "success" ;;
+            ''|*[!0-9]*) echo "Visual pipeline exit code is invalid" >&2; exit 1 ;;
+            *) test "$HIVE_TARGET_PIPELINE_OUTCOME" = "failure" ;;
+          esac
+          test ! -e .visual-hive/pipeline-exit-code.txt
+          sudo install -o root -g root -m 0444 "$runner_pipeline_exit" .visual-hive/pipeline-exit-code.txt
+          rm -f -- "$runner_pipeline_exit"
           runner_outcome="$RUNNER_TEMP/hive-visual-runner-outcome-${GITHUB_RUN_ID}.json"
           RUNNER_OUTCOME_PATH="$runner_outcome" node <<'NODE'
           const fs = require("fs");
@@ -419,9 +434,13 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           rm -f -- "$runner_outcome"
           test -f .visual-hive/hive-runner-outcome.json
           test ! -L .visual-hive/hive-runner-outcome.json
+          test -r .visual-hive/hive-runner-outcome.json
           test ! -w .visual-hive/hive-runner-outcome.json
+          test "$(stat -c '%%u:%%g:%%a' .visual-hive/pipeline-exit-code.txt)" = "0:0:444"
+          test "$(stat -c '%%u:%%g:%%a' .visual-hive/hive-runner-outcome.json)" = "0:0:444"
+          trap - EXIT
       - name: Upload isolated raw Visual evidence
-        if: always()
+        if: ${{ always() && steps.seal_raw_evidence.outcome == 'success' }}
         uses: actions/upload-artifact@%s
         with:
           name: %s
@@ -441,8 +460,9 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, config.VisualHiveRef,
 		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10), isolatedTrustedTooling,
 		captureScope, indentWorkflowShell(isolatedTargetDependencyShell(true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
-		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedVisualTargetEnvPrefix(), modeArgs, isolatedTargetAccount, isolatedTargetAccount,
-		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedTargetAccount, checkoutRef, uploadArtifactActionSHA, rawArtifact,
+		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedVisualTargetEnvPrefix(), modeArgs, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount,
+		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), isolatedTargetAccount, checkoutRef,
+		indentWorkflowShell(sealIsolatedVisualEvidenceShell(), 10), uploadArtifactActionSHA, rawArtifact,
 		indentWorkflowShell(finalEnforcement, 10))
 }
 
@@ -1065,6 +1085,86 @@ echo "HIVE_TARGET_WORKSPACE=$target_workspace" >> "$GITHUB_ENV"
 		isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount,
 		isolatedTargetRoot, isolatedTargetWorkspace, isolatedTrustedRoot,
 		isolatedTargetAccount, isolatedTargetAccount)
+}
+
+func sealIsolatedVisualEvidenceShell() string {
+	return dedentWorkflowShell(`          evidence_root="$(readlink -f .visual-hive)"
+          workspace_root="$(readlink -f "$GITHUB_WORKSPACE")"
+          if [ "$evidence_root" != "$workspace_root/.visual-hive" ]; then
+            echo "Raw target evidence escaped the runner workspace" >&2
+            exit 1
+          fi
+          test -d "$evidence_root"
+          test ! -L "$evidence_root"
+          sudo chown root:root "$evidence_root"
+          sudo chmod 0555 "$evidence_root"
+          python_bin="$(readlink -f "$(command -v python)")"
+          test -x "$python_bin"
+          sudo env HIVE_EVIDENCE_ROOT="$evidence_root" HIVE_WORKSPACE_ROOT="$workspace_root" "$python_bin" -I - <<'PY'
+          import os
+          import stat
+
+          root = os.path.realpath(os.environ["HIVE_EVIDENCE_ROOT"])
+          workspace = os.path.realpath(os.environ["HIVE_WORKSPACE_ROOT"])
+          if root != os.path.join(workspace, ".visual-hive"):
+              raise SystemExit("raw evidence root is not the exact workspace child")
+          root_stat = os.lstat(root)
+          if not stat.S_ISDIR(root_stat.st_mode):
+              raise SystemExit("raw evidence root is not a directory")
+          device = root_stat.st_dev
+          files = 0
+          total = 0
+          pending = [root]
+          while pending:
+              current = pending.pop()
+              with os.scandir(current) as entries:
+                  for entry in entries:
+                      item = entry.stat(follow_symlinks=False)
+                      if item.st_dev != device:
+                          raise SystemExit("raw evidence contains a nested mount")
+                      if stat.S_ISLNK(item.st_mode):
+                          raise SystemExit("raw evidence contains a symbolic link")
+                      if stat.S_ISDIR(item.st_mode):
+                          pending.append(entry.path)
+                          continue
+                      if not stat.S_ISREG(item.st_mode):
+                          raise SystemExit("raw evidence contains a non-regular file")
+                      if item.st_nlink != 1:
+                          raise SystemExit("raw evidence contains a hard-linked file")
+                      files += 1
+                      total += item.st_size
+                      if files > 5000 or total > 1073741824:
+                          raise SystemExit("raw evidence exceeds its bounded upload limits")
+          PY
+          sudo find "$evidence_root" -xdev -type f -exec chown root:root -- {} +
+          sudo find "$evidence_root" -xdev -type f -exec chmod 0444 -- {} +
+          sudo find "$evidence_root" -xdev -depth -type d -exec chown root:root -- {} +
+          sudo find "$evidence_root" -xdev -depth -type d -exec chmod 0555 -- {} +
+          env HIVE_EVIDENCE_ROOT="$evidence_root" "$python_bin" -I - <<'PY'
+          import os
+          import stat
+
+          root = os.path.realpath(os.environ["HIVE_EVIDENCE_ROOT"])
+          pending = [root]
+          while pending:
+              current = pending.pop()
+              current_stat = os.lstat(current)
+              if current_stat.st_uid != 0 or current_stat.st_gid != 0 or current_stat.st_mode & 0o222:
+                  raise SystemExit("sealed evidence directory is not root-owned and read-only")
+              with os.scandir(current) as entries:
+                  for entry in entries:
+                      item = entry.stat(follow_symlinks=False)
+                      if item.st_uid != 0 or item.st_gid != 0 or item.st_mode & 0o222:
+                          raise SystemExit("sealed evidence entry is not root-owned and read-only")
+                      if stat.S_ISDIR(item.st_mode):
+                          pending.append(entry.path)
+                      elif stat.S_ISREG(item.st_mode):
+                          with open(entry.path, "rb") as handle:
+                              while handle.read(1024 * 1024):
+                                  pass
+                      else:
+                          raise SystemExit("sealed evidence contains an invalid entry")
+          PY`)
 }
 
 func verifyAndSealTargetCheckoutShell() string {

@@ -200,7 +200,7 @@ func TestResolveManagedPathPreimagesLegacyVisualHiveRerunRetainsDeletionPolicy(t
 		"docs/hive-quickstart.md":                []byte("legacy Hive docs\n"),
 		"visual-hive.config.yaml":                []byte("legacy Hive Visual config\n"),
 	})
-	version, preimages, updated, err := resolveManagedPathPreimages(context.Background(), root, Config{VisualHive: true}, true, true)
+	version, preimages, updated, err := resolveManagedPathPreimages(context.Background(), root, Config{VisualHive: true}, true, true, ExecutionLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestResolveManagedPathPreimagesLegacyHiveCapturesOnlyNewVisualHivePaths(t *
 		"visual-hive.config.yaml":                     standaloneConfig,
 		".github/workflows/visual-hive-lifecycle.yml": standaloneWorkflow,
 	})
-	version, preimages, updated, err := resolveManagedPathPreimages(context.Background(), root, Config{VisualHive: false}, true, true)
+	version, preimages, updated, err := resolveManagedPathPreimages(context.Background(), root, Config{VisualHive: false}, true, true, ExecutionLocal)
 	if err != nil {
 		t.Fatal(err)
 	}

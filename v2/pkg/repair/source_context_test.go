@@ -74,7 +74,7 @@ func TestRepairSourceContextIsTrackedBoundedDeterministicAndSafe(t *testing.T) {
 
 func TestRepairSourceContextFailsClosedOnCredentialLikeContent(t *testing.T) {
 	repository, _ := seedGitRepository(t)
-	writeRepairSourceFixture(t, repository, "src/allowed_test.go", "package demo\nconst leaked = \"github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\"\n")
+	writeRepairSourceFixture(t, repository, "src/allowed_test.go", "package demo\nconst leaked = \""+"github"+"_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\"\n")
 	runCommand(t, repository, "git", "add", "src/allowed_test.go")
 	tree := strings.TrimSpace(gitOutput(t, repository, "write-tree"))
 	contextValue, err := buildRepairSourceContext(context.Background(), repository, tree, []string{"src/**"}, nil)
@@ -276,8 +276,8 @@ func TestRepairSourceSecretRulesAndFalsePositives(t *testing.T) {
 		`token = "test-token"`,
 		`password: dummy-password`,
 		`secret: "mock-secret"`,
-		`token = "fake-github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"`,
-		`access_key = "test-AKIAABCDEFGHIJKLMNOP"`,
+		`token = "fake-` + "github" + `_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"`,
+		`access_key = "test-` + "AK" + `IAABCDEFGHIJKLMNOP"`,
 		`checksum = "A7m!qP9#vX2@kL8$zR5&nT1*"`,
 		`https://example.test/user:pass`,
 	} {

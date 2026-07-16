@@ -71,7 +71,7 @@ func authorizeManagedSetupPullRequest(ctx context.Context, store *Store, client 
 		return result, err
 	}
 	allowed := map[string]bool{}
-	for _, candidate := range managedSetupFiles(config.VisualHive) {
+	for _, candidate := range managedSetupFilesForConfig(config) {
 		allowed[candidate] = true
 	}
 	for _, changed := range diff.ChangedPaths {

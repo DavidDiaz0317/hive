@@ -6,6 +6,7 @@ version="${2:?Integrated release version is required}"
 work_root="${3:?Writable proof root is required}"
 repository="${HIVE_REPOSITORY:-DavidDiaz0317/hive}"
 release_dir="${HIVE_RELEASE_DIR:-}"
+source_root="${HIVE_SOURCE_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
 
 export HOME="$work_root/home"
 export HIVE_VERSION="$version"
@@ -30,17 +31,37 @@ ln -s "$(command -v readlink)" "$launcher_path/readlink"
 "$HIVE_INSTALL_DIR/hive" --version | grep -Fx "Hive $version"
 # Use the exact launcher printed by the installer. This proves the second
 # command works in the same shell even when ~/.local/bin is not on PATH.
-"$HOME/.local/bin/hive" setup \
-  --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 \
-  --coverage comprehensive \
-  --automation advisory \
-  --provider codex \
-  --visual-hive \
-  --plan \
-  --json > "$work_root/setup-plan.json"
-grep -q '"schema_version": "hive.setup-plan.v1"' "$work_root/setup-plan.json"
+if printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$'; then
+  "$HOME/.local/bin/hive" setup \
+    --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 \
+    --coverage comprehensive \
+    --automation advisory \
+    --provider codex \
+    --visual-hive \
+    --plan \
+    --json > "$work_root/setup-plan.json"
+  grep -q '"execution_mode": "hosted"' "$work_root/setup-plan.json"
+  grep -q '"hosted_state_branch": "hive/state-' "$work_root/setup-plan.json"
+  grep -q '"hive_release_version": "'"$version"'"' "$work_root/setup-plan.json"
+else
+  # Manual workflow runs use a commit SHA rather than a publishable immutable
+  # tag. They rehearse packaging in explicit local compatibility mode; tag
+  # runs above remain the production hosted-default acceptance gate.
+  "$HOME/.local/bin/hive" setup \
+    --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 \
+    --coverage comprehensive \
+    --automation advisory \
+    --provider codex \
+    --visual-hive \
+    --runtime local \
+    --plan \
+    --json > "$work_root/setup-plan.json"
+  grep -q '"execution_mode": "local"' "$work_root/setup-plan.json"
+fi
+grep -q '"schema_version": "hive.setup-plan.v2"' "$work_root/setup-plan.json"
 grep -q '"state_dir": ' "$work_root/setup-plan.json"
 grep -q '"read_only": true' "$work_root/setup-plan.json"
+sh "$source_root/test/integrated-json-contract-smoke.sh" "$HIVE_INSTALL_DIR/hive" "$work_root/json-contract"
 
 # Installation paths are ownership boundaries. Reject unsafe/common parents and
 # unrecognized targets/backups without changing even one sentinel byte.

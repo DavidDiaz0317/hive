@@ -43,18 +43,20 @@ func (s *Store) Load() (Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return Config{}, err
 	}
-	legacy := config.SchemaVersion == legacyConfigSchema
+	needsMigration := config.SchemaVersion != ConfigSchema
 	if !supportedDurableConfigSchema(config.SchemaVersion) {
 		return Config{}, fmt.Errorf("unsupported integrated config schema %q", config.SchemaVersion)
 	}
 	if config.MaxRepairAttempts == 0 {
 		config.MaxRepairAttempts = 3
 	}
-	if legacy {
-		// Persist the v2 writer guard before returning legacy state to any caller.
-		// Older Hive binaries understand only v1 and will therefore refuse this
-		// state instead of silently dropping the managed-path preimage ledger on
-		// a later save.
+	if config.ExecutionMode == "" {
+		config.ExecutionMode = ExecutionLocal
+	}
+	if needsMigration {
+		// Persist the current writer guard before returning older state to any
+		// caller. Older Hive binaries reject this schema instead of silently
+		// dropping managed-path or hosted lifecycle ownership fields on save.
 		if err := s.save(&config); err != nil {
 			return Config{}, fmt.Errorf("migrate integrated config schema: %w", err)
 		}

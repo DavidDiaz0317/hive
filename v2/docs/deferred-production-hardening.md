@@ -2,15 +2,17 @@
 
 This ledger records non-blocking P2 work deferred by the Hive + Visual Hive
 release-scope freeze on 2026-07-12. None of these items is required for the
-current two-command installation, repository lifecycle, or persistent
-scheduler acceptance criteria.
+current two-command installation, repository lifecycle, or hosted-controller
+acceptance criteria. The production default has since moved from a local
+per-user scheduler to the repository-owned hosted controller; local scheduler
+items below apply only to the explicit `--runtime local` compatibility path.
 
 ## Deferred items
 
-- Add an optional Windows service installation mode for operation before an
-  interactive user login. The supported scheduler in this release persists
-  across restarts and resumes at the owning user's next login without asking
-  for stored credentials.
+- Add an optional Windows service installation mode for local-mode operation
+  before an interactive user login. Hosted production has no such dependency;
+  the compatibility scheduler resumes at the owning user's next login without
+  asking for stored credentials.
 - Shorten the cold Windows installer recovery-matrix runtime. The complete
   matrix is bounded, passes, and remains inside the hosted release-job limit;
   further optimization is a CI-maintenance improvement.
@@ -30,7 +32,8 @@ scheduler acceptance criteria.
 - Bound and clean up poller lifetimes in the legacy tmux agent manager under
   repeated concurrent pause/resume stress. The nil-context panic is fixed in
   this release; the remaining stress-only runtime does not affect the
-  integrated repository scheduler or either required lifecycle proof.
+  hosted repository controller, the explicit local compatibility scheduler,
+  or either required lifecycle proof.
 
 These items must be reconsidered in a separate goal with their own acceptance
 criteria. They are not release blockers for the current frozen candidate.

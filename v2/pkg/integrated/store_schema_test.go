@@ -50,6 +50,9 @@ func TestStoreLoadMigratesLegacyV1AndRetainsManagedPreimageLedger(t *testing.T) 
 	if loaded.SchemaVersion != ConfigSchema {
 		t.Fatalf("legacy config was not migrated in memory: %q", loaded.SchemaVersion)
 	}
+	if loaded.ExecutionMode != ExecutionLocal {
+		t.Fatalf("legacy config execution mode = %q, want local", loaded.ExecutionMode)
+	}
 	if !bytes.Equal(loaded.ManagedPathPreimages[".github/workflows/hive-visual-hive.yml"].Content, content) {
 		t.Fatal("legacy migration dropped managed-path preimage bytes")
 	}
@@ -64,6 +67,9 @@ func TestStoreLoadMigratesLegacyV1AndRetainsManagedPreimageLedger(t *testing.T) 
 	}
 	if persisted.SchemaVersion != ConfigSchema {
 		t.Fatalf("legacy config was returned without first persisting the v2 writer guard: %q", persisted.SchemaVersion)
+	}
+	if persisted.ExecutionMode != ExecutionLocal {
+		t.Fatalf("migrated durable execution mode = %q, want local", persisted.ExecutionMode)
 	}
 	if !bytes.Equal(persisted.ManagedPathPreimages[".github/workflows/hive-visual-hive.yml"].Content, content) {
 		t.Fatal("persisted v2 config dropped managed-path preimage bytes")

@@ -297,6 +297,7 @@ func newAuthorizerTransferFixture(t *testing.T) *authorizerTransferFixture {
 	config := Config{
 		SchemaVersion: ConfigSchema, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
 		Coverage: CoverageComprehensive, Automation: AutomationAdvisory, Provider: "codex", ProviderCommand: os.Args[0],
+		ExecutionMode: ExecutionLocal,
 		ACMMLevel: 2, MaxActiveIssues: 5, MaxRepairAttempts: 3, VisualHive: true,
 		VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("a", 40), VisualHiveConfigDigest: hex.EncodeToString(visualDigest[:]),
 		TestCommands: [][]string{{"node", "--test"}}, AllowedRepairPaths: []string{"**/*.test.*"},

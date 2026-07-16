@@ -114,12 +114,13 @@ try {
     $env:USERPROFILE = Join-Path $WorkRoot "fresh-user-home"
     New-Item -ItemType Directory -Path $env:USERPROFILE -Force | Out-Null
     try {
-        $plan = & (Join-Path $installDir "hive.exe") setup --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 --coverage comprehensive --automation advisory --provider codex --visual-hive --plan --json | ConvertFrom-Json
+        $plan = & (Join-Path $installDir "hive.exe") setup --repo DavidDiaz0317/hive-visual-hive-install-proof-20260713-234243 --coverage comprehensive --automation advisory --provider codex --visual-hive --runtime local --plan --json | ConvertFrom-Json
     } finally {
         $env:USERPROFILE = $savedUserProfile
     }
-    if ($plan.plan.schema_version -ne "hive.setup-plan.v1" -or -not $plan.plan.read_only -or -not $plan.plan.state_dir) { throw "Installed Hive did not produce a read-only setup plan with its automatic state path." }
+    if ($plan.plan.schema_version -ne "hive.setup-plan.v2" -or $plan.plan.execution_mode -ne "local" -or -not $plan.plan.read_only -or -not $plan.plan.state_dir) { throw "Installed Hive did not produce a v2 local read-only setup plan with its automatic state path." }
     if ($plan.plan.state_dir -match 'daviddiaz0317--hive-visual-hive-install-proof') { throw "Installed Hive repeated the long repository slug in its default state path: $($plan.plan.state_dir)" }
+    & (Join-Path $HiveRoot "test/integrated-json-contract-smoke.ps1") -Hive (Join-Path $installDir "hive.exe") -WorkRoot (Join-Path $WorkRoot "json-contract")
 } finally {
 	$env:Path = $originalProcessPath
 	$env:CODEX_HOME = $originalCodexHome

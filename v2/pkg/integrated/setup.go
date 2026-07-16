@@ -22,6 +22,7 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 	"github.com/kubestellar/hive/v2/pkg/automation"
+	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"gopkg.in/yaml.v3"
 )
@@ -49,28 +50,35 @@ type packageScriptInvocation struct {
 }
 
 type SetupOptions struct {
-	Repository             string
-	Coverage               Coverage
-	Automation             Automation
-	Provider               string
-	ProviderCommand        string
-	ProviderArgs           []string
-	VisualHive             bool
-	StateDir               string
-	Apply                  bool
-	Start                  bool
-	VisualHiveCommand      string
-	VisualHiveArgs         []string
-	VisualHiveRepo         string
-	VisualHiveRef          string
-	MaxActiveIssues        int
-	MaxRepairAttempts      int
-	AllowedAutoMergePaths  []string
-	AllowedAutoMergeRisk   []automation.RiskTier
-	AutoMergePathsExplicit bool
-	AutoMergeRiskExplicit  bool
-	GitHub                 *hivegithub.Client
-	Policy                 automation.Policy
+	Repository                 string
+	Coverage                   Coverage
+	Automation                 Automation
+	Provider                   string
+	ProviderCommand            string
+	ProviderArgs               []string
+	ExecutionMode              ExecutionMode
+	RunInterval                time.Duration
+	HostedSchedule             string
+	HiveReleaseRepository      string
+	HiveReleaseVersion         string
+	HiveCommit                 string
+	DistributionManifestSHA256 string
+	VisualHive                 bool
+	StateDir                   string
+	Apply                      bool
+	Start                      bool
+	VisualHiveCommand          string
+	VisualHiveArgs             []string
+	VisualHiveRepo             string
+	VisualHiveRef              string
+	MaxActiveIssues            int
+	MaxRepairAttempts          int
+	AllowedAutoMergePaths      []string
+	AllowedAutoMergeRisk       []automation.RiskTier
+	AutoMergePathsExplicit     bool
+	AutoMergeRiskExplicit      bool
+	GitHub                     *hivegithub.Client
+	Policy                     automation.Policy
 }
 
 type setupPRClient interface {
@@ -78,6 +86,12 @@ type setupPRClient interface {
 }
 
 func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
+	if options.ExecutionMode == "" {
+		options.ExecutionMode = ExecutionLocal
+	}
+	if options.RunInterval == 0 {
+		options.RunInterval = 15 * time.Minute
+	}
 	stateDir, err := filepath.Abs(options.StateDir)
 	if err != nil {
 		return SetupResult{}, fmt.Errorf("resolve persistent state directory: %w", err)
@@ -180,7 +194,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if err := validateOrdinarySetupCheckout(checkout); err != nil {
 		return result, err
 	}
-	preimagesVersion, managedPreimages, preimagesUpdated, err := resolveManagedPathPreimages(ctx, checkout, prior, hasPrior, options.VisualHive)
+	preimagesVersion, managedPreimages, preimagesUpdated, err := resolveManagedPathPreimages(ctx, checkout, prior, hasPrior, options.VisualHive, options.ExecutionMode)
 	if err != nil {
 		return result, fmt.Errorf("capture repository-owned managed path preimages: %w", err)
 	}
@@ -210,6 +224,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		SchemaVersion: ConfigSchema, Repository: options.Repository, RepositoryID: inspection.RepositoryID, DefaultBranch: defaultBranch,
 		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
 		ProviderCommand: options.ProviderCommand, ProviderArgs: append([]string(nil), options.ProviderArgs...),
+		ExecutionMode: options.ExecutionMode, RunIntervalSeconds: int64(options.RunInterval / time.Second),
+		HostedSchedule:        options.HostedSchedule,
+		HostedStateBranch:     hostedStateBranch(inspection.RepositoryID),
+		HiveReleaseRepository: options.HiveReleaseRepository, HiveReleaseVersion: options.HiveReleaseVersion,
+		HiveCommit: options.HiveCommit, DistributionManifestSHA256: options.DistributionManifestSHA256,
 		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
 		SetupBaselineRequired:       setupBaselineRequired,
 		SetupBaselineContractDigest: setupBaselineContractDigest,
@@ -222,6 +241,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		AllowedAutoMergePaths: append([]string(nil), options.AllowedAutoMergePaths...),
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
 		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,
+		Paused:                    options.ExecutionMode == ExecutionHosted && !options.Start,
 		SetupAuthorizationActorID: authorizer.ID,
 		InstalledAt:               time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
@@ -235,6 +255,18 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		config.InstalledAt = prior.InstalledAt
 		config.SetupBranch, config.SetupPRNumber, config.SetupPRURL, config.SetupHeadSHA = prior.SetupBranch, prior.SetupPRNumber, prior.SetupPRURL, prior.SetupHeadSHA
 		config.PreviousVersion, config.Paused = prior.PreviousVersion, prior.Paused
+		if options.ExecutionMode == ExecutionHosted && normalizedExecutionMode(prior.ExecutionMode) == ExecutionHosted && validHostedReleaseIdentity(hostedReleaseIdentity(prior)) {
+			current := hostedReleaseIdentity(config)
+			priorRelease := hostedReleaseIdentity(prior)
+			if !equalHostedReleaseIdentity(current, priorRelease) {
+				config.PreviousHostedRelease = &priorRelease
+			} else {
+				config.PreviousHostedRelease = cloneHostedReleaseIdentity(prior.PreviousHostedRelease)
+			}
+		}
+		if options.ExecutionMode == ExecutionHosted && options.Start {
+			config.Paused = false
+		}
 		config.SetupBaselineInitialDigest = prior.SetupBaselineInitialDigest
 		config.SetupBaselineInitialCandidates = append([]SetupBaselineCandidate(nil), prior.SetupBaselineInitialCandidates...)
 		config.AllowedRepairPaths = append([]string(nil), prior.AllowedRepairPaths...)
@@ -508,26 +540,35 @@ func VerifyVisualHiveCommit(ctx context.Context, client *hivegithub.Client, repo
 }
 
 type installedRepositoryConfig struct {
-	SchemaVersion                     string                `json:"schema_version"`
-	Repository                        string                `json:"repository"`
-	RepositoryID                      string                `json:"repository_id"`
-	DefaultBranch                     string                `json:"default_branch"`
-	Coverage                          Coverage              `json:"coverage"`
-	Automation                        Automation            `json:"automation"`
-	Provider                          string                `json:"provider"`
-	ACMMLevel                         int                   `json:"acmm_level"`
-	MaxActiveIssues                   int                   `json:"max_active_issues"`
-	MaxRepairAttempts                 int                   `json:"max_repair_attempts"`
-	VisualHive                        bool                  `json:"visual_hive"`
-	VisualHiveRepo                    string                `json:"visual_hive_repository"`
-	VisualHiveRef                     string                `json:"visual_hive_ref"`
-	VisualHiveConfigDigest            string                `json:"visual_hive_config_digest,omitempty"`
-	TestCommands                      [][]string            `json:"test_commands"`
-	AllowedRepairPaths                []string              `json:"allowed_repair_paths"`
-	AllowedAutoMergePaths             []string              `json:"allowed_auto_merge_paths"`
-	AllowedAutoMergeRisk              []automation.RiskTier `json:"allowed_auto_merge_risk"`
-	SetupAuthorizationActorID         int64                 `json:"setup_authorization_actor_id"`
-	SetupAuthorizationPreviousActorID int64                 `json:"setup_authorization_previous_actor_id,omitempty"`
+	SchemaVersion                     string                 `json:"schema_version"`
+	Repository                        string                 `json:"repository"`
+	RepositoryID                      string                 `json:"repository_id"`
+	DefaultBranch                     string                 `json:"default_branch"`
+	Coverage                          Coverage               `json:"coverage"`
+	Automation                        Automation             `json:"automation"`
+	Provider                          string                 `json:"provider"`
+	ExecutionMode                     ExecutionMode          `json:"execution_mode"`
+	RunIntervalSeconds                int64                  `json:"run_interval_seconds"`
+	HostedSchedule                    string                 `json:"hosted_schedule,omitempty"`
+	HostedStateBranch                 string                 `json:"hosted_state_branch,omitempty"`
+	HiveReleaseRepository             string                 `json:"hive_release_repository,omitempty"`
+	HiveReleaseVersion                string                 `json:"hive_release_version,omitempty"`
+	HiveCommit                        string                 `json:"hive_commit,omitempty"`
+	DistributionManifestSHA256        string                 `json:"distribution_manifest_sha256,omitempty"`
+	PreviousHostedRelease             *HostedReleaseIdentity `json:"previous_hosted_release,omitempty"`
+	ACMMLevel                         int                    `json:"acmm_level"`
+	MaxActiveIssues                   int                    `json:"max_active_issues"`
+	MaxRepairAttempts                 int                    `json:"max_repair_attempts"`
+	VisualHive                        bool                   `json:"visual_hive"`
+	VisualHiveRepo                    string                 `json:"visual_hive_repository"`
+	VisualHiveRef                     string                 `json:"visual_hive_ref"`
+	VisualHiveConfigDigest            string                 `json:"visual_hive_config_digest,omitempty"`
+	TestCommands                      [][]string             `json:"test_commands"`
+	AllowedRepairPaths                []string               `json:"allowed_repair_paths"`
+	AllowedAutoMergePaths             []string               `json:"allowed_auto_merge_paths"`
+	AllowedAutoMergeRisk              []automation.RiskTier  `json:"allowed_auto_merge_risk"`
+	SetupAuthorizationActorID         int64                  `json:"setup_authorization_actor_id"`
+	SetupAuthorizationPreviousActorID int64                  `json:"setup_authorization_previous_actor_id,omitempty"`
 }
 
 // VerifyInstalledSetup proves that the exact durable policy and immutable pin
@@ -573,7 +614,12 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 	expected := installedRepositoryConfig{
 		SchemaVersion: managedRepositoryConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
 		Coverage: config.Coverage, Automation: config.Automation, Provider: config.Provider, ACMMLevel: config.ACMMLevel,
-		MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
+		ExecutionMode: config.ExecutionMode, RunIntervalSeconds: config.RunIntervalSeconds, HostedSchedule: config.HostedSchedule,
+		HostedStateBranch: config.HostedStateBranch, HiveReleaseRepository: config.HiveReleaseRepository,
+		HiveReleaseVersion: config.HiveReleaseVersion, HiveCommit: config.HiveCommit,
+		DistributionManifestSHA256: config.DistributionManifestSHA256,
+		PreviousHostedRelease:      cloneHostedReleaseIdentity(config.PreviousHostedRelease),
+		MaxActiveIssues:            config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
 		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, VisualHiveConfigDigest: config.VisualHiveConfigDigest, TestCommands: config.TestCommands,
 		AllowedRepairPaths: config.AllowedRepairPaths, AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
 		SetupAuthorizationActorID:         config.SetupAuthorizationActorID,
@@ -595,6 +641,19 @@ func verifyInstalledSetupAtRef(ctx context.Context, client *hivegithub.Client, c
 		}
 		if normalizeManagedText(actual) != normalizeManagedText(expected) {
 			return fmt.Errorf("managed production file %s does not match the durable immutable pin and policy; rerun setup and merge its exact reviewed PR", relative)
+		}
+	}
+	if config.ExecutionMode == ExecutionHosted {
+		expected, workflowErr := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
+		if workflowErr != nil {
+			return fmt.Errorf("generate expected hosted controller workflow: %w", workflowErr)
+		}
+		actual, readErr := readTargetFile(ctx, client, owner, repo, ref, HostedControllerWorkflowPath)
+		if readErr != nil {
+			return fmt.Errorf("verify managed hosted controller workflow: %w", readErr)
+		}
+		if normalizeManagedText(actual) != normalizeManagedText(expected) {
+			return fmt.Errorf("managed hosted controller workflow does not match the durable immutable release and policy; rerun setup and merge its exact reviewed PR")
 		}
 	}
 	visualConfig, readErr := readTargetFile(ctx, client, owner, repo, ref, "visual-hive.config.yaml")
@@ -742,6 +801,13 @@ func verifyManagedPullHead(operation string, pull hivegithub.RepairPullRequest, 
 }
 
 func validateSetupOptions(options SetupOptions) error {
+	// Keep the zero value compatible with pre-hosted callers. RunSetup applies
+	// the same normalization before validation; the CLI selects hosted
+	// explicitly for new setups.
+	options.ExecutionMode = normalizedExecutionMode(options.ExecutionMode)
+	if options.RunInterval == 0 {
+		options.RunInterval = 15 * time.Minute
+	}
 	if !regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`).MatchString(options.Repository) {
 		return fmt.Errorf("repository must be owner/name")
 	}
@@ -753,6 +819,26 @@ func validateSetupOptions(options SetupOptions) error {
 	}
 	if options.StateDir == "" || options.Provider == "" || (options.Apply && options.ProviderCommand == "") {
 		return fmt.Errorf("state directory and provider are required")
+	}
+	if options.ExecutionMode != ExecutionLocal && options.ExecutionMode != ExecutionHosted {
+		return fmt.Errorf("execution mode must be local or hosted")
+	}
+	if options.RunInterval < time.Minute || options.RunInterval > 24*time.Hour {
+		return fmt.Errorf("run interval must be from one minute through 24 hours")
+	}
+	if options.ExecutionMode == ExecutionHosted {
+		if options.RunInterval < 5*time.Minute || options.RunInterval%time.Minute != 0 {
+			return fmt.Errorf("hosted run interval must be whole minutes and at least five minutes")
+		}
+		if strings.TrimSpace(options.HostedSchedule) == "" {
+			return fmt.Errorf("hosted setup requires a deterministic schedule")
+		}
+		if !regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`).MatchString(options.HiveReleaseRepository) ||
+			!regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-integrated\.[0-9]+$`).MatchString(options.HiveReleaseVersion) ||
+			!immutableCommit.MatchString(strings.ToLower(options.HiveCommit)) ||
+			!regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(strings.ToLower(options.DistributionManifestSHA256)) {
+			return fmt.Errorf("hosted setup requires an immutable integrated release repository, tag, Hive commit, and distribution manifest digest")
+		}
 	}
 	if options.MaxActiveIssues < 1 || options.MaxActiveIssues > 100 {
 		return fmt.Errorf("maximum active issues must be from 1 through 100")
@@ -800,10 +886,14 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 	if len(inspection.BaselineFiles) == 0 && options.VisualHive {
 		warnings = append(warnings, "No reviewed visual baselines were detected; setup must prepare and review baselines before the first production scan.")
 	}
-	managedFiles := managedSetupFiles(options.VisualHive)
+	managedFiles := managedSetupFilesForMode(options.VisualHive, options.ExecutionMode)
 	return SetupPlan{
 		SchemaVersion: PlanSchema, GeneratedAt: time.Now().UTC(), Repository: options.Repository,
-		StateDir: options.StateDir,
+		StateDir:      options.StateDir,
+		ExecutionMode: options.ExecutionMode, RunIntervalSeconds: int64(options.RunInterval / time.Second),
+		HostedSchedule: options.HostedSchedule, HostedStateBranch: hostedStateBranch(inspection.RepositoryID),
+		HiveReleaseRepository: options.HiveReleaseRepository, HiveReleaseVersion: options.HiveReleaseVersion,
+		HiveCommit: options.HiveCommit, DistributionManifestSHA256: options.DistributionManifestSHA256,
 		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
 		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
 		VisualHiveRepository: options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef, Inspection: inspection,
@@ -813,26 +903,91 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
 		TestingLayers:         layersForCoverage(options.Coverage),
 		FilesToManage:         managedFiles,
-		RequiredActions:       setupRequiredActions(options.Automation),
+		RequiredActions:       setupRequiredActions(options.Automation, options.ExecutionMode),
 		Warnings:              warnings, ReadOnly: true,
 	}
 }
 
-func setupRequiredActions(automation Automation) []string {
+func setupRequiredActions(automation Automation, mode ExecutionMode) []string {
 	actions := []string{"Review and merge the exact setup PR"}
 	if automation == AutomationAutoMerge {
 		actions = append(actions, "Complete the setup PR and trusted setup run to activate exact-App-bound protection; a requested scheduler starts only after all non-scheduler doctor checks are green, or run hive start explicitly later")
+	}
+	if mode == ExecutionHosted {
+		actions = append(actions, "Confirm the hosted controller completes with signed durable state; the bootstrap computer may then be removed")
 	}
 	return append(actions, "Run hive doctor and confirm production_ready=true")
 }
 
 func managedSetupFiles(visualHive bool) []string {
+	return managedSetupFilesForMode(visualHive, ExecutionLocal)
+}
+
+func managedSetupFilesForMode(visualHive bool, mode ExecutionMode) []string {
 	files := []string{".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", "docs/hive-quickstart.md"}
+	if mode == ExecutionHosted {
+		files = append(files, HostedControllerWorkflowPath)
+	}
 	if visualHive {
 		files = append(files, "docs/visual-hive.md", "visual-hive.config.yaml", ".github/workflows/visual-hive-pr.yml")
 		files = append(files, standaloneVisualHiveWriterWorkflowPaths()...)
 	}
 	return files
+}
+
+func managedSetupFilesForConfig(config Config) []string {
+	return managedSetupFilesForMode(config.VisualHive, normalizedExecutionMode(config.ExecutionMode))
+}
+
+func normalizedExecutionMode(mode ExecutionMode) ExecutionMode {
+	if mode == "" {
+		return ExecutionLocal
+	}
+	return mode
+}
+
+func hostedStateBranch(repositoryID string) string {
+	cleaned := regexp.MustCompile(`[^A-Za-z0-9]+`).ReplaceAllString(strings.TrimSpace(repositoryID), "-")
+	cleaned = strings.Trim(cleaned, "-")
+	if len(cleaned) > 48 {
+		cleaned = cleaned[:48]
+	}
+	if cleaned == "" {
+		return ""
+	}
+	return "hive/state-" + strings.ToLower(cleaned)
+}
+
+func hostedWorkflowConfig(config Config) HostedWorkflowConfig {
+	return HostedWorkflowConfig{
+		Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
+		ScheduleCron: config.HostedSchedule, StateBranch: config.HostedStateBranch, StateKeySecret: "HIVE_HOSTED_STATE_KEY",
+		ReleaseRepository: config.HiveReleaseRepository, ReleaseTag: config.HiveReleaseVersion,
+		HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef,
+		DistributionManifestSHA256: config.DistributionManifestSHA256,
+		PreviousRelease:            cloneHostedReleaseIdentity(config.PreviousHostedRelease),
+	}
+}
+
+func hostedReleaseIdentity(config Config) HostedReleaseIdentity {
+	return HostedReleaseIdentity{
+		Version: config.HiveReleaseVersion, HiveCommit: strings.ToLower(config.HiveCommit),
+		VisualHiveCommit: strings.ToLower(config.VisualHiveRef), DistributionManifestSHA256: strings.ToLower(config.DistributionManifestSHA256),
+	}
+}
+
+func cloneHostedReleaseIdentity(identity *HostedReleaseIdentity) *HostedReleaseIdentity {
+	if identity == nil {
+		return nil
+	}
+	copy := *identity
+	return &copy
+}
+
+func equalHostedReleaseIdentity(left, right HostedReleaseIdentity) bool {
+	return left.Version == right.Version && strings.EqualFold(left.HiveCommit, right.HiveCommit) &&
+		strings.EqualFold(left.VisualHiveCommit, right.VisualHiveCommit) &&
+		strings.EqualFold(left.DistributionManifestSHA256, right.DistributionManifestSHA256)
 }
 
 func standaloneVisualHiveWriterWorkflowPaths() []string {
@@ -894,15 +1049,15 @@ func captureManagedPathPreimages(ctx context.Context, checkout string, managed [
 // already-managed core paths retain legacy deletion ownership. If an older
 // Visual Hive installation has no ledger, provenance cannot be reconstructed,
 // so its legacy deletion policy is retained instead of manufacturing one.
-func resolveManagedPathPreimages(ctx context.Context, checkout string, prior Config, hasPrior, visualHive bool) (string, map[string]ManagedPathPreimage, bool, error) {
-	managed := managedSetupFiles(visualHive)
+func resolveManagedPathPreimages(ctx context.Context, checkout string, prior Config, hasPrior, visualHive bool, mode ExecutionMode) (string, map[string]ManagedPathPreimage, bool, error) {
+	managed := managedSetupFilesForMode(visualHive, mode)
 	if !hasPrior {
 		preimages, err := captureManagedPathPreimages(ctx, checkout, managed)
 		return managedPreimagesVersion, preimages, err == nil, err
 	}
 
 	if managedPathPreimagesConfigured(prior) {
-		priorManaged := managedSetupFiles(prior.VisualHive)
+		priorManaged := managedSetupFilesForConfig(prior)
 		if err := validateManagedPathPreimages(prior.ManagedPreimagesVersion, prior.ManagedPathPreimages, priorManaged); err != nil {
 			return "", nil, false, fmt.Errorf("existing managed-path preimage ledger is invalid: %w", err)
 		}
@@ -925,7 +1080,28 @@ func resolveManagedPathPreimages(ctx context.Context, checkout string, prior Con
 	}
 
 	if prior.VisualHive || !visualHive {
-		return "", nil, false, nil
+		// A local-to-hosted transition may add the controller even when Visual
+		// Hive was already installed. Capture only that newly managed path.
+		priorManaged := managedSetupFilesForConfig(prior)
+		entering := managedPathDifference(managed, priorManaged)
+		if len(entering) == 0 {
+			return "", nil, false, nil
+		}
+		preimages := make(map[string]ManagedPathPreimage, len(managed))
+		for _, relative := range priorManaged {
+			preimages[relative] = ManagedPathPreimage{Existed: false}
+		}
+		captured, err := captureManagedPathPreimages(ctx, checkout, entering)
+		if err != nil {
+			return "", nil, false, err
+		}
+		for relative, preimage := range captured {
+			preimages[relative] = preimage
+		}
+		if err := validateManagedPathPreimages(managedPreimagesVersion, preimages, managed); err != nil {
+			return "", nil, false, err
+		}
+		return managedPreimagesVersion, preimages, true, nil
 	}
 
 	// Legacy Hive owned the core paths, but the Visual Hive paths are entering
@@ -1026,7 +1202,7 @@ func cloneManagedPathPreimages(source map[string]ManagedPathPreimage) map[string
 }
 
 func hasValidManagedPathPreimages(config Config) bool {
-	return validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)) == nil
+	return validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFilesForConfig(config)) == nil
 }
 
 func managedPathPreimagesConfigured(config Config) bool {
@@ -1034,7 +1210,7 @@ func managedPathPreimagesConfigured(config Config) bool {
 }
 
 func restoreManagedPathPreimages(root string, config Config) error {
-	managed := managedSetupFiles(config.VisualHive)
+	managed := managedSetupFilesForConfig(config)
 	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managed); err != nil {
 		return err
 	}
@@ -1054,7 +1230,7 @@ func restoreManagedPathPreimages(root string, config Config) error {
 }
 
 func managedUninstallRequiredPaths(config Config) (present, absent []string) {
-	managed := managedSetupFiles(config.VisualHive)
+	managed := managedSetupFilesForConfig(config)
 	if validateManagedPathOwnership(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managed) != nil {
 		if managedPathPreimagesConfigured(config) {
 			return nil, nil
@@ -1075,10 +1251,10 @@ func applyManagedPathPreimageModes(ctx context.Context, checkout string, config 
 	if !managedPathPreimagesConfigured(config) {
 		return nil
 	}
-	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFilesForConfig(config)); err != nil {
 		return err
 	}
-	for _, relative := range managedSetupFiles(config.VisualHive) {
+	for _, relative := range managedSetupFilesForConfig(config) {
 		preimage := config.ManagedPathPreimages[relative]
 		if !preimage.Existed {
 			continue
@@ -1096,16 +1272,16 @@ func applyManagedPathPreimageModes(ctx context.Context, checkout string, config 
 
 func managedPathPolicyDigest(config Config) (string, error) {
 	if !managedPathPreimagesConfigured(config) {
-		return digestPaths(managedSetupFiles(config.VisualHive))
+		return digestPaths(managedSetupFilesForConfig(config))
 	}
-	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+	if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFilesForConfig(config)); err != nil {
 		return "", err
 	}
 	payload := struct {
 		Version   string                         `json:"version"`
 		Paths     []string                       `json:"paths"`
 		Preimages map[string]ManagedPathPreimage `json:"preimages"`
-	}{Version: config.ManagedPreimagesVersion, Paths: managedSetupFiles(config.VisualHive), Preimages: config.ManagedPathPreimages}
+	}{Version: config.ManagedPreimagesVersion, Paths: managedSetupFilesForConfig(config), Preimages: config.ManagedPathPreimages}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("encode managed path restoration policy: %w", err)
@@ -1571,7 +1747,7 @@ func readSetupBaselineBlob(ctx context.Context, checkout, objectSHA string) ([]b
 
 func writeManagedFiles(root string, config Config, inspection RepositoryInspection) error {
 	if managedPathPreimagesConfigured(config) {
-		if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFiles(config.VisualHive)); err != nil {
+		if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFilesForConfig(config)); err != nil {
 			return fmt.Errorf("refuse managed writes with an invalid managed-path preimage ledger: %w", err)
 		}
 	}
@@ -1579,6 +1755,10 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 		"schema_version": managedRepositoryConfigSchema, "repository": config.Repository, "repository_id": config.RepositoryID,
 		"default_branch": config.DefaultBranch, "coverage": config.Coverage, "automation": config.Automation,
 		"provider": config.Provider, "acmm_level": config.ACMMLevel, "max_active_issues": config.MaxActiveIssues, "max_repair_attempts": config.MaxRepairAttempts, "visual_hive": config.VisualHive,
+		"execution_mode": config.ExecutionMode, "run_interval_seconds": config.RunIntervalSeconds,
+		"hosted_schedule": config.HostedSchedule, "hosted_state_branch": config.HostedStateBranch,
+		"hive_release_repository": config.HiveReleaseRepository, "hive_release_version": config.HiveReleaseVersion,
+		"hive_commit": config.HiveCommit, "distribution_manifest_sha256": config.DistributionManifestSHA256,
 		"visual_hive_repository": config.VisualHiveRepo, "visual_hive_ref": config.VisualHiveRef,
 		"visual_hive_config_digest": config.VisualHiveConfigDigest,
 		"test_commands":             config.TestCommands, "allowed_repair_paths": config.AllowedRepairPaths,
@@ -1587,6 +1767,9 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 	}
 	if config.SetupAuthorizationPreviousActorID > 0 {
 		repositoryConfig["setup_authorization_previous_actor_id"] = config.SetupAuthorizationPreviousActorID
+	}
+	if config.PreviousHostedRelease != nil {
+		repositoryConfig["previous_hosted_release"] = cloneHostedReleaseIdentity(config.PreviousHostedRelease)
 	}
 	configData, err := json.MarshalIndent(repositoryConfig, "", "  ")
 	if err != nil {
@@ -1599,6 +1782,13 @@ func writeManagedFiles(root string, config Config, inspection RepositoryInspecti
 	}
 	if config.VisualHive {
 		files[".github/workflows/visual-hive-pr.yml"] = pullRequestWorkflow(config)
+	}
+	if config.ExecutionMode == ExecutionHosted {
+		controller, controllerErr := GenerateHostedControllerWorkflow(hostedWorkflowConfig(config))
+		if controllerErr != nil {
+			return controllerErr
+		}
+		files[HostedControllerWorkflowPath] = controller
 	}
 	for relative, content := range files {
 		if err := writeSetupCheckoutFile(root, relative, []byte(content)); err != nil {
@@ -2358,6 +2548,11 @@ func enrichRemoteInspection(ctx context.Context, client *hivegithub.Client, repo
 }
 
 func git(ctx context.Context, dir string, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "push" {
+		if err := checkpoint.BeforeMutation(ctx, "Git push"); err != nil {
+			return "", err
+		}
+	}
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir, command.Env = dir, safeEnvironment()
 	var output bytes.Buffer

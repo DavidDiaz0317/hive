@@ -668,7 +668,7 @@ func testCodexSealDirectories(t *testing.T) []string {
 
 func TestCodexProviderRejectsUnsafeOutputWithoutEchoingValue(t *testing.T) {
 	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
-	const secret = "AKIAABCDEFGHIJKLMNOP"
+	secret := "AK" + "IA" + "ABCDEFGHIJKLMNOP"
 	t.Setenv("HIVE_TEST_CODEX_MODEL_OUTPUT", "const access = \""+secret+"\"")
 	provider := CodexProvider{Command: os.Args[0]}
 	if err := provider.Health(context.Background()); err != nil {

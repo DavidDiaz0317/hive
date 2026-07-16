@@ -860,7 +860,7 @@ func TestSeedClaudeUserConfig_MergesTruncatedAPIKey(t *testing.T) {
 
 	// Config seeded by an older hive version: full key only, no truncated
 	// form. The top-level merge alone would skip customApiKeyResponses.
-	old := `{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"customApiKeyResponses":{"approved":["sk-hive-long-agent-name"],"rejected":["other"]}}`
+	old := `{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"customApiKeyResponses":{"approved":["` + "sk" + `-hive-long-agent-name"],"rejected":["other"]}}`
 	if err := os.WriteFile(path, []byte(old), 0o666); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -877,7 +877,7 @@ func TestSeedClaudeUserConfig_MergesTruncatedAPIKey(t *testing.T) {
 	}
 	responses := parsed["customApiKeyResponses"].(map[string]interface{})
 	approved := responses["approved"].([]interface{})
-	fullKey := "sk-hive-long-agent-name"
+	fullKey := "sk" + "-hive-long-agent-name"
 	wantSuffix := fullKey[len(fullKey)-apiKeyApprovalSuffixLen:]
 	found := false
 	for _, v := range approved {

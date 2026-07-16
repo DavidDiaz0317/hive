@@ -16,6 +16,7 @@ import (
 	gh "github.com/google/go-github/v72/github"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/beads"
+	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
@@ -96,6 +97,9 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	config, err := store.Load()
 	if err != nil {
 		return result, err
+	}
+	if config.ExecutionMode == ExecutionHosted && !checkpoint.Active(ctx) {
+		return result, fmt.Errorf("hosted installation lifecycle is owned by the GitHub controller; dispatch it instead of running a local lifecycle writer")
 	}
 	if transfer, exists, transferErr := store.LoadAuthorizerTransferIntent(); transferErr != nil {
 		return result, transferErr

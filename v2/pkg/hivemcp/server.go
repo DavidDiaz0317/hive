@@ -176,11 +176,18 @@ func tool(name, title, description string, readOnly, destructive bool, schema ma
 }
 
 func setupSchema() map[string]any {
-	return map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
+	return map[string]any{"type": "object", "additionalProperties": false, "allOf": []any{
+		map[string]any{
+			"if":   map[string]any{"required": []string{"runtime"}, "properties": map[string]any{"runtime": map[string]any{"const": "local"}}},
+			"then": map[string]any{"properties": map[string]any{"run_interval_seconds": map[string]any{"minimum": 60, "maximum": 86400}}},
+			"else": map[string]any{"properties": map[string]any{"run_interval_seconds": map[string]any{"minimum": 300, "maximum": 86400, "multipleOf": 60}}},
+		},
+	}, "properties": map[string]any{
 		"repo":                 map[string]any{"type": "string", "pattern": `^[^/]+/[^/]+$`},
 		"coverage":             map[string]any{"type": "string", "enum": []string{"essential", "standard", "comprehensive", "custom"}},
 		"automation":           map[string]any{"type": "string", "enum": []string{"advisory", "issues", "repair-pr", "auto-merge"}},
 		"provider":             map[string]any{"type": "string"},
+		"runtime":              map[string]any{"type": "string", "enum": []string{"hosted", "local"}, "default": "hosted"},
 		"visual_hive":          map[string]any{"type": "boolean", "const": true, "default": true},
 		"max_active_issues":    map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
 		"max_repair_attempts":  map[string]any{"type": "integer", "minimum": 1, "maximum": 10},

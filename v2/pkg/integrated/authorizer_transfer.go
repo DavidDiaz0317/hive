@@ -30,33 +30,34 @@ const (
 // Config until the exact old-actor-authorized PR is merged and its complete
 // managed tree is verified at the current default-branch head.
 type AuthorizerTransferIntent struct {
-	SchemaVersion        string    `json:"schema_version"`
-	Phase                string    `json:"phase"`
-	Repository           string    `json:"repository"`
-	RepositoryID         string    `json:"repository_id"`
-	DefaultBranch        string    `json:"default_branch"`
-	VisualHive           bool      `json:"visual_hive"`
-	SourceConfigDigest   string    `json:"source_config_digest"`
-	OldAuthorizerID      int64     `json:"old_authorizer_id"`
-	OldAuthorizerLogin   string    `json:"old_authorizer_login"`
-	NewAuthorizerID      int64     `json:"new_authorizer_id"`
-	NewAuthorizerLogin   string    `json:"new_authorizer_login"`
-	Reason               string    `json:"reason"`
-	Branch               string    `json:"branch"`
-	BaseSHA              string    `json:"base_sha"`
-	HeadSHA              string    `json:"head_sha"`
-	Marker               string    `json:"marker"`
-	ChangedFiles         []string  `json:"changed_files"`
-	PRNumber             int       `json:"pr_number,omitempty"`
-	PRURL                string    `json:"pr_url,omitempty"`
-	PullDiffDigest       string    `json:"pull_diff_digest,omitempty"`
-	SetupDiffDigest      string    `json:"setup_diff_digest,omitempty"`
-	AuthorizationContext string    `json:"authorization_context,omitempty"`
-	AuthorizationStatus  int64     `json:"authorization_status_id,omitempty"`
-	AuthorizationCreator int64     `json:"authorization_creator_id,omitempty"`
-	PreparedAt           time.Time `json:"prepared_at"`
-	PullRecordedAt       time.Time `json:"pull_recorded_at,omitempty"`
-	AuthorizedAt         time.Time `json:"authorized_at,omitempty"`
+	SchemaVersion        string        `json:"schema_version"`
+	Phase                string        `json:"phase"`
+	Repository           string        `json:"repository"`
+	RepositoryID         string        `json:"repository_id"`
+	DefaultBranch        string        `json:"default_branch"`
+	VisualHive           bool          `json:"visual_hive"`
+	ExecutionMode        ExecutionMode `json:"execution_mode,omitempty"`
+	SourceConfigDigest   string        `json:"source_config_digest"`
+	OldAuthorizerID      int64         `json:"old_authorizer_id"`
+	OldAuthorizerLogin   string        `json:"old_authorizer_login"`
+	NewAuthorizerID      int64         `json:"new_authorizer_id"`
+	NewAuthorizerLogin   string        `json:"new_authorizer_login"`
+	Reason               string        `json:"reason"`
+	Branch               string        `json:"branch"`
+	BaseSHA              string        `json:"base_sha"`
+	HeadSHA              string        `json:"head_sha"`
+	Marker               string        `json:"marker"`
+	ChangedFiles         []string      `json:"changed_files"`
+	PRNumber             int           `json:"pr_number,omitempty"`
+	PRURL                string        `json:"pr_url,omitempty"`
+	PullDiffDigest       string        `json:"pull_diff_digest,omitempty"`
+	SetupDiffDigest      string        `json:"setup_diff_digest,omitempty"`
+	AuthorizationContext string        `json:"authorization_context,omitempty"`
+	AuthorizationStatus  int64         `json:"authorization_status_id,omitempty"`
+	AuthorizationCreator int64         `json:"authorization_creator_id,omitempty"`
+	PreparedAt           time.Time     `json:"prepared_at"`
+	PullRecordedAt       time.Time     `json:"pull_recorded_at,omitempty"`
+	AuthorizedAt         time.Time     `json:"authorized_at,omitempty"`
 }
 
 type AuthorizerTransferOptions struct {
@@ -140,7 +141,7 @@ func validateAuthorizerTransferIntent(intent AuthorizerTransferIntent) error {
 		return fmt.Errorf("setup authorizer transfer source config digest is invalid")
 	}
 	allowed := map[string]bool{}
-	for _, path := range managedSetupFiles(intent.VisualHive) {
+	for _, path := range managedSetupFilesForMode(intent.VisualHive, normalizedExecutionMode(intent.ExecutionMode)) {
 		allowed[path] = true
 	}
 	for _, path := range intent.ChangedFiles {
@@ -287,7 +288,7 @@ func RunAuthorizerTransfer(ctx context.Context, options AuthorizerTransferOption
 	if err := writeManagedFiles(config.CheckoutDir, candidate, inspection); err != nil {
 		return fail(err)
 	}
-	managed := managedSetupFiles(config.VisualHive)
+	managed := managedSetupFilesForConfig(config)
 	if err := authorizeSetup(store, integratedPolicy(config), config.Repository, automation.ActionSetupCommit); err != nil {
 		return fail(err)
 	}
@@ -319,7 +320,7 @@ func RunAuthorizerTransfer(ctx context.Context, options AuthorizerTransferOption
 	}
 	intent := AuthorizerTransferIntent{
 		SchemaVersion: authorizerTransferIntentSchema, Phase: authorizerTransferPrepared,
-		Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: defaultBranch, VisualHive: config.VisualHive, SourceConfigDigest: sourceDigest,
+		Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: defaultBranch, VisualHive: config.VisualHive, ExecutionMode: config.ExecutionMode, SourceConfigDigest: sourceDigest,
 		OldAuthorizerID: current.ID, OldAuthorizerLogin: current.Login, NewAuthorizerID: target.ID, NewAuthorizerLogin: target.Login,
 		Reason: options.Reason, Branch: branch, BaseSHA: baseSHA, HeadSHA: strings.ToLower(strings.TrimSpace(headSHA)),
 		Marker: marker, ChangedFiles: changedFiles, PreparedAt: time.Now().UTC(),
@@ -543,7 +544,7 @@ func bindAuthorizerTransferPull(ctx context.Context, config Config, intent Autho
 		return intent, err
 	}
 	allowed := map[string]bool{}
-	for _, path := range managedSetupFiles(config.VisualHive) {
+	for _, path := range managedSetupFilesForConfig(config) {
 		allowed[path] = true
 	}
 	for _, path := range diff.ChangedPaths {

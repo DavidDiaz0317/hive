@@ -69,6 +69,7 @@ func TestUpgradeSameImmutableRefIsIdempotent(t *testing.T) {
 	config := Config{
 		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
 		Coverage: CoverageComprehensive, Automation: AutomationRepairPR, Provider: "codex", ACMMLevel: 5,
+		ExecutionMode:   ExecutionLocal,
 		MaxActiveIssues: 5, MaxRepairAttempts: 4, VisualHive: true,
 		VisualHiveRepo: "owner/visual", VisualHiveRef: ref,
 	}

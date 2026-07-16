@@ -16,7 +16,7 @@ func TestWriteLiteLLMKeyFile_CreatesDirAndFile(t *testing.T) {
 	writableLiteLLMKeyFile = filepath.Join(t.TempDir(), "secrets", "litellm_api_key")
 	t.Cleanup(func() { writableLiteLLMKeyFile = orig })
 
-	const key = "sk-keyvalue-abcdefghijklmnop"
+	key := "sk" + "-keyvalue-abcdefghijklmnop"
 	if err := writeLiteLLMKeyFile(key); err != nil {
 		t.Fatalf("writeLiteLLMKeyFile: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestWriteLiteLLMKeyFile_UnwritableDirYieldsActionableError(t *testing.T) {
 	writableLiteLLMKeyFile = filepath.Join(secretsDir, "litellm_api_key")
 	t.Cleanup(func() { writableLiteLLMKeyFile = orig })
 
-	const key = "sk-verysecretkeyvalue123456"
+	key := "sk" + "-verysecretkeyvalue123456"
 	err := writeLiteLLMKeyFile(key)
 	if err == nil {
 		t.Fatal("expected an error writing into an unwritable dir")

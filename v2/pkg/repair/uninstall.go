@@ -22,6 +22,7 @@ type uninstallRepairRef struct {
 // must not treat StageCancelled as terminal without this proof.
 func UninstallRefsRetired(attempt Attempt) bool {
 	return !hasToolSnapshot(attempt) &&
+		!hasPortableRepairBundle(attempt) &&
 		attempt.RecoveredPatchAttempt == 0 && attempt.RecoveredPatchSHA256 == "" && !attempt.RecoveredPatchAuthorized && attempt.RecoveredProviderSHA256 == "" &&
 		attempt.PreparationRecoveryHead == "" && attempt.PreparationReplayTree == "" && attempt.PreparationReplayProof == "" &&
 		attempt.PreparationCleanupRef == "" && attempt.PreparationCleanupCommit == "" && !attempt.PreparationCleanupPending &&
@@ -41,6 +42,11 @@ func (s *Store) CancelForUninstall(ctx context.Context, repositoryFingerprint st
 	}
 	if attempt.Stage == StageCancelled && UninstallRefsRetired(attempt) {
 		return nil
+	}
+	if hasPortableRepairBundle(attempt) {
+		if err := s.retirePortableRepairBundle(&attempt); err != nil {
+			return fmt.Errorf("retire uninstall portable repair bundle: %w", err)
+		}
 	}
 	refs, err := uninstallRepairRefs(attempt)
 	if err != nil {

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"errors"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,12 +24,12 @@ func TestMCPSetupPreservesOmittedExistingPolicyAndExplicitIntegratedVisualHive(t
 }
 
 func TestMCPSetupAndUninstallPreserveOperatorOptions(t *testing.T) {
-	setup, err := mcpCLIArgs("hive_setup_apply", map[string]any{"repo": "owner/repo", "start": false, "run_interval_seconds": 120})
+	setup, err := mcpCLIArgs("hive_setup_apply", map[string]any{"repo": "owner/repo", "runtime": "local", "start": false, "run_interval_seconds": 120})
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(setup, " ")
-	if strings.Contains(joined, "--start") || !strings.Contains(joined, "--run-interval 120s") {
+	if strings.Contains(joined, "--start") || !strings.Contains(joined, "--runtime local") || !strings.Contains(joined, "--run-interval 120s") {
 		t.Fatalf("MCP setup lost scheduler parity: %s", joined)
 	}
 	uninstall, err := mcpCLIArgs("hive_uninstall", map[string]any{"state_dir": "state", "delete_state": true})
@@ -53,8 +53,8 @@ func TestMCPProductionCommandParity(t *testing.T) {
 		arguments map[string]any
 		want      []string
 	}{
-		{"hive_setup_plan", map[string]any{"state_dir": "state", "repo": "owner/repo", "coverage": "comprehensive", "automation": "auto-merge", "provider": "codex", "max_active_issues": float64(5), "max_repair_attempts": float64(4), "run_interval_seconds": float64(120), "auto_merge_paths": []any{"tests/**"}, "auto_merge_risks": []any{"automatic", "low"}, "visual_hive": true}, []string{"setup", "--json", "--state-dir", "state", "--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "auto-merge", "--provider", "codex", "--max-active-issues", "5", "--max-repair-attempts", "4", "--run-interval", "120s", "--auto-merge-path", "tests/**", "--auto-merge-risk", "automatic", "--auto-merge-risk", "low", "--plan", "--visual-hive=true"}},
-		{"hive_setup_apply", map[string]any{"state_dir": "state", "repo": "owner/repo", "coverage": "comprehensive", "automation": "auto-merge", "provider": "codex", "max_active_issues": float64(5), "max_repair_attempts": float64(4), "run_interval_seconds": float64(120), "start": true, "visual_hive": true}, []string{"setup", "--json", "--state-dir", "state", "--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "auto-merge", "--provider", "codex", "--max-active-issues", "5", "--max-repair-attempts", "4", "--run-interval", "120s", "--start", "--visual-hive=true"}},
+		{"hive_setup_plan", map[string]any{"state_dir": "state", "repo": "owner/repo", "coverage": "comprehensive", "automation": "auto-merge", "provider": "codex", "max_active_issues": float64(5), "max_repair_attempts": float64(4), "run_interval_seconds": float64(300), "auto_merge_paths": []any{"tests/**"}, "auto_merge_risks": []any{"automatic", "low"}, "visual_hive": true}, []string{"setup", "--json", "--state-dir", "state", "--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "auto-merge", "--provider", "codex", "--max-active-issues", "5", "--max-repair-attempts", "4", "--run-interval", "300s", "--auto-merge-path", "tests/**", "--auto-merge-risk", "automatic", "--auto-merge-risk", "low", "--plan", "--visual-hive=true"}},
+		{"hive_setup_apply", map[string]any{"state_dir": "state", "repo": "owner/repo", "coverage": "comprehensive", "automation": "auto-merge", "provider": "codex", "runtime": "local", "max_active_issues": float64(5), "max_repair_attempts": float64(4), "run_interval_seconds": float64(120), "start": true, "visual_hive": true}, []string{"setup", "--json", "--state-dir", "state", "--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "auto-merge", "--provider", "codex", "--runtime", "local", "--max-active-issues", "5", "--max-repair-attempts", "4", "--run-interval", "120s", "--start", "--visual-hive=true"}},
 		{"hive_doctor", map[string]any{"state_dir": "state"}, append([]string{"doctor"}, append(state, "--json")...)},
 		{"hive_status", map[string]any{"state_dir": "state"}, append([]string{"status"}, append(state, "--json")...)},
 		{"hive_run", map[string]any{"state_dir": "state", "timeout_seconds": float64(600)}, []string{"run", "--state-dir", "state", "--timeout", "600s", "--json"}},
@@ -117,10 +117,14 @@ func TestMCPRejectsUnknownTool(t *testing.T) {
 	}
 }
 
-func TestMCPNonZeroStructuredCLIResultIsAnError(t *testing.T) {
-	_, err := decodeCLIResult([]string{"approve-merge"}, []byte(`{"error":"gate failed"}`), nil, errors.New("exit status 1"))
-	if err == nil || !strings.Contains(err.Error(), "gate failed") || !strings.Contains(err.Error(), "exit status 1") {
-		t.Fatalf("structured CLI denial was not propagated as MCP error: %v", err)
+func TestMCPNonZeroStructuredCLIResultPreservesResultAndDiagnostic(t *testing.T) {
+	result, err := decodeCLIResult([]string{"approve-merge"}, []byte(`{"error":"gate failed"}`), []byte("exact head is stale"), &exec.ExitError{})
+	if err != nil || result["error"] != "gate failed" {
+		t.Fatalf("structured CLI denial was not preserved: result=%v err=%v", result, err)
+	}
+	metadata, ok := result["hive_cli"].(map[string]any)
+	if !ok || metadata["failed"] != true || metadata["diagnostic"] != "exact head is stale" {
+		t.Fatalf("structured CLI denial lacks actionable metadata: %v", result)
 	}
 }
 

@@ -65,7 +65,7 @@ func runInstallerTransition(args []string) int {
 	ownedInstallDir := flags.String("owned-install-dir", "", "exact recognized Hive installation directory")
 	runtimeExecutable := flags.String("runtime-executable", "", "restored or activated Hive executable used to restart schedulers")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	journal, err := executeInstallerTransition(*phase, *journalPath, *ownedInstallDir, *runtimeExecutable)

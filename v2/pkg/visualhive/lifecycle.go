@@ -180,8 +180,11 @@ func NewLifecycleStore(dir string) (*LifecycleStore, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("lifecycle store directory is required")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create lifecycle store: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("protect lifecycle store: %w", err)
 	}
 	store := &LifecycleStore{
 		dir:       dir,

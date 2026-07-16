@@ -1,26 +1,36 @@
 # Integrated Hive Recovery and Troubleshooting
 
-## Scheduler recovery
+## Hosted controller recovery
 
-`hive setup --start` records a durable scheduler start intent but does not install or run a per-user OS service while the setup PR, baseline review, or another doctor prerequisite is pending. The successful trusted `hive run` that makes every non-scheduler doctor check green activates the request. The service definition, OS-held lease, and atomic `integrated/daemon.json` status then bind the absolute executable, immutable Hive commit, and executable SHA-256. `hive start` remains an explicit immediate start command and drains and replaces a service or live PID whose path is unchanged but whose commit or bytes differ. The scheduler owns one OS-locked `integrated/daemon.lease` and logs to `integrated/daemon.log`; crashed/stale owners are recovered without a permanent start marker. On Linux, Hive binds the service to the user default target and verifies exact `loginctl show-user <numeric-uid> --property=Linger --value` output. It enables linger when the exact response is `no`, rechecks for `yes`, and otherwise fails closed; this is what keeps the user manager and Hive service available after logout and reboot. Windows uses an `InteractiveToken` task to preserve access to the user's local GitHub/Codex credentials without storing a password: it restarts on failure and at user logon, but unattended execution before the first post-reboot logon is not supported. `hive stop` cancels both an active service and any pending setup start intent.
+New installations default to the hosted runtime. `hive setup --start` installs one managed `Hive Hosted Controller` workflow with both an exact cron `schedule` and `workflow_dispatch`; it does not create a local process, systemd unit, or Windows task. GitHub Actions concurrency permits only one controller operation at a time. The bootstrap computer can be shut down after the setup PR merges.
 
-After a host restart:
+Durable state is stored as one bounded, canonical `hive.hosted-state.v1` bundle on the dedicated `hive/state-<repository-id>` branch. `HIVE_HOSTED_STATE_KEY` is a create-only repository Actions secret containing the HMAC-SHA256 key. Each fresh runner verifies the exact repository, state branch, release, workflow path, signed parent sequence, regular-file inventory, and remote branch head before restoring state. Every mutation checkpoint creates the exact next-parent commit and advances the branch with compare-and-swap; overlap, ancestry drift, malformed state, or a changed remote head fails closed.
+
+After an interruption or bootstrap-host shutdown, run:
 
 ```bash
 hive status --json
+hive doctor --json
 ```
 
-The managed service should already have recovered the scheduler. If status reports a service inspection or persistence failure, `hive start --json` is an idempotent repair attempt and will not create a second scheduler. Concurrent starts converge on the OS-held lease owner, and stale/crashed ownership is recoverable. Repair and lifecycle stores are loaded before new work; an active PR is resumed rather than duplicated. Linux startup requires `loginctl`; Hive will not claim `reboot_persistent=true` unless the exact current numeric UID reports `Linger=yes`.
+Hosted status verifies the exact managed workflow bytes, state branch and secret metadata, controller run identities, lack of overlap, latest completed cycle, freshness, and current default-branch head. `hive run --json` dispatches an immediate cycle; `hive pause --json`, `hive resume --json`, and the supported recovery command dispatch exact idempotent controller operations. Rerunning the same request reconciles its request ledger instead of duplicating lifecycle records. Never edit `state.json`, force-push the state branch, or replace either repository secret.
+
+For hosted `repair-pr` and `auto-merge`, setup also provisions `OPENAI_API_KEY` as a create-only repository Actions secret. If it already exists Hive uses only its metadata and never reads or rotates it. If it is absent, rerun setup with `OPENAI_API_KEY` present only in the setup process. `advisory` and `issues` do not require this provider secret.
+
+## Local runtime compatibility
+
+Existing local installations remain local unless setup explicitly changes `--runtime`. `hive setup --runtime local --start` uses the legacy per-user scheduler. On Linux it requires systemd/logind and exact `Linger=yes`; on Windows it uses a least-privilege `InteractiveToken` task that resumes only after user logon. `hive start --json` is an idempotent service repair and concurrent starts converge on the OS-held lease. Local repair automation uses the scheduler-owning account's GitHub and Codex credential stores. These requirements do not apply to hosted installations.
 
 ## Common doctor failures
 
 - `visual_hive_runtime`: reinstall the signed integrated release matching the configured exact Visual Hive commit. Do not point Hive at a mutable branch.
-- `provider`: run the provider's login command in the same user account that owns the scheduler.
+- `provider`: for hosted `repair-pr`/`auto-merge`, confirm the create-only `OPENAI_API_KEY` Actions secret exists; for local mode, run the provider login in the scheduler-owning account.
 - `github_auth`: run `gh auth status`, then `gh auth login` if needed. Confirm access to the exact target repository.
 - `setup_installed`: review and merge the single Hive setup/upgrade PR after checks pass. A stale historical PR is ignored only when the exact durable policy is already installed on the target branch.
 - `workflow_installed`: rerun idempotent `hive setup` and inspect the setup PR.
 - `setup_baseline_state`: run `hive status --json` and follow its exact `setup_baseline.next_command`. `pending`, `dispatched`, `artifact_verified`, and `proposal_prepared` are restart-safe hosted-capture/proposal phases; `proposal_prepared` means the exact branch and commit are durable before push/PR creation. `pr_open` requires `hive approve-baseline --plan --json`, visual review of every candidate PNG, and the complete returned apply binding; `approved` means Hive will retry only the same exact merge; `merged` requires one complete trusted post-merge production verification. A phase with `pending_audit` remains blocked even if its phase text says `production_verified`; retry the reported command so Hive writes the exact idempotent audit receipt. Never copy PNGs from a local browser, edit the intent, use generic repair approval, or merge the held baseline PR outside Hive.
-- `branch_protection`: before the setup PR is merged, doctor reports setup activation pending and remains read-only. After merge, the next trusted Hive run verifies the exact production workflow path/event/default head, completes `visual-hive-production` plus the actively guarded `visual-hive` eligibility seed, and activates strict/up-to-date protection with the PR `visual-hive` context bound to the exact GitHub Actions App ID. If protection is absent, run `hive run`; a setup-requested scheduler activates after that run makes the remaining doctor gates green. If repository-owned policy exists but is missing strict mode, administrator enforcement, or the exact App identity, update that policy explicitly because Hive will not replace it. A green production seed never counts as a PR verdict; Hive requires exact `.github/workflows/visual-hive-pr.yml`/`pull_request`/PR-head Check Suite provenance at merge time.
+- `branch_protection`: before the setup PR is merged, doctor reports setup activation pending and remains read-only. After merge, the next trusted hosted cycle verifies the exact production workflow path/event/default head, completes `visual-hive-production` plus the actively guarded `visual-hive` eligibility seed, and activates strict/up-to-date protection with the PR `visual-hive` context bound to the exact GitHub Actions App ID. If protection is absent, run `hive run`; the scheduled controller continues after that cycle. If repository-owned policy exists but is missing strict mode, administrator enforcement, or the exact App identity, update that policy explicitly because Hive will not replace it. A green production seed never counts as a PR verdict; Hive requires exact `.github/workflows/visual-hive-pr.yml`/`pull_request`/PR-head Check Suite provenance at merge time.
+- `hosted_controller_workflow`, `hosted_state_branch`, `hosted_state_secret`, `hosted_controller_identity`, `hosted_controller_overlap`, `hosted_latest_cycle_success`, `hosted_latest_cycle_fresh`, or `hosted_latest_cycle_head`: do not start a local scheduler or edit the managed workflow/state. Use `hive status --json` to inspect the exact mismatch. Restore the exact setup PR bytes, permissions, or release identity and run the supported hosted operation again. A stale cycle may be refreshed with `hive run --json`; overlap or identity drift must be reconciled before lifecycle writes resume.
 - `workflow_dispatch_state`: run `hive status --json` and use its exact dispatch-recovery plan. Do not dispatch another run or delete the checkpoint.
 - `lifecycle_state` or `repair_state`: run `hive pause --json`, preserve the reported state directory and error, and correct the underlying filesystem/backup problem before retrying doctor. Hive recovers supported torn writes and schema migrations itself; never hand-edit or delete lifecycle, repair, audit, journal, or hidden-ref state to force readiness.
 
@@ -62,7 +72,7 @@ If GitHub mutation partially succeeded, rerun `hive run --json`. The durable out
 
 ### Ambiguous workflow dispatch recovery
 
-When the workflow-dispatch connection fails without an HTTP response, Hive cannot prove whether GitHub accepted the request. A resumed daemon performs one exhaustive, paginated search for the exact workflow, ref, event, and 256-bit correlation. It binds the run if found. If no run is found, it releases the production lease immediately, marks `production_ready=false`, and returns both copy-paste recovery plan commands in `hive status --json`. It does not wait for the normal run timeout and does not dispatch again automatically.
+When the workflow-dispatch connection fails without an HTTP response, Hive cannot prove whether GitHub accepted the request. The next Hive operation performs one exhaustive, paginated search for the exact workflow, ref, event, and 256-bit correlation. It binds the run if found. If no run is found, it releases the production lease immediately, marks `production_ready=false`, and returns both copy-paste recovery plan commands in `hive status --json`. It does not wait for the normal run timeout and does not dispatch again automatically.
 
 Plan first. Planning is read-only and fails if discovery is incomplete or an exact run exists:
 
@@ -87,14 +97,16 @@ Every Hive merge has an audited exact-head/base/diff authorization snapshot and 
 
 ## Upgrade and rollback
 
-An upgrade or rollback PR changes the repository's immutable Visual Hive workflow pin. The local bundled runtime must match that pin. Install the corresponding signed integrated release, merge the reviewed upgrade/rollback PR, then run:
+An upgrade or rollback PR changes the repository's immutable Visual Hive workflow pin. A hosted integrated-release transition additionally regenerates the managed repository configuration and controller workflow with the exact release tag, Hive commit, Visual Hive commit, and distribution-manifest digest. Install the candidate signed release and rerun the identical setup request so Hive records the currently installed hosted release as the one exact transition predecessor. Review and merge the one managed PR, then run:
 
 ```bash
+hive run --json
 hive doctor --json
-hive start --json
 ```
 
-If the new runtime fails doctor or compatibility checks, restore the previous integrated release and use `hive rollback`. Pixelmatch remains the default local verdict engine; optional ODiff/VRT adapters can be rolled back independently and cannot block recovery unless an operator explicitly made them required outside Visual Hive.
+The candidate controller may restore signed state only when it is already bound to the current release or to that explicitly recorded predecessor. Its next checkpoint is bound to the current release. Skipped releases, a different predecessor, mutable tags, workflow drift, or malformed release identity fail closed.
+
+Do not treat reinstalling an older binary as rollback. After the current controller checkpoints a newer schema/release identity, an older binary is expected to reject it and preserve the state branch unchanged. Use the reviewable Hive rollback/setup path with a signed integrated release that understands the current schema and explicitly binds the current installation as its predecessor. If no such release exists, keep automation paused and publish a compatible immutable patch rather than editing state. Pixelmatch remains the default deterministic verdict engine; optional adapters cannot weaken this release/state boundary.
 
 ## Uninstall
 
@@ -102,4 +114,4 @@ If the new runtime fails doctor or compatibility checks, restore the previous in
 
 Before merge, `hive uninstall --cancel --json` (MCP `hive_uninstall` with `cancel: true`) is the supported stale-cleanup recovery path. It authenticates the recorded numeric setup authorizer, binds the exact repository ID, recorded PR number/URL, transaction marker, managed head/base branches, and unmerged state, while allowing only the base/head SHA drift caused by strict-base updates. It retires a moved cleanup ref only after proving the original Hive cleanup commit is its ancestor. Wrong marker, PR, URL, branch, repository, non-descendant head, ambiguity, or merged state fails closed. Cancellation is resumable after an interrupted close/delete, restores the pre-uninstall setup PR identity, leaves automation paused, and permits a fresh `hive uninstall` transaction without colliding with the closed PR.
 
-On Linux, uninstall disables and removes only Hive's exact systemd user unit. It intentionally does not run `loginctl disable-linger`: linger is account-wide and may be required by unrelated user services. An administrator who knows the account has no remaining persistent user services may change that operating-system setting separately after reviewing the account.
+Hosted uninstall has no local service to remove; it drains lifecycle state and uses the managed cleanup PR/state reconciliation described above. In explicit local mode on Linux, uninstall disables and removes only Hive's exact systemd user unit. It intentionally does not run `loginctl disable-linger`: linger is account-wide and may be required by unrelated user services. An administrator who knows the account has no remaining persistent user services may change that operating-system setting separately after reviewing the account.

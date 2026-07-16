@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/hivemcp"
+	"github.com/kubestellar/hive/v2/pkg/logscrub"
 )
 
 func runMCPServer() int {
@@ -38,7 +40,7 @@ func mcpCLIArgs(name string, arguments map[string]any) ([]string, error) {
 		for _, argument := range []struct {
 			name string
 			flag string
-		}{{"repo", "--repo"}, {"coverage", "--coverage"}, {"automation", "--automation"}, {"provider", "--provider"}} {
+		}{{"repo", "--repo"}, {"coverage", "--coverage"}, {"automation", "--automation"}, {"provider", "--provider"}, {"runtime", "--runtime"}} {
 			if value, ok := arguments[argument.name].(string); ok && strings.TrimSpace(value) != "" {
 				args = append(args, argument.flag, value)
 			}
@@ -205,7 +207,16 @@ func decodeCLIResult(args []string, stdout, stderr []byte, runErr error) (map[st
 	decodeErr := json.Unmarshal(stdout, &value)
 	if decodeErr == nil {
 		if runErr != nil {
-			return nil, fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), runErr, strings.TrimSpace(string(stdout)))
+			exitCode := -1
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			}
+			metadata := map[string]any{"exit_code": exitCode, "failed": true}
+			if diagnostic := boundedMCPDiagnostic(stderr); diagnostic != "" {
+				metadata["diagnostic"] = diagnostic
+			}
+			value["hive_cli"] = metadata
 		}
 		return value, nil
 	}
@@ -213,6 +224,16 @@ func decodeCLIResult(args []string, stdout, stderr []byte, runErr error) (map[st
 		return nil, fmt.Errorf("%s failed: %w: %s", strings.Join(args, " "), runErr, strings.TrimSpace(string(stderr)))
 	}
 	return nil, fmt.Errorf("%s returned invalid JSON: %w", strings.Join(args, " "), decodeErr)
+}
+
+func boundedMCPDiagnostic(value []byte) string {
+	diagnostic := strings.TrimSpace(logscrub.Scrub(string(value)))
+	const maxDiagnosticRunes = 2048
+	runes := []rune(diagnostic)
+	if len(runes) > maxDiagnosticRunes {
+		diagnostic = string(runes[:maxDiagnosticRunes]) + "…"
+	}
+	return diagnostic
 }
 
 func stringArgument(arguments map[string]any, name, fallback string) string {

@@ -303,15 +303,26 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 		"git diff --no-ext-diff --no-textconv --exit-code -- .", "HIVE_VISUAL_HIVE_CLI_SHA", "test ! -w \"$VISUAL_HIVE_CLI\"",
 		"HIVE_TRUSTED_NODE_SHA", `"$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`, `sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_NODE"`,
 		"hive.visual-runner-outcome.v1", ".visual-hive/hive-runner-outcome.json", "visual-hive-raw-${{ github.run_id }}",
+		`runner_pipeline_exit="$RUNNER_TEMP/hive-visual-pipeline-exit-${GITHUB_RUN_ID}.txt"`,
+		"raw evidence contains a hard-linked file", `sudo find "$evidence_root" -xdev -type f -exec chmod 0444 -- {} +`,
+		"steps.seal_raw_evidence.outcome == 'success'",
 	} {
 		if !strings.Contains(executionText, required) {
 			t.Fatalf("isolated target execution is missing %q", required)
+		}
+	}
+	for name, generated := range map[string]string{"production": production, "pull-request": pullRequest} {
+		if !strings.Contains(generated, "id: seal_raw_evidence") {
+			t.Fatalf("%s workflow does not bind upload to the successful evidence-seal step", name)
 		}
 	}
 	for _, forbidden := range []string{"visual-hive-evidence-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "--authoritative-for-resolution"} {
 		if strings.Contains(executionText, forbidden) {
 			t.Fatalf("target execution can emit lifecycle-authority output %q", forbidden)
 		}
+	}
+	if strings.Contains(executionText, `> .visual-hive/pipeline-exit-code.txt`) {
+		t.Fatal("runner metadata is still written into the target-owned evidence directory before the authority handoff")
 	}
 	for _, required := range []string{
 		"actions/download-artifact@" + downloadArtifactActionSHA, "Rebuild exact immutable Visual Hive CLI on fresh runner",
@@ -709,14 +720,112 @@ func TestGeneratedIsolationShellsAreExecutable(t *testing.T) {
 	}
 }
 
+func TestSealIsolatedVisualEvidenceCrossPrincipal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("cross-principal evidence seal requires the hosted Linux privilege boundary")
+	}
+	bash, bashErr := exec.LookPath("bash")
+	sudo, sudoErr := exec.LookPath("sudo")
+	_, pythonErr := exec.LookPath("python")
+	if bashErr != nil || sudoErr != nil || pythonErr != nil {
+		t.Skip("bash, sudo, and python are required for the hosted evidence seal proof")
+	}
+	if output, err := exec.Command(sudo, "-n", "true").CombinedOutput(); err != nil {
+		t.Skipf("passwordless sudo is unavailable: %v: %s", err, output)
+	}
+	if uid, err := exec.Command("id", "-u").Output(); err != nil || strings.TrimSpace(string(uid)) == "0" {
+		t.Skip("the proof requires a non-root runner principal")
+	}
+	if output, err := exec.Command("id", "-u", "nobody").CombinedOutput(); err != nil {
+		t.Skipf("the distinct nobody account is unavailable: %v: %s", err, output)
+	}
+	groupOutput, err := exec.Command("id", "-gn", "nobody").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetGroup := strings.TrimSpace(string(groupOutput))
+
+	run := func(command *exec.Cmd) (string, error) {
+		output, runErr := command.CombinedOutput()
+		return string(output), runErr
+	}
+	for _, test := range []struct {
+		name        string
+		prepare     string
+		wantFailure string
+	}{
+		{name: "valid secure evidence"},
+		{name: "symbolic link", prepare: `ln -s payload.json "$HIVE_EVIDENCE_ROOT/link.json"`, wantFailure: "symbolic link"},
+		{name: "hard link", prepare: `ln "$HIVE_EVIDENCE_ROOT/payload.json" "$HIVE_EVIDENCE_ROOT/link.json"`, wantFailure: "hard-linked file"},
+		{name: "fifo", prepare: `mkfifo "$HIVE_EVIDENCE_ROOT/pipe"`, wantFailure: "non-regular file"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			if err := os.Chmod(workspace, 0o711); err != nil {
+				t.Fatal(err)
+			}
+			evidence := filepath.Join(workspace, ".visual-hive")
+			if err := os.Mkdir(evidence, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = run(exec.Command(sudo, "-n", "chown", "-R", fmt.Sprintf("%s:%s", strings.TrimSpace(mustCommandOutput(t, "id", "-u")), strings.TrimSpace(mustCommandOutput(t, "id", "-g"))), workspace))
+				_ = os.Chmod(workspace, 0o700)
+			})
+			if output, err := run(exec.Command(sudo, "-n", "chown", "-R", "nobody:"+targetGroup, evidence)); err != nil {
+				t.Fatalf("prepare target ownership: %v: %s", err, output)
+			}
+			prepare := `umask 077; printf '{"schemaVersion":"fixture"}\n' > "$HIVE_EVIDENCE_ROOT/payload.json"`
+			if test.prepare != "" {
+				prepare += "; " + test.prepare
+			}
+			prepareCommand := exec.Command(sudo, "-n", "-u", "nobody", "env", "HIVE_EVIDENCE_ROOT="+evidence, bash, "-euo", "pipefail", "-c", prepare)
+			if output, err := run(prepareCommand); err != nil {
+				t.Fatalf("prepare target evidence: %v: %s", err, output)
+			}
+			seal := exec.Command(bash, "-euo", "pipefail", "-c", sealIsolatedVisualEvidenceShell())
+			seal.Env = append(os.Environ(), "GITHUB_WORKSPACE="+workspace)
+			output, sealErr := run(seal)
+			if test.wantFailure != "" {
+				if sealErr == nil || !strings.Contains(output, test.wantFailure) {
+					t.Fatalf("unsafe evidence seal error = %v, output=%q; want %q", sealErr, output, test.wantFailure)
+				}
+				return
+			}
+			if sealErr != nil {
+				t.Fatalf("seal valid cross-principal evidence: %v: %s", sealErr, output)
+			}
+			payload := filepath.Join(evidence, "payload.json")
+			if _, err := os.ReadFile(payload); err != nil {
+				t.Fatalf("runner cannot read sealed evidence: %v", err)
+			}
+			if handle, err := os.OpenFile(payload, os.O_WRONLY, 0); err == nil {
+				_ = handle.Close()
+				t.Fatal("runner can write sealed target evidence")
+			}
+		})
+	}
+}
+
+func mustCommandOutput(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	output, err := exec.Command(name, args...).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
+}
+
 func TestRawTargetEvidenceIsBoundedBeforeArtifactUpload(t *testing.T) {
 	for name, value := range map[string]string{"production": workflow(isolationWorkflowConfig()), "pull-request": pullRequestWorkflow(isolationWorkflowConfig())} {
-		if !strings.Contains(value, "Raw target evidence contains a symbolic link") {
+		if !strings.Contains(value, "raw evidence contains a symbolic link") {
 			t.Fatalf("%s workflow does not reject target symlinks before upload", name)
 		}
 		for _, invariant := range []string{
-			`test "$(find .visual-hive -type f | wc -l)" -le 5000`,
-			`test "$(du -sb .visual-hive | cut -f 1)" -le 1073741824`,
+			`if files > 5000 or total > 1073741824:`,
+			`item.st_nlink != 1`,
+			`item.st_dev != device`,
+			`sudo find "$evidence_root" -xdev -type f -exec chmod 0444 -- {} +`,
 		} {
 			if !strings.Contains(value, invariant) {
 				t.Fatalf("%s workflow does not bound raw evidence before upload: %q", name, invariant)

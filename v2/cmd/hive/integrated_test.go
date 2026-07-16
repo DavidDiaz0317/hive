@@ -290,6 +290,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	os.Stdout = writer
 	code := runSetupCommand([]string{
 		"--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "advisory", "--plan", "--json",
+		"--runtime", "local",
 		"--state-dir", stateDir, "--github-api-url", server.URL,
 		"--visual-hive-command", os.Args[0], "--visual-hive-arg", entrypoint,
 	})

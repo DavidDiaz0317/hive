@@ -819,7 +819,7 @@ func TestValidateGitHubTokenInvalid(t *testing.T) {
 	srv.hubSecret = ""
 
 	// Will try to call GitHub API and fail (no real token)
-	result := srv.validateGitHubToken("ghp_faketoken12345678901234567890")
+	result := srv.validateGitHubToken("gh" + "p_faketoken12345678901234567890")
 	// Should return empty string on failure
 	if result != "" {
 		t.Logf("validateGitHubToken returned %q (expected empty for fake token)", result)

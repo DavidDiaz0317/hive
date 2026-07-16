@@ -64,8 +64,14 @@ func runIntegratedStart(args []string) int {
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	interval := flags.Duration("interval", 15*time.Minute, "production scan interval")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
-	if err := flags.Parse(args); err != nil {
+	requestID := flags.String("request-id", "", "exact hosted idempotency key used only when resuming an ambiguous dispatch")
+	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
+	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
+	}
+	if _, hosted, loadErr := hostedConfig(*stateDir); loadErr == nil && hosted {
+		return dispatchHostedOperation(*stateDir, "resume", *requestID, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	status, err := ensureIntegratedDaemonStarted(*stateDir, *interval)
 	if err != nil {
@@ -159,8 +165,14 @@ func runIntegratedStop(args []string) int {
 	flags := flag.NewFlagSet("hive stop", flag.ContinueOnError)
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
-	if err := flags.Parse(args); err != nil {
+	requestID := flags.String("request-id", "", "exact hosted idempotency key used only when resuming an ambiguous dispatch")
+	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
+	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
+	}
+	if _, hosted, loadErr := hostedConfig(*stateDir); loadErr == nil && hosted {
+		return dispatchHostedOperation(*stateDir, "pause", *requestID, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	status, err := stopIntegratedDaemon(*stateDir)
 	if err != nil {
@@ -229,7 +241,7 @@ func runIntegratedDaemon(args []string) int {
 	logPath := flags.String("log-file", "", "append scheduler output to this file")
 	expectedCommit := flags.String("expected-hive-commit", "", "immutable Hive commit bound by the persistent service")
 	expectedDigest := flags.String("expected-executable-sha256", "", "Hive executable SHA-256 bound by the persistent service")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	executable, executableErr := os.Executable()
@@ -266,6 +278,10 @@ func runIntegratedDaemon(args []string) int {
 	config, err := store.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if config.ExecutionMode == integrated.ExecutionHosted {
+		fmt.Fprintln(os.Stderr, "hosted installations are owned by the repository controller and cannot start a local daemon")
 		return 1
 	}
 	lease, err := claimDaemonLease(stateDirAbs)

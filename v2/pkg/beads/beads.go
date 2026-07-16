@@ -137,8 +137,11 @@ type BatchResult struct {
 }
 
 func NewStore(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating beads dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("protecting beads dir %s: %w", dir, err)
 	}
 
 	s := &Store{
@@ -494,7 +497,7 @@ func (s *Store) persist(_ *Bead) error {
 
 	path := filepath.Join(s.dir, beadsFileName)
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return fmt.Errorf("writing tmp beads: %w", err)
 	}
 	return os.Rename(tmpPath, path)
@@ -575,7 +578,7 @@ func (s *Store) Archive(id string) error {
 	}
 
 	archivePath := filepath.Join(s.dir, archiveFileName)
-	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening archive file: %w", err)
 	}

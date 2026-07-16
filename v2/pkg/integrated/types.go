@@ -8,15 +8,23 @@ import (
 )
 
 const (
-	PlanSchema                    = "hive.setup-plan.v1"
-	ConfigSchema                  = "hive.integrated-config.v2"
+	PlanSchema                    = "hive.setup-plan.v2"
+	ConfigSchema                  = "hive.integrated-config.v3"
+	previousConfigSchema          = "hive.integrated-config.v2"
 	legacyConfigSchema            = "hive.integrated-config.v1"
-	managedRepositoryConfigSchema = "hive.integrated-config.v1"
+	managedRepositoryConfigSchema = "hive.integrated-repository-config.v2"
 )
 
 func supportedDurableConfigSchema(schema string) bool {
-	return schema == ConfigSchema || schema == legacyConfigSchema
+	return schema == ConfigSchema || schema == previousConfigSchema || schema == legacyConfigSchema
 }
+
+type ExecutionMode string
+
+const (
+	ExecutionLocal  ExecutionMode = "local"
+	ExecutionHosted ExecutionMode = "hosted"
+)
 
 type Coverage string
 
@@ -55,27 +63,35 @@ type RepositoryInspection struct {
 }
 
 type SetupPlan struct {
-	SchemaVersion         string                `json:"schema_version"`
-	GeneratedAt           time.Time             `json:"generated_at"`
-	Repository            string                `json:"repository"`
-	StateDir              string                `json:"state_dir"`
-	Coverage              Coverage              `json:"coverage"`
-	Automation            Automation            `json:"automation"`
-	Provider              string                `json:"provider"`
-	ACMMLevel             int                   `json:"acmm_level"`
-	MaxActiveIssues       int                   `json:"max_active_issues"`
-	MaxRepairAttempts     int                   `json:"max_repair_attempts"`
-	AllowedAutoMergePaths []string              `json:"allowed_auto_merge_paths"`
-	AllowedAutoMergeRisk  []automation.RiskTier `json:"allowed_auto_merge_risk"`
-	VisualHive            bool                  `json:"visual_hive"`
-	VisualHiveRepository  string                `json:"visual_hive_repository"`
-	VisualHiveRef         string                `json:"visual_hive_ref"`
-	Inspection            RepositoryInspection  `json:"inspection"`
-	TestingLayers         []string              `json:"testing_layers"`
-	FilesToManage         []string              `json:"files_to_manage"`
-	RequiredActions       []string              `json:"required_actions"`
-	Warnings              []string              `json:"warnings"`
-	ReadOnly              bool                  `json:"read_only"`
+	SchemaVersion              string                `json:"schema_version"`
+	GeneratedAt                time.Time             `json:"generated_at"`
+	Repository                 string                `json:"repository"`
+	StateDir                   string                `json:"state_dir"`
+	ExecutionMode              ExecutionMode         `json:"execution_mode"`
+	RunIntervalSeconds         int64                 `json:"run_interval_seconds"`
+	HostedSchedule             string                `json:"hosted_schedule,omitempty"`
+	HostedStateBranch          string                `json:"hosted_state_branch,omitempty"`
+	HiveReleaseRepository      string                `json:"hive_release_repository,omitempty"`
+	HiveReleaseVersion         string                `json:"hive_release_version,omitempty"`
+	HiveCommit                 string                `json:"hive_commit,omitempty"`
+	DistributionManifestSHA256 string                `json:"distribution_manifest_sha256,omitempty"`
+	Coverage                   Coverage              `json:"coverage"`
+	Automation                 Automation            `json:"automation"`
+	Provider                   string                `json:"provider"`
+	ACMMLevel                  int                   `json:"acmm_level"`
+	MaxActiveIssues            int                   `json:"max_active_issues"`
+	MaxRepairAttempts          int                   `json:"max_repair_attempts"`
+	AllowedAutoMergePaths      []string              `json:"allowed_auto_merge_paths"`
+	AllowedAutoMergeRisk       []automation.RiskTier `json:"allowed_auto_merge_risk"`
+	VisualHive                 bool                  `json:"visual_hive"`
+	VisualHiveRepository       string                `json:"visual_hive_repository"`
+	VisualHiveRef              string                `json:"visual_hive_ref"`
+	Inspection                 RepositoryInspection  `json:"inspection"`
+	TestingLayers              []string              `json:"testing_layers"`
+	FilesToManage              []string              `json:"files_to_manage"`
+	RequiredActions            []string              `json:"required_actions"`
+	Warnings                   []string              `json:"warnings"`
+	ReadOnly                   bool                  `json:"read_only"`
 }
 
 // ManagedPathPreimage is the exact repository-owned state that preceded Hive
@@ -98,6 +114,15 @@ type Config struct {
 	Provider                          string                         `json:"provider"`
 	ProviderCommand                   string                         `json:"provider_command"`
 	ProviderArgs                      []string                       `json:"provider_args,omitempty"`
+	ExecutionMode                     ExecutionMode                  `json:"execution_mode"`
+	RunIntervalSeconds                int64                          `json:"run_interval_seconds"`
+	HostedSchedule                    string                         `json:"hosted_schedule,omitempty"`
+	HostedStateBranch                 string                         `json:"hosted_state_branch,omitempty"`
+	HiveReleaseRepository             string                         `json:"hive_release_repository,omitempty"`
+	HiveReleaseVersion                string                         `json:"hive_release_version,omitempty"`
+	HiveCommit                        string                         `json:"hive_commit,omitempty"`
+	DistributionManifestSHA256        string                         `json:"distribution_manifest_sha256,omitempty"`
+	PreviousHostedRelease             *HostedReleaseIdentity         `json:"previous_hosted_release,omitempty"`
 	ACMMLevel                         int                            `json:"acmm_level"`
 	MaxActiveIssues                   int                            `json:"max_active_issues"`
 	MaxRepairAttempts                 int                            `json:"max_repair_attempts"`
@@ -129,6 +154,16 @@ type Config struct {
 	InstalledAt                       time.Time                      `json:"installed_at"`
 	UpdatedAt                         time.Time                      `json:"updated_at"`
 	PreviousVersion                   string                         `json:"previous_version,omitempty"`
+}
+
+// HostedReleaseIdentity is the complete immutable distribution identity that
+// may authenticate exactly one hosted state transition. It is never a mutable
+// channel name and is cleared from signed runtime state after convergence.
+type HostedReleaseIdentity struct {
+	Version                    string `json:"version"`
+	HiveCommit                 string `json:"hive_commit"`
+	VisualHiveCommit           string `json:"visual_hive_commit"`
+	DistributionManifestSHA256 string `json:"distribution_manifest_sha256"`
 }
 
 // MarshalJSON keeps repository preimage bytes out of CLI/status/API output.
@@ -174,4 +209,11 @@ type SetupResult struct {
 	SchedulerStartRequested     bool      `json:"scheduler_start_requested,omitempty"`
 	SchedulerStartPending       bool      `json:"scheduler_start_pending,omitempty"`
 	SchedulerStartMessage       string    `json:"scheduler_start_message,omitempty"`
+	HostedStateReady            bool      `json:"hosted_state_ready,omitempty"`
+	HostedStateBranch           string    `json:"hosted_state_branch,omitempty"`
+	HostedStateCommit           string    `json:"hosted_state_commit,omitempty"`
+	HostedStateReused           bool      `json:"hosted_state_reused,omitempty"`
+	HostedProviderSecretReady   bool      `json:"hosted_provider_secret_ready,omitempty"`
+	HostedProviderSecretName    string    `json:"hosted_provider_secret_name,omitempty"`
+	HostedProviderSecretReused  bool      `json:"hosted_provider_secret_reused,omitempty"`
 }

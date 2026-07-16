@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kubestellar/hive/v2/pkg/automation"
+	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
@@ -99,6 +100,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		return Result{}, err
 	}
 	attempt, resumed := w.State.Get(finding.RepositoryFingerprint)
+	if err := w.State.sweepUnreferencedPortableRepairBundles(); err != nil {
+		return Result{}, fmt.Errorf("sweep unreferenced portable repair bundles: %w", err)
+	}
 	prCreatedThisRun := false
 	discardDirtyBranch := ""
 	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
@@ -211,6 +215,16 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted || attempt.Stage == StagePushed) {
 		if err := validateResumedSideEffectCheckpoint(finding, attempt); err != nil {
 			return Result{}, err
+		}
+	}
+	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted) && hasPortableRepairBundle(attempt) {
+		if err := w.restorePortableRepairCheckpoint(ctx, finding.Title, finding.IssueNumber, finding.RepositoryID, &attempt); err != nil {
+			return Result{}, fmt.Errorf("restore portable repair checkpoint: %w", err)
+		}
+	}
+	if resumed && !recurrenceChanged && (attempt.Stage == StagePushed || attempt.Stage == StagePROpen) && hasPortableRepairBundle(attempt) {
+		if err := w.State.retirePortableRepairBundle(&attempt); err != nil {
+			return Result{}, fmt.Errorf("retire pushed portable repair bundle: %w", err)
 		}
 	}
 	if resumed && !recurrenceChanged && attempt.Stage == StageValidated && attempt.LegacyUnsealedCheckpoint {
@@ -578,6 +592,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, checkpointResumableFailure(w.State, &attempt, FailurePatchEngine, StageModelComplete, err)
 		}
 		attempt.ChangedFiles, attempt.ModelPatch, attempt.Stage = files, "", StageValidated
+		if err := w.persistPortableRepairBundle(ctx, &attempt, StageValidated); err != nil {
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StageModelComplete, fmt.Errorf("persist validated portable repair objects: %w", err))
+		}
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
 		}
@@ -592,8 +609,14 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, err
 		}
 		attempt.CommitSHA, attempt.Stage = sha, StageCommitted
+		if err := w.persistPortableRepairBundle(ctx, &attempt, StageCommitted); err != nil {
+			return Result{}, fmt.Errorf("persist committed portable repair objects: %w", err)
+		}
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
+		}
+		if err := w.State.sweepUnreferencedPortableRepairBundles(); err != nil {
+			return Result{}, fmt.Errorf("retire superseded portable repair bundle: %w", err)
 		}
 		if err := w.releaseSealedTreeGuards(ctx, &attempt); err != nil {
 			return Result{}, err
@@ -622,6 +645,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		attempt.Stage = StagePushed
 		if err := w.State.Put(attempt); err != nil {
 			return Result{}, err
+		}
+		if err := w.State.retirePortableRepairBundle(&attempt); err != nil {
+			return Result{}, fmt.Errorf("retire pushed portable repair bundle: %w", err)
 		}
 	}
 
@@ -1369,6 +1395,11 @@ func repairCommitMessage(title string, issue int, repositoryID string) string {
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "push" {
+		if err := checkpoint.BeforeMutation(ctx, "repair Git push"); err != nil {
+			return "", err
+		}
+	}
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = dir
 	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")

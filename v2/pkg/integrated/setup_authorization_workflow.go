@@ -17,9 +17,9 @@ func setupAuthorizationWorkflowJob(config Config) string {
 		required = append(required, ".github/workflows/visual-hive-pr.yml", "docs/visual-hive.md", "visual-hive.config.yaml")
 		absent = append(absent, standaloneVisualHiveWriterWorkflowPaths()...)
 	}
-	allowed := managedSetupFiles(config.VisualHive)
+	allowed := managedSetupFilesForConfig(config)
 	uninstallRequired, uninstallAbsent := managedUninstallRequiredPaths(config)
-	uninstallAllowed := managedSetupFiles(config.VisualHive)
+	uninstallAllowed := managedSetupFilesForConfig(config)
 	requiredJSON, _ := json.Marshal(required)
 	absentJSON, _ := json.Marshal(absent)
 	allowedJSON, _ := json.Marshal(allowed)

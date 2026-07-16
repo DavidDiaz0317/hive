@@ -99,9 +99,14 @@ func installedSetupTestServerWithWorkflowAndRef(t *testing.T, config Config, pro
 	installed := installedRepositoryConfig{
 		SchemaVersion: managedRepositoryConfigSchema, Repository: config.Repository, RepositoryID: config.RepositoryID, DefaultBranch: config.DefaultBranch,
 		Coverage: config.Coverage, Automation: config.Automation, Provider: config.Provider, ACMMLevel: config.ACMMLevel,
+		ExecutionMode: config.ExecutionMode, RunIntervalSeconds: config.RunIntervalSeconds, HostedSchedule: config.HostedSchedule,
+		HostedStateBranch: config.HostedStateBranch, HiveReleaseRepository: config.HiveReleaseRepository,
+		HiveReleaseVersion: config.HiveReleaseVersion, HiveCommit: config.HiveCommit,
+		DistributionManifestSHA256: config.DistributionManifestSHA256, PreviousHostedRelease: cloneHostedReleaseIdentity(config.PreviousHostedRelease),
 		MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts, VisualHive: config.VisualHive,
-		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, TestCommands: config.TestCommands,
+		VisualHiveRepo: config.VisualHiveRepo, VisualHiveRef: config.VisualHiveRef, VisualHiveConfigDigest: config.VisualHiveConfigDigest, TestCommands: config.TestCommands,
 		AllowedRepairPaths: config.AllowedRepairPaths, AllowedAutoMergePaths: config.AllowedAutoMergePaths, AllowedAutoMergeRisk: config.AllowedAutoMergeRisk,
+		SetupAuthorizationActorID: config.SetupAuthorizationActorID, SetupAuthorizationPreviousActorID: config.SetupAuthorizationPreviousActorID,
 	}
 	data, err := json.Marshal(installed)
 	if err != nil {

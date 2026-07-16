@@ -12,12 +12,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/hostedbootstrap"
+	"github.com/kubestellar/hive/v2/pkg/hostedcontrol"
+	"github.com/kubestellar/hive/v2/pkg/hostedstate"
 	"github.com/kubestellar/hive/v2/pkg/integrated"
 	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
@@ -51,6 +55,8 @@ func runIntegratedCommand(command string, args []string) int {
 		return runIntegratedRetryLimit(args)
 	case "run":
 		return runIntegratedRun(args)
+	case "hosted-cycle":
+		return runHostedCycleCommand(args)
 	case "approve-merge":
 		return runIntegratedApproveMerge(args)
 	case "approve-baseline":
@@ -81,7 +87,7 @@ func runIntegratedAuthorizerTransfer(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if !*cancelTransfer && (strings.TrimSpace(*newAuthorizer) == "" || strings.TrimSpace(*reason) == "") {
@@ -144,6 +150,68 @@ func runIntegratedAuthorizerTransfer(args []string) int {
 	return 0
 }
 
+type hostedSetupBootstrapResult struct {
+	State          hostedbootstrap.Result
+	ProviderSecret *hostedbootstrap.ProviderSecretResult
+}
+
+func bootstrapHostedSetup(ctx context.Context, client *hivegithub.Client, stateDir string, result integrated.SetupResult) (hostedSetupBootstrapResult, error) {
+	if client == nil || client.GoGitHub() == nil || result.Config == nil {
+		return hostedSetupBootstrapResult{}, fmt.Errorf("hosted bootstrap requires the applied setup configuration and GitHub client")
+	}
+	config := *result.Config
+	owner, repository, ok := strings.Cut(config.Repository, "/")
+	if !ok || owner == "" || repository == "" {
+		return hostedSetupBootstrapResult{}, fmt.Errorf("hosted bootstrap repository identity is incomplete")
+	}
+	repositoryID, err := strconv.ParseInt(config.RepositoryID, 10, 64)
+	if err != nil || repositoryID <= 0 {
+		return hostedSetupBootstrapResult{}, fmt.Errorf("hosted bootstrap requires the numeric GitHub repository ID")
+	}
+	branch, _, err := client.GoGitHub().Repositories.GetBranch(ctx, owner, repository, config.DefaultBranch, 0)
+	if err != nil || branch == nil || branch.GetCommit() == nil || len(branch.GetCommit().GetSHA()) != 40 {
+		return hostedSetupBootstrapResult{}, fmt.Errorf("read exact default head for hosted bootstrap: %w", err)
+	}
+	paths, err := hostedcontrol.PortableInventory(stateDir)
+	if err != nil {
+		return hostedSetupBootstrapResult{}, fmt.Errorf("inventory initial portable hosted state: %w", err)
+	}
+	metadata := hostedstate.Metadata{
+		Repository:  hostedstate.RepositoryIdentity{FullName: config.Repository, ID: repositoryID},
+		StateBranch: config.HostedStateBranch, Sequence: 1, ExecutionOwner: "bootstrap",
+		Release: hostedstate.ReleaseIdentity{Version: config.HiveReleaseVersion, HiveCommit: config.HiveCommit, VisualHiveCommit: config.VisualHiveRef},
+		Controller: hostedstate.ControllerIdentity{
+			Event: "bootstrap", WorkflowPath: integrated.HostedControllerWorkflowPath,
+			WorkflowSHA: strings.ToLower(result.CommitSHA), DefaultHeadSHA: strings.ToLower(branch.GetCommit().GetSHA()),
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	var restoreRelease *hostedstate.ReleaseIdentity
+	if config.PreviousHostedRelease != nil {
+		restoreRelease = &hostedstate.ReleaseIdentity{Version: config.PreviousHostedRelease.Version, HiveCommit: config.PreviousHostedRelease.HiveCommit, VisualHiveCommit: config.PreviousHostedRelease.VisualHiveCommit}
+	}
+	stateResult, err := hostedbootstrap.Bootstrap(ctx, client.GoGitHub(), hostedbootstrap.Options{
+		Owner: owner, Repository: repository, StateBranch: config.HostedStateBranch,
+		StateRoot: stateDir, StatePaths: paths, Metadata: metadata, RestoreRelease: restoreRelease,
+	})
+	if err != nil {
+		return hostedSetupBootstrapResult{}, err
+	}
+	bootstrapResult := hostedSetupBootstrapResult{State: stateResult}
+	if hostedAutomationRequiresProviderSecret(config.Automation) {
+		providerSecret, secretErr := hostedbootstrap.EnsureProviderSecret(ctx, client.GoGitHub(), owner, repository, []byte(os.Getenv(hostedbootstrap.ProviderSecretName)))
+		if secretErr != nil {
+			return hostedSetupBootstrapResult{}, secretErr
+		}
+		bootstrapResult.ProviderSecret = &providerSecret
+	}
+	return bootstrapResult, nil
+}
+
+func hostedAutomationRequiresProviderSecret(automation integrated.Automation) bool {
+	return automation == integrated.AutomationRepairPR || automation == integrated.AutomationAutoMerge
+}
+
 func runIntegratedRecoverDispatch(args []string) int {
 	flags := flag.NewFlagSet("hive recover-dispatch", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
@@ -158,7 +226,7 @@ func runIntegratedRecoverDispatch(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	action := integrated.WorkflowDispatchRecoveryAction(strings.ToLower(strings.TrimSpace(*actionValue)))
@@ -222,7 +290,7 @@ func runIntegratedRetryRepair(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	class := repair.FailureClass(strings.ToLower(strings.TrimSpace(*failureClass)))
@@ -270,7 +338,7 @@ func runIntegratedApproveMerge(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if *prNumber <= 0 || strings.TrimSpace(*headSHA) == "" || (!*planOnly && (strings.TrimSpace(*baseSHA) == "" || strings.TrimSpace(*diffDigest) == "" || strings.TrimSpace(*reason) == "")) {
@@ -327,7 +395,7 @@ func runIntegratedApproveBaseline(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if !*planOnly && (strings.TrimSpace(*repositoryID) == "" || *runID <= 0 || *artifactID <= 0 || *prNumber <= 0 || strings.TrimSpace(*headSHA) == "" ||
@@ -378,7 +446,7 @@ func runIntegratedRevokeMergeApproval(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if strings.TrimSpace(*reason) == "" {
@@ -421,7 +489,7 @@ func runIntegratedManagement(command string, args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if command != "uninstall" && visualRef == "" && command != "rollback" {
@@ -550,8 +618,12 @@ func runIntegratedRun(args []string) int {
 	timeout := flags.Duration("timeout", 45*time.Minute, "maximum hosted run and lifecycle duration")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	requestID := flags.String("request-id", "", "exact hosted idempotency key used only when resuming an ambiguous dispatch")
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
+	}
+	if _, hosted, loadErr := hostedConfig(*stateDir); loadErr == nil && hosted {
+		return dispatchHostedOperation(*stateDir, "cycle", *requestID, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	token := resolveGitHubToken(*githubTokenEnv)
 	if token == "" {
@@ -594,6 +666,7 @@ func runSetupCommand(args []string) int {
 	automationValue := flags.String("automation", "", "advisory, issues, repair-pr, or auto-merge")
 	provider := flags.String("provider", "codex", "repair model provider")
 	providerCommand := flags.String("provider-command", os.Getenv("HIVE_CODEX_COMMAND"), "repair provider executable; auto-detected for Codex")
+	runtimeMode := flags.String("runtime", "hosted", "execution runtime: hosted or local (new installations default to hosted)")
 	visualHive := flags.Bool("visual-hive", true, "install Visual Hive deterministic testing")
 	visualCommand := flags.String("visual-hive-command", "", "Visual Hive CLI launcher; defaults to the packaged runtime")
 	visualHome := flags.String("visual-hive-home", os.Getenv("HIVE_VISUAL_HIVE_HOME"), "directory containing an immutable Visual Hive release bundle")
@@ -616,7 +689,7 @@ func runSetupCommand(args []string) int {
 	flags.Var(&visualArgs, "visual-hive-arg", "Visual Hive launcher argument before the CLI subcommand; repeatable")
 	flags.Var(&autoMergePaths, "auto-merge-path", "repository-relative glob eligible for autonomous merge; repeatable (default: test-only paths)")
 	flags.Var(&autoMergeRisks, "auto-merge-risk", "eligible risk tier: automatic, low, medium, or restricted; repeatable (default: automatic)")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	explicit := map[string]bool{}
@@ -639,12 +712,21 @@ func runSetupCommand(args []string) int {
 			fmt.Fprintln(os.Stderr, "setup failed:", err)
 			return 2
 		}
+		if !explicit["runtime"] {
+			*runtimeMode = string(prior.ExecutionMode)
+			if *runtimeMode == "" {
+				*runtimeMode = string(integrated.ExecutionLocal)
+			}
+		}
+		if !explicit["run-interval"] && prior.RunIntervalSeconds > 0 {
+			*runInterval = time.Duration(prior.RunIntervalSeconds) * time.Second
+		}
 	}
 	if cli := os.Getenv("VISUAL_HIVE_CLI"); cli != "" && !explicit["visual-hive-arg"] {
 		visualArgs = stringListFlag{cli}
 	}
 	if *repository == "" || *coverageValue == "" || *automationValue == "" {
-		if !isInteractiveTerminal() {
+		if *jsonOutput || !isInteractiveTerminal() {
 			fmt.Fprintln(os.Stderr, "--repo, --coverage, and --automation are required in noninteractive mode")
 			return 2
 		}
@@ -669,6 +751,26 @@ func runSetupCommand(args []string) int {
 	}
 	coverage := integrated.Coverage(strings.ToLower(strings.TrimSpace(*coverageValue)))
 	automationMode := integrated.Automation(strings.ToLower(strings.TrimSpace(*automationValue)))
+	executionMode := integrated.ExecutionMode(strings.ToLower(strings.TrimSpace(*runtimeMode)))
+	if executionMode != integrated.ExecutionHosted && executionMode != integrated.ExecutionLocal {
+		fmt.Fprintln(os.Stderr, "setup failed: --runtime must be hosted or local")
+		return 2
+	}
+	hostedSchedule := ""
+	releaseIdentity := installedReleaseIdentity{}
+	if executionMode == integrated.ExecutionHosted {
+		var scheduleErr error
+		hostedSchedule, scheduleErr = hostedCronForInterval(*runInterval)
+		if scheduleErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", scheduleErr)
+			return 2
+		}
+		releaseIdentity, scheduleErr = loadInstalledReleaseIdentity()
+		if scheduleErr != nil {
+			fmt.Fprintln(os.Stderr, "setup failed:", scheduleErr)
+			return 2
+		}
+	}
 	parsedAutoMergeRisks, riskErr := parseAutoMergeRiskFlags(autoMergeRisks)
 	if riskErr != nil {
 		fmt.Fprintln(os.Stderr, "setup failed:", riskErr)
@@ -694,7 +796,7 @@ func runSetupCommand(args []string) int {
 		}
 		*visualCommand, visualArgs, *visualRef = resolvedCommand, resolvedArgs, resolvedRef
 	}
-	if !*planOnly {
+	if !*planOnly && executionMode == integrated.ExecutionLocal {
 		providerCtx, providerCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		resolvedProviderCommand, providerErr := resolveIntegratedProvider(providerCtx, *provider, *providerCommand, providerArgs)
 		providerCancel()
@@ -703,11 +805,13 @@ func runSetupCommand(args []string) int {
 			return 2
 		}
 		*providerCommand = resolvedProviderCommand
+	} else if !*planOnly && strings.TrimSpace(*providerCommand) == "" {
+		*providerCommand = "codex"
 	}
 	wasRunning := false
 	hadPendingStart := false
 	restartInterval := *runInterval
-	if !*planOnly {
+	if !*planOnly && executionMode == integrated.ExecutionLocal {
 		if hasPrior {
 			store, storeErr := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
 			if storeErr != nil {
@@ -748,6 +852,9 @@ func runSetupCommand(args []string) int {
 	result, err := integrated.RunSetup(ctx, integrated.SetupOptions{
 		Repository: *repository, Coverage: coverage, Automation: automationMode, Provider: *provider,
 		ProviderCommand: *providerCommand, ProviderArgs: append([]string(nil), providerArgs...),
+		ExecutionMode: executionMode, RunInterval: *runInterval, HostedSchedule: hostedSchedule,
+		HiveReleaseRepository: releaseIdentity.Repository, HiveReleaseVersion: releaseIdentity.Version,
+		HiveCommit: releaseIdentity.HiveCommit, DistributionManifestSHA256: releaseIdentity.ManifestSHA256,
 		VisualHive: *visualHive, StateDir: *stateDir, Apply: !*planOnly, Start: shouldStart,
 		VisualHiveCommand: *visualCommand, VisualHiveArgs: append([]string(nil), visualArgs...),
 		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client,
@@ -766,13 +873,33 @@ func runSetupCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "setup failed:", err)
 		return 1
 	}
+	if executionMode == integrated.ExecutionHosted && result.Applied {
+		bootstrap, bootstrapErr := bootstrapHostedSetup(ctx, client, *stateDir, result)
+		if bootstrapErr != nil {
+			fmt.Fprintln(os.Stderr, "setup PR is ready, but hosted controller state bootstrap failed:", bootstrapErr)
+			return 1
+		}
+		result.HostedStateReady = true
+		result.HostedStateBranch = bootstrap.State.StateBranch
+		result.HostedStateCommit = bootstrap.State.StateCommitSHA
+		result.HostedStateReused = bootstrap.State.AlreadyConfigured
+		if bootstrap.ProviderSecret != nil {
+			result.HostedProviderSecretReady = true
+			result.HostedProviderSecretName = bootstrap.ProviderSecret.SecretName
+			result.HostedProviderSecretReused = bootstrap.ProviderSecret.AlreadyConfigured
+		}
+	}
 	if result.Applied && !explicit["state-dir"] && strings.TrimSpace(os.Getenv("HIVE_STATE_DIR")) == "" {
 		if pointerErr := integrated.RememberCurrentState(integratedStateRoot(), *stateDir); pointerErr != nil {
 			fmt.Fprintln(os.Stderr, "setup applied but selecting its repository state failed:", pointerErr)
 			return 1
 		}
 	}
-	if shouldStart && result.Applied {
+	if executionMode == integrated.ExecutionHosted && shouldStart && result.Applied {
+		result.SchedulerStartRequested = true
+		result.SchedulerStartPending = !result.Idempotent
+		result.SchedulerStartMessage = "The hosted controller will own cadence and lifecycle after the exact setup PR is merged; no local scheduler was created."
+	} else if shouldStart && result.Applied {
 		result.SchedulerStartRequested = true
 		if wasRunning && result.Idempotent {
 			if _, startErr := ensureIntegratedDaemonStarted(*stateDir, restartInterval); startErr != nil {
@@ -911,7 +1038,7 @@ func runIntegratedStatus(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	store, err := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
@@ -923,6 +1050,9 @@ func runIntegratedStatus(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Hive is not set up:", err)
 		return 1
+	}
+	if config.ExecutionMode == integrated.ExecutionHosted {
+		return runHostedStatusCommand(*stateDir, config, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1207,8 +1337,11 @@ func runIntegratedDoctor(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
+	}
+	if config, hosted, loadErr := hostedConfig(*stateDir); loadErr == nil && hosted {
+		return runHostedDoctorCommand(config, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	checks := collectIntegratedDoctorChecks(*stateDir, *githubTokenEnv, *githubAPIURL, true)
 	ready := doctorChecksReady(checks)
@@ -1605,8 +1738,14 @@ func runIntegratedPause(command string, args []string) int {
 	flags := flag.NewFlagSet("hive "+command, flag.ContinueOnError)
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
-	if err := flags.Parse(args); err != nil {
+	requestID := flags.String("request-id", "", "exact hosted idempotency key used only when resuming an ambiguous dispatch")
+	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
+	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
+	}
+	if _, hosted, loadErr := hostedConfig(*stateDir); loadErr == nil && hosted {
+		return dispatchHostedOperation(*stateDir, command, *requestID, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	priorDaemon := readIntegratedDaemonStatus(*stateDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Minute)
@@ -1645,7 +1784,7 @@ func runIntegratedSetting(command string, args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil || *value == "" {
+	if err := parseExactFlags(flags, args); err != nil || *value == "" {
 		fmt.Fprintln(os.Stderr, "--value is required")
 		return 2
 	}
@@ -1675,7 +1814,7 @@ func runIntegratedIssueLimit(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if *value < 1 || *value > 100 {
@@ -1693,7 +1832,7 @@ func runIntegratedRetryLimit(args []string) int {
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
 	githubAPIURL := flags.String("github-api-url", "", "optional GitHub Enterprise API URL")
-	if err := flags.Parse(args); err != nil {
+	if err := parseExactFlags(flags, args); err != nil {
 		return 2
 	}
 	if *value < 1 || *value > 10 {

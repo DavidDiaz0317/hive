@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 )
 
 type Client struct {
@@ -131,7 +133,8 @@ const slaThresholdMinutes = 30
 // from the default (https://api.github.com), the client's BaseURL and
 // UploadURL are overridden for GitHub Enterprise compatibility.
 func NewClient(token string, org string, repos []string, logger *slog.Logger, apiURL string) *Client {
-	client := gh.NewClient(nil).WithAuthToken(token)
+	httpClient := &http.Client{Transport: checkpoint.Transport{Base: http.DefaultTransport}}
+	client := gh.NewClient(httpClient).WithAuthToken(token)
 	setBaseURL(client, apiURL)
 	return &Client{
 		client: client,

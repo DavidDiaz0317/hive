@@ -61,15 +61,20 @@ func main() {
 		os.Exit(repair.RunContainmentProbeChild())
 	}
 	if len(os.Args) > 1 && os.Args[1] == "visual" {
-		os.Exit(runVisualCommand(os.Args[2:]))
+		os.Exit(runCLICommandWithJSONContract("visual", os.Args[2:], func() int {
+			return runVisualCommand(os.Args[2:])
+		}))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "mcp-server" {
 		os.Exit(runMCPServer())
 	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
-			os.Exit(runIntegratedCommand(os.Args[1], os.Args[2:]))
+		case "setup", "status", "doctor", "start", "stop", "daemon", "installer-transition", "pause", "resume", "run", "hosted-cycle", "approve-merge", "approve-baseline", "revoke-merge-approval", "retry-repair", "recover-dispatch", "transfer-setup-authorizer", "set-coverage", "set-automation", "set-issue-limit", "set-retry-limit", "upgrade", "rollback", "uninstall":
+			command, args := os.Args[1], os.Args[2:]
+			os.Exit(runCLICommandWithJSONContract(command, args, func() int {
+				return runIntegratedCommand(command, args)
+			}))
 		}
 	}
 	startTime := time.Now()
