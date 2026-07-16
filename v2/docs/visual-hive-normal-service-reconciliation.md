@@ -1,9 +1,9 @@
 # Visual Hive normal-service reconciliation
 
-Status: fork-local working vertical through one Worker-owned pull request,
-2026-07-16. Production activation is deliberately held at the exact-head
-verdict boundary until the producer isolation and verifier requirements below
-are implemented and reviewed.
+Status: fork-local composed vertical through one Worker-owned pull request and
+one sealed exact-head verdict receipt, 2026-07-16. No live GitHub demo has been
+claimed. Production activation remains held pending the privileged Linux
+isolation proof, bounded local gates, review, and a disposable-repository demo.
 
 The normative product contract is
 `docs/visual-hive-integration-contract.md`. This document records the actual
@@ -40,7 +40,7 @@ existing production workflow intent and verified bundle transport
     -> isolated one-shot Codex proposal child
     -> existing repair.Worker
     -> one branch/commit/pull request, never merge
-    -> exact-head Visual Hive verifier [P0 HELD]
+    -> exact-head Visual Hive verifier with check-evidence-only capability
     -> receipt-only controller completion, never resolution
 ```
 
@@ -98,6 +98,14 @@ capabilities.
   request.
 - The Worker policy is forced to `repair-pr` even when the installed repository
   is configured for `auto-merge`. This vertical cannot merge.
+- The normal service now installs one narrow verdict adapter over the existing
+  GitHub client and lifecycle store. It creates no poller, Manager, role,
+  queue, dashboard, wiki, graph, or repository writer.
+- The adapter independently supplies only the installed repository/ID,
+  selected PR, exact base/head refs and SHAs, fixed workflow identity, GitHub
+  Actions App ID, producer pin, protected destination, and current effective
+  ACMM. Artifact-internal identities are derived by the verifier, not accepted
+  from the service.
 
 ## Revalidation boundaries
 
@@ -141,11 +149,12 @@ Ordering is:
 1. bind exact workflow and packet;
 2. import once and persist the controller-owned source ref;
 3. prepare/reserve one `swo-*` and let Worker create/recover one PR;
-4. persist the exact-head verdict receipt;
-5. atomically close the routed bead with the exact completion receipt;
-6. persist `consume_started`;
-7. consume the exact workflow intent;
-8. persist `consumed` and clear on the next cadence.
+4. verify the exact PR and atomically apply its sealed check evidence;
+5. persist the exact-head verdict identity bytes and digest;
+6. atomically close the routed bead with the exact completion receipt;
+7. persist `consume_started`;
+8. consume the exact workflow intent;
+9. persist `consumed` and clear on the next cadence.
 
 After the source ref is persisted, restart reopens and revalidates the
 controller-owned dispatch. It does not refetch or reimport the artifact.
@@ -154,35 +163,49 @@ the same durable order/proposal/PR; it cannot create a second model side effect.
 Controller completion is exact-byte idempotent, including the crash window
 after bead close but before the service saved `completion_recorded`.
 
-## Exact-head verdict: deliberate P0 hold
+## Exact-head verdict: composed, activation still held
 
-The production `PullRequestVerdictVerifier` is intentionally `nil`. The one
-Worker PR remains open and the source workflow intent remains unconsumed until
-all of the following are true:
+The production normal-service option is no longer `nil`. Its adapter uses the
+reviewed `FetchAndVerifyVisualHivePullRequestBundle` primitive and can apply
+only the opaque `verified.ApplyCheckEvidence(store, fingerprint)` capability.
+The verifier and adapter now enforce all of the following:
 
-1. The PR evidence producer runs under a distinct evidence UID and writes to a
-   protected evidence root that the untrusted target service cannot modify.
-   The current shared `hive-target` UID allows forged evidence before root
-   sealing and is not acceptable.
-2. The producer emits an authenticated/cryptographically bound root receipt,
-   and a hostile target-service overwrite test proves pre-seal and post-seal
-   forgery fails.
-3. The Hive verifier accepts only independently knowable repository, PR,
-   exact head/base, workflow, artifact-name, and pinned producer facts. It
-   discovers the exact run attempt and artifact IDs through authenticated
-   GitHub metadata.
-4. Internal workflow/plan/report/config/changed/contracts/scopes/runtime/
-   execution/baseline digests are derived inside the verifier as untrusted
-   artifact claims and cross-bound to the index, exact head Git blobs, and root
-   receipt. A caller must never fabricate or pre-parse these pins.
-5. The adapter uses the reviewed
-   `FetchAndVerifyVisualHivePullRequestBundle` primitive and applies evidence
-   with `verified.ApplyCheckEvidence(store, fingerprint)`. It must not call the
-   generic `MarkChecksWithEvidence`, add a second poller, merge, update a
-   baseline, or mark a finding resolved.
+1. The PR evidence producer is pinned to
+   `3c900c4a57552a3e51b1ce0a90a2a874513ffdab`. The target and evidence services
+   use distinct UIDs; the evidence root is root-owned mode `0700`; and the
+   authenticated root binding uses a root-only random key.
+2. Both service identities are killed and quiesced before verification. The
+   verifier rejects unexpected ownership, modes, links, devices, file types,
+   counts, byte totals, paths, digests, source binding, and authentication.
+3. Hive supplies only independently knowable repository, PR, exact head/base,
+   workflow, GitHub Actions App, and pinned producer facts. The verifier
+   discovers the unique successful run attempt, jobs, checks, and artifact IDs
+   through authenticated GitHub metadata.
+4. Workflow/plan/report/config/changed/contracts/scopes/runtime/execution/
+   baseline identities are derived inside the verifier and cross-bound to the
+   complete content-addressed index, exact Git blobs, source binding, and
+   authenticated root receipt.
+5. The service persists the selected finding fingerprint and exact base SHA in
+   ledger schema v4. It revalidates current policy and the exact Worker PR,
+   applies sealed evidence, stores the canonical identity bytes, and passes the
+   same receipt digest to controller completion.
+6. Controller completion rejects caller-asserted verdicts while the lifecycle
+   is merely PR-open. It requires the sealed evidence application to have
+   moved the exact finding to `ready`, and cross-binds repository IDs, base,
+   head, workflow, producer, conclusion, and check-evidence-only authority.
 
-Both red and green deterministic receipts are recorded as observations. A
-green receipt does not itself grant merge or lifecycle-resolution authority.
+The current verifier intentionally accepts only a unique successful workflow
+run carrying a deterministic `ready` bundle. A failing/red run therefore
+leaves the Worker PR open and the source intent unconsumed; it cannot be
+mistaken for permission to complete, merge, resolve, or update a baseline.
+Capturing red telemetry without granting completion authority is later work,
+not a prerequisite for the first working repair proof.
+
+The remaining P0 proof is operational rather than a missing adapter: run the
+privileged hostile-producer isolation test on `ubuntu-latest`, complete bounded
+local gates, review this composition, and execute it against a disposable fork
+with merging disabled. Windows unit and fake-integration tests cannot prove
+Linux UID/mount isolation by themselves.
 
 ## Fake/no-GitHub proof currently passing
 
@@ -194,7 +217,12 @@ green receipt does not itself grant merge or lifecycle-resolution authority.
   PR, or verdict;
 - ambiguous workflow-intent consumption produces one deletion side effect,
   including the no-dispatch path without starting another workflow;
-- missing exact-head verifier leaves the one PR open and unconsumed;
+- a missing verifier still fails closed in the generic service fixture, while
+  the production normal-service composition installs the exact verifier;
+- drift in repository, fingerprint, PR, base/head, workflow, App, producer,
+  authority, conclusion, or receipt digest is rejected before lifecycle apply;
+- the exact opaque receipt moves the finding to `ready`; controller completion
+  before that application is rejected and exact replay after it is idempotent;
 - identical controller completion replay succeeds and an altered receipt fails;
 - malformed workflow/order/PR/verdict/consume ledger transitions fail before
   any source, intake, Worker, or verifier call;
@@ -238,27 +266,37 @@ Focused commands passing at this checkpoint:
 
 ```text
 go test ./pkg/visualhive/normalservice -count=1
-go test ./pkg/visualhive/controller
+go test ./pkg/visualhive/controller -run '^TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending$' -count=1
+go test ./cmd/hive -run '^TestNormalVisualPullRequestVerifier' -count=1
+go test ./pkg/github -run 'VisualHivePullRequest|PullRequestBundle' -count=1
+go test ./pkg/visualhive -run 'PullRequest|BuildImportPlan' -count=1
+go test ./pkg/internal/visualhivepr -count=1
+go test ./pkg/integrated -run 'WorkflowIsolation|VisualHive' -count=1
 go test ./pkg/repair -run '^TestGovernedSourceComposerBindsSchedulerToWorkerSealedTree$' -count=1
 go test ./pkg/repair -run '^(TestSpecialistProviderProposalIsBrokeredAndCompletedReplayDoesNotRedispatch|TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompose)$' -count=1
 go test -run '^$' ./cmd/hive ./pkg/repair ./pkg/visualhive/controller ./pkg/visualhive/normalservice ./pkg/integrated
 ```
 
-A broader source-context selection run exceeded its 180-second Windows timeout
-without producing a test failure. It is not claimed as a passing full repair
-suite.
+A combined full run of the touched packages passed `cmd/hive`, `pkg/github`,
+`pkg/visualhive`, `pkg/visualhive/controller`,
+`pkg/visualhive/normalservice`, and `pkg/internal/visualhivepr`. The unrelated
+`pkg/integrated` uninstall fixture blocked in a Git subprocess and hit the
+240-second package timeout; the focused Visual Hive/integration selection above
+passed. A full integrated-package pass is therefore not claimed.
 
 ## Remaining path to a working demo
 
-1. Cherry-pick the independently reviewed Hive verifier commit only after both
-   P0 producer isolation and callable-verifier requirements pass.
-2. Add the narrow production verdict adapter and adversarial exact-head tests.
-3. Run all bounded local Hive gates and a fake end-to-end normal-service test.
-4. Use a disposable fork/private real-code repository with `repair-pr`, a
+1. Run the privileged Linux hostile-producer isolation proof from the pinned
+   producer/verifier composition and retain its exact logs.
+2. Run all remaining bounded local Hive gates and the fake end-to-end
+   normal-service proof; investigate the unrelated Windows uninstall-fixture
+   timeout separately rather than weakening the Visual Hive boundary.
+3. Review the composed commits and use a disposable fork/private real-code
+   repository with `repair-pr`, a
    dedicated state root/dashboard port, reviewed healthy baseline, and no
    merge. Record exact SHAs, run/artifact IDs, admission, `swo-*`, Worker PR,
    verdict receipt, replay counts, and unrelated normal cadence.
-5. Only after that succeeds, repeat against a KubeStellar Console fork with a
+4. Only after that succeeds, repeat against a KubeStellar Console fork with a
    dedicated namespaced Hive built from this Hive fork. Preserve Console's
    Auto-QA, test generation, visual regression, trust workflows, existing
    checks, and production Hive. Leave every demo PR unmerged.
@@ -282,6 +320,10 @@ not on this critical path.
 | `1d15ab47` | crash-safe no-dispatch workflow consumption |
 | `630d5fad` | exact verdict-byte persistence and ledger state validation |
 | `55e704ff` | lossless Scheduler projection and exact receipt cross-binding |
+| `05e7c51a` | bounded normal service to one dispatch/Worker PR |
+| `7bf4bc84` | controller-owned deterministic deferral of every unselected finding |
+| `7c5e9249` | exact PR evidence verifier and sealed check-evidence capability |
+| `dd3cff1e` | production adapter, ledger v4 exact identity, and sealed-only completion |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.
