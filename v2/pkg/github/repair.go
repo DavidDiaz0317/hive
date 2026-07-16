@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	gh "github.com/google/go-github/v72/github"
 )
@@ -39,19 +40,45 @@ type managedRepositoryIdentity struct {
 	FullName string
 }
 
+type managedPullPriorHead struct {
+	Number  int
+	HeadSHA string
+}
+
+const (
+	managedPullHeadRefreshAttempts = 21
+	managedPullHeadRefreshDelay    = 250 * time.Millisecond
+)
+
 // UpsertRepairPullRequest creates or updates exactly one open repair PR for a
 // Hive-owned branch. The marker makes a retry after an ambiguous API response
 // idempotent without relying on the local lifecycle transaction having
 // completed.
 func (c *Client) UpsertRepairPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
-	return c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false)
+	return c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false, nil)
+}
+
+// UpsertSetupPullRequest updates a setup PR after Hive has moved its managed
+// branch. GitHub can briefly report the state-bound prior head after the branch
+// ref already exposes the expected head, so this path permits only that exact
+// prior PR/head pair to converge during a bounded refresh window.
+func (c *Client) UpsertSetupPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string, priorNumber int, priorHeadSHA string) (RepairPullRequest, error) {
+	priorHeadSHA = strings.ToLower(strings.TrimSpace(priorHeadSHA))
+	if (priorNumber == 0) != (priorHeadSHA == "") || priorNumber < 0 || (priorHeadSHA != "" && !exactManagedSHA(priorHeadSHA)) {
+		return RepairPullRequest{}, fmt.Errorf("prior setup PR number and exact head SHA must either both be present or both be absent")
+	}
+	var prior *managedPullPriorHead
+	if priorNumber > 0 {
+		prior = &managedPullPriorHead{Number: priorNumber, HeadSHA: priorHeadSHA}
+	}
+	return c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false, prior)
 }
 
 // UpsertReviewPullRequest creates a draft, hold-labeled PR for an operation
 // that requires explicit human authority, such as adding visual baselines.
 // Hive never promotes the draft or merges it automatically.
 func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
-	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, true)
+	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, true, nil)
 	if err != nil {
 		return RepairPullRequest{}, err
 	}
@@ -85,7 +112,7 @@ func (c *Client) UpsertReviewPullRequest(ctx context.Context, repository, branch
 // PR. This allows exact-head checks to run while Hive remains the sole process
 // that may remove the hold after its durable human approval binding.
 func (c *Client) UpsertHeldPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (RepairPullRequest, error) {
-	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false)
+	pull, err := c.upsertHivePullRequest(ctx, repository, branch, expectedHeadSHA, base, title, body, marker, false, nil)
 	if err != nil {
 		return RepairPullRequest{}, err
 	}
@@ -157,7 +184,7 @@ func (c *Client) ReleaseHeldSetupBaselinePullRequestExact(ctx context.Context, r
 	return nil
 }
 
-func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string, draft bool) (RepairPullRequest, error) {
+func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string, draft bool, prior *managedPullPriorHead) (RepairPullRequest, error) {
 	owner, repo, err := splitFullRepository(repository)
 	if err != nil {
 		return RepairPullRequest{}, err
@@ -204,7 +231,16 @@ func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, 
 				return RepairPullRequest{}, fmt.Errorf("re-read inexact managed pull request #%d: %w", candidate.GetNumber(), readErr)
 			}
 			if liveErr := validateManagedPullRequest(live, identity, repository, live.GetNumber(), branch, expectedHeadSHA, base, marker, "", ""); liveErr != nil {
-				return RepairPullRequest{}, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not the exact managed PR: %w", pull.GetNumber(), marker, liveErr)
+				if prior == nil || live.GetNumber() != prior.Number || !strings.EqualFold(live.GetHead().GetSHA(), prior.HeadSHA) {
+					return RepairPullRequest{}, fmt.Errorf("open pull request #%d preclaims Hive marker %q but is not the exact managed PR: %w", pull.GetNumber(), marker, liveErr)
+				}
+				if priorErr := validateManagedPullRequest(live, identity, repository, live.GetNumber(), branch, prior.HeadSHA, base, marker, "", ""); priorErr != nil {
+					return RepairPullRequest{}, fmt.Errorf("open pull request #%d does not match Hive's exact prior setup binding: %w", pull.GetNumber(), priorErr)
+				}
+				live, liveErr = c.waitForManagedPullHeadRefresh(ctx, owner, repo, identity, repository, branch, expectedHeadSHA, base, marker, prior, live)
+				if liveErr != nil {
+					return RepairPullRequest{}, fmt.Errorf("wait for setup pull request #%d to expose its managed branch head: %w", pull.GetNumber(), liveErr)
+				}
 			}
 			candidate = live
 		}
@@ -260,6 +296,39 @@ func (c *Client) upsertHivePullRequest(ctx context.Context, repository, branch, 
 		return RepairPullRequest{}, err
 	}
 	return repairPullRequestResult(live, true), nil
+}
+
+func (c *Client) waitForManagedPullHeadRefresh(ctx context.Context, owner, repo string, identity managedRepositoryIdentity, repository, branch, expectedHeadSHA, base, marker string, prior *managedPullPriorHead, current *gh.PullRequest) (*gh.PullRequest, error) {
+	for attempt := 0; attempt < managedPullHeadRefreshAttempts; attempt++ {
+		if strings.EqualFold(current.GetHead().GetSHA(), expectedHeadSHA) {
+			if err := validateManagedPullRequest(current, identity, repository, prior.Number, branch, expectedHeadSHA, base, marker, "", ""); err != nil {
+				return nil, err
+			}
+			return current, nil
+		}
+		if current.GetNumber() != prior.Number || !strings.EqualFold(current.GetHead().GetSHA(), prior.HeadSHA) {
+			return nil, fmt.Errorf("head changed to unbound SHA %q while waiting for %q", current.GetHead().GetSHA(), expectedHeadSHA)
+		}
+		if err := validateManagedPullRequest(current, identity, repository, prior.Number, branch, prior.HeadSHA, base, marker, "", ""); err != nil {
+			return nil, err
+		}
+		if attempt == managedPullHeadRefreshAttempts-1 {
+			break
+		}
+		timer := time.NewTimer(managedPullHeadRefreshDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		live, _, err := c.client.PullRequests.Get(ctx, owner, repo, prior.Number)
+		if err != nil {
+			return nil, fmt.Errorf("refresh pull request: %w", err)
+		}
+		current = live
+	}
+	return nil, fmt.Errorf("head remained at prior SHA %q after %s", prior.HeadSHA, time.Duration(managedPullHeadRefreshAttempts-1)*managedPullHeadRefreshDelay)
 }
 
 // ListOpenRepairPullRequests returns every open PR carrying one exact Hive

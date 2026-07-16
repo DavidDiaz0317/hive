@@ -112,6 +112,81 @@ func TestUpsertRepairPullRequestRefreshesStaleListHeadAfterManagedPush(t *testin
 	}
 }
 
+func TestUpsertSetupPullRequestWaitsForExactStateBoundPriorHead(t *testing.T) {
+	marker := "<!-- hive-setup: owner/repo -->"
+	priorHead := strings.Repeat("9", 40)
+	expectedHead := strings.Repeat("a", 40)
+	title, body := "Previous setup", marker+"\nprevious"
+	getCalls, editCalls, createCalls := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			writeManagedRepository(writer)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/setup-proof":
+			writeManagedRef(writer, "hive/setup-proof", expectedHead)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
+			writeManagedPullList(writer, managedPull(7, title, body, "hive/setup-proof", priorHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
+			getCalls++
+			head := expectedHead
+			if getCalls <= 2 {
+				head = priorHead
+			}
+			writeManagedPull(writer, managedPull(7, title, body, "hive/setup-proof", head, "main", 123, "owner/repo"))
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/pulls/7":
+			editCalls++
+			var input struct {
+				Title string `json:"title"`
+				Body  string `json:"body"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&input)
+			title, body = input.Title, input.Body
+			writeManagedPull(writer, managedPull(7, title, body, "hive/setup-proof", expectedHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/pulls":
+			createCalls++
+			http.Error(writer, "must not create a duplicate", http.StatusInternalServerError)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	pull, err := client.UpsertSetupPullRequest(context.Background(), "owner/repo", "hive/setup-proof", expectedHead, "main", "Current setup", marker+"\ncurrent", marker, 7, priorHead)
+	if err != nil || pull.Created || pull.Number != 7 || pull.HeadSHA != expectedHead || getCalls != 5 || editCalls != 1 || createCalls != 0 {
+		t.Fatalf("state-bound setup head did not converge safely: pull=%+v gets=%d edits=%d creates=%d err=%v", pull, getCalls, editCalls, createCalls, err)
+	}
+}
+
+func TestUpsertSetupPullRequestRejectsUnboundPriorHead(t *testing.T) {
+	marker := "<!-- hive-setup: owner/repo -->"
+	liveHead := strings.Repeat("9", 40)
+	expectedHead := strings.Repeat("a", 40)
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			writeManagedRepository(writer)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/git/ref/heads/hive/setup-proof":
+			writeManagedRef(writer, "hive/setup-proof", expectedHead)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls":
+			writeManagedPullList(writer, managedPull(7, "Previous setup", marker, "hive/setup-proof", liveHead, "main", 123, "owner/repo"))
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/pulls/7":
+			writeManagedPull(writer, managedPull(7, "Previous setup", marker, "hive/setup-proof", liveHead, "main", 123, "owner/repo"))
+		default:
+			mutations++
+			http.Error(writer, "must not mutate", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	_, err := client.UpsertSetupPullRequest(context.Background(), "owner/repo", "hive/setup-proof", expectedHead, "main", "Current setup", marker, marker, 7, strings.Repeat("8", 40))
+	if err == nil || !strings.Contains(err.Error(), "preclaims") || mutations != 0 {
+		t.Fatalf("unbound prior setup head was not rejected: mutations=%d err=%v", mutations, err)
+	}
+}
+
 func TestUpsertReviewPullRequestIsDraftAndHoldLabeled(t *testing.T) {
 	head := strings.Repeat("b", 40)
 	marker := "<!-- hive-baseline-review: proof -->"

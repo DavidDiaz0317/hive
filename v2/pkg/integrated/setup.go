@@ -435,7 +435,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	marker := "<!-- hive-setup: " + strings.ToLower(options.Repository) + " -->"
 	body := setupPRBody(marker, plan)
-	pull, err := options.GitHub.UpsertRepairPullRequest(ctx, options.Repository, branch, sha, defaultBranch, "Install Hive + Visual Hive production automation", body, marker)
+	priorSetupPRNumber, priorSetupHeadSHA := 0, ""
+	if hasPrior {
+		priorSetupPRNumber, priorSetupHeadSHA = prior.SetupPRNumber, prior.SetupHeadSHA
+	}
+	pull, err := options.GitHub.UpsertSetupPullRequest(ctx, options.Repository, branch, sha, defaultBranch, "Install Hive + Visual Hive production automation", body, marker, priorSetupPRNumber, priorSetupHeadSHA)
 	if err != nil {
 		return result, err
 	}
