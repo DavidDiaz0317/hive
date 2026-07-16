@@ -118,6 +118,9 @@ func (composer *GovernedSourceContextComposer) ComposeGovernedSourceContext(requ
 	if err != nil {
 		return scheduler.WorkerSealedSourceContext{}, err
 	}
+	if document.SourceTreeOID != composer.baseTreeSHA {
+		return scheduler.WorkerSealedSourceContext{}, errors.New("Worker source context inventory differs from the admitted exact tree")
+	}
 	files := make([]scheduler.WorkerSourceBlobIdentity, 0, len(document.Files))
 	for _, file := range document.Files {
 		files = append(files, scheduler.WorkerSourceBlobIdentity{
@@ -148,7 +151,7 @@ func decodeGovernedRepairSourceContext(content string) (repairSourceContextDocum
 	if err := json.Unmarshal([]byte(encoded), &document); err != nil {
 		return repairSourceContextDocument{}, fmt.Errorf("decode Worker source context inventory: %w", err)
 	}
-	if document.SourceTreeOID == "" || !strings.EqualFold(document.SourceTreeOID, strings.TrimSpace(document.SourceTreeOID)) || document.IncludedFiles != len(document.Files) {
+	if !validGitObjectOID(document.SourceTreeOID) || document.SourceTreeOID != strings.ToLower(strings.TrimSpace(document.SourceTreeOID)) || document.IncludedFiles != len(document.Files) {
 		return repairSourceContextDocument{}, errors.New("Worker source context inventory is internally inconsistent")
 	}
 	return document, nil

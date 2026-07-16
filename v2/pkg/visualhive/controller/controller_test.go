@@ -324,6 +324,38 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 			}
 		})
 	}
+	if err := persistVisualDispatchEnvelope(quality, visualBead.ID, reserved); err != nil {
+		t.Fatal(err)
+	}
+	branch := "hive/repair-controller-a1"
+	commitSHA := strings.Repeat("9", 40)
+	prURL := "https://example.invalid/pull/37"
+	if err := lifecycle.MarkRepairStarted(repositoryFingerprint, branch); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.MarkPROpen(repositoryFingerprint, commitSHA, 37, prURL); err != nil {
+		t.Fatal(err)
+	}
+	completion := SpecialistPullRequestCompletion{
+		WorkOrderID: workOrderID, RequestSHA256: requestDigest, Branch: branch, CommitSHA: commitSHA,
+		PullRequestNumber: 37, PullRequestURL: prURL, VerdictHeadSHA: commitSHA,
+		VerdictReceiptSHA256: strings.Repeat("4", 64), VerdictStatus: "fail",
+	}
+	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
+		t.Fatalf("complete specialist PR: %v", err)
+	}
+	completedBead := quality.FindByExternalRef(visualRef)
+	if completedBead.Status != beads.StatusClosed || visualBeadAdmissionState(completedBead) != "admitted_pr_verdict_recorded" || completedBead.Meta("visual_hive_pr_completion_json") == "" {
+		t.Fatalf("completed specialist bead = %+v", completedBead)
+	}
+	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
+		t.Fatalf("ambiguous completion replay was not idempotent: %v", err)
+	}
+	different := completion
+	different.VerdictStatus = "pass"
+	if err := controller.CompleteSpecialistPullRequest(visualRef, different); err == nil {
+		t.Fatal("completed specialist PR accepted a different replay receipt")
+	}
 }
 
 func TestVisualWorkControllerIssueOnlyPersistsStageWithoutDispatch(t *testing.T) {

@@ -268,6 +268,30 @@ type SpecialistPullRequestCompletion struct {
 func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef string, completion SpecialistPullRequestCompletion) error {
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
+	completion = normalizeSpecialistPullRequestCompletion(completion)
+	_, existingBead, err := controller.findVisualBeadLocked(sourceExternalRef)
+	if err != nil {
+		return err
+	}
+	if visualBeadAdmissionState(existingBead) == "admitted_pr_verdict_recorded" {
+		if existingBead.Status != beads.StatusClosed {
+			return errors.New("durable specialist PR completion is not terminal")
+		}
+		encoded, _ := existingBead.Metadata["visual_hive_pr_completion_json"].(string)
+		var existing SpecialistPullRequestCompletion
+		if encoded == "" || json.Unmarshal([]byte(encoded), &existing) != nil {
+			return errors.New("durable specialist PR completion is corrupt")
+		}
+		existing = normalizeSpecialistPullRequestCompletion(existing)
+		canonical, marshalErr := json.Marshal(existing)
+		if marshalErr != nil || encoded != string(canonical) {
+			return errors.New("durable specialist PR completion is not canonical")
+		}
+		if existing != completion {
+			return errors.New("specialist PR was already completed with different exact bytes")
+		}
+		return nil
+	}
 	if err := controller.refreshRuntimeConfigLocked(context.Background()); err != nil {
 		return err
 	}
@@ -278,11 +302,6 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 	if err := validateVisualDispatchEnvelope(envelope, bead.ID, envelope.Work.Packet, envelope.Work, envelope.Finding, envelope.Evidence, envelope.EvidenceRoot, decision); err != nil {
 		return errors.New("completed specialist dispatch failed immutable reconcile")
 	}
-	completion.RequestSHA256 = strings.ToLower(strings.TrimSpace(completion.RequestSHA256))
-	completion.CommitSHA = strings.ToLower(strings.TrimSpace(completion.CommitSHA))
-	completion.VerdictHeadSHA = strings.ToLower(strings.TrimSpace(completion.VerdictHeadSHA))
-	completion.VerdictReceiptSHA256 = strings.ToLower(strings.TrimSpace(completion.VerdictReceiptSHA256))
-	completion.VerdictStatus = strings.TrimSpace(completion.VerdictStatus)
 	if completion.WorkOrderID != envelope.SpecialistWorkOrderID || completion.RequestSHA256 != envelope.SpecialistRequestSHA256 ||
 		completion.WorkOrderID != "swo-"+completion.RequestSHA256 || completion.PullRequestNumber <= 0 || strings.TrimSpace(completion.Branch) == "" ||
 		!validGitObject(completion.CommitSHA) || completion.VerdictHeadSHA != completion.CommitSHA || !validSHA256(completion.VerdictReceiptSHA256) || completion.VerdictStatus == "" {
@@ -307,18 +326,41 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 	})
 }
 
-func (controller *Controller) findDispatchLocked(sourceExternalRef string) (*beads.Store, *beads.Bead, DispatchEnvelope, governor.WorkAdmissionDecision, error) {
+func normalizeSpecialistPullRequestCompletion(completion SpecialistPullRequestCompletion) SpecialistPullRequestCompletion {
+	completion.WorkOrderID = strings.TrimSpace(completion.WorkOrderID)
+	completion.RequestSHA256 = strings.ToLower(strings.TrimSpace(completion.RequestSHA256))
+	completion.Branch = strings.TrimSpace(completion.Branch)
+	completion.CommitSHA = strings.ToLower(strings.TrimSpace(completion.CommitSHA))
+	completion.PullRequestURL = strings.TrimSpace(completion.PullRequestURL)
+	completion.VerdictHeadSHA = strings.ToLower(strings.TrimSpace(completion.VerdictHeadSHA))
+	completion.VerdictReceiptSHA256 = strings.ToLower(strings.TrimSpace(completion.VerdictReceiptSHA256))
+	completion.VerdictStatus = strings.TrimSpace(completion.VerdictStatus)
+	return completion
+}
+
+func (controller *Controller) findVisualBeadLocked(sourceExternalRef string) (*beads.Store, *beads.Bead, error) {
 	var store *beads.Store
 	var bead *beads.Bead
 	for _, role := range sortedStoreRoles(controller.beadStores) {
 		if candidate := controller.beadStores[role].FindByExternalRef(sourceExternalRef); candidate != nil {
 			if bead != nil {
-				return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("source external ref exists in multiple role stores")
+				return nil, nil, errors.New("source external ref exists in multiple role stores")
 			}
 			store, bead = controller.beadStores[role], candidate
 		}
 	}
-	if bead == nil || visualBeadAdmissionState(bead) != "admitted_dispatch_pending" {
+	if bead == nil {
+		return nil, nil, errors.New("durable Visual Hive intent is unavailable")
+	}
+	return store, bead, nil
+}
+
+func (controller *Controller) findDispatchLocked(sourceExternalRef string) (*beads.Store, *beads.Bead, DispatchEnvelope, governor.WorkAdmissionDecision, error) {
+	store, bead, err := controller.findVisualBeadLocked(sourceExternalRef)
+	if err != nil {
+		return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, err
+	}
+	if visualBeadAdmissionState(bead) != "admitted_dispatch_pending" {
 		return nil, nil, DispatchEnvelope{}, governor.WorkAdmissionDecision{}, errors.New("durable dispatch-pending intent is unavailable")
 	}
 	envelope, ok := visualDispatchEnvelope(bead)
