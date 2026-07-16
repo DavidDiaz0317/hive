@@ -454,6 +454,97 @@ func TestSpecialistProviderProposalIsBrokeredAndCompletedReplayDoesNotRedispatch
 	}
 }
 
+func TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompose(t *testing.T) {
+	fixture := newSpecialistProviderFixture(t)
+	configureGovernedSpecialistFixture(&fixture)
+	builderCalls, reservationCalls, launchGuardCalls := 0, 0, 0
+	var reserved agent.SpecialistWorkOrder
+	config := fixture.provider.config
+	config.GovernedBuilder = func(_ context.Context, worktree, baseSHA, baseTreeSHA, prompt string, readiness agent.SpecialistSessionIdentity) (agent.SpecialistWorkOrderRequest, error) {
+		builderCalls++
+		if worktree != fixture.worktree || baseSHA != fixture.baseSHA || baseTreeSHA != fixture.baseTree ||
+			readiness.SessionID != fixture.dispatcher.identity.SessionID || readiness.ExecutorAuthorizationID != fixture.dispatcher.identity.ExecutorAuthorizationID {
+			return agent.SpecialistWorkOrderRequest{}, errors.New("builder did not receive the exact Worker/readiness bindings")
+		}
+		request := fixture.provider.workOrderRequest(baseSHA, baseTreeSHA, prompt)
+		request.ExternalRef = "visual-hive://owner/repo/" + strings.Repeat("a", 64)
+		request.PacketSHA256 = strings.Repeat("1", 64)
+		request.FindingSHA256 = strings.Repeat("2", 64)
+		request.SourceContextSHA256 = strings.Repeat("3", 64)
+		request.SourceContextBindingSHA256 = strings.Repeat("4", 64)
+		request.AuthorityClass = "sealed-source-context-proposal-v1"
+		request.PolicySHA256 = strings.Repeat("5", 64)
+		request.KnowledgeSHA256 = strings.Repeat("6", 64)
+		request.ToolPolicySHA256 = strings.Repeat("7", 64)
+		request.CapabilitySHA256 = strings.Repeat("8", 64)
+		request.RoleConfigSnapshot = &agent.SpecialistRoleConfigSnapshot{
+			SchemaVersion: agent.SpecialistRoleConfigSnapshotSchema, Backend: "copilot", Model: "persistent-role-model",
+			ToolRulesSHA256: strings.Repeat("9", 64), ConnectionsSHA256: strings.Repeat("a", 64), FullConfigSHA256: request.ToolPolicySHA256,
+		}
+		roleSnapshotJSON, err := json.Marshal(*request.RoleConfigSnapshot)
+		if err != nil {
+			return agent.SpecialistWorkOrderRequest{}, err
+		}
+		roleSnapshotDigest := sha256.Sum256(roleSnapshotJSON)
+		request.RoleConfigSnapshotSHA256 = hex.EncodeToString(roleSnapshotDigest[:])
+		request.ReproductionMode = agent.SpecialistReproductionModeNone
+		request.AffectedContracts = []string{"contract/value"}
+		request.KnowledgeKeywords = []string{"test_adequacy", "quality", "contract-value"}
+		return request, nil
+	}
+	config.ReserveWorkOrder = func(order agent.SpecialistWorkOrder) error {
+		reservationCalls++
+		reserved = order
+		return nil
+	}
+	config.LaunchGuard = func(agent.SpecialistWorkOrder) error {
+		launchGuardCalls++
+		return errors.New("current runtime pause blocks a fresh launch")
+	}
+	provider, err := NewSpecialistProvider(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.provider = provider
+	if err := fixture.provider.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	order, err := fixture.provider.prepareInvocation(context.Background(), fixture.worktree, "normal Scheduler governed prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if builderCalls != 1 || reservationCalls != 1 || reserved.ID != order.ID || reserved.RequestSHA256 != order.RequestSHA256 || order.ID != "swo-"+order.RequestSHA256 {
+		t.Fatalf("composition/reservation = builder %d reserve %d reserved=%+v order=%+v", builderCalls, reservationCalls, reserved, order)
+	}
+	_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+	var runErr *ProviderRunError
+	if err == nil || !errors.As(err, &runErr) || runErr.Launched || !strings.Contains(err.Error(), "current runtime pause") {
+		t.Fatalf("fresh guarded launch = %+v, %v", runErr, err)
+	}
+	if launchGuardCalls != 1 || fixture.dispatcher.checkCalls != 1 || len(fixture.dispatcher.dispatchCalls) != 0 {
+		t.Fatalf("fresh guard calls=%d readiness=%d dispatch=%d", launchGuardCalls, fixture.dispatcher.checkCalls, len(fixture.dispatcher.dispatchCalls))
+	}
+
+	// Model a crash after the exact order acquired its durable lease. Recovery
+	// must observe that lease even though the current fresh-launch guard denies;
+	// rebuilding or reserving a second order would violate at-most-once work.
+	if _, err := fixture.mailbox.AcquireLease(order, fixture.provider.config.LeaseOwner, fixture.dispatcher.identity.SessionID, order.Deadline); err != nil {
+		t.Fatal(err)
+	}
+	fixture.dispatcher.observeReply = func(request agent.SpecialistTaskResponseRequest) agent.SpecialistTaskResponse {
+		return structuredSpecialistTaskResponse(t, fixture, request, agent.SpecialistCompletionProposed, []byte(specialistProviderTestDiff), "recovered exact governed proposal")
+	}
+	result, err := fixture.provider.recoverPreparedInvocation(context.Background(), fixture.worktree, order.ID)
+	if err != nil || !strings.Contains(result.Output, "+fixed") {
+		t.Fatalf("leased governed recovery = %+v, %v", result, err)
+	}
+	if builderCalls != 1 || reservationCalls != 1 || launchGuardCalls != 1 || fixture.dispatcher.inspectCalls != 1 ||
+		fixture.dispatcher.checkCalls != 1 || len(fixture.dispatcher.dispatchCalls) != 0 {
+		t.Fatalf("recovery recomposed or launched: builder=%d reserve=%d guard=%d check=%d inspect=%d dispatch=%d",
+			builderCalls, reservationCalls, launchGuardCalls, fixture.dispatcher.checkCalls, fixture.dispatcher.inspectCalls, len(fixture.dispatcher.dispatchCalls))
+	}
+}
+
 func TestGovernedSpecialistCompletionRequiresContainedChildProvenance(t *testing.T) {
 	t.Run("legacy completion files are rejected", func(t *testing.T) {
 		fixture := newSpecialistProviderFixture(t)

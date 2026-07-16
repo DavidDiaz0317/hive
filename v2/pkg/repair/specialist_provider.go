@@ -133,6 +133,9 @@ func NewSpecialistProvider(config SpecialistProviderConfig) (*SpecialistProvider
 	if strings.TrimSpace(config.Repository) == "" || strings.TrimSpace(config.RepositoryFingerprint) == "" || strings.TrimSpace(config.RecurrenceKey) == "" || config.Attempt == 0 {
 		return nil, errors.New("specialist repository, fingerprint, recurrence key, and positive attempt are required")
 	}
+	config.Repository = strings.ToLower(strings.TrimSpace(config.Repository))
+	config.RepositoryFingerprint = strings.ToLower(strings.TrimSpace(config.RepositoryFingerprint))
+	config.RecurrenceKey = strings.TrimSpace(config.RecurrenceKey)
 	if strings.TrimSpace(string(config.Specialist)) == "" || strings.TrimSpace(config.RouteReason) == "" {
 		return nil, errors.New("specialist role and deterministic route reason are required")
 	}
