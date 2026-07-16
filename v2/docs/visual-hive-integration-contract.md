@@ -158,6 +158,24 @@ Effective proposal capability denies GitHub/Hive/bead/wiki/graph/MCP/API/subagen
 
 ## Safety boundaries
 
+### Transitional proposal executor (P0)
+
+- Proof profile `v1` is an explicitly injected, one-shot **Codex-only** executor
+  owned through the ordinary Manager facade. Claude, Copilot, inference backends,
+  launch-command overrides, live connections, and fallback to persistent agent
+  panes fail before process launch. Other backends wait for equivalent enforcement.
+- The child receives no checkout, `.git`, repository instructions, or repository
+  read/write capability. Existing Worker code seals the exact base tree and supplies
+  bounded regular-file source context from exact Git blobs; Worker remains the sole
+  component that validates, applies, branches, and creates a PR.
+- The child runs in a neutral private directory with private home/config/temp state,
+  a clean allowlisted environment, reviewed capability disables, and exact child-tree
+  cleanup. It cannot touch persistent agents, beads, wiki/graph, dashboard, GitHub,
+  Hive control state, or model-visible network/tools.
+- A started model call is ambiguous until a complete, content-bound response is
+  durably recoverable. Crash recovery MUST reuse that response or hold the lease;
+  it MUST NOT redispatch the same work-order/model-invocation identity.
+
 ### Baselines
 
 - Baseline pixels and comparison semantics belong to Visual Hive evidence.
