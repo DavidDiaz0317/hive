@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kubestellar/hive/v2/pkg/agent"
 	"github.com/kubestellar/hive/v2/pkg/classify"
 	"github.com/kubestellar/hive/v2/pkg/config"
 	"github.com/kubestellar/hive/v2/pkg/github"
@@ -18,12 +19,13 @@ import (
 )
 
 type Scheduler struct {
-	cfg            *config.Config
-	primer         *knowledge.Primer
-	inception      *knowledge.InceptionEngine
-	lastActionable *github.ActionableResult
-	logger         *slog.Logger
-	mu             sync.RWMutex
+	cfg              *config.Config
+	primer           *knowledge.Primer
+	inception        *knowledge.InceptionEngine
+	lastActionable   *github.ActionableResult
+	governedExecutor *agent.SpecialistExecutorProfile
+	logger           *slog.Logger
+	mu               sync.RWMutex
 }
 
 func New(cfg *config.Config, logger *slog.Logger) *Scheduler {

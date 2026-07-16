@@ -117,8 +117,9 @@ func TestSpecialistMailboxReadsAndPreparesPersistedOrdinaryV1WithoutGovernedFiel
 		t.Fatal(err)
 	}
 	for _, governedField := range []string{
-		"kind", "external_ref", "packet_sha256", "finding_sha256", "source_context_sha256", "authority_class",
+		"kind", "external_ref", "packet_sha256", "finding_sha256", "source_context_sha256", "source_context_binding_sha256", "authority_class",
 		"policy_sha256", "knowledge_sha256", "tool_policy_sha256", "capability_sha256",
+		"executor_profile", "executor_profile_sha256", "role_config_snapshot", "role_config_snapshot_sha256",
 		"reproduction_mode", "reproduction", "affected_contracts", "knowledge_keywords",
 	} {
 		if strings.Contains(string(fixture), `"`+governedField+`"`) {
@@ -164,15 +165,28 @@ func TestSpecialistMailboxPrepareGovernedBindsAndRequiresSecurityContext(t *test
 	}
 
 	mutations := map[string]func(*SpecialistWorkOrderRequest){
-		"external ref":   func(value *SpecialistWorkOrderRequest) { value.ExternalRef += "/changed" },
-		"packet":         func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = strings.Repeat("7", 64) },
-		"finding":        func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = strings.Repeat("8", 64) },
-		"source context": func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = strings.Repeat("d", 64) },
-		"authority":      func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "other-proposal" },
-		"policy":         func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = strings.Repeat("9", 64) },
-		"knowledge":      func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = strings.Repeat("a", 64) },
-		"tool policy":    func(value *SpecialistWorkOrderRequest) { value.ToolPolicySHA256 = strings.Repeat("b", 64) },
-		"capability":     func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = strings.Repeat("c", 64) },
+		"external ref":           func(value *SpecialistWorkOrderRequest) { value.ExternalRef += "/changed" },
+		"packet":                 func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = strings.Repeat("7", 64) },
+		"finding":                func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = strings.Repeat("8", 64) },
+		"source context":         func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = strings.Repeat("d", 64) },
+		"source context binding": func(value *SpecialistWorkOrderRequest) { value.SourceContextBindingSHA256 = strings.Repeat("e", 64) },
+		"authority":              func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "other-proposal" },
+		"policy":                 func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = strings.Repeat("9", 64) },
+		"knowledge":              func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = strings.Repeat("a", 64) },
+		"tool policy": func(value *SpecialistWorkOrderRequest) {
+			value.ToolPolicySHA256 = strings.Repeat("b", 64)
+			value.RoleConfigSnapshot.FullConfigSHA256 = value.ToolPolicySHA256
+			value.RoleConfigSnapshotSHA256 = specialistRoleConfigSnapshotDigest(*value.RoleConfigSnapshot)
+		},
+		"capability": func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = strings.Repeat("c", 64) },
+		"executor profile": func(value *SpecialistWorkOrderRequest) {
+			value.ExecutorProfile.Model = "proof-model-v2"
+			value.ExecutorProfileSHA256 = specialistExecutorProfileDigest(*value.ExecutorProfile)
+		},
+		"role config snapshot": func(value *SpecialistWorkOrderRequest) {
+			value.RoleConfigSnapshot.Model = "configured-role-model-v2"
+			value.RoleConfigSnapshotSHA256 = specialistRoleConfigSnapshotDigest(*value.RoleConfigSnapshot)
+		},
 		"reproduction mode": func(value *SpecialistWorkOrderRequest) {
 			value.ReproductionMode = SpecialistReproductionModeNone
 			value.Reproduction = nil
@@ -202,16 +216,25 @@ func TestSpecialistMailboxPrepareGovernedBindsAndRequiresSecurityContext(t *test
 	}
 
 	required := map[string]func(*SpecialistWorkOrderRequest){
-		"kind":               func(value *SpecialistWorkOrderRequest) { value.Kind = "" },
-		"external ref":       func(value *SpecialistWorkOrderRequest) { value.ExternalRef = "" },
-		"packet":             func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = "" },
-		"finding":            func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = "" },
-		"source context":     func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = "" },
-		"authority":          func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "" },
-		"policy":             func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = "" },
-		"knowledge":          func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = "" },
-		"tool policy":        func(value *SpecialistWorkOrderRequest) { value.ToolPolicySHA256 = "" },
-		"capability":         func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = "" },
+		"kind":                   func(value *SpecialistWorkOrderRequest) { value.Kind = "" },
+		"external ref":           func(value *SpecialistWorkOrderRequest) { value.ExternalRef = "" },
+		"packet":                 func(value *SpecialistWorkOrderRequest) { value.PacketSHA256 = "" },
+		"finding":                func(value *SpecialistWorkOrderRequest) { value.FindingSHA256 = "" },
+		"source context":         func(value *SpecialistWorkOrderRequest) { value.SourceContextSHA256 = "" },
+		"source context binding": func(value *SpecialistWorkOrderRequest) { value.SourceContextBindingSHA256 = "" },
+		"authority":              func(value *SpecialistWorkOrderRequest) { value.AuthorityClass = "" },
+		"policy":                 func(value *SpecialistWorkOrderRequest) { value.PolicySHA256 = "" },
+		"knowledge":              func(value *SpecialistWorkOrderRequest) { value.KnowledgeSHA256 = "" },
+		"tool policy":            func(value *SpecialistWorkOrderRequest) { value.ToolPolicySHA256 = "" },
+		"capability":             func(value *SpecialistWorkOrderRequest) { value.CapabilitySHA256 = "" },
+		"executor profile":       func(value *SpecialistWorkOrderRequest) { value.ExecutorProfile = nil },
+		"executor profile digest": func(value *SpecialistWorkOrderRequest) {
+			value.ExecutorProfileSHA256 = ""
+		},
+		"role config snapshot": func(value *SpecialistWorkOrderRequest) { value.RoleConfigSnapshot = nil },
+		"role config snapshot digest": func(value *SpecialistWorkOrderRequest) {
+			value.RoleConfigSnapshotSHA256 = ""
+		},
 		"reproduction mode":  func(value *SpecialistWorkOrderRequest) { value.ReproductionMode = "" },
 		"reproduction":       func(value *SpecialistWorkOrderRequest) { value.Reproduction = nil },
 		"affected contracts": func(value *SpecialistWorkOrderRequest) { value.AffectedContracts = nil },
@@ -236,6 +259,12 @@ func TestSpecialistMailboxPrepareGovernedBindsAndRequiresSecurityContext(t *test
 	withoutReproduction.Reproduction = nil
 	if _, err := mailbox.PrepareGoverned(withoutReproduction); err != nil {
 		t.Fatalf("PrepareGoverned rejected explicit no-reproduction mode: %v", err)
+	}
+	nonCodex := cloneSpecialistRequest(request)
+	nonCodex.ExecutorProfile.Backend = "copilot"
+	nonCodex.ExecutorProfileSHA256 = specialistExecutorProfileDigest(*nonCodex.ExecutorProfile)
+	if _, err := mailbox.PrepareGoverned(nonCodex); err == nil || !strings.Contains(err.Error(), "must be codex") {
+		t.Fatalf("PrepareGoverned did not fail closed on a non-Codex executor profile: %v", err)
 	}
 }
 
@@ -747,11 +776,25 @@ func testGovernedSpecialistRequest(now time.Time, externalRef string, deadline t
 	request.PacketSHA256 = strings.Repeat("1", 64)
 	request.FindingSHA256 = strings.Repeat("2", 64)
 	request.SourceContextSHA256 = strings.Repeat("7", 64)
+	request.SourceContextBindingSHA256 = strings.Repeat("0", 64)
 	request.AuthorityClass = "sealed-source-context-proposal-v1"
 	request.PolicySHA256 = strings.Repeat("3", 64)
 	request.KnowledgeSHA256 = strings.Repeat("4", 64)
 	request.ToolPolicySHA256 = strings.Repeat("5", 64)
 	request.CapabilitySHA256 = strings.Repeat("6", 64)
+	request.ExecutorProfile = &SpecialistExecutorProfile{
+		SchemaVersion: SpecialistExecutorProfileSchema, Backend: SpecialistExecutorBackendCodex,
+		Model: "proof-model-v1", ConfigSHA256: strings.Repeat("8", 64),
+		ContainmentProfile: SpecialistExecutorContainmentProfileV1,
+	}
+	request.ExecutorProfileSHA256 = specialistExecutorProfileDigest(*request.ExecutorProfile)
+	request.RoleConfigSnapshot = &SpecialistRoleConfigSnapshot{
+		SchemaVersion: SpecialistRoleConfigSnapshotSchema, Backend: "copilot", Model: "normal-role-model", Mode: "ADVISORY",
+		LaunchCmdPresent: true, LaunchCmdSHA256: strings.Repeat("9", 64), CavemanMode: "full", IncludeRepositories: true,
+		ToolRulesSHA256: strings.Repeat("a", 64), ConnectionsSHA256: strings.Repeat("b", 64), ConnectionCount: 1,
+		FullConfigSHA256: request.ToolPolicySHA256,
+	}
+	request.RoleConfigSnapshotSHA256 = specialistRoleConfigSnapshotDigest(*request.RoleConfigSnapshot)
 	request.ReproductionMode = SpecialistReproductionModeVerifiedValidation
 	request.Reproduction = []string{"go test ./... -run Reproduce"}
 	request.AffectedContracts = []string{"widget-contract-v1"}
@@ -766,7 +809,31 @@ func cloneSpecialistRequest(value SpecialistWorkOrderRequest) SpecialistWorkOrde
 	copy.Validation = append([]string(nil), value.Validation...)
 	copy.AffectedContracts = append([]string(nil), value.AffectedContracts...)
 	copy.KnowledgeKeywords = append([]string(nil), value.KnowledgeKeywords...)
+	if value.ExecutorProfile != nil {
+		profile := *value.ExecutorProfile
+		copy.ExecutorProfile = &profile
+	}
+	if value.RoleConfigSnapshot != nil {
+		snapshot := *value.RoleConfigSnapshot
+		copy.RoleConfigSnapshot = &snapshot
+	}
 	return copy
+}
+
+func specialistExecutorProfileDigest(profile SpecialistExecutorProfile) string {
+	digest, err := digestJSON(profile)
+	if err != nil {
+		panic(err)
+	}
+	return digest
+}
+
+func specialistRoleConfigSnapshotDigest(snapshot SpecialistRoleConfigSnapshot) string {
+	digest, err := digestJSON(snapshot)
+	if err != nil {
+		panic(err)
+	}
+	return digest
 }
 
 func sha256HexString(value string) string {
