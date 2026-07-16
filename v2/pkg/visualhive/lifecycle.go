@@ -96,9 +96,13 @@ type FindingLifecycle struct {
 }
 
 type CheckEvidence struct {
-	Name  string `json:"name"`
-	State string `json:"state"`
-	URL   string `json:"url,omitempty"`
+	Name               string `json:"name"`
+	State              string `json:"state"`
+	URL                string `json:"url,omitempty"`
+	ProvenanceVerified bool   `json:"provenance_verified,omitempty"`
+	WorkflowRunID      int64  `json:"workflow_run_id,omitempty"`
+	WorkflowPath       string `json:"workflow_path,omitempty"`
+	WorkflowEvent      string `json:"workflow_event,omitempty"`
 }
 
 type OutboxEntry struct {
@@ -315,7 +319,8 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 		}
 	}
 	coveredRoots := coveredPublicationRoots(manifest.Source.Repository, manifest.Observations, s.state.Findings)
-	publicationSet := selectIssuePublications(manifest.Source.Repository, manifest.Observations, s.state.Findings, options.MaxActiveIssues, options.PreferRepairable)
+	pendingIssueReservations := pendingOpenIssueReservationCount(manifest.Source.Repository, s.state.Findings, s.state.Outbox)
+	publicationSet := selectIssuePublications(manifest.Source.Repository, manifest.Observations, s.state.Findings, pendingIssueReservations, options.MaxActiveIssues, options.PreferRepairable)
 	for _, observation := range manifest.Observations {
 		observedFingerprints[observation.RepositoryFingerprint] = true
 		for _, legacy := range ambiguousLegacyCanonicals[observation.RepositoryFingerprint] {
@@ -536,7 +541,7 @@ func (s *LifecycleStore) ApplyBundle(bundle *ValidatedBundle, beadStore *beads.S
 	return result, nil
 }
 
-func selectIssuePublications(repository string, observations []Observation, findings map[string]*FindingLifecycle, maxActive int, preferRepairable bool) map[string]bool {
+func selectIssuePublications(repository string, observations []Observation, findings map[string]*FindingLifecycle, pendingIssueReservations, maxActive int, preferRepairable bool) map[string]bool {
 	selected := map[string]bool{}
 	coveredRoots := coveredPublicationRoots(repository, observations, findings)
 	explicitPublication := false
@@ -587,7 +592,7 @@ func selectIssuePublications(repository string, observations []Observation, find
 	})
 	slots := len(candidates)
 	if maxActive > 0 {
-		slots = maxActive - len(activeIssues)
+		slots = maxActive - len(activeIssues) - pendingIssueReservations
 		if slots < 0 {
 			slots = 0
 		}
@@ -601,6 +606,28 @@ func selectIssuePublications(repository string, observations []Observation, find
 		created++
 	}
 	return selected
+}
+
+func pendingOpenIssueReservationCount(repository string, findings map[string]*FindingLifecycle, outbox []*OutboxEntry) int {
+	repository = strings.ToLower(strings.TrimSpace(repository))
+	reservations := map[string]struct{}{}
+	for _, entry := range outbox {
+		if entry == nil || entry.Action != OutboxOpenIssue || entry.CompletedAt != nil ||
+			strings.ToLower(strings.TrimSpace(entry.Repository)) != repository || strings.TrimSpace(entry.RepositoryFingerprint) == "" {
+			continue
+		}
+		finding := findings[entry.RepositoryFingerprint]
+		if finding == nil || finding.IssueNumber != 0 || finding.Status == StatusResolved || finding.Status == StatusIssueClosed ||
+			entry.BundleDigest == "" || entry.BundleDigest != finding.LastBundleDigest {
+			continue
+		}
+		identity := strings.TrimSpace(finding.PublicationFingerprint)
+		if identity == "" {
+			identity = entry.RepositoryFingerprint
+		}
+		reservations[identity] = struct{}{}
+	}
+	return len(reservations)
 }
 
 func coveredPublicationRoots(repository string, observations []Observation, findings map[string]*FindingLifecycle) map[string]bool {
@@ -762,6 +789,16 @@ func repairSignalRank(observation Observation) int {
 	}
 	if strings.Contains(title, "failed deterministic validation") || strings.Contains(title, "contract_result") || strings.Contains(title, "contract result") {
 		return 5
+	}
+	if observation.IssueKind == "missing_visual_coverage" {
+		for _, contract := range observation.AffectedContracts {
+			if strings.TrimSpace(contract) != "" {
+				return 3
+			}
+		}
+		// Generic coverage/readiness gaps without an exact affected contract
+		// remain useful advisory issues, but they do not outrank a bounded,
+		// repository-specific repair candidate in repair modes.
 	}
 	return issueKindRank(observation.IssueKind)
 }

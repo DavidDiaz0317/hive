@@ -54,10 +54,18 @@ type Attempt struct {
 	Provider              string `json:"provider"`
 	LifecycleStarted      bool   `json:"lifecycle_started,omitempty"`
 	AttemptCounted        bool   `json:"attempt_counted"`
-	ModelInvocationID     string `json:"model_invocation_id,omitempty"`
-	ModelSummary          string `json:"model_summary,omitempty"`
-	PriorModelSummary     string `json:"prior_model_summary,omitempty"`
-	ModelPatch            string `json:"model_patch,omitempty"`
+	// SpecialistRevision* reserves one deterministic next-attempt ordinal and
+	// deadline anchor before a failed exact-head PR artifact is dispatched to a
+	// persistent specialist. It is consumed only by the Worker revision path.
+	SpecialistRevisionAttempt   int       `json:"specialist_revision_attempt,omitempty"`
+	SpecialistRevisionStartedAt time.Time `json:"specialist_revision_started_at,omitempty"`
+	SpecialistRevisionBaseSHA   string    `json:"specialist_revision_base_sha,omitempty"`
+	SpecialistRevisionBranch    string    `json:"specialist_revision_branch,omitempty"`
+	SpecialistRevisionPRNumber  int       `json:"specialist_revision_pr_number,omitempty"`
+	ModelInvocationID           string    `json:"model_invocation_id,omitempty"`
+	ModelSummary                string    `json:"model_summary,omitempty"`
+	PriorModelSummary           string    `json:"prior_model_summary,omitempty"`
+	ModelPatch                  string    `json:"model_patch,omitempty"`
 	// ModelBaseTree is the exact cumulative tree presented to a read-only
 	// provider. CandidateTree is the immutable tree authorized after applying
 	// that provider's bounded patch; commits are created from it, never by
@@ -436,6 +444,9 @@ func validatePersistedRepairState(state State) error {
 		if !validRecoveredPatchProvenance(*attempt) {
 			return fmt.Errorf("repair worker state contains invalid recovered-patch provenance for %q", fingerprint)
 		}
+		if !validSpecialistRevisionReservation(*attempt) {
+			return fmt.Errorf("repair worker state contains an invalid specialist revision reservation for %q", fingerprint)
+		}
 		if err := sealedTreeGuardStateError(*attempt); err != nil {
 			return fmt.Errorf("repair worker state contains invalid sealed-tree guards for %q: %w", fingerprint, err)
 		}
@@ -447,4 +458,14 @@ func validatePersistedRepairState(state State) error {
 		}
 	}
 	return nil
+}
+
+func validSpecialistRevisionReservation(attempt Attempt) bool {
+	if attempt.SpecialistRevisionAttempt == 0 {
+		return attempt.SpecialistRevisionStartedAt.IsZero() && attempt.SpecialistRevisionBaseSHA == "" &&
+			attempt.SpecialistRevisionBranch == "" && attempt.SpecialistRevisionPRNumber == 0
+	}
+	return attempt.SpecialistRevisionAttempt > attempt.Attempt && !attempt.SpecialistRevisionStartedAt.IsZero() &&
+		attempt.SpecialistRevisionStartedAt.Location() == time.UTC && validGitCommitSHA(attempt.SpecialistRevisionBaseSHA) &&
+		strings.TrimSpace(attempt.SpecialistRevisionBranch) != "" && attempt.SpecialistRevisionPRNumber > 0 && attempt.Stage == StagePROpen
 }

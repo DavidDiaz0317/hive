@@ -74,8 +74,11 @@ func TestFetchAndVerifyVisualHiveBundleBindsGitHubProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, manifestDigestErr := hex.DecodeString(verified.ManifestSHA256)
 	if !bundle.Validation.Trusted || !bundle.Validation.Authoritative || verified.RepositoryID != "123" || verified.WorkflowRunAttempt != "2" || verified.ArtifactID != "99" || verified.SourceArtifactID != "98" || verified.CommitSHA != "abc123" || verified.SourceArtifactPath == "" || verified.EvidenceRootPath == "" ||
-		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled [correlation]" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" {
+		verified.WorkflowName != "Visual Hive Scheduled" || verified.WorkflowRunName != "Visual Hive Scheduled [correlation]" || verified.WorkflowPath != ".github/workflows/visual-hive.yml" ||
+		verified.BundleSchemaVersion != bundle.Manifest.SchemaVersion || verified.BundleSHA256 != bundle.Manifest.OverallDigest || len(verified.ManifestSHA256) != 64 || manifestDigestErr != nil ||
+		bundle.Manifest.ArtifactIndex == nil || verified.ArtifactIndexSHA256 != bundle.Manifest.ArtifactIndex.SHA256 {
 		t.Fatalf("unexpected verified artifact: bundle=%+v verified=%+v", bundle.Validation, verified)
 	}
 	if want := filepath.Join(verified.SourceArtifactPath, ".visual-hive"); verified.EvidenceRootPath != want {
@@ -225,11 +228,13 @@ func TestFetchAndVerifyPullRequestArtifactBindsFailedExactHead(t *testing.T) {
 		switch request.URL.Path {
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)
+		case "/repos/owner/repo/pulls/7":
+			_, _ = io.WriteString(writer, `{"number":7,"state":"open","merged":false,"head":{"sha":"pr-head","ref":"hive/repair-one"}}`)
 		case "/repos/owner/repo/actions/runs":
 			if request.URL.Query().Get("event") != "pull_request" || request.URL.Query().Get("head_sha") != "pr-head" {
 				t.Errorf("missing exact-head run filters: %s", request.URL.RawQuery)
 			}
-			_, _ = io.WriteString(writer, `{"total_count":1,"workflow_runs":[{"id":77,"name":"Visual Hive PR","path":".github/workflows/visual-hive-pr.yml","head_branch":"hive/repair-one","head_sha":"pr-head","event":"pull_request","status":"completed","conclusion":"failure","html_url":"https://github.test/owner/repo/actions/runs/77"}]}`)
+			_, _ = io.WriteString(writer, `{"total_count":1,"workflow_runs":[{"id":77,"run_attempt":2,"name":"Visual Hive PR","path":".github/workflows/visual-hive-pr.yml","head_branch":"hive/repair-one","head_sha":"pr-head","event":"pull_request","status":"completed","conclusion":"failure","html_url":"https://github.test/owner/repo/actions/runs/77","pull_requests":[{"number":7}]}]}`)
 		case "/repos/owner/repo/actions/runs/77/artifacts":
 			_, _ = io.WriteString(writer, fmt.Sprintf(`{"total_count":1,"artifacts":[{"id":88,"name":"visual-hive-pr","size_in_bytes":%d,"expired":false,"workflow_run":{"id":77,"repository_id":123,"head_sha":"pr-head"}}]}`, len(artifactZip)))
 		case "/repos/owner/repo/actions/artifacts/88/zip":
@@ -248,17 +253,25 @@ func TestFetchAndVerifyPullRequestArtifactBindsFailedExactHead(t *testing.T) {
 	defer server.Close()
 	client := NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	verified, err := client.FetchAndVerifyPullRequestArtifact(context.Background(), PullRequestArtifactRequest{
-		Repository: "owner/repo", ExpectedHeadSHA: "pr-head", ExpectedHeadBranch: "hive/repair-one",
-		ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr", DestinationDir: t.TempDir(),
+		Repository: "owner/repo", PullRequestNumber: 7, ExpectedWorkflowRunID: 77, ExpectedHeadSHA: "pr-head", ExpectedHeadBranch: "hive/repair-one",
+		ExpectedWorkflowName: "Visual Hive PR", ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr", DestinationDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.RepositoryID != "123" || verified.WorkflowRunID != 77 || verified.ArtifactID != 88 || verified.Conclusion != "failure" || verified.CommitSHA != "pr-head" {
+	if verified.RepositoryID != "123" || verified.PullRequestNumber != 7 || verified.WorkflowRunID != 77 || verified.WorkflowRunAttempt != 2 || verified.ArtifactID != 88 ||
+		verified.Conclusion != "failure" || verified.CommitSHA != "pr-head" || verified.WorkflowName != "Visual Hive PR" ||
+		verified.ReviewSchemaVersion != visualhive.ReviewEvidenceSchemaVersion || len(verified.ArtifactIndexSHA256) != 64 || verified.EvidenceRootPath == "" {
 		t.Fatalf("unexpected verified PR artifact: %+v", verified)
 	}
 	if data, err := os.ReadFile(filepath.Join(verified.ArtifactRoot, ".visual-hive", "report.json")); err != nil || !strings.Contains(string(data), "missing_baseline") {
 		t.Fatalf("PR review evidence was not extracted: %q err=%v", data, err)
+	}
+	if _, err := client.FetchAndVerifyPullRequestArtifact(context.Background(), PullRequestArtifactRequest{
+		Repository: "owner/repo", PullRequestNumber: 7, ExpectedWorkflowRunID: 76, ExpectedHeadSHA: "pr-head", ExpectedHeadBranch: "hive/repair-one",
+		ExpectedWorkflowName: "Visual Hive PR", ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr", DestinationDir: t.TempDir(),
+	}); err == nil || !strings.Contains(err.Error(), "no completed failed PR run") {
+		t.Fatalf("wrong workflow run identity was accepted: %v", err)
 	}
 }
 
@@ -417,9 +430,27 @@ func testV3CapabilityDomains(active string, counts map[string]int) []map[string]
 
 func buildPRReviewZip(t *testing.T) []byte {
 	t.Helper()
+	report := []byte(`{"status":"failed","kind":"missing_baseline"}`)
+	index, err := json.Marshal(map[string]interface{}{
+		"schemaVersion": 1, "project": "demo", "generatedAt": "2026-07-15T12:00:00.000Z", "root": ".visual-hive", "contentAddressed": true, "complete": true,
+		"summary": map[string]int{
+			"discoveredArtifactCount": 1, "artifactCount": 1, "omittedArtifactCount": 0, "totalBytes": len(report),
+			"json": 1, "markdown": 0, "image": 0, "text": 0, "typescript": 0, "yaml": 0, "log": 0, "other": 0,
+			"previewed": 0, "redactedPreviews": 0, "truncatedPreviews": 0,
+		},
+		"artifacts": []map[string]interface{}{{
+			"path": ".visual-hive/report.json", "kind": "json", "contentType": "application/json", "bytes": len(report), "sha256": testDigest(report),
+			"safeToRender": true, "previewTruncated": false, "previewRedacted": false, "labels": []string{},
+		}},
+		"warnings": []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	buffer := new(bytes.Buffer)
 	archive := zip.NewWriter(buffer)
-	writeZipEntry(t, archive, ".visual-hive/report.json", []byte(`{"status":"failed","kind":"missing_baseline"}`))
+	writeZipEntry(t, archive, ".visual-hive/report.json", report)
+	writeZipEntry(t, archive, ".visual-hive/artifacts-index.json", index)
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -825,32 +825,34 @@ func TestActiveSetupBaselinePhaseTableDurablyRebindsBeforeConfigSave(t *testing.
 	}
 }
 
-func TestReconcileVerifiedSetupBaselineDispatchPreservesPostMergeProductionRetry(t *testing.T) {
-	store, err := NewStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	baseline := SetupBaselineIntent{
-		Phase: SetupBaselineMerged, CaptureCorrelation: strings.Repeat("a", 64), CaptureRunID: 77,
-	}
-	production, err := newWorkflowDispatchIntentForOperation(
-		Config{Repository: "owner/repo", RepositoryID: "123"}, "hive-visual-hive.yml", "main", "production", strings.Repeat("b", 64), now,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	production.DispatchAttemptedAt, production.DispatchAcknowledgedAt = now, now
-	production.RunID, production.RunURL, production.MatchedAt = 88, "https://example.test/runs/88", now
-	if err := store.SaveWorkflowDispatchIntent(production); err != nil {
-		t.Fatal(err)
-	}
-	if err := reconcileVerifiedSetupBaselineDispatch(store, baseline); err != nil {
-		t.Fatalf("post-merge production retry was rejected: %v", err)
-	}
-	got, exists, err := store.LoadWorkflowDispatchIntent()
-	if err != nil || !exists || got.Operation != "production" || got.RunID != 88 || got.CorrelationID != production.CorrelationID {
-		t.Fatalf("exact production retry checkpoint was not preserved: exists=%t intent=%+v err=%v", exists, got, err)
+func TestReconcileVerifiedSetupBaselineDispatchPreservesProductionRetry(t *testing.T) {
+	for _, phase := range []string{SetupBaselineMerged, SetupBaselineProductionVerified} {
+		t.Run(phase, func(t *testing.T) {
+			store, err := NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			baseline := SetupBaselineIntent{Phase: phase, CaptureCorrelation: strings.Repeat("a", 64), CaptureRunID: 77}
+			production, err := newWorkflowDispatchIntentForOperation(
+				Config{Repository: "owner/repo", RepositoryID: "123"}, "hive-visual-hive.yml", "main", "production", strings.Repeat("b", 64), now,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			production.DispatchAttemptedAt, production.DispatchAcknowledgedAt = now, now
+			production.RunID, production.RunURL, production.MatchedAt = 88, "https://example.test/runs/88", now
+			if err := store.SaveWorkflowDispatchIntent(production); err != nil {
+				t.Fatal(err)
+			}
+			if err := reconcileVerifiedSetupBaselineDispatch(store, baseline); err != nil {
+				t.Fatalf("%s production retry was rejected: %v", phase, err)
+			}
+			got, exists, err := store.LoadWorkflowDispatchIntent()
+			if err != nil || !exists || got.Operation != "production" || got.RunID != 88 || got.CorrelationID != production.CorrelationID {
+				t.Fatalf("exact production retry checkpoint was not preserved: exists=%t intent=%+v err=%v", exists, got, err)
+			}
+		})
 	}
 }
 
@@ -1350,5 +1352,70 @@ func TestSetupBaselineRebindDurablyTombstonesAmbiguousAcceptedDispatch(t *testin
 	}
 	if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
 		t.Fatalf("tombstoned ambiguous dispatch remained active: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestSetupBaselineRebindRetiresOnlyExactTerminalProductionDispatch(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		status     string
+		conclusion string
+		wantError  bool
+	}{
+		{name: "failed producer", status: "completed", conclusion: "failure"},
+		{name: "successful but unusable producer", status: "completed", conclusion: "success"},
+		{name: "nonterminal producer", status: "in_progress", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store, err := NewStore(filepath.Join(stateDir, "integrated"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, config, _ := mergedSetupBaselineIntentFixture(t, SetupBaselineMerged)
+			config.SchemaVersion, config.DefaultBranch, config.StateDir = ConfigSchema, source.DefaultBranch, stateDir
+			digest, err := setupBaselineRebindTargetDigest(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			rebind := SetupBaselineRebindIntent{SchemaVersion: SetupBaselineRebindSchema, Phase: SetupBaselineRebindPrepared,
+				Repository: source.Repository, RepositoryID: source.RepositoryID, Source: source, TargetConfig: config,
+				TargetConfigDigest: digest, CreatedAt: now, UpdatedAt: now}
+			if err := store.SaveSetupBaselineRebindIntent(rebind); err != nil {
+				t.Fatal(err)
+			}
+			dispatch, err := newWorkflowDispatchIntentForOperation(config, "hive-visual-hive.yml", source.DefaultBranch, "production", "", time.Time{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now
+			dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = 99, "https://example.test/runs/99", now
+			dispatch.RequestDigest, _ = workflowDispatchRequestDigest(dispatch)
+			if err := store.SaveWorkflowDispatchIntent(dispatch); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/99" {
+					_, _ = fmt.Fprintf(writer, `{"id":99,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":%q,"conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, dispatch.ExpectedDisplayTitle, visualHiveProductionWorkflowPath, source.MergeSHA, test.status, test.conclusion)
+					return
+				}
+				http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+			}))
+			defer server.Close()
+			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			err = retireTerminalProductionDispatchForSetupRebind(context.Background(), store, client, &rebind, dispatch)
+			if (err != nil) != test.wantError {
+				t.Fatalf("retire error=%v wantError=%t", err, test.wantError)
+			}
+			_, exists, loadErr := store.LoadWorkflowDispatchIntent()
+			if loadErr != nil || exists == !test.wantError {
+				t.Fatalf("dispatch retention mismatch: exists=%t want=%t err=%v", exists, test.wantError, loadErr)
+			}
+			if !test.wantError && !containsExact(rebind.Source.RetiredCaptureCorrelations, dispatch.CorrelationID) {
+				t.Fatal("terminal production correlation lacks a durable rebind tombstone")
+			}
+		})
 	}
 }

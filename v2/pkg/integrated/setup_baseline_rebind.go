@@ -216,6 +216,12 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 	if err != nil {
 		return err
 	}
+	if dispatchExists && dispatch.Operation == "production" {
+		if err := retireTerminalProductionDispatchForSetupRebind(ctx, store, client, rebind, dispatch); err != nil {
+			return err
+		}
+		dispatchExists = false
+	}
 	if dispatchExists {
 		if dispatch.Operation != setupBaselineWorkflowOperation || dispatch.CorrelationID != source.CaptureCorrelation {
 			return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
@@ -260,6 +266,47 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 		if err := store.DeleteWorkflowDispatchIntent(); err != nil {
 			return fmt.Errorf("retire exact obsolete setup baseline dispatch: %w", err)
 		}
+	}
+	return nil
+}
+
+func retireTerminalProductionDispatchForSetupRebind(ctx context.Context, store *Store, client *hivegithub.Client, rebind *SetupBaselineRebindIntent, dispatch WorkflowDispatchIntent) error {
+	if rebind == nil || rebind.Source.Phase != SetupBaselineMerged || dispatch.Operation != "production" || dispatch.RunID <= 0 {
+		return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+	}
+	if err := validateWorkflowDispatchOperationBinding(dispatch, rebind.TargetConfig, "hive-visual-hive.yml", rebind.Source.DefaultBranch, "production"); err != nil {
+		return fmt.Errorf("validate terminal production dispatch before setup baseline rebind: %w", err)
+	}
+	owner, repo, ok := strings.Cut(rebind.Source.Repository, "/")
+	if !ok || owner == "" || repo == "" || client == nil || client.GoGitHub() == nil {
+		return fmt.Errorf("inspect terminal production dispatch before setup baseline rebind: GitHub access is required")
+	}
+	run, _, err := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, dispatch.RunID)
+	if err != nil {
+		return fmt.Errorf("inspect terminal production dispatch before setup baseline rebind: %w", err)
+	}
+	missing, bindingErr := exactWorkflowRunBindingState(run, dispatch)
+	if bindingErr != nil || len(missing) > 0 || run.GetPath() != visualHiveProductionWorkflowPath ||
+		!strings.EqualFold(run.GetRepository().GetFullName(), rebind.Source.Repository) || !strings.EqualFold(run.GetHeadSHA(), rebind.Source.MergeSHA) {
+		return fmt.Errorf("production workflow dispatch no longer matches its exact durable setup baseline binding")
+	}
+	if !strings.EqualFold(run.GetStatus(), "completed") || strings.TrimSpace(run.GetConclusion()) == "" {
+		return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+	}
+	if !containsExact(rebind.Source.RetiredCaptureCorrelations, dispatch.CorrelationID) {
+		rebind.Source.RetiredCaptureCorrelations = append(rebind.Source.RetiredCaptureCorrelations, dispatch.CorrelationID)
+		if len(rebind.Source.RetiredCaptureCorrelations) > 32 {
+			rebind.Source.RetiredCaptureCorrelations = append([]string(nil), rebind.Source.RetiredCaptureCorrelations[len(rebind.Source.RetiredCaptureCorrelations)-32:]...)
+		}
+		updated, saveErr := saveSetupBaselineRebindTransition(store, *rebind, "setup_baseline_rebind_terminal_production_retired", true,
+			fmt.Sprintf("correlation=%s run=%d head=%s conclusion=%s", dispatch.CorrelationID, dispatch.RunID, run.GetHeadSHA(), run.GetConclusion()))
+		if saveErr != nil {
+			return fmt.Errorf("persist terminal production dispatch tombstone: %w", saveErr)
+		}
+		*rebind = updated
+	}
+	if err := store.DeleteWorkflowDispatchIntent(); err != nil {
+		return fmt.Errorf("retire exact terminal production workflow dispatch: %w", err)
 	}
 	return nil
 }

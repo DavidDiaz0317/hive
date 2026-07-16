@@ -21,6 +21,7 @@ const (
 	maxJSONSafeInteger              int64 = 1<<53 - 1
 	sourceArtifactExtractionMarker        = ".hive-extraction-complete"
 	v3TimestampLayout                     = "2006-01-02T15:04:05.000Z"
+	ReviewEvidenceSchemaVersion           = "visual-hive.pr-review-evidence.v1"
 )
 
 type ArtifactIndexReport struct {
@@ -914,6 +915,58 @@ func digestV3BundleContent(m Manifest) string {
 	return digest(stream.Bytes())
 }
 
+// VerifiedReviewEvidenceArtifact is complete content-addressed PR evidence,
+// but deliberately carries no trusted, authoritative, absence, baseline, or
+// lifecycle authority. Hive may use it only to ground a bounded revision.
+type VerifiedReviewEvidenceArtifact struct {
+	SchemaVersion       string
+	ArtifactIndexSHA256 string
+	EvidenceRoot        string
+	ArtifactCount       int64
+	TotalBytes          int64
+}
+
+// VerifyReviewEvidenceArtifact verifies the complete artifacts-index.json
+// emitted by Visual Hive's PR workflow. It never constructs a ValidatedBundle
+// and therefore cannot confer deterministic resolution authority.
+func VerifyReviewEvidenceArtifact(root string, artifactID int64) (VerifiedReviewEvidenceArtifact, error) {
+	if artifactID <= 0 {
+		return VerifiedReviewEvidenceArtifact{}, fmt.Errorf("positive PR evidence artifact ID is required")
+	}
+	const indexPath = ".visual-hive/artifacts-index.json"
+	indexFile, err := safeSourceTarget(root, indexPath)
+	if err != nil {
+		return VerifiedReviewEvidenceArtifact{}, err
+	}
+	info, err := os.Lstat(indexFile)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxFileSize {
+		return VerifiedReviewEvidenceArtifact{}, fmt.Errorf("PR evidence artifact index is not a bounded ordinary file")
+	}
+	data, err := os.ReadFile(indexFile)
+	if err != nil {
+		return VerifiedReviewEvidenceArtifact{}, fmt.Errorf("read stable PR evidence artifact index: %w", err)
+	}
+	if int64(len(data)) != info.Size() {
+		return VerifiedReviewEvidenceArtifact{}, fmt.Errorf("PR evidence artifact index changed while being read")
+	}
+	index, err := decodeArtifactIndexReport(data)
+	if err != nil {
+		return VerifiedReviewEvidenceArtifact{}, err
+	}
+	if index.Root != ".visual-hive" {
+		return VerifiedReviewEvidenceArtifact{}, fmt.Errorf("PR evidence artifact index root must be .visual-hive")
+	}
+	indexDigest := digest(data)
+	_, evidenceRoot, err := verifyCompleteArtifactIndex(root, index, indexPath, indexDigest, strconv.FormatInt(artifactID, 10))
+	if err != nil {
+		return VerifiedReviewEvidenceArtifact{}, err
+	}
+	return VerifiedReviewEvidenceArtifact{
+		SchemaVersion: ReviewEvidenceSchemaVersion, ArtifactIndexSHA256: indexDigest, EvidenceRoot: evidenceRoot,
+		ArtifactCount: index.Summary.ArtifactCount, TotalBytes: index.Summary.TotalBytes,
+	}, nil
+}
+
 // VerifySourceArtifact verifies the full source artifact against the v3
 // content-addressed index. V2 bundles remain source-compatible and are a no-op.
 func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
@@ -932,36 +985,50 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 		return fmt.Errorf("bundle v3 has no validated artifact index")
 	}
 	index := *bundle.artifactIndex
-	entries, err := validateArtifactIndexReport(index, bundle.Manifest.ArtifactIndex.SourcePath)
+	absoluteRoot, _, err := verifyCompleteArtifactIndex(root, index, bundle.Manifest.ArtifactIndex.SourcePath, bundle.Manifest.ArtifactIndex.SHA256, bundle.Manifest.Source.WorkflowArtifactID)
 	if err != nil {
 		return err
 	}
-	indexFile, err := safeSourceTarget(root, bundle.Manifest.ArtifactIndex.SourcePath)
-	if err != nil {
-		return err
+	if bundle.provenanceVerified {
+		bundle.Validation.Trusted = true
+		bundle.Validation.Authoritative = bundle.Manifest.Scan.AuthoritativeForResolution
 	}
-	if err := verifyIndexedFile(indexFile, int64(-1), bundle.Manifest.ArtifactIndex.SHA256); err != nil {
-		return fmt.Errorf("source artifact index identity mismatch: %w", err)
+	bundle.sourceVerified = true
+	bundle.verifiedSourceRoot = absoluteRoot
+	return nil
+}
+
+func verifyCompleteArtifactIndex(root string, index ArtifactIndexReport, indexPath, indexDigest, artifactID string) (string, string, error) {
+	entries, err := validateArtifactIndexReport(index, indexPath)
+	if err != nil {
+		return "", "", err
+	}
+	indexFile, err := safeSourceTarget(root, indexPath)
+	if err != nil {
+		return "", "", err
+	}
+	if err := verifyIndexedFile(indexFile, int64(-1), indexDigest); err != nil {
+		return "", "", fmt.Errorf("source artifact index identity mismatch: %w", err)
 	}
 	for relative, entry := range entries {
 		target, err := safeSourceTarget(root, relative)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 		if err := verifyIndexedFile(target, entry.Bytes, entry.SHA256); err != nil {
-			return fmt.Errorf("source artifact entry %q: %w", relative, err)
+			return "", "", fmt.Errorf("source artifact entry %q: %w", relative, err)
 		}
 	}
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	indexedRoot, err := safeSourceTarget(absoluteRoot, index.Root)
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	if _, err := os.Lstat(indexedRoot); err != nil {
-		return err
+	if info, err := os.Lstat(indexedRoot); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", "", fmt.Errorf("source artifact indexed root is not an ordinary directory")
 	}
 	err = filepath.WalkDir(absoluteRoot, func(filePath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -995,7 +1062,7 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 			return fmt.Errorf("source artifact contains non-regular file %q", relative)
 		}
 		if relative == sourceArtifactExtractionMarker {
-			expected := []byte(bundle.Manifest.Source.WorkflowArtifactID + "\n")
+			expected := []byte(artifactID + "\n")
 			if info.Size() != int64(len(expected)) {
 				return fmt.Errorf("source artifact extraction marker is invalid")
 			}
@@ -1011,7 +1078,7 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 		if !pathWithin(index.Root, relative) {
 			return fmt.Errorf("source artifact contains unindexed file %q", relative)
 		}
-		if relative == bundle.Manifest.ArtifactIndex.SourcePath {
+		if relative == indexPath {
 			return nil
 		}
 		if _, ok := entries[relative]; !ok {
@@ -1020,15 +1087,9 @@ func (bundle *ValidatedBundle) VerifySourceArtifact(root string) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("verify complete source artifact index: %w", err)
+		return "", "", fmt.Errorf("verify complete source artifact index: %w", err)
 	}
-	if bundle.provenanceVerified {
-		bundle.Validation.Trusted = true
-		bundle.Validation.Authoritative = bundle.Manifest.Scan.AuthoritativeForResolution
-	}
-	bundle.sourceVerified = true
-	bundle.verifiedSourceRoot = absoluteRoot
-	return nil
+	return absoluteRoot, indexedRoot, nil
 }
 
 // VerifiedEvidenceRoot returns the content-addressed evidence directory only

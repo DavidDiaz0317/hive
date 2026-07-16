@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -125,6 +126,49 @@ func TestDispatchAcceptsOnlyRepositoryTestCausedWorkflowFailure(t *testing.T) {
 	}
 	if workflow.Conclusion != "failure" || workflow.RepositoryTestOverall != 1 || len(workflow.RepositoryTests) != 1 || workflow.RepositoryTests[0].ExitCode != 1 || len(workflow.RepositoryTestDigest) != 64 {
 		t.Fatalf("repository-test-caused workflow failure was not preserved as trusted lifecycle evidence: %+v", workflow)
+	}
+}
+
+func TestDispatchRetiresExactFailedProducerRunBeforeRetry(t *testing.T) {
+	var correlation string
+	head := strings.Repeat("d", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/dispatches":
+			var body struct {
+				Inputs map[string]any `json:"inputs"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			correlation, _ = body.Inputs[workflowDispatchInput].(string)
+			writer.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/hive-visual-hive.yml/runs":
+			_, _ = fmt.Fprintf(writer, `{"total_count":1,"workflow_runs":[{"id":61,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"failure","html_url":"https://example.test/runs/61"}]}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), head)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/61":
+			_, _ = fmt.Fprintf(writer, `{"id":61,"workflow_id":12,"name":%q,"path":%q,"display_title":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"failure","repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, workflowDispatchDisplayTitle(correlation), head)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/workflows/12":
+			_, _ = fmt.Fprintf(writer, `{"id":12,"name":%q,"path":%q,"state":"active"}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/61/jobs":
+			_, _ = fmt.Fprintf(writer, `{"total_count":3,"jobs":[{"id":700,"run_id":61,"head_sha":%q,"status":"completed","conclusion":"failure","name":"visual-hive-production","workflow_name":%q},{"id":701,"run_id":61,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive","workflow_name":%q},{"id":702,"run_id":61,"head_sha":%q,"status":"completed","conclusion":"success","name":"visual-hive-execution","workflow_name":%q}]}`, head, visualHiveProductionWorkflowName, head, visualHiveProductionWorkflowName, head, visualHiveProductionWorkflowName)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	stateDir := t.TempDir()
+	config := dispatchTestConfig(stateDir)
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	if _, err := dispatchAndWait(context.Background(), client, config); err == nil || !strings.Contains(err.Error(), "visual-hive-production") {
+		t.Fatalf("failed producer run was accepted: %v", err)
+	}
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
+		t.Fatalf("exact failed producer dispatch remained replayable: exists=%t err=%v", exists, err)
 	}
 }
 

@@ -346,15 +346,35 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	finding.Status, finding.RepairAttempts = visualhive.StatusNeedsRevision, 1
+	finding.Branch, finding.PRNumber, finding.RepairCommitSHA = first.Branch, first.PRNumber, first.CommitSHA
+	checkpoint, _ := state.Get(finding.RepositoryFingerprint)
+	if err := validateRevisionCheckpoint(context.Background(), finding, checkpoint); err != nil {
+		t.Fatalf("exact revision checkpoint was rejected: %v", err)
+	}
+	drifted := finding
+	drifted.RepairCommitSHA = strings.Repeat("a", 40)
+	if err := validateRevisionCheckpoint(context.Background(), drifted, checkpoint); err == nil {
+		t.Fatal("drifted revision head was accepted")
+	}
+	anchor := time.Date(2026, 7, 16, 15, 0, 0, 0, time.UTC)
+	checkpoint.SpecialistRevisionAttempt = 2
+	checkpoint.SpecialistRevisionStartedAt = anchor
+	checkpoint.SpecialistRevisionBaseSHA = first.CommitSHA
+	checkpoint.SpecialistRevisionBranch = first.Branch
+	checkpoint.SpecialistRevisionPRNumber = first.PRNumber
+	if err := state.Put(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	worker.Config.AttemptStartedAt = anchor
 	second, err := worker.Run(context.Background(), finding)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Branch != second.Branch || first.PRNumber != second.PRNumber || pulls.calls != 2 || provider.runs != 2 {
+	if first.Branch != second.Branch || first.PRNumber != second.PRNumber || pulls.calls != 2 || provider.runs != 2 || lifecycle.starts != 1 || lifecycle.retries != 1 {
 		t.Fatalf("revision created duplicate lifecycle objects: first=%+v second=%+v pulls=%d runs=%d", first, second, pulls.calls, provider.runs)
 	}
 	attempt, _ := state.Get(finding.RepositoryFingerprint)
-	if attempt.Attempt != 2 || attempt.Stage != StagePROpen {
+	if attempt.Attempt != 2 || attempt.Stage != StagePROpen || !attempt.StartedAt.Equal(anchor) || attempt.SpecialistRevisionAttempt != 0 {
 		t.Fatalf("revision attempt was not persisted: %+v", attempt)
 	}
 }

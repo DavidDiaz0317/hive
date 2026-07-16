@@ -326,11 +326,15 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 	}
 	for _, required := range []string{
 		"actions/download-artifact@" + downloadArtifactActionSHA, "Rebuild exact immutable Visual Hive CLI on fresh runner",
+		`GITHUB_SHA="$HIVE_VISUAL_HIVE_REF" node scripts/build-release-bundle.mjs --output "$release_dir"`,
+		`cli="$trusted_tooling/visual-hive.mjs"`, `manifest.release !== true`, `manifest.clean !== true`,
 		"visual-hive-evidence-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "--authoritative-for-resolution",
 		"authoritative-resolution.txt", "authority_args=()", `pipeline.mode === "full"`, `report.mode === "full"`,
 		`runnerOutcome.outcome === "success"`, `plan --config visual-hive.config.yaml --mode full --output .visual-hive/plan.json`,
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN", "Raw evidence contains a symbolic link", "Verify isolated runner prerequisites before trusted publication",
-		"isolated Visual Hive execution did not complete successfully",
+		"isolated Visual Hive execution did not complete successfully", "Stage content-addressed evidence root",
+		`evidence_stage="$RUNNER_TEMP/hive-visual-hive-evidence-${GITHUB_RUN_ID}"`,
+		`test -f "$evidence_stage/.visual-hive/artifacts-index.json"`,
 	} {
 		if !strings.Contains(aggregatorText, required) {
 			t.Fatalf("runner-owned production aggregator is missing %q", required)
@@ -338,6 +342,12 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 	}
 	if strings.Contains(aggregatorText, `--scan-scope full --authoritative-for-resolution`) {
 		t.Fatal("production bundle still receives unconditional resolution authority")
+	}
+	if !strings.Contains(production, `path: ${{ runner.temp }}/hive-visual-hive-evidence-${{ github.run_id }}`) {
+		t.Fatal("content-addressed evidence upload does not preserve the staged .visual-hive source root")
+	}
+	if strings.Contains(production, "path: |\n            .visual-hive") {
+		t.Fatal("content-addressed evidence upload flattens the required .visual-hive source root")
 	}
 	receiptIndex := strings.Index(executionText, `sudo install -o root -g root -m 0444 "$runner_outcome" .visual-hive/hive-runner-outcome.json`)
 	uploadIndex := strings.Index(executionText, "Upload isolated raw Visual evidence")

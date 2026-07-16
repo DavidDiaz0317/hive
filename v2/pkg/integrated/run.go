@@ -14,6 +14,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/kubestellar/hive/v2/pkg/agent"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/beads"
 	"github.com/kubestellar/hive/v2/pkg/checkpoint"
@@ -23,9 +24,11 @@ import (
 )
 
 type RunOptions struct {
-	StateDir string
-	Timeout  time.Duration
-	GitHub   *hivegithub.Client
+	StateDir          string
+	Timeout           time.Duration
+	GitHub            *hivegithub.Client
+	Specialists       repair.SpecialistDispatcher
+	SpecialistWorkDir string
 }
 
 type WorkflowRunEvidence struct {
@@ -81,6 +84,12 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 	result := RunResult{SchemaVersion: "hive.production-run.v1", StartedAt: time.Now().UTC()}
 	if options.GitHub == nil || options.StateDir == "" {
 		return result, fmt.Errorf("GitHub client and persistent state directory are required")
+	}
+	if (options.Specialists == nil) != (strings.TrimSpace(options.SpecialistWorkDir) == "") {
+		return result, fmt.Errorf("specialist dispatcher and absolute specialist work directory must be configured together")
+	}
+	if options.Specialists != nil && !filepath.IsAbs(options.SpecialistWorkDir) {
+		return result, fmt.Errorf("specialist work directory must be absolute")
 	}
 	if options.Timeout <= 0 {
 		options.Timeout = 45 * time.Minute
@@ -276,7 +285,7 @@ func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
 		}
 	}
 	if config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge {
-		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact.EvidenceRootPath)
+		orchestration, orchestrationErr := orchestrateRepairs(runCtx, options.StateDir, config, lifecycle, beadStore, options.GitHub, policy, verifiedArtifact, options.Specialists, options.SpecialistWorkDir)
 		result.Repairs, result.Gates = orchestration.Repairs, orchestration.Gates
 		result.PostMergeWorkflow, result.PostMergeLifecycle = orchestration.PostMergeWorkflow, orchestration.PostMergeLifecycle
 		result.Outbox.Succeeded += orchestration.Outbox.Succeeded
@@ -570,7 +579,7 @@ func discardStaleWorkflowDispatch(stateDir string, config Config, workflow Workf
 	return nil
 }
 
-func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) (repairOrchestrationResult, error) {
+func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lifecycle *visualhive.LifecycleStore, beadStore *beads.Store, client *hivegithub.Client, policy automation.Policy, verifiedArtifact hivegithub.VerifiedVisualHiveArtifact, specialists repair.SpecialistDispatcher, specialistWorkDir string) (repairOrchestrationResult, error) {
 	result := repairOrchestrationResult{}
 	resumed, baselineGate, pendingReview, err := reconcileBaselineReview(ctx, stateDir, config, lifecycle, client, policy)
 	if baselineGate != nil {
@@ -590,7 +599,7 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		maxAttempts = 3
 	}
 	for cycle := 0; cycle <= maxAttempts; cycle++ {
-		repairs, err := runEligibleRepairs(ctx, config, lifecycle, client, policy, evidenceRoot)
+		repairs, err := runEligibleRepairs(ctx, config, lifecycle, client, policy, verifiedArtifact, specialists, specialistWorkDir)
 		result.Repairs = append(result.Repairs, repairs...)
 		if err != nil {
 			finding, ok := activeRepairFinding(lifecycle.Snapshot())
@@ -652,7 +661,10 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 		green := gateChecksGreen(gate)
 		checkEvidence := make([]visualhive.CheckEvidence, 0, len(gate.Checks))
 		for _, check := range gate.Checks {
-			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{Name: check.Name, State: check.State, URL: check.URL})
+			checkEvidence = append(checkEvidence, visualhive.CheckEvidence{
+				Name: check.Name, State: check.State, URL: check.URL, ProvenanceVerified: check.ProvenanceVerified,
+				WorkflowRunID: check.WorkflowRunID, WorkflowPath: check.WorkflowPath, WorkflowEvent: check.WorkflowEvent,
+			})
 		}
 		summary := checkSummary(gate)
 		evaluation := GateEvaluation{RepositoryFingerprint: finding.RepositoryFingerprint, Purpose: "repair", Gate: gate}
@@ -672,14 +684,15 @@ func orchestrateRepairs(ctx context.Context, stateDir string, config Config, lif
 					return result, fmt.Errorf("baseline review proposal denied: %s", strings.Join(decision.Reasons, "; "))
 				}
 				verified, fetchErr := client.FetchAndVerifyPullRequestArtifact(ctx, hivegithub.PullRequestArtifactRequest{
-					Repository: config.Repository, ExpectedHeadSHA: attempt.CommitSHA, ExpectedHeadBranch: attempt.Branch,
-					ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
+					Repository: config.Repository, PullRequestNumber: finding.PRNumber, ExpectedWorkflowRunID: gate.VisualHiveWorkflowRunID,
+					ExpectedHeadSHA: attempt.CommitSHA, ExpectedHeadBranch: attempt.Branch,
+					ExpectedWorkflowName: "Visual Hive PR", ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
 					DestinationDir: filepath.Join(stateDir, "repair", "baseline-artifacts", repairStateKey(finding.RepositoryFingerprint)),
 				})
 				if fetchErr != nil {
 					return result, fetchErr
 				}
-				hosted, recognized, reviewErr := repair.ReadHostedBaselineReview(verified.ArtifactRoot)
+				hosted, recognized, reviewErr := repair.ReadHostedBaselineReview(verified.EvidenceRootPath)
 				if reviewErr != nil {
 					return result, reviewErr
 				}
@@ -1338,6 +1351,19 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 			}
 			return WorkflowRunEvidence{}, fmt.Errorf("Visual Hive workflow %s concluded unsupported state %s", selected.GetHTMLURL(), selected.GetConclusion())
 		}
+		terminalRunError := func(cause error) (WorkflowRunEvidence, error) {
+			// A conclusively failed, exactly bound run cannot become usable on a
+			// later controller retry. Retaining it would replay the same failed run
+			// forever and block a managed workflow upgrade. Repository-test-caused
+			// failures that publish complete evidence continue through the normal
+			// success path below and are consumed only after evidence application.
+			if selected.GetConclusion() == "failure" {
+				if discardErr := discardWorkflowDispatch(store, intent, selected.GetID()); discardErr != nil {
+					return WorkflowRunEvidence{}, fmt.Errorf("%v; retire exact failed workflow dispatch: %w", cause, discardErr)
+				}
+			}
+			return WorkflowRunEvidence{}, cause
+		}
 		repositoryTests, err := client.VerifyRepositoryTestJobs(ctx, hivegithub.RepositoryTestJobsRequest{
 			Repository: config.Repository, WorkflowRunID: selected.GetID(), ExpectedHeadSHA: selected.GetHeadSHA(),
 			ExpectedWorkflowName: visualHiveProductionWorkflowName, ExpectedWorkflowPath: visualHiveProductionWorkflowPath,
@@ -1345,14 +1371,14 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 			RequiredSuccessfulJobNames: []string{visualHivePRCheckContext, visualExecutionJobName},
 		})
 		if err != nil {
-			return WorkflowRunEvidence{}, fmt.Errorf("verify runner-controlled repository test jobs: %w", err)
+			return terminalRunError(fmt.Errorf("verify runner-controlled repository test jobs: %w", err))
 		}
 		if (repositoryTests.Overall == 0) != (selected.GetConclusion() == "success") {
-			return WorkflowRunEvidence{}, fmt.Errorf("workflow conclusion %s is inconsistent with runner-controlled repository test outcome %d", selected.GetConclusion(), repositoryTests.Overall)
+			return terminalRunError(fmt.Errorf("workflow conclusion %s is inconsistent with runner-controlled repository test outcome %d", selected.GetConclusion(), repositoryTests.Overall))
 		}
 		artifacts, _, err := client.GoGitHub().Actions.ListWorkflowRunArtifacts(ctx, owner, repo, selected.GetID(), &gh.ListOptions{PerPage: 100})
 		if err != nil {
-			return WorkflowRunEvidence{}, fmt.Errorf("list production evidence artifacts: %w", err)
+			return terminalRunError(fmt.Errorf("list production evidence artifacts: %w", err))
 		}
 		workflow := WorkflowRunEvidence{
 			CorrelationID: intent.CorrelationID, RunID: selected.GetID(), RunURL: selected.GetHTMLURL(), HeadSHA: selected.GetHeadSHA(), Conclusion: selected.GetConclusion(),
@@ -1369,7 +1395,7 @@ func dispatchAndWait(ctx context.Context, client *hivegithub.Client, config Conf
 			}
 		}
 		if workflow.EvidenceArtifact <= 0 || workflow.BundleArtifact <= 0 {
-			return WorkflowRunEvidence{}, fmt.Errorf("workflow did not publish both evidence and provenance-bound bundle artifacts")
+			return terminalRunError(fmt.Errorf("workflow did not publish both evidence and provenance-bound bundle artifacts"))
 		}
 		return workflow, nil
 	}
@@ -1745,7 +1771,7 @@ func retryCancelledDispatch(conclusion string, attempt, limit int) bool {
 	return strings.EqualFold(strings.TrimSpace(conclusion), "cancelled") && attempt < limit
 }
 
-func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, evidenceRoot string) ([]repair.Result, error) {
+func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhive.LifecycleStore, client *hivegithub.Client, policy automation.Policy, verifiedArtifact hivegithub.VerifiedVisualHiveArtifact, specialists repair.SpecialistDispatcher, specialistWorkDir string) ([]repair.Result, error) {
 	snapshot := lifecycle.Snapshot()
 	key := selectedRepairKey(snapshot)
 	if key == "" {
@@ -1764,17 +1790,24 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		// locally. Safe git index validation remains; exact hosted PR jobs are the
 		// executable validation authority before merge.
 		commands := []repair.Command{{Name: "git", Args: []string{"diff", "--check"}}}
-		repairEvidenceRoot := evidenceRoot
+		repairEvidenceRoot := verifiedArtifact.EvidenceRootPath
+		var revisionArtifact *hivegithub.VerifiedPullRequestArtifact
 		if needsHostedRevisionEvidence(*finding) {
+			expectedRunID, runIdentityErr := failedVisualHiveWorkflowRunID(*finding)
+			if runIdentityErr != nil {
+				return nil, runIdentityErr
+			}
 			verified, fetchErr := client.FetchAndVerifyPullRequestArtifact(ctx, hivegithub.PullRequestArtifactRequest{
-				Repository: config.Repository, ExpectedHeadSHA: finding.RepairCommitSHA, ExpectedHeadBranch: finding.Branch,
-				ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
+				Repository: config.Repository, PullRequestNumber: finding.PRNumber, ExpectedWorkflowRunID: expectedRunID,
+				ExpectedHeadSHA: finding.RepairCommitSHA, ExpectedHeadBranch: finding.Branch,
+				ExpectedWorkflowName: "Visual Hive PR", ExpectedWorkflowPath: ".github/workflows/visual-hive-pr.yml", ArtifactName: "visual-hive-pr",
 				DestinationDir: filepath.Join(config.StateDir, "repair", "revision-artifacts", repairStateKey(finding.RepositoryFingerprint)),
 			})
 			if fetchErr != nil {
 				return nil, fmt.Errorf("fetch exact-head failed Visual Hive evidence for repair revision: %w", fetchErr)
 			}
-			repairEvidenceRoot = verified.ArtifactRoot
+			repairEvidenceRoot = verified.EvidenceRootPath
+			revisionArtifact = &verified
 		}
 		evidenceSummary, err := repair.LoadEvidenceSummary(repairEvidenceRoot, *finding)
 		if err != nil {
@@ -1787,17 +1820,76 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 			}
 			return nil, err
 		}
+		allowedPaths := repairPathsForFinding(config.AllowedRepairPaths, *finding)
+		var provider repair.Provider = repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}
+		repairAgent := ""
+		attemptStartedAt := time.Time{}
+		if specialists != nil {
+			resolution := specialistResolutionForFinding(*finding)
+			if !resolution.DispatchAllowed {
+				reason := "Verified Visual Hive evidence cannot be routed to a proposal-capable Hive specialist: " + resolution.Reason
+				if reviewErr := lifecycle.MarkManualReviewRequired(finding.RepositoryFingerprint, "specialist_route", reason); reviewErr != nil {
+					return nil, reviewErr
+				}
+				return nil, nil
+			}
+			expectedBaseSHA := verifiedArtifact.CommitSHA
+			evidenceIdentity, identityErr := specialistEvidenceIdentity(verifiedArtifact, *finding)
+			if revisionArtifact != nil {
+				expectedBaseSHA = finding.RepairCommitSHA
+				evidenceIdentity, identityErr = specialistRevisionEvidenceIdentity(*revisionArtifact, *finding)
+			}
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			binding, bindingErr := nextSpecialistAttemptBinding(state, *finding, time.Now().UTC())
+			if bindingErr != nil {
+				return nil, bindingErr
+			}
+			deadline := binding.DeadlineAnchor.Add(25 * time.Minute)
+			existingAttempt, hasAttempt := state.Get(finding.RepositoryFingerprint)
+			recoveringExactSpecialistOrder := hasAttempt && existingAttempt.Recurrence == finding.Recurrences && existingAttempt.Stage == repair.StageModelRunning
+			if !deadline.After(time.Now().UTC()) && !recoveringExactSpecialistOrder {
+				return nil, fmt.Errorf("persisted specialist attempt deadline has expired; recover or explicitly retry the existing repair attempt")
+			}
+			role := agent.SpecialistRole(resolution.Role)
+			mailbox, mailboxErr := agent.NewSpecialistMailbox(filepath.Join(specialistWorkDir, resolution.Role, "mailbox"), agent.SpecialistMailboxOptions{})
+			if mailboxErr != nil {
+				return nil, fmt.Errorf("open %s specialist mailbox: %w", resolution.Role, mailboxErr)
+			}
+			validation := make([]string, 0, len(commands))
+			for _, command := range commands {
+				validation = append(validation, strings.Join(append([]string{command.Name}, command.Args...), " "))
+			}
+			specialistProvider, providerErr := repair.NewSpecialistProvider(repair.SpecialistProviderConfig{
+				Dispatcher: specialists, Mailbox: mailbox,
+				Repository: config.Repository, RepositoryFingerprint: finding.RepositoryFingerprint,
+				RecurrenceKey: fmt.Sprintf("%s:r%d", finding.RepositoryFingerprint, finding.Recurrences), Attempt: binding.Attempt,
+				ExpectedBaseSHA: expectedBaseSHA, Evidence: evidenceIdentity,
+				Specialist: role, RouteReason: resolution.Reason, AllowedPaths: allowedPaths, Validation: validation,
+				Deadline: deadline,
+			})
+			if providerErr != nil {
+				return nil, providerErr
+			}
+			provider = specialistProvider
+			repairAgent = resolution.Role
+			attemptStartedAt = binding.StartedAt
+		}
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
-				Policy: policy, AllowedRepairPaths: repairPathsForFinding(config.AllowedRepairPaths, *finding), ValidationCommands: commands,
-				EvidenceSummary: evidenceSummary,
-				ModelTimeout:    20 * time.Minute, CommandTimeout: 15 * time.Minute,
+				Agent: repairAgent, Policy: policy, AllowedRepairPaths: allowedPaths, ValidationCommands: commands,
+				EvidenceSummary: evidenceSummary, AttemptStartedAt: attemptStartedAt,
+				ModelTimeout: 20 * time.Minute, CommandTimeout: 15 * time.Minute,
 			},
-			Provider: repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}, State: state, Lifecycle: lifecycle, GitHub: client,
+			Provider: provider, State: state, Lifecycle: lifecycle, GitHub: client,
 		}
 		result, err := worker.Run(ctx, *finding)
 		if err != nil {
+			if errors.Is(err, repair.ErrSpecialistWorkPending) {
+				return nil, nil
+			}
 			return nil, err
 		}
 		return []repair.Result{result}, nil // repository concurrency budget defaults to one repair
@@ -1860,6 +1952,24 @@ func needsHostedRevisionEvidence(finding visualhive.FindingLifecycle) bool {
 		}
 	}
 	return false
+}
+
+func failedVisualHiveWorkflowRunID(finding visualhive.FindingLifecycle) (int64, error) {
+	var runID int64
+	for _, check := range finding.LastCheckRuns {
+		if !check.ProvenanceVerified || check.WorkflowRunID <= 0 || check.State != "failure" || check.WorkflowEvent != "pull_request" ||
+			!workflowPathMatchesForSpecialist(check.WorkflowPath, ".github/workflows/visual-hive-pr.yml") {
+			continue
+		}
+		if runID != 0 && runID != check.WorkflowRunID {
+			return 0, fmt.Errorf("failed Visual Hive checks map to multiple workflow runs")
+		}
+		runID = check.WorkflowRunID
+	}
+	if runID == 0 {
+		return 0, fmt.Errorf("repair revision requires one provenance-verified failed Visual Hive workflow run")
+	}
+	return runID, nil
 }
 
 // selectedRepairKey enforces the repository-wide concurrency budget before a

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -678,9 +679,42 @@ func runIntegratedRun(args []string) int {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	client := hivegithub.NewClient(token, "", nil, logger, *githubAPIURL)
+	store, err := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+	if err != nil {
+		if *jsonOutput {
+			return encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error()})
+		}
+		fmt.Fprintln(os.Stderr, "Hive production run failed:", err)
+		return 1
+	}
+	durable, err := store.Load()
+	if err != nil {
+		if *jsonOutput {
+			return encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error()})
+		}
+		fmt.Fprintln(os.Stderr, "Hive production run failed:", err)
+		return 1
+	}
+	specialists, err := newIntegratedSpecialistRuntime(*stateDir, durable)
+	if err != nil {
+		if *jsonOutput {
+			return encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error()})
+		}
+		fmt.Fprintln(os.Stderr, "Hive production run failed:", err)
+		return 1
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+time.Minute)
 	defer cancel()
-	result, err := integrated.RunOnce(ctx, integrated.RunOptions{StateDir: *stateDir, Timeout: *timeout, GitHub: client})
+	options := integrated.RunOptions{StateDir: *stateDir, Timeout: *timeout, GitHub: client}
+	if specialists != nil {
+		options.Specialists = specialists.Manager
+		options.SpecialistWorkDir = specialists.WorkDir
+	}
+	result, err := integrated.RunOnce(ctx, options)
+	cleanupErr := specialists.Close()
+	if cleanupErr != nil {
+		err = errors.Join(err, fmt.Errorf("shutdown persistent Hive specialists: %w", cleanupErr))
+	}
 	if err != nil {
 		if *jsonOutput {
 			_ = encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error(), "partial": result})

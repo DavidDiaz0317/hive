@@ -295,6 +295,17 @@ func runIntegratedDaemon(args []string) int {
 		return 1
 	}
 	defer releaseDaemonLease(lease)
+	specialists, err := newIntegratedSpecialistRuntime(stateDirAbs, config)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "initialize persistent Hive specialists:", err)
+		return 1
+	}
+	specialistsClosed := false
+	defer func() {
+		if !specialistsClosed {
+			_ = specialists.Close()
+		}
+	}()
 	started := time.Now().UTC()
 	status := integratedDaemonStatus{SchemaVersion: daemonStatusSchema, PID: os.Getpid(), Running: true, Repository: config.Repository, StateDir: stateDirAbs, Executable: executable, HiveCommit: commit, ExecutableSHA256: digest, StartedAt: started, IntervalSeconds: int64(interval.Seconds())}
 	if err := writeIntegratedDaemonStatus(stateDirAbs, status); err != nil {
@@ -316,7 +327,7 @@ func runIntegratedDaemon(args []string) int {
 		status.LastError = ""
 		_ = writeIntegratedDaemonStatus(stateDirAbs, status)
 		cycleCtx, cancel := context.WithTimeout(ctx, *runTimeout+time.Minute)
-		result, cycleErr := runIntegratedDaemonCycle(cycleCtx, stateDirAbs, *runTimeout)
+		result, cycleErr := runIntegratedDaemonCycle(cycleCtx, stateDirAbs, *runTimeout, specialists)
 		cancel()
 		now := time.Now().UTC()
 		wait := *interval
@@ -343,13 +354,18 @@ func runIntegratedDaemon(args []string) int {
 			if !timer.Stop() {
 				<-timer.C
 			}
+			if err := specialists.Close(); err != nil {
+				fmt.Fprintln(os.Stderr, "shutdown persistent Hive specialists:", err)
+				return 1
+			}
+			specialistsClosed = true
 			return 0
 		case <-timer.C:
 		}
 	}
 }
 
-func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time.Duration) (integrated.RunResult, error) {
+func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time.Duration, specialists *integratedSpecialistRuntime) (integrated.RunResult, error) {
 	token := resolveGitHubToken("HIVE_GITHUB_TOKEN")
 	if token == "" {
 		return integrated.RunResult{}, fmt.Errorf("GitHub authorization is unavailable; run gh auth login")
@@ -369,11 +385,17 @@ func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time
 	if ok, message := validateVisualHiveLauncher(config); !ok {
 		return integrated.RunResult{}, fmt.Errorf("Visual Hive runtime is not ready: %s", message)
 	}
-	providerCtx, providerCancel := context.WithTimeout(ctx, 45*time.Second)
-	providerErr := (repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}).Health(providerCtx)
-	providerCancel()
-	if providerErr != nil {
-		return integrated.RunResult{}, providerErr
+	if specialists != nil {
+		if err := specialists.matches(stateDir, config); err != nil {
+			return integrated.RunResult{}, err
+		}
+	} else {
+		providerCtx, providerCancel := context.WithTimeout(ctx, 45*time.Second)
+		providerErr := (repair.CodexProvider{Command: config.ProviderCommand, Prefix: config.ProviderArgs}).Health(providerCtx)
+		providerCancel()
+		if providerErr != nil {
+			return integrated.RunResult{}, providerErr
+		}
 	}
 	for _, check := range liveRepositoryChecks(ctx, client, config) {
 		if check.OK {
@@ -393,7 +415,12 @@ func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time
 		}
 		return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %s", check.Name, check.Message)
 	}
-	return integrated.RunOnce(ctx, integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client})
+	options := integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client}
+	if specialists != nil {
+		options.Specialists = specialists.Manager
+		options.SpecialistWorkDir = specialists.WorkDir
+	}
+	return integrated.RunOnce(ctx, options)
 }
 
 func daemonCanRunProtectionActivation(ctx context.Context, client *hivegithub.Client, config integrated.Config) (bool, error) {

@@ -89,6 +89,46 @@ func TestValidateV3BundleAndCompleteSourceArtifact(t *testing.T) {
 	}
 }
 
+func TestVerifyReviewEvidenceArtifactRequiresCompleteContentAddressedBytes(t *testing.T) {
+	root := t.TempDir()
+	report := []byte(`{"status":"failed","kind":"visual_regression"}`)
+	reportPath := ".visual-hive/report.json"
+	writeTestData(t, filepath.Join(root, filepath.FromSlash(reportPath)), report)
+	index := ArtifactIndexReport{
+		SchemaVersion: 1, Project: "demo", GeneratedAt: "2026-07-15T12:00:00.000Z", Root: ".visual-hive", ContentAddressed: true, Complete: true,
+		Summary:   ArtifactIndexSummary{DiscoveredArtifactCount: 1, ArtifactCount: 1, TotalBytes: int64(len(report)), JSON: 1},
+		Artifacts: []ArtifactIndexEntry{{Path: reportPath, Kind: "json", ContentType: "application/json", Bytes: int64(len(report)), SHA256: digest(report), SafeToRender: true, Labels: []string{}}},
+		Warnings:  []string{},
+	}
+	indexData, err := json.Marshal(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestData(t, filepath.Join(root, ".visual-hive", "artifacts-index.json"), indexData)
+	writeTestData(t, filepath.Join(root, sourceArtifactExtractionMarker), []byte("88\n"))
+
+	verified, err := VerifyReviewEvidenceArtifact(root, 88)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.SchemaVersion != ReviewEvidenceSchemaVersion || verified.ArtifactIndexSHA256 != digest(indexData) ||
+		verified.EvidenceRoot != filepath.Join(root, ".visual-hive") || verified.ArtifactCount != 1 || verified.TotalBytes != int64(len(report)) {
+		t.Fatalf("review evidence identity = %+v", verified)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(reportPath)), []byte(`{"tampered":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyReviewEvidenceArtifact(root, 88); err == nil || !strings.Contains(err.Error(), "source artifact entry") {
+		t.Fatalf("tampered review evidence was accepted: %v", err)
+	}
+	writeTestData(t, filepath.Join(root, filepath.FromSlash(reportPath)), report)
+	writeTestData(t, filepath.Join(root, ".visual-hive", "extra.json"), []byte("{}"))
+	if _, err := VerifyReviewEvidenceArtifact(root, 88); err == nil || !strings.Contains(err.Error(), "unindexed") {
+		t.Fatalf("extra review evidence was accepted: %v", err)
+	}
+}
+
 func TestValidateV3RejectsLocalAndVerifiedProvenanceCombination(t *testing.T) {
 	manifestPath, _ := writeTestV3Bundle(t, nil)
 	_, err := ValidateBundle(manifestPath, ValidationOptions{

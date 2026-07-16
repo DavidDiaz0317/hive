@@ -1859,3 +1859,32 @@ func TestFixSharedConfigPerms_AlreadyCorrect(t *testing.T) {
 	// Should be a no-op
 	m.fixSharedConfigPerms(agent)
 }
+
+func TestCodexTrustPromptIsConsentUntilExactAffirmativeSelection(t *testing.T) {
+	pane := "> You are in /private/hive/specialists/quality\n\n" +
+		"  Do you trust the contents of this directory? Working with untrusted contents\n" +
+		"  comes with higher risk of prompt injection.\n\n" +
+		"\u203a 1. Yes, continue\n  2. No, quit\n\n  Press enter to continue"
+
+	if !paneShowsConsentScreen(pane) {
+		t.Fatal("Codex directory trust was not recognized as a consent screen")
+	}
+	if !paneSelectsCodexTrustAffirmative(pane) {
+		t.Fatal("exact Codex affirmative trust selection was not recognized")
+	}
+	if paneHasInputPrompt(pane) {
+		t.Fatal("Codex trust selection was mistaken for a ready input prompt")
+	}
+	if !paneHasInputPrompt("Codex ready\n\u203a Find and fix a bug in @filename\n\n  gpt-5.6-sol default") {
+		t.Fatal("Codex placeholder input prompt was not recognized")
+	}
+	if paneSelectsCodexTrustAffirmative(strings.Replace(pane, "1. Yes, continue", "1. No, quit", 1)) {
+		t.Fatal("Codex negative trust selection was accepted")
+	}
+	if backendAllowsInterruptBeforeKick("codex") || backendAllowsInterruptBeforeKick("goose") {
+		t.Fatal("interactive backend that exits on Ctrl+C was marked interrupt-safe")
+	}
+	if !backendAllowsInterruptBeforeKick("claude") {
+		t.Fatal("backend with established stale-input interrupt behavior was disabled")
+	}
+}

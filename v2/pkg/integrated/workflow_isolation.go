@@ -602,14 +602,34 @@ func productionAggregatorWorkflowJob(config Config, needs string) string {
         shell: bash
         run: |
 %s
+      - name: Stage content-addressed evidence root
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_stage="$RUNNER_TEMP/hive-visual-hive-evidence-${GITHUB_RUN_ID}"
+          test ! -e "$evidence_stage"
+          install -d -m 0700 "$evidence_stage/.visual-hive"
+          if find .visual-hive -type l -print -quit | grep -q .; then
+            echo "Runner-owned evidence contains a symbolic link" >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' source; do
+            relative="${source#.visual-hive/}"
+            case "$relative" in
+              bundles/*) continue ;;
+            esac
+            target="$evidence_stage/.visual-hive/$relative"
+            install -D -m 0444 -- "$source" "$target"
+            cmp -- "$source" "$target"
+          done < <(find .visual-hive -type f -print0 | sort -z)
+          test -f "$evidence_stage/.visual-hive/artifacts-index.json"
+          find "$evidence_stage" -depth -type d -exec chmod 0555 -- {} +
       - name: Upload independently verifiable evidence
         id: evidence
         uses: actions/upload-artifact@%s
         with:
           name: visual-hive-evidence-${{ github.run_id }}
-          path: |
-            .visual-hive
-            !.visual-hive/bundles/**
+          path: ${{ runner.temp }}/hive-visual-hive-evidence-${{ github.run_id }}
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 14
@@ -768,18 +788,42 @@ func runnerOwnedVerifierSetupSteps(config Config, targetRef, condition string) s
           npm ci
           npm run build
           test -z "$(git status --porcelain --untracked-files=no)"
-      - name: Move reverified tooling outside target checkout
+          release_dir="$RUNNER_TEMP/visual-hive-release-${GITHUB_RUN_ID}"
+          rm -rf -- "$release_dir"
+          GITHUB_SHA="$HIVE_VISUAL_HIVE_REF" node scripts/build-release-bundle.mjs --output "$release_dir"
+          test -f "$release_dir/release-manifest.json"
+          echo "HIVE_VISUAL_HIVE_RELEASE_DIR=$release_dir" >> "$GITHUB_ENV"
+      - name: Seal reverified release outside target checkout
 %s        shell: bash
+        env:
+          HIVE_VISUAL_HIVE_REF: %s
         run: |
           set -euo pipefail
-          mv .hive-visual-tooling "$RUNNER_TEMP/visual-hive-tooling"
-          cli="$RUNNER_TEMP/visual-hive-tooling/packages/cli/dist/index.js"
+          case "$HIVE_VISUAL_HIVE_RELEASE_DIR" in
+            "$RUNNER_TEMP"/visual-hive-release-*) ;;
+            *) echo "Visual Hive release path escaped the runner temp root" >&2; exit 1 ;;
+          esac
+          trusted_tooling="$RUNNER_TEMP/visual-hive-tooling"
+          test ! -e "$trusted_tooling"
+          mv "$HIVE_VISUAL_HIVE_RELEASE_DIR" "$trusted_tooling"
+          rm -rf -- .hive-visual-tooling
+          cli="$trusted_tooling/visual-hive.mjs"
           test -f "$cli"
-          sudo chown -R root:root "$RUNNER_TEMP/visual-hive-tooling"
-          sudo chmod -R a-w "$RUNNER_TEMP/visual-hive-tooling"
+          node - "$trusted_tooling/release-manifest.json" "$HIVE_VISUAL_HIVE_REF" <<'NODE'
+          const fs = require("fs");
+          const [manifestPath, expectedCommit] = process.argv.slice(2);
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          if (manifest.schemaVersion !== "visual-hive.release.v1" || manifest.name !== "visual-hive" ||
+              manifest.gitCommit !== expectedCommit || manifest.release !== true || manifest.clean !== true ||
+              manifest.entrypoint !== "visual-hive.mjs") {
+            throw new Error("rebuilt Visual Hive release identity is incomplete or mismatched");
+          }
+          NODE
+          sudo chown -R root:root "$trusted_tooling"
+          sudo chmod -R a-w "$trusted_tooling"
           echo "VISUAL_HIVE_CLI=$cli" >> "$GITHUB_ENV"
 `, checkoutActionSHA, conditionLine, targetRef, checkoutActionSHA, conditionLine, config.VisualHiveRepo, config.VisualHiveRef,
-		setupNodeActionSHA, conditionLine, conditionLine, config.VisualHiveRef, conditionLine)
+		setupNodeActionSHA, conditionLine, conditionLine, config.VisualHiveRef, conditionLine, config.VisualHiveRef)
 }
 
 func runnerOwnedEvaluationScopeScript() string {

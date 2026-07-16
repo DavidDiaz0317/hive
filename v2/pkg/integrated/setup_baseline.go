@@ -890,9 +890,10 @@ func reconcileVerifiedSetupBaselineDispatch(store *Store, intent SetupBaselineIn
 	if err != nil || !exists {
 		return err
 	}
-	// A failed or interrupted post-merge verifier deliberately retains its
-	// exact production checkpoint. Leave it for dispatchAndWait to resume.
-	if intent.Phase == SetupBaselineMerged && dispatch.Operation == "production" {
+	// A failed or interrupted production verifier deliberately retains its
+	// exact checkpoint. Leave it for dispatchAndWait to resume both while the
+	// baseline is being verified and after that verification has completed.
+	if (intent.Phase == SetupBaselineMerged || intent.Phase == SetupBaselineProductionVerified) && dispatch.Operation == "production" {
 		return nil
 	}
 	if dispatch.Operation != setupBaselineWorkflowOperation || dispatch.CorrelationID != intent.CaptureCorrelation || dispatch.RunID != intent.CaptureRunID {

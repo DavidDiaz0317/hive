@@ -3,6 +3,8 @@ package github
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,31 +48,38 @@ type VisualHiveArtifactRequest struct {
 }
 
 type VerifiedVisualHiveArtifact struct {
-	RepositoryID       string `json:"repository_id"`
-	WorkflowRunID      string `json:"workflow_run_id"`
-	WorkflowRunAttempt string `json:"workflow_run_attempt"`
-	ArtifactID         string `json:"artifact_id"`
-	SourceArtifactID   string `json:"source_artifact_id"`
-	ArtifactName       string `json:"artifact_name"`
-	CommitSHA          string `json:"commit_sha"`
-	HeadBranch         string `json:"head_branch"`
-	Event              string `json:"event"`
-	WorkflowName       string `json:"workflow_name"`
-	WorkflowRunName    string `json:"workflow_run_name"`
-	WorkflowPath       string `json:"workflow_path"`
-	RunURL             string `json:"run_url"`
-	ManifestPath       string `json:"manifest_path"`
-	SourceArtifactPath string `json:"source_artifact_path"`
-	EvidenceRootPath   string `json:"evidence_root_path"`
+	RepositoryID        string `json:"repository_id"`
+	WorkflowRunID       string `json:"workflow_run_id"`
+	WorkflowRunAttempt  string `json:"workflow_run_attempt"`
+	ArtifactID          string `json:"artifact_id"`
+	SourceArtifactID    string `json:"source_artifact_id"`
+	ArtifactName        string `json:"artifact_name"`
+	CommitSHA           string `json:"commit_sha"`
+	HeadBranch          string `json:"head_branch"`
+	Event               string `json:"event"`
+	WorkflowName        string `json:"workflow_name"`
+	WorkflowRunName     string `json:"workflow_run_name"`
+	WorkflowPath        string `json:"workflow_path"`
+	RunURL              string `json:"run_url"`
+	ManifestPath        string `json:"manifest_path"`
+	SourceArtifactPath  string `json:"source_artifact_path"`
+	EvidenceRootPath    string `json:"evidence_root_path"`
+	BundleSchemaVersion string `json:"bundle_schema_version"`
+	BundleSHA256        string `json:"bundle_sha256"`
+	ManifestSHA256      string `json:"manifest_sha256"`
+	ArtifactIndexSHA256 string `json:"artifact_index_sha256,omitempty"`
 }
 
 type PullRequestArtifactRequest struct {
-	Repository           string
-	ExpectedHeadSHA      string
-	ExpectedHeadBranch   string
-	ExpectedWorkflowPath string
-	ArtifactName         string
-	DestinationDir       string
+	Repository            string
+	PullRequestNumber     int
+	ExpectedWorkflowRunID int64
+	ExpectedHeadSHA       string
+	ExpectedHeadBranch    string
+	ExpectedWorkflowName  string
+	ExpectedWorkflowPath  string
+	ArtifactName          string
+	DestinationDir        string
 }
 
 // VerifiedPullRequestArtifact is deliberately review-only evidence. A failed
@@ -78,16 +87,22 @@ type PullRequestArtifactRequest struct {
 // exact-head screenshots may be presented through the separate baseline review
 // path after Hive independently verifies the run and artifact provenance.
 type VerifiedPullRequestArtifact struct {
-	RepositoryID  string `json:"repository_id"`
-	WorkflowRunID int64  `json:"workflow_run_id"`
-	ArtifactID    int64  `json:"artifact_id"`
-	ArtifactName  string `json:"artifact_name"`
-	CommitSHA     string `json:"commit_sha"`
-	HeadBranch    string `json:"head_branch"`
-	WorkflowPath  string `json:"workflow_path"`
-	Conclusion    string `json:"conclusion"`
-	RunURL        string `json:"run_url"`
-	ArtifactRoot  string `json:"artifact_root"`
+	RepositoryID        string `json:"repository_id"`
+	PullRequestNumber   int    `json:"pull_request_number"`
+	WorkflowRunID       int64  `json:"workflow_run_id"`
+	WorkflowRunAttempt  int    `json:"workflow_run_attempt"`
+	ArtifactID          int64  `json:"artifact_id"`
+	ArtifactName        string `json:"artifact_name"`
+	CommitSHA           string `json:"commit_sha"`
+	HeadBranch          string `json:"head_branch"`
+	WorkflowName        string `json:"workflow_name"`
+	WorkflowPath        string `json:"workflow_path"`
+	Conclusion          string `json:"conclusion"`
+	RunURL              string `json:"run_url"`
+	ArtifactRoot        string `json:"artifact_root"`
+	EvidenceRootPath    string `json:"evidence_root_path"`
+	ReviewSchemaVersion string `json:"review_schema_version"`
+	ArtifactIndexSHA256 string `json:"artifact_index_sha256"`
 }
 
 // FetchAndVerifyPullRequestArtifact retrieves a failed exact-head PR artifact
@@ -99,13 +114,20 @@ func (c *Client) FetchAndVerifyPullRequestArtifact(ctx context.Context, request 
 	if err != nil {
 		return VerifiedPullRequestArtifact{}, err
 	}
-	if strings.TrimSpace(request.ExpectedHeadSHA) == "" || strings.TrimSpace(request.ExpectedHeadBranch) == "" ||
-		strings.TrimSpace(request.ExpectedWorkflowPath) == "" || strings.TrimSpace(request.ArtifactName) == "" || strings.TrimSpace(request.DestinationDir) == "" {
-		return VerifiedPullRequestArtifact{}, fmt.Errorf("exact PR head, branch, workflow path, artifact name, and destination are required")
+	if request.PullRequestNumber <= 0 || request.ExpectedWorkflowRunID <= 0 || strings.TrimSpace(request.ExpectedHeadSHA) == "" || strings.TrimSpace(request.ExpectedHeadBranch) == "" ||
+		strings.TrimSpace(request.ExpectedWorkflowName) == "" || strings.TrimSpace(request.ExpectedWorkflowPath) == "" || strings.TrimSpace(request.ArtifactName) == "" || strings.TrimSpace(request.DestinationDir) == "" {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("exact PR number, workflow run, head, branch, workflow name/path, artifact name, and destination are required")
 	}
 	repository, _, err := c.client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
 		return VerifiedPullRequestArtifact{}, fmt.Errorf("verify PR artifact repository: %w", err)
+	}
+	pull, _, err := c.client.PullRequests.Get(ctx, owner, repo, request.PullRequestNumber)
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("verify current PR artifact target: %w", err)
+	}
+	if pull.GetState() != "open" || pull.GetMerged() || pull.GetNumber() != request.PullRequestNumber || pull.GetHead().GetSHA() != request.ExpectedHeadSHA || pull.GetHead().GetRef() != request.ExpectedHeadBranch {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("PR artifact target is not the exact current open pull request head")
 	}
 	runs, _, err := c.client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repo, &gh.ListWorkflowRunsOptions{
 		Event: "pull_request", Status: "completed", HeadSHA: request.ExpectedHeadSHA, ListOptions: gh.ListOptions{PerPage: 100},
@@ -115,13 +137,13 @@ func (c *Client) FetchAndVerifyPullRequestArtifact(ctx context.Context, request 
 	}
 	var selected *gh.WorkflowRun
 	for _, run := range runs.WorkflowRuns {
-		if run.GetHeadSHA() != request.ExpectedHeadSHA || run.GetHeadBranch() != request.ExpectedHeadBranch || run.GetEvent() != "pull_request" ||
-			run.GetStatus() != "completed" || run.GetConclusion() != "failure" || !workflowPathMatches(run.GetPath(), request.ExpectedWorkflowPath) {
+		if run.GetID() != request.ExpectedWorkflowRunID || run.GetHeadSHA() != request.ExpectedHeadSHA || run.GetHeadBranch() != request.ExpectedHeadBranch || run.GetEvent() != "pull_request" ||
+			run.GetStatus() != "completed" || run.GetConclusion() != "failure" || run.GetName() != request.ExpectedWorkflowName || run.GetRunAttempt() <= 0 ||
+			!workflowPathMatches(run.GetPath(), request.ExpectedWorkflowPath) || !workflowRunReferencesPullRequest(run, request.PullRequestNumber) {
 			continue
 		}
-		if selected == nil || run.GetID() > selected.GetID() {
-			selected = run
-		}
+		selected = run
+		break
 	}
 	if selected == nil {
 		return VerifiedPullRequestArtifact{}, fmt.Errorf("no completed failed PR run matches exact head %s and workflow %s", request.ExpectedHeadSHA, request.ExpectedWorkflowPath)
@@ -148,11 +170,29 @@ func (c *Client) FetchAndVerifyPullRequestArtifact(ctx context.Context, request 
 	if err != nil {
 		return VerifiedPullRequestArtifact{}, err
 	}
+	review, err := visualhive.VerifyReviewEvidenceArtifact(root, artifact.GetID())
+	if err != nil {
+		return VerifiedPullRequestArtifact{}, fmt.Errorf("verify complete PR review evidence: %w", err)
+	}
 	return VerifiedPullRequestArtifact{
-		RepositoryID: strconv.FormatInt(repository.GetID(), 10), WorkflowRunID: selected.GetID(), ArtifactID: artifact.GetID(),
-		ArtifactName: artifact.GetName(), CommitSHA: selected.GetHeadSHA(), HeadBranch: selected.GetHeadBranch(), WorkflowPath: selected.GetPath(),
-		Conclusion: selected.GetConclusion(), RunURL: selected.GetHTMLURL(), ArtifactRoot: root,
+		RepositoryID: strconv.FormatInt(repository.GetID(), 10), PullRequestNumber: request.PullRequestNumber,
+		WorkflowRunID: selected.GetID(), WorkflowRunAttempt: selected.GetRunAttempt(), ArtifactID: artifact.GetID(), ArtifactName: artifact.GetName(),
+		CommitSHA: selected.GetHeadSHA(), HeadBranch: selected.GetHeadBranch(), WorkflowName: selected.GetName(), WorkflowPath: selected.GetPath(),
+		Conclusion: selected.GetConclusion(), RunURL: selected.GetHTMLURL(), ArtifactRoot: root, EvidenceRootPath: review.EvidenceRoot,
+		ReviewSchemaVersion: review.SchemaVersion, ArtifactIndexSHA256: review.ArtifactIndexSHA256,
 	}, nil
+}
+
+func workflowRunReferencesPullRequest(run *gh.WorkflowRun, number int) bool {
+	if run == nil || number <= 0 {
+		return false
+	}
+	for _, pull := range run.PullRequests {
+		if pull != nil && pull.GetNumber() == number {
+			return true
+		}
+	}
+	return false
 }
 
 // FetchAndVerifyVisualHiveBundle downloads the artifact through Hive's GitHub
@@ -271,6 +311,17 @@ func (c *Client) FetchAndVerifyVisualHiveBundle(ctx context.Context, request Vis
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("validate independently fetched Visual Hive bundle: %w", err)
 	}
 	manifest := bundle.Manifest
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("read verified Visual Hive manifest identity: %w", err)
+	}
+	manifestDigest := sha256.Sum256(manifestBytes)
+	verified.BundleSchemaVersion = manifest.SchemaVersion
+	verified.BundleSHA256 = manifest.OverallDigest
+	verified.ManifestSHA256 = hex.EncodeToString(manifestDigest[:])
+	if manifest.ArtifactIndex != nil {
+		verified.ArtifactIndexSHA256 = manifest.ArtifactIndex.SHA256
+	}
 	if manifest.Source.CommitSHA != verified.CommitSHA || manifest.Source.Event != verified.Event || manifest.Source.WorkflowArtifactID != verified.SourceArtifactID {
 		return nil, VerifiedVisualHiveArtifact{}, fmt.Errorf("Visual Hive manifest does not match independently fetched workflow metadata")
 	}

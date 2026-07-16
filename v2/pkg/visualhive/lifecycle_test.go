@@ -656,7 +656,7 @@ func TestIssuePublicationSelectionEnforcesActiveWIPAndRanksDirectFailuresFirst(t
 		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen},
 	}
 
-	selected := selectIssuePublications("", observations, findings, 2, false)
+	selected := selectIssuePublications("", observations, findings, 0, 2, false)
 
 	if len(selected) != 1 || !selected["regression"] {
 		t.Fatalf("expected one remaining slot to select the direct high-severity failure, got %v", selected)
@@ -673,7 +673,7 @@ func TestIssuePublicationSelectionPrefersRepairableConsoleFailure(t *testing.T) 
 		"existing": {RepositoryFingerprint: "existing", IssueNumber: 17, Status: StatusIssueOpen, HumanReviewRequired: true},
 	}
 
-	selected := selectIssuePublications("", observations, findings, 2, true)
+	selected := selectIssuePublications("", observations, findings, 0, 2, true)
 
 	if len(selected) != 1 || !selected["console"] {
 		t.Fatalf("expected repair mode to select the actionable console failure, got %v", selected)
@@ -688,7 +688,7 @@ func TestIssuePublicationSelectionPrioritizesBlockingRepositoryPlan(t *testing.T
 		{RepositoryFingerprint: "visual", State: "present", Severity: "critical", IssueKind: "visual_regression", Title: "Critical visual regression"},
 		{RepositoryFingerprint: "repository-plan", State: "present", Severity: "high", IssueKind: RepositoryTestFailureKind, Title: "Repository test failed"},
 	}
-	selected := selectIssuePublications("", observations, nil, 1, true)
+	selected := selectIssuePublications("", observations, nil, 0, 1, true)
 	if len(selected) != 1 || !selected["repository-plan"] {
 		t.Fatalf("blocking repository plan did not reserve the bounded repair slot: %v", selected)
 	}
@@ -699,13 +699,109 @@ func TestIssuePublicationSelectionPrefersTestOnlyRepairOverUnrepairableBacklog(t
 		{RepositoryFingerprint: "onboarding", State: "present", Severity: "critical", IssueKind: "external_repo_onboarding", Title: "Review readiness gate"},
 		{RepositoryFingerprint: "tests", State: "present", Severity: "high", IssueKind: "test_adequacy_gap", Title: "Add repository unit test coverage"},
 	}
-	selected := selectIssuePublications("", observations, nil, 1, true)
+	selected := selectIssuePublications("", observations, nil, 0, 1, true)
 	if len(selected) != 1 || !selected["tests"] {
 		t.Fatalf("repair mode should select the bounded test-only repair before advisory backlog: %v", selected)
 	}
-	selected = selectIssuePublications("", observations, nil, 1, false)
+	selected = selectIssuePublications("", observations, nil, 0, 1, false)
 	if len(selected) != 1 || !selected["onboarding"] {
 		t.Fatalf("issues-only mode should preserve severity ordering: %v", selected)
+	}
+}
+
+func TestIssuePublicationSelectionCountsHumanHeldIssueAgainstRepositoryWIP(t *testing.T) {
+	const repository = "owner/repo"
+	scopeRoot := "test-adequacy/repository/scope-review"
+	observations := []Observation{
+		{RepositoryFingerprint: "scope-review", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", PublicationRole: "canonical", RootCauseKey: scopeRoot},
+		{RepositoryFingerprint: "actionable", State: "present", Severity: "medium", IssueKind: "test_adequacy_gap", Title: "Add deterministic contract assertions", PublicationRole: "canonical", RootCauseKey: "test-adequacy/repository/actionable"},
+	}
+	findings := map[string]*FindingLifecycle{
+		"scope-review": {
+			Repository: repository, RepositoryFingerprint: "scope-review", PublicationRole: "canonical", RootCauseKey: scopeRoot,
+			PublicationFingerprint: digest([]byte(repository + "\x00" + scopeRoot)), IssueNumber: 17, Status: StatusIssueOpen,
+			HumanReviewRequired: true, ManualReviewKind: "repair_scope",
+		},
+	}
+
+	selected := selectIssuePublications(repository, observations, findings, 0, 1, true)
+	if !selected["scope-review"] || selected["actionable"] {
+		t.Fatalf("repair mode exceeded repository WIP while preserving the human-held issue: %v", selected)
+	}
+	selected = selectIssuePublications(repository, observations, findings, 0, 1, false)
+	if selected["actionable"] {
+		t.Fatalf("issues-only mode unexpectedly excluded a human-held issue from the active issue limit: %v", selected)
+	}
+}
+
+func TestIssuePublicationSelectionPrefersContractScopedCoverageRepair(t *testing.T) {
+	observations := []Observation{
+		{RepositoryFingerprint: "generic", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", Title: "Add mutation evidence"},
+		{RepositoryFingerprint: "contract", State: "present", Severity: "medium", IssueKind: "missing_visual_coverage", Title: "Add deterministic flow steps", AffectedContracts: []string{"production-ready-marker"}},
+	}
+	selected := selectIssuePublications("", observations, nil, 0, 1, true)
+	if len(selected) != 1 || !selected["contract"] {
+		t.Fatalf("repair mode did not select the contract-scoped contribution before a generic advisory gap: %v", selected)
+	}
+	selected = selectIssuePublications("", observations, nil, 0, 1, false)
+	if len(selected) != 1 || !selected["generic"] {
+		t.Fatalf("issues-only mode did not preserve severity ordering: %v", selected)
+	}
+}
+
+func TestPendingOpenIssueReservationConsumesRepositoryWIP(t *testing.T) {
+	repository := "owner/repo"
+	findings := map[string]*FindingLifecycle{
+		"reserved": {Repository: repository, RepositoryFingerprint: "reserved", PublicationFingerprint: "publication-reserved", Status: StatusDetected, LastBundleDigest: "bundle-digest"},
+	}
+	outbox := []*OutboxEntry{{Action: OutboxOpenIssue, Repository: repository, RepositoryFingerprint: "reserved", BundleDigest: "bundle-digest"}}
+	reserved := pendingOpenIssueReservationCount(repository, findings, outbox)
+	if reserved != 1 {
+		t.Fatalf("pending open-issue reservations = %d, want 1", reserved)
+	}
+	selected := selectIssuePublications(repository, []Observation{{RepositoryFingerprint: "second", State: "present", Severity: "critical", IssueKind: "visual_regression"}}, findings, reserved, 1, true)
+	if selected["second"] {
+		t.Fatalf("pending outbox reservation did not consume the repository WIP slot: %v", selected)
+	}
+}
+
+func TestApplyBundleSequentialEvidenceApplicationsShareOnePendingWIPSlot(t *testing.T) {
+	root := t.TempDir()
+	lifecycle, err := NewLifecycleStore(filepath.Join(root, "lifecycle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beadStore := newTestBeadStore(t, filepath.Join(root, "beads"))
+	options := ApplyLifecycleOptions{TargetRef: "main", MaxActiveIssues: 1, PreferRepairable: true}
+
+	first := publicationTestObservation("first", "canonical", "test-adequacy/repository/first", "test_adequacy_gap", "Add the first deterministic contract assertion")
+	firstBundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "first"), "bundle-pending-wip-first", []Observation{first}, false))
+	firstResult, err := lifecycle.ApplyBundle(firstBundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingAfterFirst := lifecycle.PendingOutbox()
+	if firstResult.OutboxCreated != 1 || len(pendingAfterFirst) != 1 || pendingAfterFirst[0].Action != OutboxOpenIssue {
+		t.Fatalf("first evidence application did not reserve exactly one issue slot: result=%+v pending=%+v", firstResult, pendingAfterFirst)
+	}
+
+	second := publicationTestObservation("second", "canonical", "test-adequacy/repository/second", "test_adequacy_gap", "Add the second deterministic contract assertion")
+	secondBundle := validateLocalBundle(t, writePublicationLifecycleBundle(t, filepath.Join(root, "second"), "bundle-pending-wip-second", []Observation{second}, false))
+	secondResult, err := lifecycle.ApplyBundle(secondBundle, beadStore, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingAfterSecond := lifecycle.PendingOutbox()
+	if secondResult.OutboxCreated != 0 || secondResult.Deferred != 1 {
+		t.Fatalf("second evidence application exceeded the pending repository WIP slot: result=%+v", secondResult)
+	}
+	if len(pendingAfterSecond) != 1 || pendingAfterSecond[0].ID != pendingAfterFirst[0].ID {
+		t.Fatalf("second evidence application replaced or duplicated the pending issue reservation: first=%+v second=%+v", pendingAfterFirst, pendingAfterSecond)
+	}
+	secondFingerprint := secondBundle.Manifest.Observations[0].RepositoryFingerprint
+	secondFinding, ok := lifecycle.Finding(secondFingerprint)
+	if !ok || secondFinding.IssueNumber != 0 || secondFinding.Status != StatusDetected {
+		t.Fatalf("deferred finding was not retained locally without an issue: found=%t finding=%+v", ok, secondFinding)
 	}
 }
 
@@ -725,7 +821,7 @@ func TestExplicitRootPublicationCollapsesNineObservationsToTwoIssues(t *testing.
 	}
 
 	for _, maxActive := range []int{0, 10} {
-		selected := selectIssuePublications("", observations, nil, maxActive, true)
+		selected := selectIssuePublications("", observations, nil, 0, maxActive, true)
 		if len(selected) != 2 || !selected["mutation"] || !selected["tests"] {
 			t.Fatalf("maxActive=%d publication set = %v, want exact two canonical roots", maxActive, selected)
 		}
@@ -739,7 +835,7 @@ func TestExplicitRootPublicationFailsOpenForUncoveredValidLinkage(t *testing.T) 
 		{RepositoryFingerprint: "aggregate", State: "present", Severity: "high", IssueKind: "external_repo_onboarding", PublicationRole: "aggregate", RootCauseKey: "aggregate/readiness", BlockedByRootKeys: []string{root, "workflow/unknown"}},
 		{RepositoryFingerprint: "legacy-text", State: "present", Severity: "high", IssueKind: "missing_visual_coverage", Title: "Maintain visual test: mutation_survivor"},
 	}
-	selected := selectIssuePublications("", observations, nil, 0, true)
+	selected := selectIssuePublications("", observations, nil, 0, 0, true)
 	if len(selected) != len(observations) {
 		t.Fatalf("uncovered or legacy valid metadata was suppressed: %v", selected)
 	}
@@ -747,12 +843,12 @@ func TestExplicitRootPublicationFailsOpenForUncoveredValidLinkage(t *testing.T) 
 	active := map[string]*FindingLifecycle{
 		"owner": {Repository: "owner/repo", RepositoryFingerprint: "owner", PublicationFingerprint: "corrupt", RootCauseKey: root, IssueNumber: 7, Status: StatusIssueOpen},
 	}
-	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, true)
+	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, 0, true)
 	if len(selected) != 1 || !selected["uncovered"] {
 		t.Fatalf("invalid root ownership suppressed an independently actionable derivative: %v", selected)
 	}
 	active["owner"].PublicationFingerprint = digest([]byte("owner/repo\x00" + root))
-	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, true)
+	selected = selectIssuePublications("owner/repo", observations[:1], active, 0, 0, true)
 	if len(selected) != 0 {
 		t.Fatalf("derivative was not deferred by exact active root owner: %v", selected)
 	}
