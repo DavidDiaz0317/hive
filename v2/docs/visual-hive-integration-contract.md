@@ -31,6 +31,16 @@ A disposable private real-code repo MAY provide initial no-merge safety proof, b
 cannot satisfy P0 or unlock release work; only the later Console fork/PR can. Other
 tests are supporting evidence. Until P0 passes, packaging/polish is not completion.
 
+### Fork-only repository boundary
+
+Until the repository owner explicitly lifts this boundary, upstream/real Hive and
+KubeStellar Console repositories, checkouts, remotes, issues, PRs, workflows, and
+production Hive state are read-only. Implementation runs only in isolated local
+branches/worktrees derived from the owner's forks. Console P0 means an actual PR
+whose base and head are both inside the Console fork, operated by a dedicated
+namespaced normal Hive built from the Hive fork. It does not authorize an upstream
+PR, an upstream workflow mutation, or use of the production KubeStellar Hive.
+
 ## Exact ownership split
 
 Visual Hive owns only the deterministic testing boundary:
@@ -217,8 +227,10 @@ or integration control plane; its port, auth, lifecycle, and authority stay inde
 Because `ProjectConfig` is single-org and normal Hive forms `project.org/repo`, a
 `DavidDiaz0317` disposable proof uses a dedicated namespaced **normal** Hive config:
 separate state root, tmux/session prefix, and dashboard port, with existing policies.
-That is isolation, not a new runtime. Console P0 uses its existing `kubestellar`
-production Hive uninterrupted; disposable proof never satisfies P0.
+That is isolation, not a new runtime. Console P0 uses the same fork-only isolation:
+the Console fork and a dedicated namespaced normal Hive built from the Hive fork.
+Upstream Console and the production `kubestellar` Hive remain read-only and
+uninterrupted. The preliminary disposable-repository proof still cannot satisfy P0.
 
 ## Migration and reuse map
 
@@ -264,10 +276,12 @@ All gates are blocking:
 ### Mandatory P0 real-repository scenario
 
 Before release work, run an actual KubeStellar Console fork and PR (not a fixture),
-using its existing production Hive, reviewed baselines, and no-merge authority:
+with both PR refs in the fork, a dedicated namespaced normal Hive built from the
+Hive fork, reviewed baselines, and no-merge authority. Upstream Console and the
+production KubeStellar Hive remain read-only:
 
-1. Record exact base/head, installed commits/policy, persistent Hive health/cadence,
-   and existing checks.
+1. Record exact fork base/head, installed fork commits/policy, namespaced Hive
+   health/cadence, upstream read-only proof, and existing checks.
 2. Select one reproducible real UI defect or deterministic failing contract; do
    not create/update a baseline, weaken a check, or expose a credential.
 3. Verify one packet; create its stable role bead/ref; record `Governor.AdmitWork` reason.
@@ -347,4 +361,5 @@ deferred ideas, not authority for parallel state, roles, release work, or writes
 - **2026-07-16 -- one path:** Hive orchestrates/lifecycles; Visual Hive tests/verdicts.
 - **2026-07-16 -- one packet:** `bundle.v3`; other packets/exports are payload/previews.
 - **2026-07-16 -- transition:** the second manager/repair path is compatibility only.
-- **2026-07-16 -- proof:** isolated disposable safety first; production-Hive Console P0 gates release.
+- **2026-07-16 -- proof:** isolated disposable safety first; fork-only Console P0
+  with namespaced fork-built Hive gates release; upstream and production stay read-only.
