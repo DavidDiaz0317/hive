@@ -74,7 +74,8 @@ capabilities.
 - `BuildSchedulerAdmittedWork` is the only intake-envelope projection into
   `scheduler.AdmittedWork`. It preserves canonical work, packet, finding,
   evidence receipts, exact base/tree, recurrence, role, paths, contracts,
-  validation, and deadline.
+  validation, and deadline. It independently rejects valid JSON receipt bytes
+  that differ from the exact receipt carried by the evidence identity.
 - The existing Scheduler composes the governed request with the current normal
   role snapshot, project context, knowledge primer, capability/policy digests,
   and a separately injected contained-Codex executor profile.
@@ -255,6 +256,7 @@ not on this critical path.
 | `102c4d94` | controller-owned resume without refetch/reimport |
 | `1d15ab47` | crash-safe no-dispatch workflow consumption |
 | `630d5fad` | exact verdict-byte persistence and ledger state validation |
+| `55e704ff` | lossless Scheduler projection and exact receipt cross-binding |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.
