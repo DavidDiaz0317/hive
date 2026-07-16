@@ -199,6 +199,27 @@ Effective proposal capability denies GitHub/Hive/bead/wiki/graph/MCP/API/subagen
 - It MUST NOT use PR-head code/artifacts, interpolate untrusted shell text, expose
   secrets, or issue a Visual Hive verdict/admission receipt.
 
+### PR evidence producer and verifier isolation
+
+- The untrusted target service and the evidence producer MUST run under
+  distinct operating-system identities. The target identity MUST NOT be able
+  to create, replace, rename, link, truncate, or chmod files in the producer's
+  evidence root before or after sealing.
+- The producer MUST emit one authenticated root receipt that binds the complete
+  artifact index, exact PR head/base, pinned producer, workflow/run attempt,
+  runtime, plan/config/contracts/scopes, changed-file set, and baselines. A
+  hostile target-service overwrite test is required evidence, not optional
+  hardening.
+- Hive MUST discover the exact run attempt and named artifacts from
+  authenticated GitHub metadata using independently known repository, PR,
+  head/base, workflow, and producer facts. Internal artifact digests are
+  untrusted claims until Hive recomputes and cross-binds them to the root
+  receipt, index, and exact-head Git blobs.
+- A caller MUST NOT pre-parse the downloaded artifact and feed its own claimed
+  internal SHA values back as "expected" verifier inputs. If a verifier API
+  cannot be called without such self-asserted pins, it is not a production
+  verification boundary.
+
 ### Replay and deduplication
 
 - `(repository ID, replay key)` identifies one immutable-digest admission; different
@@ -298,6 +319,9 @@ All gates are blocking:
    after digests, require that change to be the sole authorized repair, forbid any
    reduction in required checks, and keep the producer commit, mutation operator
    implementation/ID, target contract, runtime, and baseline digests fixed.
+   The producer/verifier isolation requirements above, including distinct UIDs,
+   protected root, authenticated root receipt, trusted run/artifact discovery,
+   internal recomputation, and hostile-overwrite rejection, are part of this gate.
 7. **Lifecycle:** closure/merge uses verified rerun evidence and normal gates;
    `repair-pr` proves no merge.
 8. **Coexistence:** normal Hive and Console workflows continue without lost cadence,
