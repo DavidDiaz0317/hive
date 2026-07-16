@@ -1430,10 +1430,7 @@ func TestSealIsolatedVisualEvidenceCrossPrincipal(t *testing.T) {
 		{name: "fifo", prepare: `mkfifo "$HIVE_EVIDENCE_ROOT/pipe"`, wantFailure: "non-regular file"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			workspace := t.TempDir()
-			if err := os.Chmod(workspace, 0o711); err != nil {
-				t.Fatal(err)
-			}
+			workspace := crossPrincipalTempDir(t)
 			evidence := filepath.Join(workspace, ".visual-hive")
 			if err := os.Mkdir(evidence, 0o755); err != nil {
 				t.Fatal(err)
@@ -1454,6 +1451,7 @@ func TestSealIsolatedVisualEvidenceCrossPrincipal(t *testing.T) {
 				t.Fatalf("prepare target evidence: %v: %s", err, output)
 			}
 			seal := exec.Command(bash, "-euo", "pipefail", "-c", sealIsolatedVisualEvidenceShell())
+			seal.Dir = workspace
 			seal.Env = append(os.Environ(), "GITHUB_WORKSPACE="+workspace)
 			output, sealErr := run(seal)
 			if test.wantFailure != "" {
@@ -1496,10 +1494,7 @@ func TestProtectedEvidenceDeniesContinuousTargetOverwriteAndPostAuthenticationFo
 		t.Skipf("the distinct nobody target account is unavailable: %v: %s", err, output)
 	}
 
-	workspace := t.TempDir()
-	if err := os.Chmod(workspace, 0o711); err != nil {
-		t.Fatal(err)
-	}
+	workspace := crossPrincipalTempDir(t)
 	evidence := filepath.Join(workspace, ".visual-hive")
 	if err := os.Mkdir(evidence, 0o700); err != nil {
 		t.Fatal(err)
@@ -1562,6 +1557,19 @@ func mustCommandOutput(t *testing.T, name string, args ...string) string {
 		t.Fatal(err)
 	}
 	return string(output)
+}
+
+func crossPrincipalTempDir(t *testing.T) string {
+	t.Helper()
+	workspace, err := os.MkdirTemp("", "hive-cross-principal-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workspace) })
+	if err := os.Chmod(workspace, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	return workspace
 }
 
 func TestRawTargetEvidenceIsBoundedBeforeArtifactUpload(t *testing.T) {
