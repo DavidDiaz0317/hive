@@ -21,7 +21,7 @@ import (
 	visualcontroller "github.com/kubestellar/hive/v2/pkg/visualhive/controller"
 )
 
-const ledgerSchema = "hive.normal-visual-work.v2"
+const ledgerSchema = "hive.normal-visual-work.v3"
 
 var (
 	ErrFinalVerdictPending = errors.New("exact-head pull-request verdict is pending")
@@ -36,6 +36,7 @@ type ArtifactSource interface {
 type Intake interface {
 	Import(context.Context, hivegithub.VerifiedVisualHiveArtifact) (visualcontroller.Result, error)
 	RevalidateSpecialistBoundary(string, string, string) (visualcontroller.DispatchEnvelope, error)
+	DeferUnselectedSpecialistDispatches(context.Context, string, []string, string) error
 	CompleteSpecialistPullRequest(string, visualcontroller.SpecialistPullRequestCompletion) error
 }
 
@@ -224,7 +225,11 @@ func (service *Service) RunCycle(ctx context.Context) error {
 			return fmt.Errorf("native Visual Hive intake held: %s", strings.Join(result.Errors, "; "))
 		}
 		var found bool
-		envelope, found = selectDispatch(result.DispatchPending, "")
+		var deferred []string
+		envelope, deferred, found, err = selectDispatchSet(result.DispatchPending)
+		if err != nil {
+			return err
+		}
 		if !found {
 			// A green report or a current pause/WIP/policy hold creates no model or
 			// PR. Retire this exact workflow and let the ordinary cadence produce a
@@ -243,6 +248,17 @@ func (service *Service) RunCycle(ctx context.Context) error {
 			return ErrNoDispatch
 		}
 		ledger.SourceExternalRef = envelope.SourceExternalRef
+		ledger.DeferredSourceExternalRefs = deferred
+		ledger.DeferralsRecorded = len(deferred) == 0
+		if err := service.saveLedger(ledger); err != nil {
+			return err
+		}
+	}
+	if !ledger.DeferralsRecorded {
+		if err := service.options.Intake.DeferUnselectedSpecialistDispatches(ctx, ledger.SourceExternalRef, ledger.DeferredSourceExternalRefs, ledger.WorkflowKey); err != nil {
+			return err
+		}
+		ledger.DeferralsRecorded = true
 		if err := service.saveLedger(ledger); err != nil {
 			return err
 		}
@@ -314,15 +330,22 @@ func (service *Service) finish(_ context.Context, ledger workLedger) error {
 	return service.saveLedger(ledger)
 }
 
-func selectDispatch(values []visualcontroller.DispatchEnvelope, sourceExternalRef string) (visualcontroller.DispatchEnvelope, bool) {
+func selectDispatchSet(values []visualcontroller.DispatchEnvelope) (visualcontroller.DispatchEnvelope, []string, bool, error) {
 	ordered := append([]visualcontroller.DispatchEnvelope(nil), values...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].SourceExternalRef < ordered[j].SourceExternalRef })
-	for _, value := range ordered {
-		if sourceExternalRef == "" || value.SourceExternalRef == sourceExternalRef {
-			return value, true
+	for index, value := range ordered {
+		if strings.TrimSpace(value.SourceExternalRef) == "" || (index > 0 && value.SourceExternalRef == ordered[index-1].SourceExternalRef) {
+			return visualcontroller.DispatchEnvelope{}, nil, false, errors.New("controller returned empty or duplicate launchable source refs")
 		}
 	}
-	return visualcontroller.DispatchEnvelope{}, false
+	if len(ordered) == 0 {
+		return visualcontroller.DispatchEnvelope{}, nil, false, nil
+	}
+	deferred := make([]string, 0, len(ordered)-1)
+	for _, value := range ordered[1:] {
+		deferred = append(deferred, value.SourceExternalRef)
+	}
+	return ordered[0], deferred, true, nil
 }
 
 func validateRepairOutcome(envelope visualcontroller.DispatchEnvelope, outcome RepairOutcome) error {
@@ -371,26 +394,28 @@ func validGitObject(value string) bool {
 }
 
 type workLedger struct {
-	SchemaVersion        string                         `json:"schema_version"`
-	WorkflowKey          string                         `json:"workflow_key"`
-	Workflow             integrated.WorkflowRunEvidence `json:"workflow"`
-	Repository           string                         `json:"repository"`
-	BaseBranch           string                         `json:"base_branch"`
-	PacketDigest         string                         `json:"packet_digest"`
-	SourceExternalRef    string                         `json:"source_external_ref,omitempty"`
-	WorkOrderID          string                         `json:"work_order_id,omitempty"`
-	RequestSHA256        string                         `json:"request_sha256,omitempty"`
-	Branch               string                         `json:"branch,omitempty"`
-	CommitSHA            string                         `json:"commit_sha,omitempty"`
-	PullRequestNumber    int                            `json:"pull_request_number,omitempty"`
-	PullRequestURL       string                         `json:"pull_request_url,omitempty"`
-	VerdictHeadSHA       string                         `json:"verdict_head_sha,omitempty"`
-	VerdictStatus        string                         `json:"verdict_status,omitempty"`
-	VerdictReceipt       []byte                         `json:"verdict_receipt_bytes,omitempty"`
-	VerdictReceiptSHA256 string                         `json:"verdict_receipt_sha256,omitempty"`
-	CompletionRecorded   bool                           `json:"completion_recorded,omitempty"`
-	ConsumeStarted       bool                           `json:"consume_started,omitempty"`
-	Consumed             bool                           `json:"consumed,omitempty"`
+	SchemaVersion              string                         `json:"schema_version"`
+	WorkflowKey                string                         `json:"workflow_key"`
+	Workflow                   integrated.WorkflowRunEvidence `json:"workflow"`
+	Repository                 string                         `json:"repository"`
+	BaseBranch                 string                         `json:"base_branch"`
+	PacketDigest               string                         `json:"packet_digest"`
+	SourceExternalRef          string                         `json:"source_external_ref,omitempty"`
+	DeferredSourceExternalRefs []string                       `json:"deferred_source_external_refs,omitempty"`
+	DeferralsRecorded          bool                           `json:"deferrals_recorded,omitempty"`
+	WorkOrderID                string                         `json:"work_order_id,omitempty"`
+	RequestSHA256              string                         `json:"request_sha256,omitempty"`
+	Branch                     string                         `json:"branch,omitempty"`
+	CommitSHA                  string                         `json:"commit_sha,omitempty"`
+	PullRequestNumber          int                            `json:"pull_request_number,omitempty"`
+	PullRequestURL             string                         `json:"pull_request_url,omitempty"`
+	VerdictHeadSHA             string                         `json:"verdict_head_sha,omitempty"`
+	VerdictStatus              string                         `json:"verdict_status,omitempty"`
+	VerdictReceipt             []byte                         `json:"verdict_receipt_bytes,omitempty"`
+	VerdictReceiptSHA256       string                         `json:"verdict_receipt_sha256,omitempty"`
+	CompletionRecorded         bool                           `json:"completion_recorded,omitempty"`
+	ConsumeStarted             bool                           `json:"consume_started,omitempty"`
+	Consumed                   bool                           `json:"consumed,omitempty"`
 }
 
 func (service *Service) ledgerPath() string {
@@ -465,6 +490,21 @@ func validateWorkLedger(ledger workLedger) error {
 	if (ledger.WorkOrderID == "") != (ledger.RequestSHA256 == "") {
 		return errors.New("specialist work-order identity is partial")
 	}
+	if ledger.SourceExternalRef != strings.TrimSpace(ledger.SourceExternalRef) {
+		return errors.New("selected source external ref is not canonical")
+	}
+	for index, ref := range ledger.DeferredSourceExternalRefs {
+		if ref == "" || ref != strings.TrimSpace(ref) || ref == ledger.SourceExternalRef ||
+			(index > 0 && ref <= ledger.DeferredSourceExternalRefs[index-1]) {
+			return errors.New("deferred source external refs are empty, duplicate, selected, or unsorted")
+		}
+	}
+	if ledger.SourceExternalRef == "" && (len(ledger.DeferredSourceExternalRefs) != 0 || ledger.DeferralsRecorded) {
+		return errors.New("unselected dispatch state exists without a selected source ref")
+	}
+	if ledger.SourceExternalRef != "" && !ledger.DeferralsRecorded && len(ledger.DeferredSourceExternalRefs) == 0 {
+		return errors.New("selected dispatch has an incomplete empty deferral checkpoint")
+	}
 	if ledger.WorkOrderID != "" && (!validSHA256Value(ledger.RequestSHA256) || ledger.WorkOrderID != "swo-"+ledger.RequestSHA256) {
 		return errors.New("specialist work-order identity is invalid")
 	}
@@ -483,6 +523,9 @@ func validateWorkLedger(ledger workLedger) error {
 	}
 	if ledger.SourceExternalRef == "" && (ledger.WorkOrderID != "" || prPresent || verdictPresent || ledger.CompletionRecorded) {
 		return errors.New("unimported workflow carries specialist or pull-request state")
+	}
+	if ledger.SourceExternalRef != "" && !ledger.DeferralsRecorded && (ledger.WorkOrderID != "" || prPresent || verdictPresent || ledger.CompletionRecorded || ledger.ConsumeStarted || ledger.Consumed) {
+		return errors.New("specialist or workflow side effects started before all launchable peers were durably deferred")
 	}
 	if ledger.CompletionRecorded && !verdictPresent {
 		return errors.New("controller completion has no exact-head verdict")

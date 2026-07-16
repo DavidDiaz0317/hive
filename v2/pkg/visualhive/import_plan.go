@@ -354,6 +354,7 @@ func buildObservationImportInputs(manifest Manifest, index *ArtifactIndexReport)
 				"visual_hive_root_cause_key": observation.RootCauseKey, "visual_hive_blocked_by_root_keys": append([]string(nil), observation.BlockedByRootKeys...),
 				"visual_hive_dependency_external_refs": dependencyRefs, "visual_hive_affected_contracts": append([]string(nil), observation.AffectedContracts...),
 				"visual_hive_validation_commands": validation, "visual_hive_evidence_artifacts": artifacts,
+				"visual_hive_knowledge_keywords": []string{}, "visual_hive_knowledge_keyword_state": "unavailable_no_verified_facts",
 				"visual_hive_route_role": route.Role, "visual_hive_route_reason": route.Reason, "visual_hive_route_allowed": route.DispatchAllowed,
 				"hive_proposal_only": true, "hive_github_write_allowed": false, "hive_merge_allowed": false,
 				"hive_baseline_changes_allowed": false, "hive_baseline_approval_allowed": false,

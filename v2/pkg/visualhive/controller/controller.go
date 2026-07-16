@@ -27,8 +27,10 @@ import (
 )
 
 const (
-	trustedWorkflowName = "Hive Visual Hive Production"
-	trustedWorkflowPath = ".github/workflows/hive-visual-hive.yml"
+	trustedWorkflowName    = "Hive Visual Hive Production"
+	trustedWorkflowPath    = ".github/workflows/hive-visual-hive.yml"
+	dispatchDeferralSchema = "hive.visual-dispatch-deferral.v1"
+	dispatchDeferralReason = "one-PR acceptance loop selected another launchable finding; retry only from a later verified packet"
 )
 
 type visualSpecialistEvidenceSource interface {
@@ -188,6 +190,119 @@ func (controller *Controller) RevalidateSpecialistBoundary(sourceExternalRef, wo
 		return DispatchEnvelope{}, err
 	}
 	return envelope, nil
+}
+
+type dispatchDeferral struct {
+	SchemaVersion             string `json:"schema_version"`
+	SourceExternalRef         string `json:"source_external_ref"`
+	SelectedSourceExternalRef string `json:"selected_source_external_ref"`
+	WorkflowCorrelationSHA256 string `json:"workflow_correlation_sha256"`
+	PacketDigest              string `json:"packet_digest"`
+	Reason                    string `json:"reason"`
+}
+
+// DeferUnselectedSpecialistDispatches durably retains every launchable peer
+// that the one-PR normal-service acceptance loop did not select. The existing
+// role bead remains the sole work record; this method creates no queue, model
+// invocation, lifecycle transition, or GitHub side effect. Replaying the exact
+// selection is idempotent, while a later verified packet may re-admit the bead.
+func (controller *Controller) DeferUnselectedSpecialistDispatches(
+	_ context.Context,
+	selectedSourceExternalRef string,
+	deferredSourceExternalRefs []string,
+	workflowCorrelationSHA256 string,
+) error {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	selectedSourceExternalRef = strings.TrimSpace(selectedSourceExternalRef)
+	workflowCorrelationSHA256 = strings.ToLower(strings.TrimSpace(workflowCorrelationSHA256))
+	if selectedSourceExternalRef == "" || !validSHA256(workflowCorrelationSHA256) {
+		return errors.New("dispatch deferral requires one selected source ref and exact workflow correlation")
+	}
+	_, selectedBead, err := controller.findVisualBeadLocked(selectedSourceExternalRef)
+	if err != nil || visualBeadAdmissionState(selectedBead) != "admitted_dispatch_pending" {
+		return errors.New("selected dispatch-pending intent is unavailable")
+	}
+	selectedEnvelope, ok := visualDispatchEnvelope(selectedBead)
+	if !ok || selectedEnvelope.SourceExternalRef != selectedSourceExternalRef || !validSHA256(selectedEnvelope.Work.Packet.PacketDigest) || selectedEnvelope.SpecialistWorkOrderID != "" {
+		return errors.New("selected dispatch-pending intent is corrupt")
+	}
+	if err := controller.validateDeferrableEnvelopeLocked(selectedBead, selectedEnvelope); err != nil {
+		return fmt.Errorf("selected dispatch-pending intent failed immutable reconcile: %w", err)
+	}
+
+	refs := append([]string(nil), deferredSourceExternalRefs...)
+	for index := range refs {
+		refs[index] = strings.TrimSpace(refs[index])
+	}
+	sort.Strings(refs)
+	type target struct {
+		store   *beads.Store
+		bead    *beads.Bead
+		record  dispatchDeferral
+		already bool
+	}
+	targets := make([]target, 0, len(refs))
+	for index, ref := range refs {
+		if ref == "" || ref == selectedSourceExternalRef || (index > 0 && ref == refs[index-1]) {
+			return errors.New("deferred dispatch source refs must be unique and exclude the selected intent")
+		}
+		store, bead, findErr := controller.findVisualBeadLocked(ref)
+		if findErr != nil {
+			return findErr
+		}
+		state := visualBeadAdmissionState(bead)
+		if state != "admitted_dispatch_pending" && state != "admitted_dispatch_deferred" {
+			return fmt.Errorf("deferred dispatch %s is not a launchable or exactly deferred intent", ref)
+		}
+		envelope, envelopeOK := visualDispatchEnvelope(bead)
+		if !envelopeOK || envelope.SourceExternalRef != ref || envelope.Work.Packet.PacketDigest != selectedEnvelope.Work.Packet.PacketDigest ||
+			!strings.EqualFold(envelope.Work.Packet.Repository, selectedEnvelope.Work.Packet.Repository) || envelope.SpecialistWorkOrderID != "" {
+			return fmt.Errorf("deferred dispatch %s does not match the selected packet or is already reserved", ref)
+		}
+		if err := controller.validateDeferrableEnvelopeLocked(bead, envelope); err != nil {
+			return fmt.Errorf("deferred dispatch %s failed immutable reconcile: %w", ref, err)
+		}
+		record := dispatchDeferral{
+			SchemaVersion: dispatchDeferralSchema, SourceExternalRef: ref, SelectedSourceExternalRef: selectedSourceExternalRef,
+			WorkflowCorrelationSHA256: workflowCorrelationSHA256, PacketDigest: selectedEnvelope.Work.Packet.PacketDigest, Reason: dispatchDeferralReason,
+		}
+		already := false
+		if state == "admitted_dispatch_deferred" {
+			existing, exists := visualDispatchDeferral(bead)
+			if !exists || existing != record {
+				return fmt.Errorf("deferred dispatch %s is already bound to different selection bytes", ref)
+			}
+			already = true
+		}
+		targets = append(targets, target{store: store, bead: bead, record: record, already: already})
+	}
+	for _, target := range targets {
+		if target.already {
+			continue
+		}
+		if err := persistVisualDispatchDeferral(target.store, target.bead.ID, target.record); err != nil {
+			return err
+		}
+		persisted := target.store.FindByExternalRef(target.record.SourceExternalRef)
+		record, exists := visualDispatchDeferral(persisted)
+		if visualBeadAdmissionState(persisted) != "admitted_dispatch_deferred" || !exists || record != target.record {
+			return errors.New("unselected dispatch deferral was not durably persisted")
+		}
+	}
+	return nil
+}
+
+func (controller *Controller) validateDeferrableEnvelopeLocked(bead *beads.Bead, envelope DispatchEnvelope) error {
+	decision, recorded := visualBeadAdmissionDecision(bead)
+	finding, exists := controller.lifecycle.Finding(envelope.Work.RepositoryFingerprint)
+	if !recorded || !exists {
+		return errors.New("durable Governor decision or lifecycle finding is unavailable")
+	}
+	return validateVisualDispatchEnvelope(
+		envelope, bead.ID, envelope.Work.Packet, envelope.Work, finding,
+		envelope.Evidence, envelope.EvidenceRoot, decision,
+	)
 }
 
 // BuildSchedulerAdmittedWork is the sole lossless projection from the native
@@ -668,6 +783,30 @@ func (controller *Controller) resumeAppliedWork(
 				controller.holdCorruptStage(ctx, store, bead, work, "held_corrupt_admission_receipt", err.Error(), &result)
 				continue
 			}
+		}
+		if state == "admitted_dispatch_deferred" {
+			deferred, deferredOK := visualDispatchDeferral(bead)
+			envelope, envelopeOK := visualDispatchEnvelope(bead)
+			if !deferredOK || !envelopeOK || deferred.SourceExternalRef != work.SourceExternalRef || deferred.SelectedSourceExternalRef == work.SourceExternalRef ||
+				deferred.PacketDigest != envelope.Work.Packet.PacketDigest {
+				controller.holdCorruptStage(ctx, store, bead, work, "held_corrupt_dispatch_intent", "deferred dispatch has no exact selection, correlation, packet, or envelope binding", &result)
+				continue
+			}
+			if deferred.PacketDigest == packet.PacketDigest {
+				if validateVisualDispatchEnvelope(envelope, bead.ID, packet, work, finding, evidence, evidenceRoot, decision) != nil {
+					controller.holdCorruptStage(ctx, store, bead, work, "held_corrupt_dispatch_intent", "deferred dispatch conflicts with its exact verified packet", &result)
+					continue
+				}
+				if launchErr := controller.dispatchLaunchAllowed(envelope, finding); launchErr != nil {
+					controller.persistAndAuditStage(ctx, store, bead, work, decision, dispatchHoldStage(finding), launchErr.Error(), &result)
+				}
+				continue
+			}
+			if err := controller.markStage(store, bead.ID, "pending", "later verified packet reopened a previously deferred launchable finding"); err != nil {
+				result.Errors = append(result.Errors, err.Error())
+				continue
+			}
+			decision, recorded, state = governor.WorkAdmissionDecision{}, false, "pending"
 		}
 		if state == "admitted_dispatch_pending" || state == "admitted_dispatch_runtime_held" || state == "admitted_manual_review_held" {
 			envelope, ok := visualDispatchEnvelope(bead)
@@ -1198,6 +1337,26 @@ func visualDispatchEnvelope(bead *beads.Bead) (DispatchEnvelope, bool) {
 	return envelope, true
 }
 
+func visualDispatchDeferral(bead *beads.Bead) (dispatchDeferral, bool) {
+	if bead == nil || bead.Metadata == nil {
+		return dispatchDeferral{}, false
+	}
+	encoded, _ := bead.Metadata["visual_hive_dispatch_deferral_json"].(string)
+	var value dispatchDeferral
+	if encoded == "" || json.Unmarshal([]byte(encoded), &value) != nil || value.SchemaVersion != dispatchDeferralSchema ||
+		value.SourceExternalRef == "" || value.SourceExternalRef != strings.TrimSpace(value.SourceExternalRef) ||
+		value.SelectedSourceExternalRef == "" || value.SelectedSourceExternalRef != strings.TrimSpace(value.SelectedSourceExternalRef) || value.SourceExternalRef == value.SelectedSourceExternalRef ||
+		value.WorkflowCorrelationSHA256 != strings.ToLower(strings.TrimSpace(value.WorkflowCorrelationSHA256)) || value.PacketDigest != strings.ToLower(strings.TrimSpace(value.PacketDigest)) ||
+		!validSHA256(value.WorkflowCorrelationSHA256) || !validSHA256(value.PacketDigest) || value.Reason != dispatchDeferralReason {
+		return dispatchDeferral{}, false
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil || encoded != string(canonical) {
+		return dispatchDeferral{}, false
+	}
+	return value, true
+}
+
 func validateVisualDispatchEnvelope(
 	envelope DispatchEnvelope,
 	expectedBeadID string,
@@ -1465,6 +1624,9 @@ func markVisualBeadStage(store *beads.Store, id, state, detail string) error {
 		}
 		bead.Metadata["visual_hive_admission_state"] = state
 		bead.Metadata["visual_hive_stage_detail"] = detail
+		if state == "pending" {
+			delete(bead.Metadata, "visual_hive_dispatch_deferral_json")
+		}
 	}
 	if state == "admitted_lifecycle_synced" || state == "held_manual_review_lifecycle_synced" {
 		return store.CloseWithUpdate(id, update)
@@ -1489,6 +1651,27 @@ func persistVisualDispatchEnvelope(store *beads.Store, id string, envelope Dispa
 		bead.Metadata["visual_hive_admission_state"] = "admitted_dispatch_pending"
 		bead.Metadata["visual_hive_stage_detail"] = "awaiting production scheduler composition"
 		bead.Metadata["visual_hive_dispatch_envelope_json"] = string(encoded)
+		delete(bead.Metadata, "visual_hive_dispatch_deferral_json")
+	})
+}
+
+func persistVisualDispatchDeferral(store *beads.Store, id string, value dispatchDeferral) error {
+	if store == nil || id == "" {
+		return errors.New("selected role bead is unavailable")
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return store.Update(id, func(bead *beads.Bead) {
+		bead.Status = beads.StatusBlocked
+		bead.ClosedAt = nil
+		if bead.Metadata == nil {
+			bead.Metadata = map[string]interface{}{}
+		}
+		bead.Metadata["visual_hive_admission_state"] = "admitted_dispatch_deferred"
+		bead.Metadata["visual_hive_stage_detail"] = fmt.Sprintf("%s; selected=%s correlation=%s", value.Reason, value.SelectedSourceExternalRef, value.WorkflowCorrelationSHA256)
+		bead.Metadata["visual_hive_dispatch_deferral_json"] = string(encoded)
 	})
 }
 

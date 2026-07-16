@@ -68,6 +68,11 @@ func TestBuildImportPlanUsesVerifiedObservationsNotProducerPreview(t *testing.T)
 	if imported == nil || imported.Status != beads.StatusBlocked || imported.Metadata["visual_hive_controller_owned"] != true {
 		t.Fatalf("sealed controller import was not admission-gated: %+v", imported)
 	}
+	keywords, keywordsExist := imported.Metadata["visual_hive_knowledge_keywords"]
+	if imported.Metadata["visual_hive_knowledge_keyword_state"] != "unavailable_no_verified_facts" || !keywordsExist ||
+		reflect.ValueOf(keywords).Kind() != reflect.Slice || reflect.ValueOf(keywords).Len() != 0 {
+		t.Fatalf("normal bead did not preserve the explicit no-fabricated-knowledge state: %+v", imported.Metadata)
+	}
 }
 
 func TestApplyImportPlanProjectsExactLegacyReplayIntoNormalStoreOnce(t *testing.T) {

@@ -709,7 +709,7 @@ func TestMixedPacketAdmitsRoutedPeerAndNeverDispatchesManualHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	routedFingerprint, heldFingerprint := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	routedFingerprint, heldFingerprint, peerFingerprint := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
 	digest := strings.Repeat("8", 64)
 	bundle := &visualhive.ValidatedBundle{Validation: visualhive.Validation{Trusted: true}, Manifest: visualhive.Manifest{
 		BundleID: "mixed-held-packet", OverallDigest: digest,
@@ -718,13 +718,14 @@ func TestMixedPacketAdmitsRoutedPeerAndNeverDispatchesManualHold(t *testing.T) {
 		Observations: []visualhive.Observation{
 			{Fingerprint: "routed/source", RepositoryFingerprint: routedFingerprint, PublicationRole: "canonical", RootCauseKey: "routed/source", State: "present", IssueKind: "visual_regression", Severity: "high", OwningAgentHint: "hive/quality", Title: "routed finding", Body: "repairable", AffectedContracts: []string{"contract/app"}, ValidationCommand: "go test ./...", FirstSeenAt: "2026-07-09T12:00:00Z"},
 			{Fingerprint: "baseline/source", RepositoryFingerprint: heldFingerprint, PublicationRole: "canonical", RootCauseKey: "baseline/source", State: "present", IssueKind: "missing_baseline", Severity: "medium", OwningAgentHint: "hive/quality", Title: "baseline review", Body: "human authority required", AffectedContracts: []string{"contract/baseline"}, ValidationCommand: "go test ./...", FirstSeenAt: "2026-07-09T12:00:00Z"},
+			{Fingerprint: "peer/source", RepositoryFingerprint: peerFingerprint, PublicationRole: "canonical", RootCauseKey: "peer/source", State: "present", IssueKind: "test_adequacy", Severity: "medium", OwningAgentHint: "hive/quality", Title: "second routed finding", Body: "defer without loss", AffectedContracts: []string{"contract/peer"}, ValidationCommand: "go test ./...", FirstSeenAt: "2026-07-09T12:00:00Z"},
 		},
 	}}
 	apply, err := lifecycle.ApplyBundle(bundle, store, visualhive.ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 3})
-	if err != nil || apply.BeadsCreated != 2 {
+	if err != nil || apply.BeadsCreated != 3 {
 		t.Fatalf("mixed lifecycle apply = %+v err=%v", apply, err)
 	}
-	for _, fingerprint := range []string{routedFingerprint, heldFingerprint} {
+	for _, fingerprint := range []string{routedFingerprint, heldFingerprint, peerFingerprint} {
 		bead := store.FindByExternalRef("visual-hive://owner/repo/" + fingerprint)
 		if bead == nil {
 			t.Fatalf("mixed packet finding %s is not visible", fingerprint)
@@ -749,19 +750,55 @@ func TestMixedPacketAdmitsRoutedPeerAndNeverDispatchesManualHold(t *testing.T) {
 	controller.baseTree = func(context.Context, integrated.Config, string) (string, error) { return strings.Repeat("f", 40), nil }
 	packet := completeControllerPacket("mixed-held-packet", digest)
 	works := []visualhive.AdmittedVisualWork{
-		{SourceExternalRef: "visual-hive://owner/repo/" + routedFingerprint, Packet: packet, FindingFingerprint: "routed/source", RepositoryFingerprint: routedFingerprint, ObservationState: "present", Role: "quality", RoutingAllowed: true, RoutingReason: "verified route", ValidationCommands: []string{"go test ./..."}, ReproductionCommands: []string{"go test ./..."}},
+		{SourceExternalRef: "visual-hive://owner/repo/" + routedFingerprint, Packet: packet, FindingFingerprint: "routed/source", RepositoryFingerprint: routedFingerprint, ObservationState: "present", Role: "quality", RoutingAllowed: true, RoutingReason: "verified route", KnowledgeKeywordState: "unavailable_no_verified_facts", ValidationCommands: []string{"go test ./..."}, ReproductionCommands: []string{"go test ./..."}},
 		{SourceExternalRef: "visual-hive://owner/repo/" + heldFingerprint, Packet: packet, FindingFingerprint: "baseline/source", RepositoryFingerprint: heldFingerprint, ObservationState: "present", RoutingAllowed: false, RoutingReason: "baseline approval remains human-held"},
+		{SourceExternalRef: "visual-hive://owner/repo/" + peerFingerprint, Packet: packet, FindingFingerprint: "peer/source", RepositoryFingerprint: peerFingerprint, ObservationState: "present", Role: "quality", RoutingAllowed: true, RoutingReason: "verified route", KnowledgeKeywordState: "unavailable_no_verified_facts", ValidationCommands: []string{"go test ./..."}, ReproductionCommands: []string{"go test ./..."}},
 	}
 	result := resumeAppliedForTest(controller, context.Background(), controllerEvidenceSource{completeControllerEvidence(digest)}, packet, works, Result{Lifecycle: apply})
 	held := store.FindByExternalRef(works[1].SourceExternalRef)
-	if len(result.Decisions) != 2 || !result.Decisions[0].Allowed || result.Decisions[1].Code != "routing_held" || len(result.DispatchPending) != 1 || result.DispatchPending[0].SourceExternalRef != works[0].SourceExternalRef ||
-		issues.upserts != 2 || len(gov.AdmissionHistory()) != 2 || held == nil || held.Status != beads.StatusBlocked || visualBeadAdmissionState(held) != "held_manual_review" || len(store.Ready("quality")) != 0 {
+	if len(result.Decisions) != 3 || !result.Decisions[0].Allowed || result.Decisions[1].Code != "routing_held" || !result.Decisions[2].Allowed || len(result.DispatchPending) != 2 || result.DispatchPending[0].SourceExternalRef != works[0].SourceExternalRef || result.DispatchPending[1].SourceExternalRef != works[2].SourceExternalRef ||
+		issues.upserts != 3 || len(gov.AdmissionHistory()) != 3 || held == nil || held.Status != beads.StatusBlocked || visualBeadAdmissionState(held) != "held_manual_review" || len(store.Ready("quality")) != 0 {
 		t.Fatalf("mixed controller result lost valid work or dispatched the hold: result=%+v held=%+v upserts=%d history=%+v", result, held, issues.upserts, gov.AdmissionHistory())
+	}
+	correlation := strings.Repeat("7", 64)
+	if err := controller.DeferUnselectedSpecialistDispatches(context.Background(), works[0].SourceExternalRef, []string{works[2].SourceExternalRef}, correlation); err != nil {
+		t.Fatalf("defer routed peer: %v", err)
+	}
+	peer := store.FindByExternalRef(works[2].SourceExternalRef)
+	deferred, deferredOK := visualDispatchDeferral(peer)
+	if peer == nil || visualBeadAdmissionState(peer) != "admitted_dispatch_deferred" || !deferredOK || deferred.SourceExternalRef != works[2].SourceExternalRef ||
+		deferred.SelectedSourceExternalRef != works[0].SourceExternalRef || deferred.WorkflowCorrelationSHA256 != correlation || deferred.PacketDigest != digest {
+		t.Fatalf("routed peer was not durably correlated as deferred: peer=%+v deferral=%+v ok=%t", peer, deferred, deferredOK)
+	}
+	if err := controller.DeferUnselectedSpecialistDispatches(context.Background(), works[0].SourceExternalRef, []string{works[2].SourceExternalRef}, correlation); err != nil {
+		t.Fatalf("exact deferral replay: %v", err)
+	}
+	if err := controller.DeferUnselectedSpecialistDispatches(context.Background(), works[0].SourceExternalRef, []string{works[2].SourceExternalRef}, strings.Repeat("9", 64)); err == nil {
+		t.Fatal("changed workflow correlation replay replaced an existing exact deferral")
 	}
 	history := len(gov.AdmissionHistory())
 	replay := resumeAppliedForTest(controller, context.Background(), controllerEvidenceSource{completeControllerEvidence(digest)}, packet, works, Result{Lifecycle: apply})
-	if len(replay.Decisions) != 0 || len(replay.DispatchPending) != 1 || issues.upserts != 2 || len(gov.AdmissionHistory()) != history || visualBeadAdmissionState(store.FindByExternalRef(works[1].SourceExternalRef)) != "held_manual_review" {
+	if len(replay.Decisions) != 0 || len(replay.DispatchPending) != 1 || replay.DispatchPending[0].SourceExternalRef != works[0].SourceExternalRef || issues.upserts != 3 || len(gov.AdmissionHistory()) != history || visualBeadAdmissionState(store.FindByExternalRef(works[1].SourceExternalRef)) != "held_manual_review" || visualBeadAdmissionState(store.FindByExternalRef(works[2].SourceExternalRef)) != "admitted_dispatch_deferred" {
 		t.Fatalf("mixed replay duplicated or dispatched manual-held work: %+v", replay)
+	}
+	peerDigest := strings.Repeat("2", 64)
+	peerManifest := bundle.Manifest
+	peerManifest.BundleID, peerManifest.OverallDigest = "peer-retry-packet", peerDigest
+	peerManifest.ReplayProtection = visualhive.ReplayProtection{Key: strings.Repeat("1", 64)}
+	peerManifest.Observations = []visualhive.Observation{bundle.Manifest.Observations[2]}
+	peerApply, err := lifecycle.ApplyBundle(&visualhive.ValidatedBundle{Validation: visualhive.Validation{Trusted: true}, Manifest: peerManifest}, store, visualhive.ApplyLifecycleOptions{TargetRef: "main", DisableIssuePublication: true, MaxActiveIssues: 3, PreferRepairable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPacket := completeControllerPacket("peer-retry-packet", peerDigest)
+	peerWork := works[2]
+	peerWork.Packet = peerPacket
+	peerRetry := resumeAppliedForTest(controller, context.Background(), controllerEvidenceSource{completeControllerEvidence(peerDigest)}, peerPacket, []visualhive.AdmittedVisualWork{peerWork}, Result{Lifecycle: peerApply})
+	peer = store.FindByExternalRef(peerWork.SourceExternalRef)
+	_, staleDeferral := visualDispatchDeferral(peer)
+	if len(peerRetry.Decisions) != 1 || !peerRetry.Decisions[0].Allowed || len(peerRetry.DispatchPending) != 1 || peerRetry.DispatchPending[0].SourceExternalRef != peerWork.SourceExternalRef ||
+		peerRetry.DispatchPending[0].Work.KnowledgeKeywordState != "unavailable_no_verified_facts" || visualBeadAdmissionState(peer) != "admitted_dispatch_pending" || staleDeferral {
+		t.Fatalf("later verified packet did not re-admit exactly the deferred peer: result=%+v peer=%+v", peerRetry, peer)
 	}
 	updateDigest := strings.Repeat("6", 64)
 	updateManifest := bundle.Manifest
@@ -777,8 +814,9 @@ func TestMixedPacketAdmitsRoutedPeerAndNeverDispatchesManualHold(t *testing.T) {
 	updatePacket := completeControllerPacket("manual-update-packet", updateDigest)
 	updateWork := works[1]
 	updateWork.Packet, updateWork.Body = updatePacket, updateManifest.Observations[0].Body
+	updatesBeforeManual := issues.updates
 	updated := resumeAppliedForTest(controller, context.Background(), controllerEvidenceSource{completeControllerEvidence(updateDigest)}, updatePacket, []visualhive.AdmittedVisualWork{updateWork}, Result{Lifecycle: updateApply})
-	if len(updated.DispatchPending) != 0 || len(updated.Decisions) != 1 || updated.Decisions[0].Code != "routing_held" || issues.updates != 1 || visualBeadAdmissionState(store.FindByExternalRef(updateWork.SourceExternalRef)) != "held_manual_review" {
+	if len(updated.DispatchPending) != 0 || len(updated.Decisions) != 1 || updated.Decisions[0].Code != "routing_held" || issues.updates != updatesBeforeManual+1 || visualBeadAdmissionState(store.FindByExternalRef(updateWork.SourceExternalRef)) != "held_manual_review" {
 		t.Fatalf("manual route stranded linked issue update or dispatched: result=%+v updates=%d", updated, issues.updates)
 	}
 	absentDigest := strings.Repeat("4", 64)

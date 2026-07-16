@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -77,6 +78,62 @@ func TestNormalServiceRepairResponseLossRevalidatesWithoutRefetchOrReimport(t *t
 	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.intake.revalidates != 2 ||
 		fixture.repairer.runs != 2 || fixture.repairer.sideEffects != 1 || fixture.verifier.calls != 1 || fixture.source.consumeSideEffects != 1 {
 		t.Fatalf("Worker recovery refetched, reimported, or repeated a side effect: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+}
+
+func TestNormalServiceMultiFindingReplayDefersEveryUnselectedFindingBeforeOneWorkerPR(t *testing.T) {
+	fixture := newServiceFixture(t)
+	refs := []string{
+		"visual-hive://owner/repo/z-last",
+		"visual-hive://owner/repo/a-first",
+		"visual-hive://owner/repo/m-middle",
+	}
+	fixture.intake.dispatch = []visualcontroller.DispatchEnvelope{
+		{SourceExternalRef: refs[0], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("1", 64)}},
+		{SourceExternalRef: refs[1], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("2", 64)}},
+		{SourceExternalRef: refs[2], Work: visualhive.AdmittedVisualWork{RepositoryFingerprint: strings.Repeat("3", 64)}},
+	}
+	fixture.repairer.outcome.Result.RepositoryFingerprint = strings.Repeat("2", 64)
+	fixture.intake.failDeferralAfterSideEffect = true
+	service := fixture.service(t, fixture.verifier)
+
+	if err := service.RunCycle(context.Background()); err == nil || !strings.Contains(err.Error(), "deferral response lost") {
+		t.Fatalf("first multi-finding cycle error = %v", err)
+	}
+	ledger, exists, err := service.loadLedger()
+	if err != nil || !exists || ledger.SourceExternalRef != refs[1] || ledger.DeferralsRecorded ||
+		!reflect.DeepEqual(ledger.DeferredSourceExternalRefs, []string{refs[2], refs[0]}) {
+		t.Fatalf("durable deterministic selection = %+v exists=%t err=%v", ledger, exists, err)
+	}
+	if fixture.repairer.runs != 0 || fixture.verifier.calls != 0 || fixture.source.consumes != 0 || fixture.intake.imports != 1 {
+		t.Fatalf("Worker or consume ran before peer deferrals: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatalf("multi-finding replay: %v", err)
+	}
+	if fixture.source.fetches != 1 || fixture.intake.imports != 1 || fixture.intake.deferralCalls != 2 ||
+		fixture.repairer.runs != 1 || fixture.repairer.sideEffects != 1 || fixture.repairer.lastSourceExternalRef != refs[1] ||
+		fixture.verifier.calls != 1 || fixture.source.consumeSideEffects != 1 {
+		t.Fatalf("multi-finding replay duplicated selection, Worker, PR, verdict, or deletion: source=%+v intake=%+v repair=%+v verifier=%+v", fixture.source, fixture.intake, fixture.repairer, fixture.verifier)
+	}
+	completed, exists, err := service.loadLedger()
+	if err != nil || !exists || !completed.DeferralsRecorded || !completed.Consumed ||
+		!reflect.DeepEqual(completed.DeferredSourceExternalRefs, []string{refs[2], refs[0]}) {
+		t.Fatalf("completed ledger lost deferred packet peers: %+v exists=%t err=%v", completed, exists, err)
+	}
+	for _, ref := range refs {
+		if fixture.intake.represented[ref] != 1 {
+			t.Fatalf("finding %s representation count = %d, want exactly one", ref, fixture.intake.represented[ref])
+		}
+	}
+	for _, ref := range []string{refs[2], refs[0]} {
+		if fixture.intake.deferred[ref] != 1 {
+			t.Fatalf("unselected finding %s durable deferral count = %d, want exactly one", ref, fixture.intake.deferred[ref])
+		}
+	}
+	if len(fixture.intake.deferred) != 2 || fixture.intake.deferred[refs[1]] != 0 {
+		t.Fatalf("selected or unknown findings were deferred: %+v", fixture.intake.deferred)
 	}
 }
 
@@ -176,6 +233,15 @@ func TestNormalServiceRejectsCorruptLedgerStateMachineBeforeSideEffects(t *testi
 			ledger.SourceExternalRef = "visual-hive://owner/repo/finding"
 			ledger.Branch, ledger.CommitSHA = "hive/repair-one", strings.Repeat("f", 40)
 			ledger.PullRequestNumber, ledger.PullRequestURL = 9, "https://example.test/pr/9"
+		},
+		"unsorted deferred sources": func(ledger *workLedger) {
+			ledger.SourceExternalRef = "visual-hive://owner/repo/selected"
+			ledger.DeferredSourceExternalRefs = []string{"visual-hive://owner/repo/z", "visual-hive://owner/repo/a"}
+		},
+		"side effect before deferral checkpoint": func(ledger *workLedger) {
+			ledger.SourceExternalRef = "visual-hive://owner/repo/selected"
+			ledger.DeferredSourceExternalRefs = []string{"visual-hive://owner/repo/peer"}
+			ledger.WorkOrderID, ledger.RequestSHA256 = "swo-"+strings.Repeat("e", 64), strings.Repeat("e", 64)
 		},
 		"verdict digest": func(ledger *workLedger) {
 			ledger.SourceExternalRef = "visual-hive://owner/repo/finding"
@@ -291,16 +357,30 @@ func (source *fakeArtifactSource) Consume(_ integrated.WorkflowRunEvidence, allo
 }
 
 type fakeIntake struct {
-	dispatch       []visualcontroller.DispatchEnvelope
-	imports        int
-	revalidates    int
-	completes      int
-	failCompletion bool
-	completion     visualcontroller.SpecialistPullRequestCompletion
+	dispatch                    []visualcontroller.DispatchEnvelope
+	imports                     int
+	revalidates                 int
+	deferralCalls               int
+	completes                   int
+	failCompletion              bool
+	failDeferralAfterSideEffect bool
+	represented                 map[string]int
+	deferred                    map[string]int
+	deferralSelection           string
+	deferralCorrelation         string
+	completion                  visualcontroller.SpecialistPullRequestCompletion
 }
 
 func (intake *fakeIntake) Import(context.Context, hivegithub.VerifiedVisualHiveArtifact) (visualcontroller.Result, error) {
 	intake.imports++
+	if intake.represented == nil {
+		intake.represented = map[string]int{}
+	}
+	for _, envelope := range intake.dispatch {
+		if intake.represented[envelope.SourceExternalRef] == 0 {
+			intake.represented[envelope.SourceExternalRef] = 1
+		}
+	}
 	return visualcontroller.Result{DispatchPending: append([]visualcontroller.DispatchEnvelope(nil), intake.dispatch...)}, nil
 }
 
@@ -314,6 +394,30 @@ func (intake *fakeIntake) RevalidateSpecialistBoundary(sourceExternalRef, _, _ s
 	return visualcontroller.DispatchEnvelope{}, errors.New("exact durable dispatch is unavailable")
 }
 
+func (intake *fakeIntake) DeferUnselectedSpecialistDispatches(_ context.Context, selected string, refs []string, correlation string) error {
+	intake.deferralCalls++
+	if intake.deferred == nil {
+		intake.deferred = map[string]int{}
+	}
+	if intake.deferralSelection != "" && (intake.deferralSelection != selected || intake.deferralCorrelation != correlation) {
+		return errors.New("deferral replay changed exact selection or correlation")
+	}
+	intake.deferralSelection, intake.deferralCorrelation = selected, correlation
+	for _, ref := range refs {
+		if ref == selected {
+			return errors.New("selected dispatch cannot be deferred")
+		}
+		if intake.deferred[ref] == 0 {
+			intake.deferred[ref] = 1
+		}
+	}
+	if intake.failDeferralAfterSideEffect {
+		intake.failDeferralAfterSideEffect = false
+		return errors.New("deferral response lost after exact durable bead updates")
+	}
+	return nil
+}
+
 func (intake *fakeIntake) CompleteSpecialistPullRequest(_ string, completion visualcontroller.SpecialistPullRequestCompletion) error {
 	intake.completes++
 	if intake.failCompletion {
@@ -325,14 +429,16 @@ func (intake *fakeIntake) CompleteSpecialistPullRequest(_ string, completion vis
 }
 
 type fakeRepairer struct {
-	runs                int
-	sideEffects         int
-	failAfterSideEffect bool
-	outcome             RepairOutcome
+	runs                  int
+	sideEffects           int
+	failAfterSideEffect   bool
+	lastSourceExternalRef string
+	outcome               RepairOutcome
 }
 
-func (repairer *fakeRepairer) Run(context.Context, visualcontroller.DispatchEnvelope) (RepairOutcome, error) {
+func (repairer *fakeRepairer) Run(_ context.Context, envelope visualcontroller.DispatchEnvelope) (RepairOutcome, error) {
 	repairer.runs++
+	repairer.lastSourceExternalRef = envelope.SourceExternalRef
 	if repairer.sideEffects == 0 {
 		repairer.sideEffects++
 		if repairer.failAfterSideEffect {

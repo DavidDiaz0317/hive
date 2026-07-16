@@ -21,7 +21,7 @@ Branch: `codex/vh-normal-service-integration`.
 No upstream/real Hive or KubeStellar Console checkout, remote, workflow, issue,
 pull request, or production state was changed. The immutable Visual Hive
 producer reference currently under review is
-`e201aae4c0011f62a87962a507b3abd32f284395` in the separate
+`97bd5cc5d0d1e37405d2a91cb1995d4fac0c676a` (tree prefix `e53af25b`) in the separate
 `vis-proof-harness` worktree. It is a producer input, not a Hive commit, and
 must not be cherry-picked into Hive.
 
@@ -128,8 +128,10 @@ installed repository policy continue to reload through their existing owners.
 The service ledger is
 `<state-dir>/visual-hive/normal-service/active.json`. It is a small exact-binding
 checkpoint, not a queue. It records the workflow, packet digest, source ref,
-one work-order/request identity, Worker PR, verdict receipt, completion, and
-intent-consumption checkpoints using durable atomic replacement. Canonical
+the exact selected source ref, every unselected launchable source ref and its
+controller-owned deferral checkpoint, one work-order/request identity, Worker
+PR, verdict receipt, completion, and intent-consumption checkpoints using
+durable atomic replacement. Canonical
 verdict JSON is stored as opaque encoded bytes, never re-indented, and its
 SHA-256 is rechecked after every disk load. The complete ledger state machine
 is validated before fetch, import, Worker, verifier, completion, or consume.
@@ -211,13 +213,19 @@ retirement.
 
 ## Current one-dispatch scope boundary
 
-The runnable vertical currently selects the first launchable controller dispatch
-(ordered by source ref), creates or recovers one specialist work order and one
-Worker PR, records that PR's exact-head verdict, and then consumes the source
-workflow intent. Controller intake may preserve more findings and pending
-dispatches from the same verified packet, but this service does not yet iterate
-them. Consequently, the current implementation must not be described as
-processing every launchable finding in a multi-finding packet.
+The runnable vertical selects the first launchable controller dispatch (ordered
+by source ref), durably marks every other launchable peer as deferred on its
+existing routed role bead with the exact packet, selected source ref, workflow
+correlation, and reason, then creates or recovers one specialist work order and
+one Worker PR. Only after that PR's exact-head verdict is recorded does it
+consume the source workflow intent. Import still admits and represents every
+finding through existing lifecycle and bead owners; packet consumption does
+not delete deferred beads. Every imported bead also stores the explicit
+`unavailable_no_verified_facts` keyword state instead of fabricating or writing
+knowledge; a later selected specialist still reads the existing Scheduler
+primer. An exact same-packet replay keeps those peers deferred, while a later
+verified packet may re-admit them through the Governor. The implementation
+therefore preserves a multi-finding packet without claiming multi-PR processing.
 
 That limit is acceptable for the one-defect disposable-repository proof and the
 one-defect Console-fork P0 scenario. General packet fan-out needs a later
