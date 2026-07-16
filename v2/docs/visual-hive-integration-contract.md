@@ -267,7 +267,12 @@ All gates are blocking:
    Existing Worker alone validates/applies the diff and owns branch/PR authority.
 5. **Proposal:** Hive creates/reuses at most one linked work/branch/PR; Visual Hive none.
 6. **Rerun:** the exact proposal head is tested with the pinned Visual Hive commit,
-   plan/config, contracts, browser/runtime, and baseline digest; head drift fails.
+   contracts, browser/runtime, and baseline digest; head drift fails. Product-code
+   repairs also pin the plan/config digest. An explicitly classified test-plan repair
+   MAY change only work-order-allowlisted plan/config paths: bind both before and
+   after digests, require that change to be the sole authorized repair, forbid any
+   reduction in required checks, and keep the producer commit, mutation operator
+   implementation/ID, target contract, runtime, and baseline digests fixed.
 7. **Lifecycle:** closure/merge uses verified rerun evidence and normal gates;
    `repair-pr` proves no merge.
 8. **Coexistence:** normal Hive and Console workflows continue without lost cadence,
@@ -288,6 +293,9 @@ production KubeStellar Hive remain read-only:
 4. Show Scheduler -> existing work order/Mailbox -> Manager child session producing
    one proposal; repair Worker creates/reuses at most one repair PR.
 5. Rerun exact Visual Hive on the PR head; record verdict/check/digests/lifecycle.
+   For a test-plan repair, record both plan/config digests and prove the allowlisted
+   plan/config change is the only repair while producer/operator/runtime/baselines
+   remain pinned.
 6. Replay both packets; each reports idempotence and **zero duplicate work**.
 7. Leave the PR unmerged. Show that ordinary Hive processed an unrelated existing
    work item/cadence through the same normal manager during the scenario, that the
