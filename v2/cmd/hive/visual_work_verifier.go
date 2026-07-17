@@ -124,8 +124,9 @@ func (verifier *normalVisualPullRequestVerifier) ObservePullRequestState(ctx con
 		return normalservice.PullRequestStateObservation{}, err
 	}
 	finding, exists := verifier.lifecycle.Finding(request.RepositoryFingerprint)
-	if !exists || !readyFindingMatchesPullRequestState(finding, current, request) {
-		return normalservice.PullRequestStateObservation{}, errors.New("PR state request does not match the existing Ready Worker PR and sealed receipt")
+	mergedSuccessor, matches := findingMatchesPullRequestState(finding, current, request)
+	if !exists || !matches {
+		return normalservice.PullRequestStateObservation{}, errors.New("PR state request does not match the existing Ready or exact merged-successor Worker PR and sealed receipt")
 	}
 	marker := "<!-- hive-repair: " + request.RepositoryFingerprint + " -->"
 	snapshot, err := verifier.inspectPullRequestState(ctx, current.Repository, current.RepositoryID, request.PullRequestNumber, marker, request.HeadBranch, request.HeadSHA, request.BaseBranch)
@@ -142,21 +143,38 @@ func (verifier *normalVisualPullRequestVerifier) ObservePullRequestState(ctx con
 		if snapshot.Merged {
 			return normalservice.PullRequestStateObservation{}, errors.New("live Worker PR is simultaneously open and merged")
 		}
+		if mergedSuccessor {
+			return normalservice.PullRequestStateObservation{}, errors.New("merged-successor lifecycle points to a live open Worker PR")
+		}
 		return normalservice.PullRequestStateObservation{State: state, Open: true}, nil
 	case "closed":
+		if mergedSuccessor && (!snapshot.Merged || !strings.EqualFold(strings.TrimSpace(snapshot.MergeSHA), strings.TrimSpace(finding.MergeSHA))) {
+			return normalservice.PullRequestStateObservation{}, errors.New("merged-successor lifecycle differs from the exact live Worker PR merge")
+		}
 		return normalservice.PullRequestStateObservation{State: state, Merged: snapshot.Merged}, nil
 	default:
 		return normalservice.PullRequestStateObservation{}, errors.New("live Worker PR returned an unsupported state")
 	}
 }
 
-func readyFindingMatchesPullRequestState(finding visualhive.FindingLifecycle, current integrated.Config, request normalservice.PullRequestStateRequest) bool {
+func findingMatchesPullRequestState(finding visualhive.FindingLifecycle, current integrated.Config, request normalservice.PullRequestStateRequest) (bool, bool) {
 	receipt := finding.LastPullRequestCheckReceipt
-	if finding.Status != visualhive.StatusReady || receipt == nil || request.VerdictReceiptSHA256 == "" ||
+	mergedSuccessor := false
+	switch finding.Status {
+	case visualhive.StatusReady:
+	case visualhive.StatusMerged, visualhive.StatusPostMergeVerifying, visualhive.StatusResolved, visualhive.StatusIssueClosed, visualhive.StatusNeedsRevision:
+		mergedSuccessor = exactNormalVisualGitCommit(finding.MergeSHA)
+		if !mergedSuccessor {
+			return false, false
+		}
+	default:
+		return false, false
+	}
+	if receipt == nil || request.VerdictReceiptSHA256 == "" ||
 		!strings.EqualFold(finding.Repository, current.Repository) || finding.RepositoryID != current.RepositoryID ||
 		finding.PRNumber != request.PullRequestNumber || finding.PRURL != request.PullRequestURL || finding.Branch != request.HeadBranch ||
 		!strings.EqualFold(finding.RepairCommitSHA, request.HeadSHA) || receipt.ReceiptSHA256 != request.VerdictReceiptSHA256 {
-		return false
+		return false, false
 	}
 	identity := receipt.Identity
 	if identity.SchemaVersion != visualhive.PullRequestCheckReceiptSchema || identity.Authority != (visualhive.PullRequestCheckAuthority{CheckEvidenceOnly: true}) ||
@@ -167,14 +185,14 @@ func readyFindingMatchesPullRequestState(finding visualhive.FindingLifecycle, cu
 		identity.Source.Head.Ref != request.HeadBranch || identity.Source.Head.SHA != request.HeadSHA ||
 		identity.Workflow.Name != normalVisualPullRequestWorkflowName || identity.Workflow.Path != normalVisualPullRequestWorkflowPath || identity.Workflow.Event != "pull_request" ||
 		identity.Producer.GitCommit != hivegithub.VisualHivePullRequestProducerCommit || identity.Check.State != "success" || identity.Check.Conclusion != "success" || identity.ReplayKey == "" {
-		return false
+		return false, false
 	}
 	encoded, err := json.Marshal(identity)
 	if err != nil {
-		return false
+		return false, false
 	}
 	digest := sha256.Sum256(encoded)
-	return receipt.ReceiptSHA256 == hex.EncodeToString(digest[:])
+	return mergedSuccessor, receipt.ReceiptSHA256 == hex.EncodeToString(digest[:])
 }
 
 func (verifier *normalVisualPullRequestVerifier) inspectPullRequestState(ctx context.Context, repository, repositoryID string, number int, marker, branch, headSHA, base string) (hivegithub.ManagedPullRequestSnapshot, error) {

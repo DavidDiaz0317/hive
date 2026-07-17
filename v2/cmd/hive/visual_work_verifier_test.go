@@ -144,6 +144,7 @@ func TestNormalVisualPullRequestStateObserverRejectsNonReadyOrDriftedSealedLifec
 		digest  string
 	}{
 		{name: "not Ready", status: visualhive.StatusPROpen, receipt: &valid, digest: valid.ReceiptSHA256},
+		{name: "pre-merge needs revision", status: visualhive.StatusNeedsRevision, receipt: &valid, digest: valid.ReceiptSHA256},
 		{name: "missing receipt", status: visualhive.StatusReady, receipt: nil, digest: valid.ReceiptSHA256},
 		{name: "ledger digest drift", status: visualhive.StatusReady, receipt: &valid, digest: strings.Repeat("0", 64)},
 		{name: "sealed head drift", status: visualhive.StatusReady, receipt: &drifted, digest: drifted.ReceiptSHA256},
@@ -170,8 +171,60 @@ func TestNormalVisualPullRequestStateObserverRejectsNonReadyOrDriftedSealedLifec
 				},
 				VerdictReceiptSHA256: test.digest,
 			})
-			if observeErr == nil || !strings.Contains(observeErr.Error(), "Ready Worker PR and sealed receipt") || inspections != 0 {
+			if observeErr == nil || !strings.Contains(observeErr.Error(), "Ready or exact merged-successor Worker PR and sealed receipt") || inspections != 0 {
 				t.Fatalf("unsealed lifecycle reached live PR inspection: err=%v inspections=%d", observeErr, inspections)
+			}
+		})
+	}
+}
+
+func TestNormalVisualPullRequestStateObserverAcceptsOnlyExactMergedLifecycleSuccessors(t *testing.T) {
+	fingerprint := strings.Repeat("f", 64)
+	baseSHA, headSHA, mergeSHA := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("d", 40)
+	sealedReceipt := normalVisualVerifierSnapshot(t, baseSHA, headSHA)
+	config := integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(),
+		VisualHive: true, Automation: integrated.AutomationRepairPR, ACMMLevel: 5,
+	}
+	request := normalservice.PullRequestStateRequest{
+		PullRequestVerdictRequest: normalservice.PullRequestVerdictRequest{
+			IdempotencyKey: "workflow:order", Repository: config.Repository, RepositoryFingerprint: fingerprint,
+			PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+		},
+		VerdictReceiptSHA256: sealedReceipt.ReceiptSHA256,
+	}
+	for _, status := range []visualhive.LifecycleStatus{
+		visualhive.StatusMerged, visualhive.StatusPostMergeVerifying, visualhive.StatusResolved, visualhive.StatusIssueClosed, visualhive.StatusNeedsRevision,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			lifecycle := writeNormalVisualVerifierMergedLifecycleState(t, fingerprint, headSHA, status, sealedReceipt, mergeSHA)
+			observedMerge := mergeSHA
+			merged := true
+			state := "closed"
+			verifier := &normalVisualPullRequestVerifier{
+				lifecycle: lifecycle, loadConfig: func() (integrated.Config, int, error) { return config, 5, nil },
+				inspectState: func(context.Context, string, string, int, string, string, string, string) (hivegithub.ManagedPullRequestSnapshot, error) {
+					return hivegithub.ManagedPullRequestSnapshot{
+						Number: 7, URL: request.PullRequestURL, State: state, Merged: merged, MergeSHA: observedMerge,
+						HeadBranch: request.HeadBranch, HeadSHA: request.HeadSHA, BaseBranch: request.BaseBranch,
+					}, nil
+				},
+			}
+			observation, err := verifier.ObservePullRequestState(context.Background(), request)
+			if err != nil || observation.Open || !observation.Merged || observation.State != "closed" {
+				t.Fatalf("exact merged successor observation = %+v err=%v", observation, err)
+			}
+			observedMerge = strings.Repeat("e", 40)
+			if _, err := verifier.ObservePullRequestState(context.Background(), request); err == nil || !strings.Contains(err.Error(), "exact live Worker PR merge") {
+				t.Fatalf("drifted successor merge was accepted: %v", err)
+			}
+			observedMerge, merged = mergeSHA, false
+			if _, err := verifier.ObservePullRequestState(context.Background(), request); err == nil || !strings.Contains(err.Error(), "exact live Worker PR merge") {
+				t.Fatalf("unmerged successor PR was accepted: %v", err)
+			}
+			merged, state = false, "open"
+			if _, err := verifier.ObservePullRequestState(context.Background(), request); err == nil || !strings.Contains(err.Error(), "live open Worker PR") {
+				t.Fatalf("open successor PR was accepted: %v", err)
 			}
 		})
 	}
@@ -242,6 +295,14 @@ func writeNormalVisualReadyVerifierLifecycle(t *testing.T, fingerprint, headSHA 
 }
 
 func writeNormalVisualVerifierLifecycleState(t *testing.T, fingerprint, headSHA string, status visualhive.LifecycleStatus, receipt *visualhive.PullRequestCheckReceiptSnapshot) *visualhive.LifecycleStore {
+	return writeNormalVisualVerifierLifecycleStateWithMerge(t, fingerprint, headSHA, status, receipt, "")
+}
+
+func writeNormalVisualVerifierMergedLifecycleState(t *testing.T, fingerprint, headSHA string, status visualhive.LifecycleStatus, receipt visualhive.PullRequestCheckReceiptSnapshot, mergeSHA string) *visualhive.LifecycleStore {
+	return writeNormalVisualVerifierLifecycleStateWithMerge(t, fingerprint, headSHA, status, &receipt, mergeSHA)
+}
+
+func writeNormalVisualVerifierLifecycleStateWithMerge(t *testing.T, fingerprint, headSHA string, status visualhive.LifecycleStatus, receipt *visualhive.PullRequestCheckReceiptSnapshot, mergeSHA string) *visualhive.LifecycleStore {
 	t.Helper()
 	dir := t.TempDir()
 	state := visualhive.LifecycleState{
@@ -249,7 +310,7 @@ func writeNormalVisualVerifierLifecycleState(t *testing.T, fingerprint, headSHA 
 		Findings: map[string]*visualhive.FindingLifecycle{fingerprint: {
 			Repository: "owner/repo", RepositoryID: "123", Fingerprint: "finding", RepositoryFingerprint: fingerprint,
 			Status: status, Branch: "hive/repair-proof", RepairCommitSHA: headSHA, PRNumber: 7, PRURL: "https://example.test/pr/7",
-			LastPullRequestCheckReceipt: receipt,
+			MergeSHA: mergeSHA, LastPullRequestCheckReceipt: receipt,
 		}},
 		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
 	}
