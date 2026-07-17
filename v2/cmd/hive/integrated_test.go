@@ -328,8 +328,10 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	originalStdout := os.Stdout
 	os.Stdout = writer
 	code := runSetupCommand([]string{
-		"--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "advisory", "--plan", "--json",
+		"--repo", "owner/repo", "--coverage", "comprehensive", "--automation", "repair-pr", "--plan", "--json",
 		"--runtime", "local",
+		"--direct-bootstrap", "--adopt-reviewed-baselines",
+		"--expected-seed-sha", strings.Repeat("a", 40), "--reviewed-baseline-digest", strings.Repeat("b", 64),
 		"--state-dir", stateDir, "--github-api-url", server.URL,
 		"--visual-hive-command", os.Args[0], "--visual-hive-arg", entrypoint,
 	})
@@ -347,7 +349,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	if err := json.Unmarshal(output, &result); err != nil {
 		t.Fatalf("decode setup plan JSON: %v: %s", err, output)
 	}
-	if result.Applied || !result.Plan.ReadOnly || result.Plan.StateDir != stateDir || result.Plan.VisualHiveRepository != defaultVisualHiveRepository || result.Plan.VisualHiveRef != visualRef {
+	if result.Applied || !result.Plan.ReadOnly || !result.Plan.DirectBootstrap || !result.Plan.AdoptReviewedBaselines || result.Plan.ExpectedSeedSHA != strings.Repeat("a", 40) || result.Plan.ReviewedBaselineDigest != strings.Repeat("b", 64) || result.Plan.StateDir != stateDir || result.Plan.VisualHiveRepository != defaultVisualHiveRepository || result.Plan.VisualHiveRef != visualRef {
 		t.Fatalf("setup plan did not emit the installed dependency: %+v", result.Plan)
 	}
 }

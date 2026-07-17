@@ -22,7 +22,17 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/visualhive/normalservice"
 )
 
-var normalVisualWorkRunner *normalservice.Service
+var (
+	normalVisualWorkRunner       *normalservice.Service
+	normalVisualWorkHealthWriter *normalVisualServiceHealthReporter
+)
+
+const (
+	normalVisualArtifactFetchTimeout = 45 * time.Minute
+	normalVisualRepairModelTimeout   = 20 * time.Minute
+	normalVisualRepairCommandTimeout = 15 * time.Minute
+	normalVisualCycleFixedOverhead   = 30 * time.Minute
+)
 
 type normalVisualArtifactSource struct {
 	stateDir string
@@ -174,7 +184,7 @@ func (runner *normalVisualRepairer) Run(ctx context.Context, supplied visualcont
 			RepositoryDir: current.CheckoutDir, WorktreeRoot: filepath.Join(current.StateDir, "repair", "worktrees"), BaseBranch: current.DefaultBranch,
 			Agent: string(role), Policy: policy, PolicyLoader: policyLoader, RuntimeGuard: runtimeGuard,
 			AllowedRepairPaths: envelope.AllowedRepairPaths, ValidationCommands: commands, EvidenceSummary: evidenceSummary,
-			ModelTimeout: boundedVisualWorkDuration(envelope.CompositionDeadline, 20*time.Minute), CommandTimeout: 15 * time.Minute,
+			ModelTimeout: boundedVisualWorkDuration(envelope.CompositionDeadline, normalVisualRepairModelTimeout), CommandTimeout: normalVisualRepairCommandTimeout,
 		},
 		Provider: provider, State: state, Lifecycle: runner.lifecycle, GitHub: runner.github,
 	}
@@ -242,21 +252,21 @@ func configureNormalVisualWorkRunner(
 	manager *agent.Manager,
 	github *hivegithub.Client,
 	logger *slog.Logger,
-) (*normalservice.Service, error) {
-	if installed.Automation != integrated.AutomationRepairPR && installed.Automation != integrated.AutomationAutoMerge {
-		return nil, nil
+) (*normalservice.Service, *normalVisualServiceHealthReporter, error) {
+	if configuredRuntimeOwnerIntent(installed) != runtimeOwnerNormalHive {
+		return nil, nil, nil
 	}
 	if github == nil {
-		return nil, errors.New("normal governed repair service requires the existing GitHub client")
+		return nil, nil, errors.New("normal governed repair service requires the existing GitHub client")
 	}
 	executor, err := repair.NewCodexSpecialistChildExecutor(repair.CodexProvider{Command: installed.ProviderCommand, Prefix: installed.ProviderArgs})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := manager.ConfigureSpecialistChildDispatcher(agent.SpecialistChildDispatcherOptions{
 		RepairStateRoot: filepath.Join(installed.StateDir, "repair"), Executor: executor,
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	loader := func() (integrated.Config, int, error) {
 		current, exists, err := loadAuthoritativeVisualWorkContract()
@@ -268,15 +278,20 @@ func configureNormalVisualWorkRunner(
 		}
 		return current, manager.GetACMMLevel(), nil
 	}
-	source := &normalVisualArtifactSource{stateDir: installed.StateDir, timeout: 45 * time.Minute, github: github}
+	source := &normalVisualArtifactSource{stateDir: installed.StateDir, timeout: normalVisualArtifactFetchTimeout, github: github}
 	repairer := &normalVisualRepairer{
 		scheduler: sched, manager: manager, controller: controller, lifecycle: lifecycle, github: github,
 		providerCommand: installed.ProviderCommand, providerArgs: append([]string(nil), installed.ProviderArgs...), loadConfig: loader,
 	}
 	verdict := &normalVisualPullRequestVerifier{github: github, lifecycle: lifecycle, loadConfig: loader}
 	poll := time.Duration(installed.RunIntervalSeconds) * time.Second
+	maxCycle := configuredNormalVisualServiceMaxCycle(installed)
+	health, err := newNormalVisualServiceHealthReporter(installed.StateDir, installed.Repository, poll, maxCycle, logger)
+	if err != nil {
+		return nil, nil, err
+	}
 	service, err := normalservice.New(normalservice.Options{
-		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, LeaseRetry: 30 * time.Second, QuiesceInterval: 100 * time.Millisecond,
+		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, MaxCycleDuration: maxCycle, LeaseRetry: 30 * time.Second, QuiesceInterval: 100 * time.Millisecond,
 		AcquireLease: func() (func(), error) { return integrated.AcquireNormalVisualWorkLease(installed.StateDir) },
 		ShouldQuiesce: func() (bool, error) {
 			requested, err := integrated.PauseRequested(installed.StateDir)
@@ -298,7 +313,26 @@ func configureNormalVisualWorkRunner(
 		// The verifier applies only its opaque check-evidence capability. The
 		// service/controller still own completion and workflow consumption; no
 		// merge, baseline, issue-resolution, or repository-write authority exists.
-		Verdict: verdict, Logger: logger,
+		Verdict: verdict, Logger: logger, OnCycleStart: health.StartCycle, OnCycle: health.RecordCycle, OnInactive: health.RecordInactive,
 	})
-	return service, err
+	if err != nil {
+		return nil, nil, err
+	}
+	return service, health, nil
+}
+
+// configuredNormalVisualServiceMaxCycle is a hard context deadline, not only
+// a health hint. Its budget covers the hosted evidence fetch, one bounded model
+// invocation, every configured validation command, and bounded Git/GitHub /
+// checkpoint overhead. Interrupted command recovery starts a later cycle with
+// a new bound. Pathological configurations remain capped rather than creating
+// an unbounded reconciler.
+func configuredNormalVisualServiceMaxCycle(installed integrated.Config) time.Duration {
+	fixed := normalVisualArtifactFetchTimeout + normalVisualRepairModelTimeout + normalVisualCycleFixedOverhead
+	perCommand := normalVisualRepairCommandTimeout
+	maximumCommands := int((normalVisualServiceMaxCycleCap - fixed) / perCommand)
+	if len(installed.TestCommands) > maximumCommands {
+		return normalVisualServiceMaxCycleCap
+	}
+	return fixed + time.Duration(len(installed.TestCommands))*perCommand
 }

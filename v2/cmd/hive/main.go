@@ -332,6 +332,10 @@ func main() {
 		PolicyDir:  policyDir,
 	}
 	agentMgr := agent.NewManager(cfg.EnabledAgents(), logger, projectCtx)
+	var normalVisualWorkOwnership *os.File
+	defer shutdownOrdinaryVisualRuntime(cancel, agentMgr, func() {
+		releaseDaemonLease(normalVisualWorkOwnership)
+	}, logger)
 	configCoordinator := dashboard.NewConfigCoordinator(cfg, gov, agentMgr)
 	if appAuth != nil {
 		agentMgr.SetAppAuth(appAuth)
@@ -576,25 +580,31 @@ func main() {
 				}
 				return current, agentMgr.GetACMMLevel(), nil
 			})
-			normalVisualWorkService = service
-			logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
-			ownership, runnerErr := claimNormalVisualWorkOwnership(installed.StateDir, agentMgr, func(ordinaryManager *agent.Manager) (bool, error) {
-				runner, configureErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, ordinaryManager, ghClient, logger)
-				if configureErr != nil || runner == nil {
-					return false, configureErr
+			if configuredRuntimeOwnerIntent(installed) != runtimeOwnerNormalHive {
+				normalVisualWorkService = service
+				logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
+				logger.Info("normal Visual Hive intake does not own repair polling for the current installed config", "repository", installed.Repository, "runtime_owner", configuredRuntimeOwnerIntent(installed))
+			} else {
+				ownership, runnerErr := claimNormalVisualWorkOwnership(installed.StateDir, agentMgr, func(ordinaryManager *agent.Manager) (bool, error) {
+					runner, health, configureErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, ordinaryManager, ghClient, logger)
+					if configureErr != nil || runner == nil {
+						return false, configureErr
+					}
+					normalVisualWorkRunner = runner
+					normalVisualWorkHealthWriter = health
+					return true, nil
+				})
+				if runnerErr != nil {
+					if errors.Is(runnerErr, errDaemonLeaseHeld) {
+						logger.Warn("normal Visual Hive governed repair service held because the legacy scheduler owns this repository; stop it and restart normal Hive for a controlled transition", "repository", installed.Repository)
+					} else {
+						logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
+					}
+				} else if ownership != nil {
+					normalVisualWorkService = service
+					normalVisualWorkOwnership = ownership
+					logger.Info("normal Visual Hive intake and governed repair service initialized with exclusive ordinary-Manager ownership", "repository", installed.Repository)
 				}
-				normalVisualWorkRunner = runner
-				return true, nil
-			})
-			if runnerErr != nil {
-				if errors.Is(runnerErr, errDaemonLeaseHeld) {
-					logger.Warn("normal Visual Hive governed repair service held because the legacy scheduler owns this repository; stop it and restart normal Hive for a controlled transition", "repository", installed.Repository)
-				} else {
-					logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
-				}
-			} else if ownership != nil {
-				defer releaseDaemonLease(ownership)
-				logger.Info("normal Visual Hive governed repair service initialized with exclusive ordinary-Manager ownership", "repository", installed.Repository)
 			}
 		}
 	}
@@ -1675,7 +1685,13 @@ func main() {
 
 	dashSrv.MarkReady()
 	if normalVisualWorkRunner != nil {
-		go normalVisualWorkRunner.Run(ctx)
+		if normalVisualWorkHealthWriter == nil {
+			logger.Error("normal Visual Hive service will not start without its health writer")
+		} else if err := normalVisualWorkHealthWriter.Initialize(); err != nil {
+			logger.Error("normal Visual Hive service will not start without a generation-bound health record", "error", err)
+		} else {
+			go normalVisualWorkRunner.Run(ctx)
+		}
 	}
 
 	const cliStartupDelay = 10 * time.Second

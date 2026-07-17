@@ -747,6 +747,10 @@ func runSetupCommand(args []string) int {
 	stateDir := flags.String("state-dir", defaultIntegratedStateDir(), "persistent Hive state directory")
 	planOnly := flags.Bool("plan", false, "produce a read-only setup plan")
 	start := flags.Bool("start", false, "start after the setup PR is merged and doctor is green")
+	directBootstrap := flags.Bool("direct-bootstrap", false, "explicitly install one exact commit into a new private disposable repository without a setup PR")
+	adoptReviewedBaselines := flags.Bool("adopt-reviewed-baselines", false, "with --direct-bootstrap, bind exact human-reviewed baseline PNGs already present in the seed commit")
+	expectedSeedSHA := flags.String("expected-seed-sha", "", "with --direct-bootstrap, exact 40-character seed commit reviewed before setup")
+	reviewedBaselineDigest := flags.String("reviewed-baseline-digest", "", "with --adopt-reviewed-baselines, SHA-256 of the exact reviewed baseline inventory")
 	runInterval := flags.Duration("run-interval", 15*time.Minute, "persistent production scan interval")
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	githubTokenEnv := flags.String("github-token-env", "HIVE_GITHUB_TOKEN", "environment variable containing GitHub token")
@@ -927,6 +931,8 @@ func runSetupCommand(args []string) int {
 		HiveCommit: releaseIdentity.HiveCommit, DistributionManifestSHA256: releaseIdentity.ManifestSHA256,
 		HostedControllerProtocol: releaseIdentity.HostedControllerProtocol,
 		VisualHive:               *visualHive, StateDir: *stateDir, Apply: !*planOnly, Start: shouldStart,
+		DirectBootstrap: *directBootstrap, AdoptReviewedBaselines: *adoptReviewedBaselines,
+		ExpectedSeedSHA: *expectedSeedSHA, ReviewedBaselineDigest: *reviewedBaselineDigest,
 		VisualHiveCommand: *visualCommand, VisualHiveArgs: append([]string(nil), visualArgs...),
 		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client,
 		MaxActiveIssues:        *maxActiveIssues,
@@ -966,10 +972,27 @@ func runSetupCommand(args []string) int {
 			return 1
 		}
 	}
+	configuredOwner := configuredRuntimeOwnerIntent(integrated.Config{ExecutionMode: executionMode, VisualHive: *visualHive, Automation: automationMode})
+	if result.Config != nil {
+		configuredOwner = configuredRuntimeOwnerIntent(*result.Config)
+	}
 	if executionMode == integrated.ExecutionHosted && shouldStart && result.Applied {
 		result.SchedulerStartRequested = true
 		result.SchedulerStartPending = !result.Idempotent
 		result.SchedulerStartMessage = "The hosted controller will own cadence and lifecycle after the exact setup PR is merged; no local scheduler was created."
+	} else if shouldStart && result.Applied && configuredOwner == runtimeOwnerNormalHive {
+		if clearErr := clearDeferredSchedulerStart(*stateDir); clearErr != nil {
+			fmt.Fprintln(os.Stderr, "setup applied but canceling an obsolete legacy scheduler request failed:", clearErr)
+			return 1
+		}
+		_, _, normalRuntimeRunning := normalVisualDaemonObserved(*stateDir)
+		result.SchedulerStartRequested = true
+		result.SchedulerStartPending = !normalRuntimeRunning
+		if normalRuntimeRunning {
+			result.SchedulerStartMessage = "Ordinary Hive/dashboard remains the configured runtime owner; no legacy scheduler was created."
+		} else {
+			result.SchedulerStartMessage = "Ordinary Hive/dashboard is the configured runtime owner; restart the normal Hive/dashboard process to activate polling. No legacy scheduler was created."
+		}
 	} else if shouldStart && result.Applied {
 		result.SchedulerStartRequested = true
 		if wasRunning && result.Idempotent {
@@ -1006,7 +1029,11 @@ func runSetupCommand(args []string) int {
 		return encodeJSON(result)
 	}
 	if result.Applied {
-		fmt.Printf("Setup PR ready: %s\nPersistent state: %s\n", result.PRURL, *stateDir)
+		if *directBootstrap {
+			fmt.Printf("Direct bootstrap installed at %s without a setup PR.\nPersistent state: %s\n", result.CommitSHA, *stateDir)
+		} else {
+			fmt.Printf("Setup PR ready: %s\nPersistent state: %s\n", result.PRURL, *stateDir)
+		}
 		if result.ActivationMessage != "" {
 			fmt.Println(result.ActivationMessage)
 		}
@@ -1151,12 +1178,36 @@ func runIntegratedStatus(args []string) int {
 	}
 	daemon := readIntegratedDaemonStatus(*stateDir)
 	daemonReady := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
-	ready = ready && daemonReady
+	normalHealth := inspectNormalVisualServiceHealth(*stateDir, config.Repository, time.Duration(config.RunIntervalSeconds)*time.Second, time.Now().UTC())
+	ownerIntent := configuredRuntimeOwnerIntent(config)
+	ownerObservation := inspectRuntimeOwner(*stateDir, config, daemon)
+	runtimeReady := daemonReady
+	if ownerIntent == runtimeOwnerNormalHive {
+		runtimeReady = normalHealth.ServiceReady
+	}
+	runtimeReady = runtimeReady && !ownerObservation.Conflict
+	ready = ready && runtimeReady
+	normalServiceMessage := normalHealth.Message
+	if ownerIntent != runtimeOwnerNormalHive {
+		normalServiceMessage = "normal Visual service is not the configured runtime owner; " + ownerObservation.Message
+	}
 	status := map[string]any{
 		"schema_version": "hive.status.v1", "state_dir": *stateDir, "config": config, "paused": config.Paused, "pause_requested": pauseRequested, "production_ready": ready,
 		"readiness_checks": liveChecks, "provider_ready": providerErr == nil, "provider_message": providerMessage, "daemon_ready": daemonReady,
+		"normal_hive_dashboard_ready": normalHealth.DashboardReady,
+		"normal_visual_service_ready": normalHealth.ServiceReady, "normal_visual_service_message": normalServiceMessage, "runtime_ready": runtimeReady,
+	}
+	for key, value := range runtimeOwnerStatusFields(ownerIntent, ownerObservation) {
+		status[key] = value
 	}
 	status["daemon"] = daemon
+	if ownerObservation.NormalLeaseRecordPresent || normalHealth.DashboardReady {
+		status["normal_visual_service"] = normalHealth.Owner
+	}
+	if normalHealth.HealthExists {
+		status["normal_visual_service_health"] = normalHealth.Health
+	}
+	status["runtime_owner"] = ownerObservation.ObservedOwner
 	lifecycle := collectIntegratedLifecycleStatus(*stateDir, config, *stateDir)
 	status["lifecycle_status"] = lifecycle
 	if lifecycleReady, _ := lifecycle["production_ready"].(bool); !lifecycleReady {
@@ -1762,25 +1813,37 @@ func collectIntegratedDoctorChecks(stateDir, githubTokenEnv, githubAPIURL string
 			checks = append(checks, doctorCheck{Name: "provider", OK: true, Message: "repair provider is not required for this automation level"})
 		}
 		if includeScheduler {
+			normalHealth := inspectNormalVisualServiceHealth(stateDir, config.Repository, time.Duration(config.RunIntervalSeconds)*time.Second, time.Now().UTC())
+			ownerIntent := configuredRuntimeOwnerIntent(config)
 			daemon := readIntegratedDaemonStatus(stateDir)
-			daemonOK := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
-			daemonMessage := "persistent scheduler service is installed, exact, and running"
-			if daemon.Service == nil || !daemon.Service.Managed {
-				if _, pending, intentErr := store.LoadSchedulerStartIntent(); intentErr != nil {
-					daemonMessage = "persistent scheduler start intent is unreadable: " + intentErr.Error()
-				} else if pending {
-					daemonMessage = "persistent scheduler start is requested and will activate after setup and all other doctor checks are green"
-				} else {
-					daemonMessage = "persistent scheduler service is not installed; run hive start"
+			ownerObservation := inspectRuntimeOwner(stateDir, config, daemon)
+			checks = append(checks, runtimeOwnerDoctorCheck(ownerIntent, ownerObservation))
+			if ownerIntent == runtimeOwnerNormalHive {
+				checks = append(checks, normalVisualServiceDoctorChecks(normalHealth)...)
+			} else if ownerIntent == runtimeOwnerLegacyScheduler {
+				daemonOK := daemon.RuntimeRunning && daemonServiceReady(daemon.Service)
+				daemonMessage := "persistent scheduler service is installed, exact, and running"
+				if ownerObservation.NormalOwnerLive {
+					daemonMessage = ownerObservation.Message
+				} else if daemon.Service == nil || !daemon.Service.Managed {
+					if _, pending, intentErr := store.LoadSchedulerStartIntent(); intentErr != nil {
+						daemonMessage = "persistent scheduler start intent is unreadable: " + intentErr.Error()
+					} else if pending {
+						daemonMessage = "persistent scheduler start is requested and will activate after setup and all other doctor checks are green"
+					} else if ownerObservation.NormalLeaseRecordPresent {
+						daemonMessage = ownerObservation.Message
+					} else {
+						daemonMessage = "persistent scheduler service is not installed; run hive start"
+					}
+				} else if daemon.Service.InspectionError != "" {
+					daemonMessage = daemon.Service.InspectionError
+				} else if !daemonServiceReady(daemon.Service) {
+					daemonMessage = "persistent scheduler registration is incomplete or disabled; run hive start to repair it"
+				} else if !daemon.RuntimeRunning {
+					daemonMessage = "persistent scheduler is enabled but its runtime is still in crash-recovery backoff"
 				}
-			} else if daemon.Service.InspectionError != "" {
-				daemonMessage = daemon.Service.InspectionError
-			} else if !daemonServiceReady(daemon.Service) {
-				daemonMessage = "persistent scheduler registration is incomplete or disabled; run hive start to repair it"
-			} else if !daemon.RuntimeRunning {
-				daemonMessage = "persistent scheduler is enabled but its runtime is still in crash-recovery backoff"
+				checks = append(checks, doctorCheck{Name: "persistent_scheduler", OK: daemonOK, Message: daemonMessage})
 			}
-			checks = append(checks, doctorCheck{Name: "persistent_scheduler", OK: daemonOK, Message: daemonMessage})
 		}
 		var client *hivegithub.Client
 		if token := resolveGitHubToken(githubTokenEnv); token != "" {
@@ -2064,6 +2127,23 @@ func runIntegratedPause(command string, args []string) int {
 		return dispatchHostedOperation(*stateDir, command, *requestID, *githubTokenEnv, *githubAPIURL, *jsonOutput)
 	}
 	priorDaemon := readIntegratedDaemonStatus(*stateDir)
+	_, _, normalRuntimeRunning := normalVisualDaemonObserved(*stateDir)
+	store, storeErr := integrated.NewStore(filepath.Join(*stateDir, "integrated"))
+	if storeErr != nil {
+		fmt.Fprintln(os.Stderr, storeErr)
+		return 1
+	}
+	priorConfig, loadErr := store.Load()
+	if loadErr != nil {
+		fmt.Fprintln(os.Stderr, loadErr)
+		return 1
+	}
+	if command == "resume" && configuredRuntimeOwnerIntent(priorConfig) == runtimeOwnerLegacyScheduler {
+		if ownerErr := preflightLegacySchedulerStart(*stateDir, priorConfig); ownerErr != nil {
+			fmt.Fprintln(os.Stderr, "Hive authority remains paused because its runtime owner must transition first:", ownerErr)
+			return 1
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Minute)
 	defer cancel()
 	config, err := integrated.SetPaused(ctx, *stateDir, command == "pause")
@@ -2071,25 +2151,45 @@ func runIntegratedPause(command string, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	normalRuntimeIntent := configuredRuntimeOwnerIntent(config) == runtimeOwnerNormalHive
+	runtimeRunning := priorDaemon.RuntimeRunning
+	if normalRuntimeIntent {
+		runtimeRunning = normalRuntimeRunning
+	}
 	if command == "pause" {
 		if _, err := stopIntegratedDaemon(*stateDir); err != nil {
 			fmt.Fprintln(os.Stderr, "Hive is safely paused, but scheduler shutdown failed:", err)
 			return 1
 		}
 	} else {
-		interval := 15 * time.Minute
-		if priorDaemon.IntervalSeconds >= 60 {
-			interval = time.Duration(priorDaemon.IntervalSeconds) * time.Second
-		}
-		if _, err := ensureIntegratedDaemonStarted(*stateDir, interval); err != nil {
-			fmt.Fprintln(os.Stderr, "Hive authority resumed, but scheduler restart failed:", err)
-			return 1
+		if !normalRuntimeIntent {
+			interval := 15 * time.Minute
+			if priorDaemon.IntervalSeconds >= 60 {
+				interval = time.Duration(priorDaemon.IntervalSeconds) * time.Second
+			}
+			started, err := ensureIntegratedDaemonStarted(*stateDir, interval)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Hive authority resumed, but scheduler restart failed:", err)
+				return 1
+			}
+			runtimeRunning = started.RuntimeRunning
 		}
 	}
+	ownerObservation := inspectRuntimeOwner(*stateDir, config, readIntegratedDaemonStatus(*stateDir))
 	if *jsonOutput {
-		return encodeJSON(map[string]any{"repository": config.Repository, "paused": config.Paused})
+		response := map[string]any{
+			"repository": config.Repository, "paused": config.Paused,
+			"runtime_owner": ownerObservation.ObservedOwner, "runtime_running": runtimeRunning,
+		}
+		for key, value := range runtimeOwnerStatusFields(configuredRuntimeOwnerIntent(config), ownerObservation) {
+			response[key] = value
+		}
+		return encodeJSON(response)
 	}
 	fmt.Printf("Hive automation for %s is %s.\n", config.Repository, ternary(config.Paused, "paused", "active"))
+	if command == "resume" && normalRuntimeIntent && !normalRuntimeRunning {
+		fmt.Println(ownerObservation.Message + " No legacy scheduler was started.")
+	}
 	return 0
 }
 

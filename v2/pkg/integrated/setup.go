@@ -28,25 +28,37 @@ import (
 )
 
 const (
-	checkoutActionSHA       = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" // actions/checkout v7.0.0
-	setupNodeActionSHA      = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" // actions/setup-node v6.4.0
-	setupPythonActionSHA    = "a309ff8b426b58ec0e2a45f0f869d46889d02405" // actions/setup-python v6.2.0
-	uploadArtifactActionSHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
-	managedPreimagesVersion = "hive.managed-path-preimages.v1"
-	maxManagedPreimageBytes = 4 << 20
-	maxManagedPreimageFile  = 1 << 20
+	checkoutActionSHA           = "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0" // actions/checkout v7.0.0
+	setupNodeActionSHA          = "48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" // actions/setup-node v6.4.0
+	setupPythonActionSHA        = "a309ff8b426b58ec0e2a45f0f869d46889d02405" // actions/setup-python v6.2.0
+	uploadArtifactActionSHA     = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" // actions/upload-artifact v7.0.1
+	managedPreimagesVersion     = "hive.managed-path-preimages.v1"
+	maxManagedPreimageBytes     = 4 << 20
+	maxManagedPreimageFile      = 1 << 20
+	directBootstrapMaxBaselines = 200
+	directBootstrapMaxBaseline  = 20 << 20
+	directBootstrapMaxTotal     = 500 << 20
+	directBootstrapMaxPathBytes = 512
 )
 
 var (
 	strictPackageRunPattern = regexp.MustCompile(`^(npm|pnpm|yarn)[[:space:]]+(--silent[[:space:]]+)?run[[:space:]]+([A-Za-z0-9_.:-]+)([[:space:]]+--([[:space:]]+[A-Za-z0-9_./:@%+=,-]+)*)?$`)
 	safeShellTokenPattern   = regexp.MustCompile(`^[A-Za-z0-9_./:@%+=,\\-]+$`)
 	environmentTokenPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+=,\\-]+$`)
+	directBootstrapSafeName = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 	setupRepositoryCloneURL = func(repository string) string { return "https://github.com/" + repository + ".git" }
 )
 
 type packageScriptInvocation struct {
 	Name      string
 	Forwarded string
+}
+
+type directBootstrapProof struct {
+	RepositoryID  string
+	DefaultBranch string
+	BaseSHA       string
+	SeedCommits   int
 }
 
 type SetupOptions struct {
@@ -68,18 +80,25 @@ type SetupOptions struct {
 	StateDir                   string
 	Apply                      bool
 	Start                      bool
-	VisualHiveCommand          string
-	VisualHiveArgs             []string
-	VisualHiveRepo             string
-	VisualHiveRef              string
-	MaxActiveIssues            int
-	MaxRepairAttempts          int
-	AllowedAutoMergePaths      []string
-	AllowedAutoMergeRisk       []automation.RiskTier
-	AutoMergePathsExplicit     bool
-	AutoMergeRiskExplicit      bool
-	GitHub                     *hivegithub.Client
-	Policy                     automation.Policy
+	// DirectBootstrap is a deliberately narrow no-PR install path for a new,
+	// private, disposable repository. It is never inferred from repository
+	// shape and is rejected for an existing durable installation.
+	DirectBootstrap        bool
+	AdoptReviewedBaselines bool
+	ExpectedSeedSHA        string
+	ReviewedBaselineDigest string
+	VisualHiveCommand      string
+	VisualHiveArgs         []string
+	VisualHiveRepo         string
+	VisualHiveRef          string
+	MaxActiveIssues        int
+	MaxRepairAttempts      int
+	AllowedAutoMergePaths  []string
+	AllowedAutoMergeRisk   []automation.RiskTier
+	AutoMergePathsExplicit bool
+	AutoMergeRiskExplicit  bool
+	GitHub                 *hivegithub.Client
+	Policy                 automation.Policy
 }
 
 type setupPRClient interface {
@@ -122,6 +141,27 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	if hasPrior && !strings.EqualFold(prior.Repository, options.Repository) {
 		return SetupResult{}, fmt.Errorf("state directory %s is already bound to %s; use a different --state-dir for %s", options.StateDir, prior.Repository, options.Repository)
+	}
+	directIntent, directIntentExists, directIntentErr := store.loadDirectBootstrapIntent()
+	if directIntentErr != nil {
+		return SetupResult{}, fmt.Errorf("load direct-bootstrap recovery intent: %w", directIntentErr)
+	}
+	if directIntentExists {
+		if !options.DirectBootstrap || !options.Apply {
+			return SetupResult{}, fmt.Errorf("an exact direct-bootstrap recovery is pending; rerun apply with the original direct-bootstrap request")
+		}
+		if options.GitHub == nil {
+			return SetupResult{}, fmt.Errorf("GitHub client is required to recover direct bootstrap")
+		}
+		return recoverDirectBootstrap(ctx, options, store, prior, hasPrior, directIntent)
+	}
+	if options.DirectBootstrap && hasPrior {
+		if options.Apply && options.GitHub != nil {
+			if recovered, recognized, replayErr := replayCompletedDirectBootstrap(ctx, options, store, prior); recognized {
+				return recovered, replayErr
+			}
+		}
+		return SetupResult{}, fmt.Errorf("direct bootstrap requires a fresh state directory with no prior durable installation or an exact completed-bootstrap audit receipt")
 	}
 	existingHosted := hasPrior && normalizedExecutionMode(prior.ExecutionMode) == ExecutionHosted
 	if existingHosted && options.ExecutionMode != ExecutionHosted {
@@ -201,6 +241,16 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 			return result, err
 		}
 	}
+	directProof := directBootstrapProof{}
+	if options.DirectBootstrap {
+		directProof, err = inspectDirectBootstrapTarget(ctx, options.GitHub, options.Repository, inspection.RepositoryID, checkout, defaultBranch)
+		if err != nil {
+			return result, err
+		}
+		if err := validateDirectBootstrapExpectedSeed(options, directProof); err != nil {
+			return result, err
+		}
+	}
 	branch := managedOperationBranch("setup", inspection.RepositoryID)
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupBranch); err != nil {
 		return result, err
@@ -228,6 +278,8 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	setupBaselineRequired := false
 	setupBaselineContractDigest := ""
+	var adoptedBaselineCandidates []SetupBaselineCandidate
+	adoptedBaselineDigest := ""
 	if options.VisualHive {
 		requiresBaselines, contractDigest, baselinePlanErr := visualHiveScreenshotContractInventory(checkout)
 		if baselinePlanErr != nil {
@@ -240,6 +292,34 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		setupBaselineRequired = requiresBaselines
 		setupBaselineContractDigest = contractDigest
 	}
+	if options.DirectBootstrap {
+		switch {
+		case setupBaselineRequired && !options.AdoptReviewedBaselines:
+			return result, fmt.Errorf("direct bootstrap found screenshot contracts; separately opt into adoption of exact reviewed baseline bytes already present in the seed commit")
+		case !setupBaselineRequired && options.AdoptReviewedBaselines:
+			return result, fmt.Errorf("reviewed baseline adoption was requested but the generated Visual Hive configuration has no screenshot contracts")
+		case setupBaselineRequired:
+			adoptedBaselineCandidates, adoptedBaselineDigest, err = validateDirectBootstrapReviewedBaselines(ctx, checkout, directProof.BaseSHA)
+			if err != nil {
+				return result, err
+			}
+			if err := validateDirectBootstrapReviewedDigest(options, adoptedBaselineDigest); err != nil {
+				return result, err
+			}
+			// This one exact seed inventory has already been reviewed by the
+			// operator. Do not persist a reusable adoption flag: every later
+			// setup/configuration change returns to the normal capture/PR gate.
+			setupBaselineRequired = false
+		}
+	}
+	setupBranch := branch
+	if options.DirectBootstrap {
+		// The default branch is an inert setup-authorization head (a same-repo
+		// pull request cannot use the default branch as both head and base). It
+		// keeps the generated workflow valid without naming a setup branch that
+		// direct bootstrap never creates.
+		setupBranch = defaultBranch
+	}
 	config := Config{
 		SchemaVersion: ConfigSchema, Repository: options.Repository, RepositoryID: inspection.RepositoryID, DefaultBranch: defaultBranch,
 		Coverage: options.Coverage, Automation: options.Automation, Provider: options.Provider,
@@ -251,17 +331,19 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		HiveCommit: options.HiveCommit, DistributionManifestSHA256: options.DistributionManifestSHA256,
 		HostedControllerProtocol: options.HostedControllerProtocol,
 		ACMMLevel:                acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
-		SetupBaselineRequired:       setupBaselineRequired,
-		SetupBaselineContractDigest: setupBaselineContractDigest,
-		MaxActiveIssues:             options.MaxActiveIssues,
-		MaxRepairAttempts:           options.MaxRepairAttempts,
-		VisualHiveRepo:              options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
+		SetupBaselineRequired:          setupBaselineRequired,
+		SetupBaselineContractDigest:    setupBaselineContractDigest,
+		SetupBaselineInitialDigest:     adoptedBaselineDigest,
+		SetupBaselineInitialCandidates: append([]SetupBaselineCandidate(nil), adoptedBaselineCandidates...),
+		MaxActiveIssues:                options.MaxActiveIssues,
+		MaxRepairAttempts:              options.MaxRepairAttempts,
+		VisualHiveRepo:                 options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef,
 		VisualHiveCommand: options.VisualHiveCommand, VisualHiveArgs: append([]string(nil), options.VisualHiveArgs...),
 		ManagedPreimagesVersion: preimagesVersion, ManagedPathPreimages: managedPreimages,
 		TestCommands: testCommandsForCoverage(inspection, options.Coverage), AllowedRepairPaths: defaultAllowedRepairPaths(),
 		AllowedAutoMergePaths: append([]string(nil), options.AllowedAutoMergePaths...),
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
-		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: branch,
+		CheckoutDir:           checkout, StateDir: options.StateDir, SetupBranch: setupBranch,
 		Paused:                    options.ExecutionMode == ExecutionHosted && !options.Start,
 		SetupAuthorizationActorID: authorizer.ID,
 		InstalledAt:               time.Now().UTC(), UpdatedAt: time.Now().UTC(),
@@ -308,7 +390,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	// The exact repository preimages must outlive any branch push or setup PR.
 	// Persist them before the first remote mutation so an interrupted setup can
 	// resume without reclassifying already-managed bytes as repository-owned.
-	if preimagesUpdated {
+	if preimagesUpdated && !options.DirectBootstrap {
 		if existingHosted {
 			return result, fmt.Errorf("setup cannot replace the active hosted managed-path ownership ledger; use a dedicated hosted policy transition")
 		}
@@ -338,7 +420,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if hasPrior && prior.SetupAuthorizationActorID > 0 && authorizer.ID != prior.SetupAuthorizationActorID && strings.TrimSpace(diff) != "" {
 		return result, fmt.Errorf("managed setup changes are bound to GitHub user ID %d, but the current authenticated user is %d; rerun with the recorded setup authorizer (an identical cross-user rerun remains a no-op)", prior.SetupAuthorizationActorID, authorizer.ID)
 	}
-	if updateSetupAuthorizationBranchForManagedChange(&config, branch, diff) {
+	if !options.DirectBootstrap && updateSetupAuthorizationBranchForManagedChange(&config, branch, diff) {
 		if err := writeManagedFiles(checkout, config, inspection); err != nil {
 			return result, err
 		}
@@ -354,6 +436,9 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		return result, fmt.Errorf("setup cannot publish a changed hosted policy while the active configuration still owns the controller; use a dedicated managed policy or release transition command")
 	}
 	idempotent := strings.TrimSpace(diff) == ""
+	if options.DirectBootstrap && idempotent {
+		return result, fmt.Errorf("direct bootstrap produced no managed setup change; refusing to advance the default branch")
+	}
 	reuseRemoteSetup := false
 	sha := ""
 	if !idempotent && hasPrior && prior.SetupBranch != "" {
@@ -418,7 +503,12 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 			return result, fmt.Errorf("bind exact pre-setup baseline inventory: %w", err)
 		}
 	}
-	config.SetupBranch = branch
+	if !options.DirectBootstrap {
+		config.SetupBranch = branch
+	}
+	if options.DirectBootstrap {
+		return finishDirectBootstrap(ctx, options, store, config, result, checkout, directProof, sha)
+	}
 	if !reuseRemoteSetup {
 		if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPush); err != nil {
 			return result, err
@@ -835,6 +925,224 @@ func pushManagedBranch(ctx context.Context, checkout, branch, repositoryID, oper
 	return nil
 }
 
+func inspectDirectBootstrapTarget(ctx context.Context, client *hivegithub.Client, repository, repositoryID, checkout, defaultBranch string) (directBootstrapProof, error) {
+	proof := directBootstrapProof{}
+	if client == nil || client.GoGitHub() == nil {
+		return proof, fmt.Errorf("GitHub client is required to prove a direct-bootstrap repository")
+	}
+	owner, name, ok := strings.Cut(strings.TrimSpace(repository), "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return proof, fmt.Errorf("direct bootstrap repository identity is invalid")
+	}
+	metadata, _, err := client.GoGitHub().Repositories.Get(ctx, owner, name)
+	if err != nil {
+		return proof, fmt.Errorf("read direct-bootstrap repository metadata: %w", err)
+	}
+	liveID := strconv.FormatInt(metadata.GetID(), 10)
+	if metadata.GetID() <= 0 || liveID != strings.TrimSpace(repositoryID) || !strings.EqualFold(metadata.GetFullName(), repository) || metadata.GetDefaultBranch() != defaultBranch {
+		return proof, fmt.Errorf("direct-bootstrap repository identity/default branch changed (expected %s ID %s branch %s, got %s ID %s branch %s)", repository, repositoryID, defaultBranch, metadata.GetFullName(), liveID, metadata.GetDefaultBranch())
+	}
+	if metadata.Private == nil || !metadata.GetPrivate() {
+		return proof, fmt.Errorf("direct bootstrap is restricted to a repository GitHub proves is private")
+	}
+	if metadata.GetFork() || metadata.GetArchived() || metadata.GetDisabled() {
+		return proof, fmt.Errorf("direct bootstrap requires a non-fork, active disposable repository")
+	}
+	if !metadata.GetPermissions()["push"] {
+		return proof, fmt.Errorf("direct bootstrap requires GitHub to prove push permission on the disposable repository")
+	}
+	if err := validateDirectBootstrapRemoteBinding(ctx, checkout, repository, defaultBranch); err != nil {
+		return proof, err
+	}
+	baseSHA, err := git(ctx, checkout, "rev-parse", "--verify", "refs/remotes/origin/"+defaultBranch)
+	if err != nil {
+		return proof, fmt.Errorf("read exact direct-bootstrap base: %w", err)
+	}
+	baseSHA = strings.ToLower(strings.TrimSpace(baseSHA))
+	if !immutableCommit.MatchString(baseSHA) {
+		return proof, fmt.Errorf("direct-bootstrap default branch does not resolve to an exact 40-character commit")
+	}
+	branch, _, err := client.GoGitHub().Repositories.GetBranch(ctx, owner, name, defaultBranch, 0)
+	if err != nil {
+		return proof, fmt.Errorf("read direct-bootstrap default-branch head: %w", err)
+	}
+	if branch.GetName() != defaultBranch || !strings.EqualFold(branch.GetCommit().GetSHA(), baseSHA) {
+		return proof, fmt.Errorf("direct-bootstrap API head does not match the exact fetched default-branch base")
+	}
+	countText, err := git(ctx, checkout, "rev-list", "--count", baseSHA)
+	if err != nil {
+		return proof, fmt.Errorf("count direct-bootstrap seed history: %w", err)
+	}
+	seedCommits, err := strconv.Atoi(strings.TrimSpace(countText))
+	if err != nil || seedCommits != 1 {
+		return proof, fmt.Errorf("direct bootstrap requires exactly one seed commit, got %q", strings.TrimSpace(countText))
+	}
+	managed, err := git(ctx, checkout, "ls-tree", "-r", "--name-only", baseSHA, "--", ".hive/integrated.json", ".github/workflows/hive-visual-hive.yml", ".github/workflows/visual-hive-pr.yml")
+	if err != nil {
+		return proof, fmt.Errorf("inspect seed for an existing Hive installation: %w", err)
+	}
+	if strings.TrimSpace(managed) != "" {
+		return proof, fmt.Errorf("direct-bootstrap seed already contains managed Hive installation files")
+	}
+	pulls, response, err := client.GoGitHub().PullRequests.List(ctx, owner, name, &gh.PullRequestListOptions{State: "open", ListOptions: gh.ListOptions{PerPage: 1}})
+	if err != nil {
+		return proof, fmt.Errorf("prove direct-bootstrap repository has no open pull requests: %w", err)
+	}
+	if len(pulls) != 0 || (response != nil && response.NextPage != 0) {
+		return proof, fmt.Errorf("direct bootstrap requires a repository with no open pull requests")
+	}
+	protection, err := client.BranchProtection(ctx, repository, defaultBranch)
+	if err != nil {
+		return proof, fmt.Errorf("prove direct-bootstrap default branch has no protection or applicable rules: %w", err)
+	}
+	if protection.Enabled {
+		return proof, fmt.Errorf("direct bootstrap refuses a default branch with existing protection or applicable repository rules")
+	}
+	return directBootstrapProof{RepositoryID: liveID, DefaultBranch: defaultBranch, BaseSHA: baseSHA, SeedCommits: seedCommits}, nil
+}
+
+func validateDirectBootstrapExpectedSeed(options SetupOptions, proof directBootstrapProof) error {
+	expected := strings.ToLower(strings.TrimSpace(options.ExpectedSeedSHA))
+	if proof.BaseSHA == "" || !strings.EqualFold(proof.BaseSHA, expected) {
+		return fmt.Errorf("direct-bootstrap live seed %s does not match the explicitly reviewed seed %s", proof.BaseSHA, expected)
+	}
+	return nil
+}
+
+func validateDirectBootstrapReviewedDigest(options SetupOptions, actual string) error {
+	expected := strings.ToLower(strings.TrimSpace(options.ReviewedBaselineDigest))
+	actual = strings.ToLower(strings.TrimSpace(actual))
+	if !sha256DigestPattern.MatchString(actual) || actual != expected {
+		return fmt.Errorf("direct-bootstrap baseline inventory digest %s does not match the explicitly reviewed digest %s", actual, expected)
+	}
+	return nil
+}
+
+func validateDirectBootstrapRemoteBinding(ctx context.Context, checkout, repository, defaultBranch string) error {
+	remotes, err := git(ctx, checkout, "remote")
+	if err != nil {
+		return fmt.Errorf("inspect direct-bootstrap remotes: %w", err)
+	}
+	if lines := nonEmptyLines(remotes); len(lines) != 1 || lines[0] != "origin" {
+		return fmt.Errorf("direct bootstrap requires exactly one canonical origin remote")
+	}
+	expected := strings.TrimSpace(setupRepositoryCloneURL(repository))
+	for _, arguments := range [][]string{{"remote", "get-url", "--all", "origin"}, {"remote", "get-url", "--push", "--all", "origin"}} {
+		value, readErr := git(ctx, checkout, arguments...)
+		if readErr != nil {
+			return fmt.Errorf("inspect direct-bootstrap origin URL: %w", readErr)
+		}
+		urls := nonEmptyLines(value)
+		if len(urls) != 1 || urls[0] != expected {
+			return fmt.Errorf("direct bootstrap requires the exact canonical origin URL %q", expected)
+		}
+	}
+	fetch, err := git(ctx, checkout, "config", "--get-all", "remote.origin.fetch")
+	if err != nil || strings.TrimSpace(fetch) != "+refs/heads/*:refs/remotes/origin/*" {
+		return fmt.Errorf("direct bootstrap requires the canonical origin fetch refspec")
+	}
+	heads, err := git(ctx, checkout, "ls-remote", "--heads", expected)
+	if err != nil {
+		return fmt.Errorf("list direct-bootstrap remote heads: %w", err)
+	}
+	headLines := nonEmptyLines(heads)
+	if len(headLines) != 1 {
+		return fmt.Errorf("direct bootstrap requires exactly one remote branch")
+	}
+	fields := strings.Fields(headLines[0])
+	if len(fields) != 2 || fields[1] != "refs/heads/"+defaultBranch || !immutableCommit.MatchString(strings.ToLower(fields[0])) {
+		return fmt.Errorf("direct bootstrap remote branch inventory is not the exact default branch")
+	}
+	tags, err := git(ctx, checkout, "ls-remote", "--tags", expected)
+	if err != nil {
+		return fmt.Errorf("list direct-bootstrap remote tags: %w", err)
+	}
+	if strings.TrimSpace(tags) != "" {
+		return fmt.Errorf("direct bootstrap requires a disposable repository with no tags")
+	}
+	return nil
+}
+
+func pushDirectBootstrapDefaultBranch(ctx context.Context, checkout, repository, defaultBranch, baseSHA, headSHA string) error {
+	baseSHA, headSHA = strings.ToLower(strings.TrimSpace(baseSHA)), strings.ToLower(strings.TrimSpace(headSHA))
+	if !immutableCommit.MatchString(baseSHA) || !immutableCommit.MatchString(headSHA) || baseSHA == headSHA {
+		return fmt.Errorf("direct bootstrap requires distinct exact base and head commits")
+	}
+	if _, err := git(ctx, checkout, "check-ref-format", "refs/heads/"+defaultBranch); err != nil {
+		return fmt.Errorf("direct-bootstrap default branch is not a valid ref: %w", err)
+	}
+	if err := validateDirectBootstrapRemoteBinding(ctx, checkout, repository, defaultBranch); err != nil {
+		return err
+	}
+	remoteURL := strings.TrimSpace(setupRepositoryCloneURL(repository))
+	refspec := "+refs/heads/" + defaultBranch + ":refs/remotes/origin/" + defaultBranch
+	if _, err := git(ctx, checkout, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+		return fmt.Errorf("refresh direct-bootstrap exact base: %w", err)
+	}
+	remoteSHA, err := git(ctx, checkout, "rev-parse", "--verify", "refs/remotes/origin/"+defaultBranch)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(remoteSHA), baseSHA) {
+		return fmt.Errorf("direct-bootstrap default branch changed before its exact leased push")
+	}
+	parents, err := git(ctx, checkout, "rev-list", "--parents", "-n", "1", headSHA)
+	if err != nil {
+		return fmt.Errorf("inspect direct-bootstrap commit parent: %w", err)
+	}
+	parentFields := strings.Fields(parents)
+	if len(parentFields) != 2 || !strings.EqualFold(parentFields[0], headSHA) || !strings.EqualFold(parentFields[1], baseSHA) {
+		return fmt.Errorf("direct-bootstrap commit must be one exact child of the reviewed seed base")
+	}
+	lease := "--force-with-lease=refs/heads/" + defaultBranch + ":" + baseSHA
+	if _, err := git(ctx, checkout, "push", lease, remoteURL, headSHA+":refs/heads/"+defaultBranch); err != nil {
+		return fmt.Errorf("push exact direct-bootstrap default branch: %w", err)
+	}
+	if _, err := git(ctx, checkout, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+		return fmt.Errorf("refresh direct-bootstrap pushed head: %w", err)
+	}
+	remoteSHA, err = git(ctx, checkout, "rev-parse", "--verify", "refs/remotes/origin/"+defaultBranch)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(remoteSHA), headSHA) {
+		return fmt.Errorf("direct-bootstrap remote head does not equal the exact pushed commit")
+	}
+	return nil
+}
+
+func finishDirectBootstrap(ctx context.Context, options SetupOptions, store *Store, config Config, result SetupResult, checkout string, initial directBootstrapProof, sha string) (SetupResult, error) {
+	sha = strings.ToLower(strings.TrimSpace(sha))
+	if store == nil || !immutableCommit.MatchString(sha) || initial.BaseSHA == "" || config.SetupBranch != config.DefaultBranch || config.SetupPRNumber != 0 || config.SetupPRURL != "" {
+		return result, fmt.Errorf("direct-bootstrap durable identity is incomplete")
+	}
+	if !options.DirectBootstrap || options.Start || normalizedExecutionMode(config.ExecutionMode) != ExecutionLocal || config.Automation != AutomationRepairPR {
+		return result, fmt.Errorf("direct-bootstrap execution boundary changed before publication")
+	}
+	baselineDigest, err := setupBaselineCandidateDigest(config.SetupBaselineInitialCandidates)
+	if err != nil {
+		return result, err
+	}
+	if len(config.SetupBaselineInitialCandidates) == 0 {
+		baselineDigest = ""
+	}
+	if baselineDigest != strings.ToLower(strings.TrimSpace(config.SetupBaselineInitialDigest)) {
+		return result, fmt.Errorf("direct-bootstrap reviewed baseline digest changed before publication")
+	}
+	intent, err := newDirectBootstrapIntent(ctx, options, config, initial, checkout, sha)
+	if err != nil {
+		return result, err
+	}
+	if err := store.saveDirectBootstrapIntent(intent); err != nil {
+		return result, fmt.Errorf("persist direct-bootstrap intent before remote mutation: %w", err)
+	}
+	return resumeDirectBootstrap(ctx, options, store, Config{}, false, intent, result)
+}
+
+func nonEmptyLines(value string) []string {
+	lines := []string{}
+	for _, line := range strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func hasExactCommitTrailer(message, key, value string) bool {
 	want := strings.TrimSpace(key) + ": " + strings.TrimSpace(value)
 	for _, line := range strings.Split(strings.ReplaceAll(message, "\r\n", "\n"), "\n") {
@@ -875,6 +1183,31 @@ func validateSetupOptions(options SetupOptions) error {
 	}
 	if options.ExecutionMode != ExecutionLocal && options.ExecutionMode != ExecutionHosted {
 		return fmt.Errorf("execution mode must be local or hosted")
+	}
+	if options.DirectBootstrap {
+		if options.ExecutionMode != ExecutionLocal {
+			return fmt.Errorf("direct bootstrap is restricted to local execution")
+		}
+		if options.Automation != AutomationRepairPR {
+			return fmt.Errorf("direct bootstrap is restricted to repair-pr automation")
+		}
+		if options.Start {
+			return fmt.Errorf("direct bootstrap cannot start Hive during the repository mutation")
+		}
+		if !immutableCommit.MatchString(strings.ToLower(strings.TrimSpace(options.ExpectedSeedSHA))) {
+			return fmt.Errorf("direct bootstrap requires the exact expected 40-character seed commit SHA")
+		}
+		if options.AdoptReviewedBaselines {
+			if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(strings.ToLower(strings.TrimSpace(options.ReviewedBaselineDigest))) {
+				return fmt.Errorf("reviewed baseline adoption requires the exact reviewed inventory SHA-256 digest")
+			}
+		} else if strings.TrimSpace(options.ReviewedBaselineDigest) != "" {
+			return fmt.Errorf("reviewed baseline digest is valid only with explicit reviewed baseline adoption")
+		}
+	} else if options.AdoptReviewedBaselines {
+		return fmt.Errorf("reviewed baseline adoption is restricted to an explicit direct bootstrap")
+	} else if strings.TrimSpace(options.ExpectedSeedSHA) != "" || strings.TrimSpace(options.ReviewedBaselineDigest) != "" {
+		return fmt.Errorf("direct-bootstrap seed and baseline bindings require explicit direct bootstrap")
 	}
 	if options.RunInterval < time.Minute || options.RunInterval > 24*time.Hour {
 		return fmt.Errorf("run interval must be from one minute through 24 hours")
@@ -942,6 +1275,9 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 	if len(inspection.BaselineFiles) == 0 && options.VisualHive {
 		warnings = append(warnings, "No reviewed visual baselines were detected; setup must prepare and review baselines before the first production scan.")
 	}
+	if options.DirectBootstrap {
+		warnings = append(warnings, "Direct bootstrap is an explicit disposable-repository exception: apply revalidates a private single-seed repository with no open pull requests or default-branch policy, then advances the default branch under an exact lease without creating a setup pull request.")
+	}
 	managedFiles := managedSetupFilesForMode(options.VisualHive, options.ExecutionMode)
 	return SetupPlan{
 		SchemaVersion: PlanSchema, GeneratedAt: time.Now().UTC(), Repository: options.Repository,
@@ -953,6 +1289,8 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		HostedControllerProtocol: options.HostedControllerProtocol,
 		Coverage:                 options.Coverage, Automation: options.Automation, Provider: options.Provider,
 		ACMMLevel: acmmForAutomation(options.Automation), VisualHive: options.VisualHive,
+		DirectBootstrap: options.DirectBootstrap, AdoptReviewedBaselines: options.AdoptReviewedBaselines,
+		ExpectedSeedSHA: strings.ToLower(strings.TrimSpace(options.ExpectedSeedSHA)), ReviewedBaselineDigest: strings.ToLower(strings.TrimSpace(options.ReviewedBaselineDigest)),
 		VisualHiveRepository: options.VisualHiveRepo, VisualHiveRef: options.VisualHiveRef, Inspection: inspection,
 		MaxActiveIssues:       options.MaxActiveIssues,
 		MaxRepairAttempts:     options.MaxRepairAttempts,
@@ -960,13 +1298,16 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
 		TestingLayers:         layersForCoverage(options.Coverage),
 		FilesToManage:         managedFiles,
-		RequiredActions:       setupRequiredActions(options.Automation, options.ExecutionMode),
+		RequiredActions:       setupRequiredActions(options.Automation, options.ExecutionMode, options.DirectBootstrap),
 		Warnings:              warnings, ReadOnly: true,
 	}
 }
 
-func setupRequiredActions(automation Automation, mode ExecutionMode) []string {
+func setupRequiredActions(automation Automation, mode ExecutionMode, directBootstrap bool) []string {
 	actions := []string{"Review and merge the exact setup PR"}
+	if directBootstrap {
+		actions = []string{"Confirm the target is a new private disposable repository and explicitly authorize one exact leased default-branch bootstrap commit"}
+	}
 	if automation == AutomationAutoMerge {
 		actions = append(actions, "Complete the setup PR and trusted setup run to activate exact-App-bound protection; a requested scheduler starts only after all non-scheduler doctor checks are green, or run hive start explicitly later")
 	}
@@ -1756,6 +2097,135 @@ func existingVisualBaselines(checkout string) []string {
 		}
 	}
 	return sortedUnique(files)
+}
+
+func validateDirectBootstrapReviewedBaselines(ctx context.Context, checkout, seedSHA string) ([]SetupBaselineCandidate, string, error) {
+	expected, err := directBootstrapExpectedBaselinePaths(checkout)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(expected) == 0 {
+		return nil, "", fmt.Errorf("direct-bootstrap baseline adoption requires at least one screenshot contract")
+	}
+	candidates, digest, err := directBootstrapBaselineInventoryAtCommit(ctx, checkout, seedSHA)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(candidates) != len(expected) {
+		return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline inventory has %d PNGs, but the screenshot contracts require exactly %d", len(candidates), len(expected))
+	}
+	for _, candidate := range candidates {
+		if !expected[candidate.Path] {
+			return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline %s does not match an exact configured screenshot contract", candidate.Path)
+		}
+	}
+	return candidates, digest, nil
+}
+
+func directBootstrapExpectedBaselinePaths(checkout string) (map[string]bool, error) {
+	data, err := readSetupCheckoutFile(checkout, "visual-hive.config.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("read Visual Hive configuration for direct-bootstrap baseline adoption: %w", err)
+	}
+	var config struct {
+		Visual struct {
+			SnapshotDir      string `yaml:"snapshotDir"`
+			BaselinePlatform string `yaml:"baselinePlatform"`
+		} `yaml:"visual"`
+		Contracts []struct {
+			ID          string `yaml:"id"`
+			Screenshots []struct {
+				Name     string `yaml:"name"`
+				Viewport string `yaml:"viewport"`
+			} `yaml:"screenshots"`
+		} `yaml:"contracts"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("parse Visual Hive configuration for direct-bootstrap baseline adoption: %w", err)
+	}
+	snapshotDir := config.Visual.SnapshotDir
+	if snapshotDir == "" {
+		snapshotDir = ".visual-hive/snapshots"
+	}
+	if strings.Contains(snapshotDir, "\\") || path.Clean(snapshotDir) != snapshotDir || snapshotDir != ".visual-hive/snapshots" {
+		return nil, fmt.Errorf("direct-bootstrap baseline adoption requires the canonical .visual-hive/snapshots directory")
+	}
+	platform := config.Visual.BaselinePlatform
+	if platform == "" {
+		platform = "shared"
+	}
+	if platform != "shared" && platform != "platform" {
+		return nil, fmt.Errorf("direct-bootstrap baseline adoption requires shared or platform baseline identity")
+	}
+	if platform == "platform" {
+		snapshotDir = path.Join(snapshotDir, "linux")
+	}
+	expected := map[string]bool{}
+	for _, contract := range config.Contracts {
+		for _, screenshot := range contract.Screenshots {
+			contractID := directBootstrapSafeName.ReplaceAllString(contract.ID, "-")
+			name := directBootstrapSafeName.ReplaceAllString(screenshot.Name, "-")
+			viewport := directBootstrapSafeName.ReplaceAllString(screenshot.Viewport, "-")
+			if contract.ID == "" || screenshot.Name == "" || screenshot.Viewport == "" || contractID == "" || name == "" || viewport == "" {
+				return nil, fmt.Errorf("direct-bootstrap screenshot baseline identity requires non-empty contract, name, and viewport values")
+			}
+			relative := path.Join(snapshotDir, contractID+"__"+name+"__"+viewport+".png")
+			if len(relative) > directBootstrapMaxPathBytes || expected[relative] {
+				return nil, fmt.Errorf("direct-bootstrap screenshot contracts produce a duplicate or oversized baseline path %q", relative)
+			}
+			expected[relative] = true
+			if len(expected) > directBootstrapMaxBaselines {
+				return nil, fmt.Errorf("direct-bootstrap screenshot contract inventory exceeds %d baselines", directBootstrapMaxBaselines)
+			}
+		}
+	}
+	return expected, nil
+}
+
+func directBootstrapBaselineInventoryAtCommit(ctx context.Context, checkout, commitSHA string) ([]SetupBaselineCandidate, string, error) {
+	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
+	if !immutableCommit.MatchString(commitSHA) {
+		return nil, "", fmt.Errorf("exact seed commit is required for direct-bootstrap baseline adoption")
+	}
+	output, err := git(ctx, checkout, "ls-tree", "-r", "-z", commitSHA, "--", ".visual-hive/snapshots")
+	if err != nil {
+		return nil, "", fmt.Errorf("list direct-bootstrap reviewed baseline tree: %w", err)
+	}
+	candidates := []SetupBaselineCandidate{}
+	var totalBytes int64
+	for _, record := range strings.Split(output, "\x00") {
+		if record == "" {
+			continue
+		}
+		if len(candidates) >= directBootstrapMaxBaselines {
+			return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline inventory exceeds %d PNGs", directBootstrapMaxBaselines)
+		}
+		metadata, relative, ok := strings.Cut(record, "\t")
+		fields := strings.Fields(metadata)
+		relative = filepath.ToSlash(relative)
+		if !ok || len(fields) != 3 || fields[0] != "100644" || fields[1] != "blob" || !immutableCommit.MatchString(strings.ToLower(fields[2])) ||
+			len(relative) > directBootstrapMaxPathBytes || path.Clean(relative) != relative || !strings.HasPrefix(relative, ".visual-hive/snapshots/") || !strings.HasSuffix(strings.ToLower(relative), ".png") {
+			return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline entry %q is not a canonical regular PNG blob", relative)
+		}
+		sizeText, sizeErr := git(ctx, checkout, "cat-file", "-s", strings.ToLower(fields[2]))
+		size, parseErr := strconv.ParseInt(strings.TrimSpace(sizeText), 10, 64)
+		if sizeErr != nil || parseErr != nil || size <= 8 || size > directBootstrapMaxBaseline || totalBytes > directBootstrapMaxTotal-size {
+			return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline %s has an invalid or excessive size", relative)
+		}
+		content, readErr := readSetupBaselineBlob(ctx, checkout, strings.ToLower(fields[2]))
+		if readErr != nil || int64(len(content)) != size || !bytes.Equal(content[:8], []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}) {
+			return nil, "", fmt.Errorf("read direct-bootstrap reviewed PNG %s: %w", relative, readErr)
+		}
+		totalBytes += size
+		digest := sha256.Sum256(content)
+		candidates = append(candidates, SetupBaselineCandidate{Path: relative, SHA256: hex.EncodeToString(digest[:]), Bytes: size})
+	}
+	if len(candidates) == 0 {
+		return nil, "", fmt.Errorf("direct-bootstrap reviewed baseline inventory is empty")
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
+	digest, err := setupBaselineCandidateDigest(candidates)
+	return candidates, digest, err
 }
 
 func setupBaselineInventoryAtCommit(ctx context.Context, checkout, commitSHA string) ([]SetupBaselineCandidate, string, error) {

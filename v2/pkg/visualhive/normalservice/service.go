@@ -99,6 +99,7 @@ type QuiescenceProbe func() (bool, error)
 type Options struct {
 	StateDir         string
 	PollInterval     time.Duration
+	MaxCycleDuration time.Duration
 	LeaseRetry       time.Duration
 	QuiesceInterval  time.Duration
 	AcquireLease     LeaseAcquirer
@@ -109,7 +110,9 @@ type Options struct {
 	Verdict          PullRequestVerdictVerifier
 	PullRequestState PullRequestStateObserver
 	Logger           *slog.Logger
+	OnCycleStart     func(time.Time, time.Time)
 	OnCycle          func(error)
+	OnInactive       func()
 }
 
 // Service is a bounded sequential reconciler, not another queue or manager.
@@ -131,6 +134,9 @@ func New(options Options) (*Service, error) {
 	options.StateDir = root
 	if options.PollInterval <= 0 {
 		options.PollInterval = 5 * time.Minute
+	}
+	if options.MaxCycleDuration <= 0 {
+		options.MaxCycleDuration = 2 * time.Hour
 	}
 	if options.LeaseRetry <= 0 {
 		options.LeaseRetry = 30 * time.Second
@@ -156,9 +162,11 @@ func (service *Service) Run(ctx context.Context) {
 	if service == nil {
 		return
 	}
+	defer service.inactive()
 	for {
 		quiesced, err := service.options.ShouldQuiesce()
 		if err != nil {
+			service.inactive()
 			service.report(fmt.Errorf("inspect normal Visual Hive quiescence: %w", err))
 			if !waitForContext(ctx, service.options.LeaseRetry) {
 				return
@@ -166,6 +174,7 @@ func (service *Service) Run(ctx context.Context) {
 			continue
 		}
 		if quiesced {
+			service.inactive()
 			if !waitForContext(ctx, service.options.QuiesceInterval) {
 				return
 			}
@@ -186,6 +195,7 @@ func (service *Service) Run(ctx context.Context) {
 		quiesced, err = service.options.ShouldQuiesce()
 		if err != nil || quiesced {
 			release()
+			service.inactive()
 			if err != nil {
 				service.report(fmt.Errorf("inspect claimed normal Visual Hive epoch: %w", err))
 			}
@@ -225,14 +235,19 @@ func (service *Service) runLeaseEpoch(ctx context.Context, release func()) {
 	}()
 
 	for {
-		err := service.RunCycle(epochCtx)
+		startedAt := time.Now().UTC()
+		deadline := startedAt.Add(service.options.MaxCycleDuration)
+		cycleCtx, cancelCycle := context.WithDeadline(epochCtx, deadline)
+		deadline, _ = cycleCtx.Deadline()
+		service.startCycle(startedAt, deadline)
+		err := service.RunCycle(cycleCtx)
+		cancelCycle()
+		service.reportCycle(err)
 		if ctx.Err() != nil {
 			return
 		}
 		if epochCtx.Err() != nil {
-			if err != nil && !errors.Is(err, context.Canceled) {
-				service.report(err)
-			}
+			service.inactive()
 			select {
 			case status, ok := <-result:
 				if ok && status.err != nil {
@@ -242,14 +257,15 @@ func (service *Service) runLeaseEpoch(ctx context.Context, release func()) {
 			}
 			return
 		}
-		service.report(err)
 		timer := time.NewTimer(service.options.PollInterval)
 		select {
 		case <-ctx.Done():
 			stopTimer(timer)
+			service.inactive()
 			return
 		case status, ok := <-result:
 			stopTimer(timer)
+			service.inactive()
 			if ok && status.err != nil {
 				service.report(fmt.Errorf("monitor normal Visual Hive quiescence: %w", status.err))
 			}
@@ -298,11 +314,27 @@ func stopTimer(timer *time.Timer) {
 }
 
 func (service *Service) report(err error) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrNoDispatch) && !errors.Is(err, ErrFinalVerdictPending) && !errors.Is(err, ErrOpenPullRequest) && !errors.Is(err, integrated.ErrRunInProgress) {
+		service.options.Logger.Warn("normal Visual Hive cycle held", "error", err)
+	}
+}
+
+func (service *Service) startCycle(startedAt, deadline time.Time) {
+	if service.options.OnCycleStart != nil {
+		service.options.OnCycleStart(startedAt, deadline)
+	}
+}
+
+func (service *Service) reportCycle(err error) {
 	if service.options.OnCycle != nil {
 		service.options.OnCycle(err)
 	}
-	if err != nil && !errors.Is(err, ErrNoDispatch) && !errors.Is(err, ErrFinalVerdictPending) && !errors.Is(err, ErrOpenPullRequest) && !errors.Is(err, integrated.ErrRunInProgress) {
-		service.options.Logger.Warn("normal Visual Hive cycle held", "error", err)
+	service.report(err)
+}
+
+func (service *Service) inactive() {
+	if service.options.OnInactive != nil {
+		service.options.OnInactive()
 	}
 }
 

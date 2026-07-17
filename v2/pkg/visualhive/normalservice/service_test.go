@@ -300,6 +300,89 @@ func TestNormalServiceLeaseContentionDoesNotRunCycleUntilOwnership(t *testing.T)
 	}
 }
 
+func TestNormalServicePublishesBoundedCycleStartBeforeRunCycle(t *testing.T) {
+	fixture := newServiceFixture(t)
+	fixture.intake.dispatch = nil
+	started := make(chan struct{})
+	observedDeadline := make(chan time.Time, 1)
+	source := &cycleWindowArtifactSource{inner: fixture.source, started: started, deadline: observedDeadline}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const maximum = 20 * time.Minute
+	var callbackStart, callbackDeadline time.Time
+	service, err := New(Options{
+		StateDir: t.TempDir(), PollInterval: time.Hour, MaxCycleDuration: maximum,
+		AcquireLease:  func() (func(), error) { return func() {}, nil },
+		ShouldQuiesce: func() (bool, error) { return false, nil },
+		Source:        source, Intake: fixture.intake, Repairer: fixture.repairer, Verdict: fixture.verifier, PullRequestState: fixture.verifier,
+		OnCycleStart: func(start, deadline time.Time) {
+			callbackStart, callbackDeadline = start, deadline
+			close(started)
+		},
+		OnCycle: func(err error) {
+			if errors.Is(err, ErrNoDispatch) {
+				cancel()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Run(ctx)
+	if callbackStart.IsZero() || !callbackDeadline.Equal(callbackStart.Add(maximum)) {
+		t.Fatalf("cycle callback window = %v .. %v", callbackStart, callbackDeadline)
+	}
+	select {
+	case deadline := <-observedDeadline:
+		if !deadline.Equal(callbackDeadline) {
+			t.Fatalf("RunCycle context deadline = %v, callback = %v", deadline, callbackDeadline)
+		}
+	default:
+		t.Fatal("RunCycle did not observe the published bounded deadline")
+	}
+}
+
+func TestNormalServiceMaximumCycleDurationCancelsBlockedCycle(t *testing.T) {
+	fixture := newServiceFixture(t)
+	cycleResult := make(chan error, 1)
+	service, err := New(Options{
+		StateDir: t.TempDir(), PollInterval: time.Hour, MaxCycleDuration: 20 * time.Millisecond,
+		AcquireLease:  func() (func(), error) { return func() {}, nil },
+		ShouldQuiesce: func() (bool, error) { return false, nil },
+		Source:        blockingArtifactSource{}, Intake: fixture.intake, Repairer: fixture.repairer, Verdict: fixture.verifier, PullRequestState: fixture.verifier,
+		OnCycle: func(err error) {
+			select {
+			case cycleResult <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		service.Run(ctx)
+		close(done)
+	}()
+	select {
+	case err := <-cycleResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded cycle result = %v", err)
+		}
+		cancel()
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("bounded cycle did not reach its deadline")
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("normal service did not stop after bounded cycle test")
+	}
+}
+
 func TestNormalServiceParentCancellationUnwindsCycleBeforeLeaseRelease(t *testing.T) {
 	fixture := newServiceFixture(t)
 	repairer := &pauseReplayRepairer{
@@ -307,6 +390,8 @@ func TestNormalServiceParentCancellationUnwindsCycleBeforeLeaseRelease(t *testin
 	}
 	released := make(chan struct{})
 	releasedBeforeUnwind := make(chan struct{}, 1)
+	cycleResults := make(chan error, 1)
+	inactive := make(chan struct{}, 1)
 	service, err := New(Options{
 		StateDir: t.TempDir(), PollInterval: time.Hour, LeaseRetry: time.Millisecond, QuiesceInterval: time.Millisecond,
 		AcquireLease: func() (func(), error) {
@@ -321,6 +406,13 @@ func TestNormalServiceParentCancellationUnwindsCycleBeforeLeaseRelease(t *testin
 		},
 		ShouldQuiesce: func() (bool, error) { return false, nil },
 		Source:        fixture.source, Intake: fixture.intake, Repairer: repairer, Verdict: fixture.verifier, PullRequestState: fixture.verifier,
+		OnCycle: func(err error) { cycleResults <- err },
+		OnInactive: func() {
+			select {
+			case inactive <- struct{}{}:
+			default:
+			}
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -357,6 +449,19 @@ func TestNormalServiceParentCancellationUnwindsCycleBeforeLeaseRelease(t *testin
 		t.Fatal("lease released before the active Worker context unwound")
 	default:
 	}
+	select {
+	case err := <-cycleResults:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parent-canceled cycle result = %v", err)
+		}
+	default:
+		t.Fatal("parent cancellation did not complete the cycle callback")
+	}
+	select {
+	case <-inactive:
+	default:
+		t.Fatal("parent cancellation did not mark the service loop inactive")
+	}
 }
 
 func TestNormalServicePauseReleasesRealLeaseAndResumesExactLedgerWithoutDuplicateWorkerSideEffect(t *testing.T) {
@@ -370,6 +475,7 @@ func TestNormalServicePauseReleasesRealLeaseAndResumesExactLedgerWithoutDuplicat
 	}
 	fixture := newServiceFixture(t)
 	cycles := make(chan error, 8)
+	inactive := make(chan struct{}, 8)
 	repairer := &pauseReplayRepairer{
 		outcome: fixture.repairer.outcome, firstStarted: make(chan struct{}), firstCanceled: make(chan struct{}), secondStarted: make(chan struct{}),
 	}
@@ -388,6 +494,12 @@ func TestNormalServicePauseReleasesRealLeaseAndResumesExactLedgerWithoutDuplicat
 		OnCycle: func(err error) {
 			select {
 			case cycles <- err:
+			default:
+			}
+		},
+		OnInactive: func() {
+			select {
+			case inactive <- struct{}{}:
 			default:
 			}
 		},
@@ -432,6 +544,11 @@ func TestNormalServicePauseReleasesRealLeaseAndResumesExactLedgerWithoutDuplicat
 	case <-repairer.firstCanceled:
 	default:
 		t.Fatal("pause completed before the active Worker context unwound")
+	}
+	select {
+	case <-inactive:
+	default:
+		t.Fatal("pause did not mark the normal service loop inactive")
 	}
 	select {
 	case <-repairer.secondStarted:
@@ -611,6 +728,41 @@ type fakeArtifactSource struct {
 	consumes                   int
 	consumeSideEffects         int
 	failConsumeAfterSideEffect bool
+}
+
+type cycleWindowArtifactSource struct {
+	inner    *fakeArtifactSource
+	started  <-chan struct{}
+	deadline chan<- time.Time
+}
+
+func (source *cycleWindowArtifactSource) Fetch(ctx context.Context) (integrated.NormalVisualWork, error) {
+	select {
+	case <-source.started:
+	default:
+		return integrated.NormalVisualWork{}, errors.New("RunCycle started before OnCycleStart")
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return integrated.NormalVisualWork{}, errors.New("RunCycle context has no bounded deadline")
+	}
+	source.deadline <- deadline
+	return source.inner.Fetch(ctx)
+}
+
+func (source *cycleWindowArtifactSource) Consume(workflow integrated.WorkflowRunEvidence, allow bool) error {
+	return source.inner.Consume(workflow, allow)
+}
+
+type blockingArtifactSource struct{}
+
+func (blockingArtifactSource) Fetch(ctx context.Context) (integrated.NormalVisualWork, error) {
+	<-ctx.Done()
+	return integrated.NormalVisualWork{}, ctx.Err()
+}
+
+func (blockingArtifactSource) Consume(integrated.WorkflowRunEvidence, bool) error {
+	return nil
 }
 
 func (source *fakeArtifactSource) Fetch(context.Context) (integrated.NormalVisualWork, error) {

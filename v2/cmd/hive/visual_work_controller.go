@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -46,17 +47,37 @@ func loadCurrentVisualWorkContract(normal *config.Config) (integrated.Config, bo
 }
 
 func loadAuthoritativeVisualWorkContract() (integrated.Config, bool, error) {
-	stateDir, exists, err := integrated.CurrentState(integratedStateRoot())
-	if err != nil || !exists {
-		return integrated.Config{}, exists, err
+	stateDir := strings.TrimSpace(os.Getenv("HIVE_STATE_DIR"))
+	exists := stateDir != ""
+	var err error
+	if exists {
+		stateDir, err = filepath.Abs(stateDir)
+		if err != nil {
+			return integrated.Config{}, false, fmt.Errorf("resolve HIVE_STATE_DIR: %w", err)
+		}
+		info, statErr := os.Stat(stateDir)
+		if statErr != nil || !info.IsDir() {
+			if statErr == nil {
+				statErr = errors.New("path is not a directory")
+			}
+			return integrated.Config{}, false, fmt.Errorf("HIVE_STATE_DIR %s is unavailable: %w", stateDir, statErr)
+		}
+	} else {
+		stateDir, exists, err = integrated.CurrentState(integratedStateRoot())
+		if err != nil || !exists {
+			return integrated.Config{}, exists, err
+		}
 	}
-	store, err := integrated.NewStore(stateDir)
+	store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
 	if err != nil {
 		return integrated.Config{}, false, err
 	}
 	installed, err := store.Load()
 	if err != nil {
 		return integrated.Config{}, false, err
+	}
+	if !sameSpecialistRuntimePath(installed.StateDir, stateDir) {
+		return integrated.Config{}, false, fmt.Errorf("authoritative Visual Hive state identity drifted: selected %s but installed contract names %s", stateDir, installed.StateDir)
 	}
 	return installed, true, nil
 }

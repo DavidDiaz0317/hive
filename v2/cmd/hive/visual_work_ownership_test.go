@@ -160,8 +160,11 @@ func TestNormalVisualOwnershipIsNotReportedAsLegacyDaemon(t *testing.T) {
 		t.Fatalf("claim normal ownership: lease=%v err=%v", normalLease, err)
 	}
 	defer releaseDaemonLease(normalLease)
+	if owner, held := readNormalVisualDaemonLease(stateDir); !held || owner.PID != os.Getpid() || owner.SchemaVersion != normalVisualDaemonLeaseSchema {
+		t.Fatalf("ordinary Hive ownership was not observable as its distinct runtime: owner=%+v held=%t", owner, held)
+	}
 	if owner, held := readIntegratedDaemonLease(stateDir); held {
-		t.Fatalf("metadata-silent normal owner was exposed as legacy daemon: owner=%+v", owner)
+		t.Fatalf("normal owner was exposed as legacy daemon: owner=%+v", owner)
 	}
 	if status := readIntegratedDaemonRuntimeStatus(stateDir); status.Running {
 		t.Fatalf("normal Hive process could be targeted by legacy stop/status: %+v", status)
@@ -172,7 +175,25 @@ func TestNormalVisualOwnershipIsNotReportedAsLegacyDaemon(t *testing.T) {
 		t.Fatalf("legacy termination path did not leave the normal owner untouched: status=%+v err=%v", stopped, stopErr)
 	}
 	if _, err := claimDaemonLease(stateDir); !errors.Is(err, errDaemonLeaseHeld) {
-		t.Fatalf("metadata-silent normal ownership did not retain authoritative exclusion: %v", err)
+		t.Fatalf("normal ownership did not retain authoritative exclusion: %v", err)
+	}
+}
+
+func TestNormalVisualOwnershipRecordIsLiveOnlyWhileOSLeaseIsHeld(t *testing.T) {
+	stateDir := t.TempDir()
+	lease, err := claimNormalVisualDaemonLease(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner, held := readNormalVisualDaemonLease(stateDir); !held || owner.PID != os.Getpid() || !sameSpecialistRuntimePath(owner.StateDir, stateDir) {
+		t.Fatalf("live normal owner = %+v held=%t", owner, held)
+	}
+	releaseDaemonLease(lease)
+	if owner, held := readNormalVisualDaemonLease(stateDir); held {
+		t.Fatalf("released normal owner remained live: %+v", owner)
+	}
+	if owner, configured, running := normalVisualDaemonObserved(stateDir); !configured || running || owner.SchemaVersion != normalVisualDaemonLeaseSchema {
+		t.Fatalf("stopped normal runtime lost its durable owner mode or remained live: owner=%+v configured=%t running=%t", owner, configured, running)
 	}
 }
 

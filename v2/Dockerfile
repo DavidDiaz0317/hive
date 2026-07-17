@@ -31,7 +31,7 @@ FROM node:24-slim
 
 # --- Layer 1: system packages (rarely changes) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates bash curl bzip2 gosu iptables inotify-tools libevent-core-2.1-7 \
+    git ca-certificates bash bubblewrap curl bzip2 gosu iptables inotify-tools libevent-core-2.1-7 \
     gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -88,6 +88,23 @@ RUN rm -f /usr/local/lib/node_modules/@github/copilot/node_modules/@github/copil
 # --- Layer 7: Claude Code (most frequent updates) ---
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache clean --force
+
+# --- Layer 7b: reviewed native Codex runtime for governed repair children ---
+# Hive rejects npm/npx/script wrappers at the repair boundary. Keep the npm
+# package only as the pinned distribution source, then copy its architecture-
+# specific native vendor directory to a stable path that remains usable when
+# Hive seals the exact executable for a one-shot child.
+ARG CODEX_VERSION=0.144.1
+RUN npm install -g @openai/codex@${CODEX_VERSION} \
+ && CODEX_VENDOR="$(find /usr/local/lib/node_modules/@openai/codex/node_modules -type f -path '*/vendor/*/bin/codex' -printf '%h/..\n' | head -n 1)" \
+ && test -n "$CODEX_VENDOR" \
+ && mkdir -p /opt/hive/codex \
+ && cp -a "$CODEX_VENDOR"/. /opt/hive/codex/ \
+ && test -f /opt/hive/codex/bin/codex \
+ && chmod 0555 /opt/hive/codex/bin/codex \
+ && test "$(/opt/hive/codex/bin/codex --version)" = "codex-cli ${CODEX_VERSION}" \
+ && npm cache clean --force
+ENV PATH="/opt/hive/codex/bin:${PATH}"
 
 # --- Layer 8: Goose CLI (aaif-goose/goose — supports custom providers via env vars) ---
 ARG GOOSE_VERSION=1.37.0

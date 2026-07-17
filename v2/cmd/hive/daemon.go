@@ -24,12 +24,26 @@ import (
 
 const daemonStatusSchema = "hive.integrated-daemon.v2"
 const daemonLeaseSchema = "hive.integrated-daemon-lease.v2"
+const normalVisualDaemonLeaseSchema = "hive.normal-visual-daemon-lease.v1"
 
 var errDaemonLeaseHeld = errors.New("hive scheduler lease is already held")
 
 type integratedDaemonLease struct {
 	SchemaVersion    string    `json:"schema_version"`
 	PID              int       `json:"pid"`
+	Executable       string    `json:"executable"`
+	HiveCommit       string    `json:"hive_commit"`
+	ExecutableSHA256 string    `json:"executable_sha256"`
+	AcquiredAt       time.Time `json:"acquired_at"`
+}
+
+// normalVisualDaemonLease is an observable ownership proof for the ordinary
+// Hive/dashboard process. Its distinct schema can never be mistaken for a
+// legacy scheduler identity or targeted by legacy stop operations.
+type normalVisualDaemonLease struct {
+	SchemaVersion    string    `json:"schema_version"`
+	PID              int       `json:"pid"`
+	StateDir         string    `json:"state_dir"`
 	Executable       string    `json:"executable"`
 	HiveCommit       string    `json:"hive_commit"`
 	ExecutableSHA256 string    `json:"executable_sha256"`
@@ -104,6 +118,9 @@ func ensureIntegratedDaemonStarted(stateDir string, interval time.Duration) (int
 	config, err := store.Load()
 	if err != nil {
 		return integratedDaemonStatus{}, fmt.Errorf("complete hive setup before start: %w", err)
+	}
+	if err := preflightLegacySchedulerStart(stateDir, config); err != nil {
+		return integratedDaemonStatus{}, err
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -289,6 +306,10 @@ func runIntegratedDaemon(args []string) int {
 	}
 	if config.ExecutionMode == integrated.ExecutionHosted {
 		fmt.Fprintln(os.Stderr, "hosted installations are owned by the repository controller and cannot start a local daemon")
+		return 1
+	}
+	if err := preflightLegacySchedulerStart(stateDirAbs, config); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	runtimeState, err := claimIntegratedDaemonRuntime(stateDirAbs, config, newIntegratedSpecialistRuntime)
@@ -555,11 +576,51 @@ func claimDaemonLease(stateDir string) (*os.File, error) {
 	return claimDaemonOwnershipLease(stateDir, true)
 }
 
-// claimNormalVisualDaemonLease uses the scheduler's authoritative OS lock but
-// deliberately leaves no daemon identity record. Status and stop operations
-// must never mistake the ordinary Hive/dashboard process for a legacy daemon.
+// claimNormalVisualDaemonLease uses the scheduler's authoritative OS lock and
+// writes a distinct ordinary-runtime identity. Legacy status/stop parsing does
+// not accept that schema, while normal status can prove the dashboard-owned
+// Visual service is live without launching a second scheduler.
 func claimNormalVisualDaemonLease(stateDir string) (*os.File, error) {
-	return claimDaemonOwnershipLease(stateDir, false)
+	stateDir, err := filepath.Abs(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	file, err := claimDaemonOwnershipLease(stateDir, false)
+	if err != nil {
+		return nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, err
+	}
+	commit, digest, err := currentDaemonExecutableIdentity(executable)
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, err
+	}
+	lease := normalVisualDaemonLease{
+		SchemaVersion: normalVisualDaemonLeaseSchema, PID: os.Getpid(), StateDir: stateDir,
+		Executable: executable, HiveCommit: commit, ExecutableSHA256: digest, AcquiredAt: time.Now().UTC(),
+	}
+	data, err := json.MarshalIndent(lease, "", "  ")
+	if err == nil {
+		err = file.Truncate(0)
+	}
+	if err == nil {
+		_, err = file.Seek(0, 0)
+	}
+	if err == nil {
+		_, err = file.Write(append(data, '\n'))
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if err != nil {
+		releaseDaemonLease(file)
+		return nil, fmt.Errorf("persist ordinary Hive Visual service ownership: %w", err)
+	}
+	return file, nil
 }
 
 func claimDaemonOwnershipLease(stateDir string, persistDaemonIdentity bool) (*os.File, error) {
@@ -669,6 +730,52 @@ func readIntegratedDaemonLease(stateDir string) (integratedDaemonLease, bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return integratedDaemonLease{}, false
+}
+
+func readNormalVisualDaemonLease(stateDir string) (normalVisualDaemonLease, bool) {
+	stateDir, err := filepath.Abs(stateDir)
+	if err != nil {
+		return normalVisualDaemonLease{}, false
+	}
+	path := filepath.Join(stateDir, "integrated", "daemon.lease")
+	for attempt := 0; attempt < 5; attempt++ {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return normalVisualDaemonLease{}, false
+		}
+		var lease normalVisualDaemonLease
+		valid := json.Unmarshal(data, &lease) == nil && lease.SchemaVersion == normalVisualDaemonLeaseSchema &&
+			lease.PID > 0 && !lease.AcquiredAt.IsZero() && lease.Executable != "" && sameSpecialistRuntimePath(lease.StateDir, stateDir) &&
+			validDaemonHexIdentity(lease.HiveCommit, 40) && validDaemonHexIdentity(lease.ExecutableSHA256, 64)
+		if valid {
+			file, openErr := os.OpenFile(path, os.O_RDWR, 0o600)
+			if openErr != nil {
+				return normalVisualDaemonLease{}, false
+			}
+			locked, lockErr := tryReadDaemonLease(file)
+			if locked {
+				_ = unlockDaemonLease(file)
+			}
+			_ = file.Close()
+			if lockErr != nil || locked {
+				return lease, false
+			}
+			current, currentErr := os.ReadFile(path)
+			// The held OS lock is the ownership proof. Process-table metadata is
+			// diagnostic only and may drift during an atomic executable upgrade;
+			// never permit a second service owner merely because it drifted.
+			if currentErr == nil && string(current) == string(data) {
+				return lease, true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return normalVisualDaemonLease{}, false
+}
+
+func normalVisualDaemonObserved(stateDir string) (normalVisualDaemonLease, bool, bool) {
+	lease, running := readNormalVisualDaemonLease(stateDir)
+	return lease, lease.SchemaVersion == normalVisualDaemonLeaseSchema, running
 }
 
 func readIntegratedDaemonStatus(stateDir string) integratedDaemonStatus {

@@ -13,6 +13,13 @@ func recordDeferredSchedulerStart(stateDir, repository string, interval time.Dur
 	if err != nil {
 		return err
 	}
+	config, err := store.Load()
+	if err != nil {
+		return err
+	}
+	if err := preflightLegacySchedulerStart(stateDir, config); err != nil {
+		return fmt.Errorf("refuse deferred legacy scheduler start: %w", err)
+	}
 	existing, exists, err := store.LoadSchedulerStartIntent()
 	if err != nil {
 		return err
@@ -42,6 +49,13 @@ func activateDeferredSchedulerIfReady(stateDir, githubTokenEnv, githubAPIURL str
 	intent, exists, err := store.LoadSchedulerStartIntent()
 	if err != nil || !exists {
 		return false, err
+	}
+	config, err := store.Load()
+	if err != nil {
+		return false, err
+	}
+	if err := preflightLegacySchedulerStart(stateDir, config); err != nil {
+		return false, fmt.Errorf("deferred legacy scheduler activation is blocked: %w; run hive stop to cancel the obsolete deferred request", err)
 	}
 	if !doctorChecksReady(collectIntegratedDoctorChecks(stateDir, githubTokenEnv, githubAPIURL, false)) {
 		return false, nil

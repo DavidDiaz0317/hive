@@ -87,6 +87,10 @@ type SetupPlan struct {
 	AllowedAutoMergePaths      []string              `json:"allowed_auto_merge_paths"`
 	AllowedAutoMergeRisk       []automation.RiskTier `json:"allowed_auto_merge_risk"`
 	VisualHive                 bool                  `json:"visual_hive"`
+	DirectBootstrap            bool                  `json:"direct_bootstrap,omitempty"`
+	AdoptReviewedBaselines     bool                  `json:"adopt_reviewed_baselines,omitempty"`
+	ExpectedSeedSHA            string                `json:"expected_seed_sha,omitempty"`
+	ReviewedBaselineDigest     string                `json:"reviewed_baseline_digest,omitempty"`
 	VisualHiveRepository       string                `json:"visual_hive_repository"`
 	VisualHiveRef              string                `json:"visual_hive_ref"`
 	Inspection                 RepositoryInspection  `json:"inspection"`
