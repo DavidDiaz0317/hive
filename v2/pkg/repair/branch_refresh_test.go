@@ -8,6 +8,50 @@ import (
 	"testing"
 )
 
+func TestRepairRefreshRejectsProtectedVisualBaselinesWithoutBlockingPublicAssets(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	worktree := filepath.Join(root, "worktree")
+	if _, err := runGit(ctx, root, "init", "--bare", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, worktree, "init", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, worktree, "remote", "add", "origin", remote); err != nil {
+		t.Fatal(err)
+	}
+	writeRefreshFixture(t, worktree, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/visual-reference\n")
+	writeRefreshFixture(t, worktree, "public/visual-reference/home.png", "reviewed baseline\n")
+	writeRefreshFixture(t, worktree, "public/logo.png", "ordinary asset\n")
+	commitRefreshFixture(t, worktree, "seed visual baselines")
+	protection, err := InspectVisualBaselineProtection(ctx, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := refreshGitOutput(t, worktree, "rev-parse", "HEAD")
+	request := RefreshedBranchCheckpointRequest{
+		Worktree: worktree, Branch: "hive/repair-baseline-a1", RepositoryID: "123", ExpectedRemoteURL: remote,
+		BaselineProtection: protection, RemoteHeadSHA: head, BaseBranch: "main", BaseSHA: head,
+		ExpectedChangedFiles: []string{"public/visual-reference/home.png"},
+	}
+	if err := validateRefreshedBranchRequest(ctx, request); err == nil || !strings.Contains(err.Error(), "protected visual baseline") {
+		t.Fatalf("refresh accepted configured visual baseline contribution: %v", err)
+	}
+	request.ExpectedChangedFiles = []string{"e2e/dashboard.spec.ts-snapshots/home.png"}
+	if err := validateRefreshedBranchRequest(ctx, request); err == nil || !strings.Contains(err.Error(), "restricted path") {
+		t.Fatalf("refresh accepted Playwright snapshot contribution: %v", err)
+	}
+	request.ExpectedChangedFiles = []string{"public/logo.png"}
+	if err := validateRefreshedBranchRequest(ctx, request); err != nil {
+		t.Fatalf("refresh broadly blocked ordinary public PNG: %v", err)
+	}
+}
+
 func TestPrepareAndPushRefreshedRepairBranchUsesExactLocalBaseAndLease(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -56,7 +100,7 @@ func TestPrepareAndPushRefreshedRepairBranchUsesExactLocalBaseAndLease(t *testin
 	}
 
 	request := RefreshedBranchCheckpointRequest{
-		Worktree: worktree, Branch: "hive/repair-proof-a1", RepositoryID: "123", RemoteHeadSHA: oldHead,
+		Worktree: worktree, Branch: "hive/repair-proof-a1", RepositoryID: "123", ExpectedRemoteURL: remote, RemoteHeadSHA: oldHead,
 		BaseBranch: "main", BaseSHA: refreshGitOutput(t, worktree, "rev-parse", "main"), ExpectedChangedFiles: []string{"tests/proof.test.ts"},
 		ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check", "HEAD"}}},
 	}
@@ -64,7 +108,7 @@ func TestPrepareAndPushRefreshedRepairBranchUsesExactLocalBaseAndLease(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remoteHead, err := remoteRepairBranchHead(ctx, worktree, request.Branch); err != nil || remoteHead != oldHead {
+	if remoteHead, err := remoteRepairBranchHead(ctx, worktree, remote, request.Branch); err != nil || remoteHead != oldHead {
 		t.Fatalf("local preparation mutated remote head: head=%s err=%v", remoteHead, err)
 	}
 	if err := PushRefreshedRepairBranchExact(ctx, request, checkpoint); err != nil {
@@ -88,11 +132,11 @@ func TestPrepareAndPushRefreshedRepairBranchUsesExactLocalBaseAndLease(t *testin
 	if !hasExactRepairTrailer(message, "Hive-Repository-ID", "123") || !hasExactRepairTrailer(message, "Hive-Operation", "repair") {
 		t.Fatalf("checkpoint lacks ownership trailers: %s", message)
 	}
-	remoteHead, err := remoteRepairBranchHead(ctx, worktree, "hive/repair-proof-a1")
+	remoteHead, err := remoteRepairBranchHead(ctx, worktree, remote, "hive/repair-proof-a1")
 	if err != nil || remoteHead != checkpointSHA {
 		t.Fatalf("remote head = %s, want %s: %v", remoteHead, checkpointSHA, err)
 	}
-	if err := pushRepairBranchExact(ctx, worktree, "hive/repair-proof-a1", checkpointSHA, "123", "repair"); err != nil {
+	if err := pushRepairBranchExact(ctx, worktree, remote, "hive/repair-proof-a1", checkpointSHA, "123", "repair"); err != nil {
 		t.Fatalf("future owned repair lease rejected refreshed tip: %v", err)
 	}
 }
@@ -138,13 +182,13 @@ func TestPrepareRefreshedRepairBranchConflictLeavesRemoteUnchanged(t *testing.T)
 		t.Fatal(err)
 	}
 	_, err := PrepareRefreshedRepairBranch(ctx, RefreshedBranchCheckpointRequest{
-		Worktree: worktree, Branch: "hive/repair-conflict-a1", RepositoryID: "123", RemoteHeadSHA: head,
+		Worktree: worktree, Branch: "hive/repair-conflict-a1", RepositoryID: "123", ExpectedRemoteURL: remote, RemoteHeadSHA: head,
 		BaseBranch: "main", BaseSHA: base, ExpectedChangedFiles: []string{"shared.txt"},
 	})
 	if err == nil || !IsRepairBranchRefreshConflict(err) {
 		t.Fatalf("conflicting exact-base merge was not classified: %v", err)
 	}
-	remoteHead, remoteErr := remoteRepairBranchHead(ctx, worktree, "hive/repair-conflict-a1")
+	remoteHead, remoteErr := remoteRepairBranchHead(ctx, worktree, remote, "hive/repair-conflict-a1")
 	if remoteErr != nil || remoteHead != head {
 		t.Fatalf("conflict mutated remote repair head: head=%s err=%v", remoteHead, remoteErr)
 	}
@@ -196,7 +240,7 @@ func TestPushRefreshedRepairBranchRejectsExactHeadLeaseRace(t *testing.T) {
 	if _, err := runGit(ctx, worktree, "checkout", "hive/repair-race-a1"); err != nil {
 		t.Fatal(err)
 	}
-	request := RefreshedBranchCheckpointRequest{Worktree: worktree, Branch: "hive/repair-race-a1", RepositoryID: "123", RemoteHeadSHA: head, BaseBranch: "main", BaseSHA: base, ExpectedChangedFiles: []string{"proof.txt"}}
+	request := RefreshedBranchCheckpointRequest{Worktree: worktree, Branch: "hive/repair-race-a1", RepositoryID: "123", ExpectedRemoteURL: remote, RemoteHeadSHA: head, BaseBranch: "main", BaseSHA: base, ExpectedChangedFiles: []string{"proof.txt"}}
 	checkpoint, err := PrepareRefreshedRepairBranch(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +264,7 @@ func TestPushRefreshedRepairBranchRejectsExactHeadLeaseRace(t *testing.T) {
 	if err := PushRefreshedRepairBranchExact(ctx, request, checkpoint); err == nil || !strings.Contains(err.Error(), "changed before exact refresh push") {
 		t.Fatalf("moved exact-head lease was not rejected: %v", err)
 	}
-	remoteHead, _ := remoteRepairBranchHead(ctx, worktree, request.Branch)
+	remoteHead, _ := remoteRepairBranchHead(ctx, worktree, remote, request.Branch)
 	if remoteHead != raceHead {
 		t.Fatalf("lease race overwrote competing remote head: got %s want %s", remoteHead, raceHead)
 	}
@@ -266,7 +310,7 @@ func TestPrepareRefreshedRepairBranchRejectsChangedContributionWithSamePath(t *t
 	if _, err := runGit(ctx, worktree, "checkout", "hive/repair-proof-a1"); err != nil {
 		t.Fatal(err)
 	}
-	request := RefreshedBranchCheckpointRequest{Worktree: worktree, Branch: "hive/repair-proof-a1", RepositoryID: "123", RemoteHeadSHA: head, BaseBranch: "main", BaseSHA: base, ExpectedChangedFiles: []string{"proof.txt"}}
+	request := RefreshedBranchCheckpointRequest{Worktree: worktree, Branch: "hive/repair-proof-a1", RepositoryID: "123", ExpectedRemoteURL: remote, RemoteHeadSHA: head, BaseBranch: "main", BaseSHA: base, ExpectedChangedFiles: []string{"proof.txt"}}
 	checkpoint, err := PrepareRefreshedRepairBranch(ctx, request)
 	if err != nil {
 		t.Fatal(err)

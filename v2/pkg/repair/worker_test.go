@@ -79,7 +79,7 @@ func (p *unsafeOutputProvider) Run(context.Context, string, string) (ProviderRes
 }
 
 func TestWorkerRejectsUnsafeProviderOutputBeforeStatePersistence(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestWorkerRejectsUnsafeProviderOutputBeforeStatePersistence(t *testing.T) {
 	}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -119,7 +119,7 @@ func TestRepairPreparationHelperProcess(t *testing.T) {
 }
 
 func TestWorkerPreparesIsolatedWorktreeBeforeModel(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestWorkerPreparesIsolatedWorktreeBeforeModel(t *testing.T) {
 	provider := &fakeProvider{requiredMarker: marker}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:              automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths:  []string{"src/**"},
 			PreparationCommands: []Command{{Name: os.Args[0], Args: []string{"-test.run=^TestRepairPreparationHelperProcess$", "--", marker}}},
@@ -211,7 +211,7 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -247,7 +247,7 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 
 func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +257,7 @@ func TestWorkerStartsFreshBoundedCycleForRecurrence(t *testing.T) {
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -306,12 +306,12 @@ func TestRepairStateMigratesV2WithInitialRecurrence(t *testing.T) {
 }
 
 func TestWorkerDeniesModelAtLowerACMMBeforeRun(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
-		Config:   Config{RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", Policy: automation.Policy{ACMMLevel: 2, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}}},
+		Config:   Config{RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote, Policy: automation.Policy{ACMMLevel: 2, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}}},
 		Provider: provider, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{state: state},
 	}
 	_, err := worker.Run(context.Background(), visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: "fp", IssueNumber: 1, IssueURL: "https://example.test/1"})
@@ -322,14 +322,14 @@ func TestWorkerDeniesModelAtLowerACMMBeforeRun(t *testing.T) {
 
 func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -381,14 +381,14 @@ func TestWorkerRevisesTheSameBranchAndPullRequest(t *testing.T) {
 
 func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -422,14 +422,14 @@ func TestWorkerNoChangeRetryPreservesOpenBranchAndPullRequest(t *testing.T) {
 
 func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &fakeProvider{}
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -461,14 +461,14 @@ func TestWorkerStartsFreshBranchAfterMergedFixNeedsRevision(t *testing.T) {
 
 func TestWorkerRetriesNoChangeCheckpointOnCleanNewAttempt(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &noChangeThenFixProvider{}
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			EvidenceSummary: "- key=playwright.console_error.deploy-preview-smoke source=playwright kind=console_error status=failed contract=deploy-preview-smoke target=deployPreview reason=404",
@@ -506,7 +506,7 @@ func TestWorkerAppliesAuthorizedReadOnlyModelPatch(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -544,7 +544,7 @@ func TestWorkerAppliesCorrectivePatchOverDirtyFailedAttempt(t *testing.T) {
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "api-500")
 	branch := "hive/repair-api-500-a2"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	failedPatch := "serve: node scripts/testing/start-lhci-server.mjs\ntextMustNotExist:\n  - visual-hive api-500 mutation\n"
@@ -567,7 +567,7 @@ func TestWorkerAppliesCorrectivePatchOverDirtyFailedAttempt(t *testing.T) {
 	}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"visual-hive.config.yaml"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -602,9 +602,25 @@ func containsDecision(values []string, expected string) bool {
 }
 
 func TestValidateChangedFilesRejectsSensitivePaths(t *testing.T) {
-	for _, file := range []string{".github/workflows/test.yml", "visual-hive.baselines/a.png", "src/auth/token.ts", "deploy/app.yml"} {
+	for _, file := range []string{
+		".github/workflows/test.yml",
+		"visual-hive.baselines/a.png",
+		"src/auth/token.ts",
+		"deploy/app.yml",
+		"src/components/Button.snapshot.tsx",
+		"artifacts/screenshots/failure.txt",
+		"e2e/dashboard.spec.ts-snapshots/home.png",
+		"tests/foo.snap",
+		"tests/fixtures/render.png",
+		"testdata/expected/home.webp",
+	} {
 		if err := validateChangedFiles([]string{file}, []string{"**"}); err == nil {
 			t.Fatalf("expected %s to require review", file)
+		}
+	}
+	for _, file := range []string{"public/logo.png", "src/assets/product-photo.jpg", "src/snapshot-service.ts"} {
+		if err := validateChangedFiles([]string{file}, []string{"**"}); err != nil {
+			t.Fatalf("ordinary public raster asset %s should remain repair-eligible: %v", file, err)
 		}
 	}
 }
@@ -763,9 +779,9 @@ func TestLimitedBufferPreservesValidationFailureTail(t *testing.T) {
 }
 
 func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "attempt")
-	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a1", "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a1", "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	dirty := filepath.Join(worktree, "test", "failed.test.js")
@@ -775,13 +791,13 @@ func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 	if err := os.WriteFile(dirty, []byte("failed patch\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "wrong-branch"); err == nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "wrong-branch", remote); err == nil {
 		t.Fatal("dirty worktree must not be cleaned without the exact persisted failed branch")
 	}
 	if _, err := os.Stat(dirty); err != nil {
 		t.Fatalf("unauthorized cleanup changed the worktree: %v", err)
 	}
-	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "hive/repair-test-a1"); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a2", "main", "hive/repair-test-a1", remote); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(dirty); !os.IsNotExist(err) {
@@ -796,9 +812,9 @@ func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 }
 
 func TestNormalizeTrackedLineEndingsPreservesIndexAndPatchSemantics(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "line-endings")
-	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-eol-a1", "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-eol-a1", "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	file := filepath.Join(worktree, "src", "value.txt")

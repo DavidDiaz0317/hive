@@ -812,7 +812,7 @@ func copyExecutableFile(t *testing.T, source, destination string) {
 }
 
 func TestCodexSecurityPreflightFailureDoesNotConsumeModelAttempt(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -822,7 +822,7 @@ func TestCodexSecurityPreflightFailureDoesNotConsumeModelAttempt(t *testing.T) {
 	provider := CodexProvider{Command: os.Args[0]}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -843,7 +843,7 @@ func TestCodexSecurityPreflightFailureDoesNotConsumeModelAttempt(t *testing.T) {
 }
 
 func TestUnsupportedCodexVersionDoesNotConsumeModelAttempt(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -852,7 +852,7 @@ func TestUnsupportedCodexVersionDoesNotConsumeModelAttempt(t *testing.T) {
 	t.Setenv("HIVE_TEST_CODEX_VERSION_OUTPUT", "codex-cli 0.145.0")
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},

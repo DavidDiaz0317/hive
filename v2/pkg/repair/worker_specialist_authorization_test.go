@@ -32,7 +32,7 @@ func TestWorkerAuthorizationUsesExactConfiguredSpecialist(t *testing.T) {
 }
 
 func TestWorkerUsesControllerBoundAttemptStart(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +41,7 @@ func TestWorkerUsesControllerBoundAttemptStart(t *testing.T) {
 	provider := &fakeProvider{}
 	worker := Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", Agent: "quality",
+			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote, Agent: "quality",
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			AttemptStartedAt: anchor, ModelTimeout: time.Minute, CommandTimeout: time.Minute,

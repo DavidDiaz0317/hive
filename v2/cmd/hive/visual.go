@@ -184,9 +184,18 @@ func runVisualLifecycleCommand(args []string) int {
 		if strings.TrimSpace(root) == "" {
 			root = filepath.Join(*stateDir, "repair", "worktrees")
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		defer cancel()
+		baselineProtection, protectionErr := repair.InspectVisualBaselineProtection(ctx, *repositoryDir)
+		if protectionErr != nil {
+			fmt.Fprintln(os.Stderr, "inspect trusted visual baseline protection:", protectionErr)
+			return 1
+		}
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: *repositoryDir, WorktreeRoot: root, BaseBranch: strings.TrimPrefix(*targetRef, "refs/heads/"),
+				ExpectedRemoteURL:  "https://github.com/" + strings.TrimSpace(*repository) + ".git",
+				BaselineProtection: baselineProtection,
 				Policy: automation.Policy{
 					ACMMLevel: *maxACMM, Mode: mode, Paused: *paused, KillSwitch: *killSwitch,
 					AllowedRepositories: []string{*repository}, MaxRepairAttempts: *maxAttempts,
@@ -197,8 +206,6 @@ func runVisualLifecycleCommand(args []string) int {
 			Provider: repair.CodexProvider{Command: *providerCommand, Prefix: append([]string(nil), providerArgs...)},
 			State:    repairState, Lifecycle: lifecycle, GitHub: client,
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
-		defer cancel()
 		result, runErr := worker.Run(ctx, finding)
 		if runErr != nil {
 			fmt.Fprintln(os.Stderr, "repair failed:", runErr)

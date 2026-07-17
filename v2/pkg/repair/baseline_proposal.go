@@ -23,6 +23,7 @@ type BaselineProposalConfig struct {
 	RepositoryDir      string
 	WorktreeRoot       string
 	BaseBranch         string
+	ExpectedRemoteURL  string
 	ValidationCommands []Command
 	Environment        map[string]string
 	CommandTimeout     time.Duration
@@ -69,7 +70,7 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 		return Attempt{}, err
 	}
 	worktree := filepath.Join(config.WorktreeRoot, shortFingerprint(finding.RepositoryFingerprint))
-	if err := prepareWorktree(ctx, config.RepositoryDir, worktree, review.ProposalBranch, config.BaseBranch, ""); err != nil {
+	if err := prepareWorktree(ctx, config.RepositoryDir, worktree, review.ProposalBranch, config.BaseBranch, "", config.ExpectedRemoteURL); err != nil {
 		return Attempt{}, err
 	}
 	expectedFiles := make([]string, 0, len(candidates))
@@ -131,7 +132,7 @@ func CreateBaselineProposal(ctx context.Context, config BaselineProposalConfig, 
 	if err := state.Put(attempt); err != nil {
 		return Attempt{}, err
 	}
-	if err := pushRepairBranchExact(ctx, worktree, review.ProposalBranch, review.ProposalCommitSHA, finding.RepositoryID, "baseline"); err != nil {
+	if err := pushRepairBranchExact(ctx, worktree, config.ExpectedRemoteURL, review.ProposalBranch, review.ProposalCommitSHA, finding.RepositoryID, "baseline"); err != nil {
 		return Attempt{}, fmt.Errorf("push baseline proposal: %w", err)
 	}
 	marker := fmt.Sprintf("<!-- hive-baseline-review: %s:%s -->", finding.RepositoryFingerprint, review.RepairHeadSHA)
@@ -166,7 +167,12 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 	if strings.TrimSpace(proposalMergeSHA) == "" {
 		return Attempt{}, fmt.Errorf("baseline proposal merge SHA is required")
 	}
-	if _, err := runGit(ctx, attempt.Worktree, "fetch", "--prune", "origin", config.BaseBranch); err != nil {
+	expectedRemoteURL, err := validateExpectedRemoteURL(ctx, attempt.Worktree, config.ExpectedRemoteURL)
+	if err != nil {
+		return Attempt{}, err
+	}
+	baseRefspec := "+refs/heads/" + config.BaseBranch + ":refs/remotes/origin/" + config.BaseBranch
+	if _, err := runGit(ctx, attempt.Worktree, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
 		return Attempt{}, fmt.Errorf("fetch approved baseline: %w", err)
 	}
 	mergeMessage := fmt.Sprintf("test(visual): sync approved baselines\n\nHive-Repository-ID: %s\nHive-Operation: repair", strings.TrimSpace(finding.RepositoryID))
@@ -184,7 +190,7 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 		return Attempt{}, err
 	}
 	sha = strings.TrimSpace(sha)
-	if err := pushRepairBranchExact(ctx, attempt.Worktree, attempt.Branch, sha, finding.RepositoryID, "repair"); err != nil {
+	if err := pushRepairBranchExact(ctx, attempt.Worktree, expectedRemoteURL, attempt.Branch, sha, finding.RepositoryID, "repair"); err != nil {
 		return Attempt{}, fmt.Errorf("push repair after baseline approval: %w", err)
 	}
 	attempt.CommitSHA = sha

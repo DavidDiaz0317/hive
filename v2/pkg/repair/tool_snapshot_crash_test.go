@@ -22,7 +22,7 @@ func seedPendingRecoveredCleanup(t *testing.T) (string, string, string, string, 
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "pending-cleanup")
 	branch := "hive/repair-pending-a4"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	command := repairToolHelperCommand("generate-build")
@@ -77,7 +77,7 @@ func seedPendingRecoveredCleanup(t *testing.T) (string, string, string, string, 
 func TestPendingRecoveryCleanupResumesPartialOrCompleteCrashWithoutApplying(t *testing.T) {
 	for _, mode := range []string{"partial", "complete"} {
 		t.Run(mode, func(t *testing.T) {
-			repository, _, worktreeRoot, stateDir, _, attempt, finding := seedPendingRecoveredCleanup(t)
+			repository, remote, worktreeRoot, stateDir, _, attempt, finding := seedPendingRecoveredCleanup(t)
 			switch mode {
 			case "partial":
 				if err := os.Remove(filepath.Join(attempt.Worktree, "build", "lib", "service", "metrics.py")); err != nil {
@@ -96,7 +96,7 @@ func TestPendingRecoveryCleanupResumesPartialOrCompleteCrashWithoutApplying(t *t
 			lifecycle := &fakeLifecycle{}
 			pulls := &fakePRClient{state: reloaded}
 			worker := &Worker{
-				Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}},
+				Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}},
 				Provider: provider, State: reloaded, Lifecycle: lifecycle, GitHub: pulls,
 			}
 			_, runErr := worker.Run(context.Background(), finding)
@@ -125,11 +125,11 @@ func TestRecoveredPatchStateRejectsAlteredBytes(t *testing.T) {
 }
 
 func TestSealedModelAndCandidateTreesSurvivePruneAndRestart(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "sealed-prune")
 	branch := "hive/repair-sealed-prune-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("cumulative uncommitted\n"), 0o600); err != nil {
@@ -421,7 +421,7 @@ func TestV5AppliedModelPatchRecoversExactBaseWithoutProviderRecall(t *testing.T)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "v5-model-complete")
 	branch := "hive/repair-v5-model-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	patch := "diff --git a/src/value.txt b/src/value.txt\n--- a/src/value.txt\n+++ b/src/value.txt\n@@ -1 +1 @@\n-broken\n+v5 exact recovery\n"
@@ -442,7 +442,7 @@ func TestV5AppliedModelPatchRecoversExactBaseWithoutProviderRecall(t *testing.T)
 	provider := &runFailureProvider{}
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
-		Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}}, CommandTimeout: time.Minute},
+		Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}}, CommandTimeout: time.Minute},
 		Provider: provider, State: state, Lifecycle: &fakeLifecycle{}, GitHub: pulls,
 	}
 	finding := standardRepairFinding(fingerprint)
@@ -457,11 +457,11 @@ func TestV5AppliedModelPatchRecoversExactBaseWithoutProviderRecall(t *testing.T)
 }
 
 func TestV5ValidatedCandidateIsQuarantinedBeforeFreshBoundedAttempt(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "v5-validated")
 	branch := "hive/repair-v5-validated-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("v5 validated recovery\n"), 0o600); err != nil {
@@ -481,7 +481,7 @@ func TestV5ValidatedCandidateIsQuarantinedBeforeFreshBoundedAttempt(t *testing.T
 	provider := &runFailureProvider{}
 	pulls := &fakePRClient{state: state}
 	lifecycle := &fakeLifecycle{}
-	worker := &Worker{Config: Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}}, Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls}
+	worker := &Worker{Config: Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}}, Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls}
 	finding := standardRepairFinding(fingerprint)
 	finding.Status, finding.RepairAttempts, finding.Branch = visualhive.StatusRepairRunning, 1, branch
 	_, err = worker.Run(context.Background(), finding)
@@ -504,11 +504,11 @@ func TestV5ValidatedCandidateIsQuarantinedBeforeFreshBoundedAttempt(t *testing.T
 }
 
 func TestV5ModelCompleteWithoutPatchQuarantinesAndRestarts(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "v5-no-patch")
 	branch := "hive/repair-v5-no-patch-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("unproven legacy bytes\n"), 0o600); err != nil {
@@ -524,7 +524,7 @@ func TestV5ModelCompleteWithoutPatchQuarantinesAndRestarts(t *testing.T) {
 	}
 	provider := &runFailureProvider{}
 	pulls, lifecycle := &fakePRClient{state: state}, &fakeLifecycle{}
-	worker := &Worker{Config: Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}}, Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls}
+	worker := &Worker{Config: Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}}, Provider: provider, State: state, Lifecycle: lifecycle, GitHub: pulls}
 	finding := standardRepairFinding(fingerprint)
 	finding.Status, finding.RepairAttempts, finding.Branch = visualhive.StatusRepairRunning, 1, branch
 	_, runErr := worker.Run(context.Background(), finding)
@@ -556,11 +556,11 @@ func writeLegacyRepairState(t *testing.T, stateDir, schema string, attempt Attem
 }
 
 func TestIndeterminateToolSnapshotPutRetainsRefForSafeSweep(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "indeterminate")
 	branch := "hive/repair-indeterminate-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -624,11 +624,11 @@ func TestRecurrenceRolloverWaitsForPendingToolSnapshot(t *testing.T) {
 	crashContainment := repairProcessTreeCrashContainmentGuaranteed
 	repairProcessTreeCrashContainmentGuaranteed = func() bool { return false }
 	defer func() { repairProcessTreeCrashContainmentGuaranteed = crashContainment }()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "rollover")
 	branch := "hive/repair-rollover-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
@@ -639,7 +639,7 @@ func TestRecurrenceRolloverWaitsForPendingToolSnapshot(t *testing.T) {
 	}
 	provider := &fakeProvider{}
 	worker := &Worker{
-		Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}, CommandTimeout: time.Minute},
+		Config:   Config{RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"}, CommandTimeout: time.Minute},
 		Provider: provider, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
 	}
 	if err := worker.beginToolSnapshot(context.Background(), &attempt, toolSnapshotPreparation, 1); err != nil {

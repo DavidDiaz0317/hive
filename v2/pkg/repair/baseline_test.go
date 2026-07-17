@@ -158,7 +158,7 @@ func TestCreateBaselineProposalUsesSeparateHeldBranchAndPersistsState(t *testing
 	client := &fakeReviewPRClient{state: state}
 	finding := visualhive.FindingLifecycle{Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: fingerprint, IssueNumber: 48, IssueURL: "https://example.test/issues/48"}
 	updated, err := CreateBaselineProposal(context.Background(), BaselineProposalConfig{
-		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "baseline-worktrees"), BaseBranch: "main",
+		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "baseline-worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 	}, finding, BaselineProposalSource{WorkflowRunID: 77, ArtifactID: 88, RunURL: "https://example.test/actions/runs/77"},
 		&BaselineReview{Status: BaselineReviewCandidateReady, Candidates: []BaselineCandidate{hosted}}, state, client)
 	if err != nil {
@@ -180,7 +180,7 @@ func TestCreateBaselineProposalUsesSeparateHeldBranchAndPersistsState(t *testing
 		t.Fatalf("review body lacks exact evidence: %s", client.body)
 	}
 	resumed, err := CreateBaselineProposal(context.Background(), BaselineProposalConfig{
-		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "unused"), BaseBranch: "main",
+		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "unused"), BaseBranch: "main", ExpectedRemoteURL: remote,
 	}, finding, BaselineProposalSource{}, nil, state, client)
 	if err != nil || resumed.BaselineReview.ProposalPRNumber != 29 || client.calls != 1 {
 		t.Fatalf("proposal retry was not idempotent: %+v calls=%d err=%v", resumed.BaselineReview, client.calls, err)

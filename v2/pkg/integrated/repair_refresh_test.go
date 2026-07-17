@@ -100,7 +100,7 @@ func TestRefreshOwnedRepairBranchPrunesStaleStateAndKeepsAttempt(t *testing.T) {
 	}
 	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
 	config := Config{
-		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir,
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir, CheckoutDir: worktree,
 		Automation: AutomationAutoMerge, ACMMLevel: 6, MaxRepairAttempts: 4,
 		AllowedRepairPaths: []string{"**"}, AllowedAutoMergePaths: []string{"tests/**"}, AllowedAutoMergeRisk: []automation.RiskTier{automation.RiskAutomatic},
 		TestCommands: [][]string{{"git", "diff", "--check", "HEAD"}},
@@ -241,8 +241,13 @@ func TestRepairRefreshWALRecoversBeforeAndAfterExactLeasePush(t *testing.T) {
 			if err := repairStore.Put(attempt); err != nil {
 				t.Fatal(err)
 			}
+			baselineProtection, err := repair.InspectVisualBaselineProtection(ctx, worktree)
+			if err != nil {
+				t.Fatal(err)
+			}
 			request := repair.RefreshedBranchCheckpointRequest{
-				Worktree: worktree, Branch: branch, RepositoryID: "123", RemoteHeadSHA: oldHead, BaseBranch: "main", BaseSHA: baseSHA,
+				Worktree: worktree, Branch: branch, RepositoryID: "123", ExpectedRemoteURL: remote, RemoteHeadSHA: oldHead, BaseBranch: "main", BaseSHA: baseSHA,
+				BaselineProtection:   baselineProtection,
 				ExpectedChangedFiles: []string{"visual-hive.config.yaml"}, ValidationCommands: []repair.Command{{Name: "git", Args: []string{"diff", "--check", "HEAD"}}},
 			}
 			checkpoint, err := repair.PrepareRefreshedRepairBranch(ctx, request)
@@ -292,7 +297,7 @@ func TestRepairRefreshWALRecoversBeforeAndAfterExactLeasePush(t *testing.T) {
 			}))
 			defer server.Close()
 			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
-			config := Config{Repository: finding.Repository, RepositoryID: finding.RepositoryID, DefaultBranch: "main", StateDir: stateDir, Automation: AutomationAutoMerge, ACMMLevel: 6, TestCommands: [][]string{{"git", "diff", "--check", "HEAD"}}}
+			config := Config{Repository: finding.Repository, RepositoryID: finding.RepositoryID, DefaultBranch: "main", StateDir: stateDir, CheckoutDir: worktree, Automation: AutomationAutoMerge, ACMMLevel: 6, TestCommands: [][]string{{"git", "diff", "--check", "HEAD"}}}
 			updated, refreshed, err := refreshOwnedRepairBranchIfBehind(ctx, stateDir, config, finding, lifecycle, client, integratedPolicy(config))
 			if err != nil || !refreshed || updated.RepairCommitSHA != checkpoint.HeadSHA || remoteHead() != checkpoint.HeadSHA || updated.RepairAttempts != 10 {
 				t.Fatalf("WAL recovery failed: pushed_before=%t refreshed=%t finding=%+v remote=%s err=%v", pushedBeforeRecovery, refreshed, updated, remoteHead(), err)
@@ -309,6 +314,9 @@ func setupIntegratedRefreshRepository(t *testing.T) (remote, worktree, oldHead, 
 	ctx := context.Background()
 	root := t.TempDir()
 	remote, worktree = filepath.Join(root, "remote.git"), filepath.Join(root, "worktree")
+	oldCloneURL := setupRepositoryCloneURL
+	setupRepositoryCloneURL = func(string) string { return remote }
+	t.Cleanup(func() { setupRepositoryCloneURL = oldCloneURL })
 	if _, err := git(ctx, root, "init", "--bare", remote); err != nil {
 		t.Fatal(err)
 	}

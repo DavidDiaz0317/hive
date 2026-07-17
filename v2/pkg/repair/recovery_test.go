@@ -46,7 +46,7 @@ func (p *healthFailureProvider) Run(_ context.Context, worktree, _ string) (Prov
 
 func TestInfrastructureFailureDoesNotCountModelAttempt(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	stateDir := filepath.Join(t.TempDir(), "state")
 	state, err := NewStore(stateDir)
 	if err != nil {
@@ -56,7 +56,7 @@ func TestInfrastructureFailureDoesNotCountModelAttempt(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -99,7 +99,7 @@ func TestInfrastructureFailureDoesNotCountModelAttempt(t *testing.T) {
 }
 
 func TestPostLaunchProviderFailureCountsExactlyOneAmbiguousAttempt(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestPostLaunchProviderFailureCountsExactlyOneAmbiguousAttempt(t *testing.T)
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -129,7 +129,7 @@ func TestPostLaunchProviderFailureCountsExactlyOneAmbiguousAttempt(t *testing.T)
 }
 
 func TestProviderLaunchFailureResumesSameUncountedAttempt(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestProviderLaunchFailureResumesSameUncountedAttempt(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -160,7 +160,7 @@ func TestProviderLaunchFailureResumesSameUncountedAttempt(t *testing.T) {
 
 func TestValidationLaunchFailureResumesCountedPatchCheckpoint(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +169,7 @@ func TestValidationLaunchFailureResumesCountedPatchCheckpoint(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"},
 			ValidationCommands: []Command{{Name: "hive-validation-command-that-does-not-exist"}},
@@ -211,7 +211,7 @@ func TestRepairCommandFailureClassificationSeparatesInfrastructureFromTestFailur
 
 func TestWorktreeInfrastructureFailureResumesProvisioning(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +220,7 @@ func TestWorktreeInfrastructureFailureResumesProvisioning(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "missing-base",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "missing-base", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -306,9 +306,9 @@ func TestModelAttemptCountReconcilesExactlyOnceAcrossReload(t *testing.T) {
 
 func TestStaleModelCheckpointCannotSpendNewRecurrenceBudget(t *testing.T) {
 	t.Parallel()
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "stale")
-	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-stale-a1", "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-stale-a1", "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
@@ -327,7 +327,7 @@ func TestStaleModelCheckpointCannotSpendNewRecurrenceBudget(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Dir(worktree), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Dir(worktree), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -349,10 +349,10 @@ func TestStaleModelCheckpointCannotSpendNewRecurrenceBudget(t *testing.T) {
 }
 
 func TestAmbiguousModelInvocationIsCountedWithoutReexecution(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "ambiguous")
 	branch := "hive/repair-ambiguous-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
@@ -371,7 +371,7 @@ func TestAmbiguousModelInvocationIsCountedWithoutReexecution(t *testing.T) {
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Dir(worktree), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Dir(worktree), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -418,10 +418,10 @@ func TestAttemptCounterDriftFailsClosed(t *testing.T) {
 }
 
 func TestCommitAndPushCrashRecoveryAreIdempotent(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, expectedRemote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "commit-recovery")
 	branch := "hive/repair-commit-recovery-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", expectedRemote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
@@ -438,18 +438,18 @@ func TestCommitAndPushCrashRecoveryAreIdempotent(t *testing.T) {
 	if _, err := runGit(context.Background(), worktree, "push", "--force-with-lease", "origin", "HEAD:refs/heads/"+branch); err != nil {
 		t.Fatal(err)
 	}
-	remote, err := remoteRepairBranchHead(context.Background(), worktree, branch)
+	remote, err := remoteRepairBranchHead(context.Background(), worktree, expectedRemote, branch)
 	if err != nil || remote != sha {
 		t.Fatalf("pushed exact head was not recoverable: remote=%s sha=%s err=%v", remote, sha, err)
 	}
 }
 
 func TestCommittedCheckpointRejectsMovedLocalHeadBeforePush(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, expectedRemote := seedGitRepository(t)
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "moved-head")
 	branch := "hive/repair-moved-head-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", expectedRemote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
@@ -477,7 +477,7 @@ func TestCommittedCheckpointRejectsMovedLocalHeadBeforePush(t *testing.T) {
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: expectedRemote,
 			Policy: automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 		},
 		Provider: &healthFailureProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: pulls,
@@ -490,7 +490,7 @@ func TestCommittedCheckpointRejectsMovedLocalHeadBeforePush(t *testing.T) {
 	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "does not match checkpoint commit") {
 		t.Fatalf("moved local head was not rejected before push: %v", err)
 	}
-	remote, err := remoteRepairBranchHead(context.Background(), worktree, branch)
+	remote, err := remoteRepairBranchHead(context.Background(), worktree, expectedRemote, branch)
 	if err != nil || remote != "" || pulls.calls != 0 {
 		t.Fatalf("moved local head mutated remote state: remote=%s pulls=%d err=%v", remote, pulls.calls, err)
 	}
@@ -508,7 +508,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 		{name: "repository identity", stage: StagePushed, mutate: func(f *visualhive.FindingLifecycle) { f.Repository = "owner/other" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			repository, _ := seedGitRepository(t)
+			repository, remote := seedGitRepository(t)
 			state, err := NewStore(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
@@ -527,7 +527,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 			pulls := &fakePRClient{state: state}
 			worker := &Worker{
 				Config: Config{
-					RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main",
+					RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote,
 					Policy: automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo", "owner/other"}, MaxRepairAttempts: 3},
 				},
 				Provider: &healthFailureProvider{}, State: state, Lifecycle: lifecycle, GitHub: pulls,
@@ -553,7 +553,7 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 }
 
 func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +571,7 @@ func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
 	pulls := &fakePRClient{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 		},
 		Provider: &healthFailureProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: pulls,
@@ -601,6 +601,79 @@ func TestRepairForceLeaseBindsObservedRemoteSHA(t *testing.T) {
 	}
 }
 
+func TestPushRepairBranchRejectsRemoteURLRedirection(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		wantError string
+		configure func(context.Context, string, string, string) error
+	}{
+		{
+			name:      "foreign fetch URL",
+			wantError: "fetch URL does not match",
+			configure: func(ctx context.Context, repository, expected, foreign string) error {
+				if _, err := runGit(ctx, repository, "config", "--replace-all", "remote.origin.url", foreign); err != nil {
+					return err
+				}
+				_, err := runGit(ctx, repository, "config", "--add", "remote.origin.pushurl", expected)
+				return err
+			},
+		},
+		{
+			name:      "foreign push URL",
+			wantError: "push URL does not match",
+			configure: func(ctx context.Context, repository, _, foreign string) error {
+				_, err := runGit(ctx, repository, "config", "--add", "remote.origin.pushurl", foreign)
+				return err
+			},
+		},
+		{
+			name:      "multiple push URLs",
+			wantError: "exactly one configured push URL",
+			configure: func(ctx context.Context, repository, expected, foreign string) error {
+				if _, err := runGit(ctx, repository, "config", "--add", "remote.origin.pushurl", expected); err != nil {
+					return err
+				}
+				_, err := runGit(ctx, repository, "config", "--add", "remote.origin.pushurl", foreign)
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			repository, expected := seedGitRepository(t)
+			foreign := filepath.Join(t.TempDir(), "foreign.git")
+			if _, err := runGit(ctx, filepath.Dir(foreign), "init", "--bare", foreign); err != nil {
+				t.Fatal(err)
+			}
+			branch := "hive/repair-remote-binding-a1"
+			worktree := filepath.Join(t.TempDir(), "worktrees", "remote-binding")
+			if err := prepareWorktree(ctx, repository, worktree, branch, "main", "", expected); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("remote-bound\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sha, err := commitRepair(ctx, worktree, []string{"src/value.txt"}, "Bind remote", 9, "123")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.configure(ctx, repository, expected, foreign); err != nil {
+				t.Fatal(err)
+			}
+			err = pushRepairBranchExact(ctx, worktree, expected, branch, sha, "123", "repair")
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("remote redirection was not rejected before push: %v", err)
+			}
+			ref := "refs/heads/" + branch
+			for label, remote := range map[string]string{"expected": expected, "foreign": foreign} {
+				if _, refErr := runGit(ctx, remote, "show-ref", "--verify", "--quiet", ref); refErr == nil {
+					t.Fatalf("%s remote received unauthorized ref %s", label, ref)
+				}
+			}
+		})
+	}
+}
+
 func TestPushRepairBranchRefusesUnownedRemoteTip(t *testing.T) {
 	repository, remote := seedGitRepository(t)
 	branch := "hive/repair-ownership-a1"
@@ -609,7 +682,7 @@ func TestPushRepairBranchRefusesUnownedRemoteTip(t *testing.T) {
 	}
 	remoteBefore := strings.TrimSpace(gitOutput(t, remote, "rev-parse", branch))
 	worktree := filepath.Join(t.TempDir(), "worktrees", "ownership")
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
@@ -619,7 +692,7 @@ func TestPushRepairBranchRefusesUnownedRemoteTip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = pushRepairBranchExact(context.Background(), worktree, branch, sha, "123", "repair")
+	err = pushRepairBranchExact(context.Background(), worktree, remote, branch, sha, "123", "repair")
 	if err == nil || !strings.Contains(err.Error(), "lacks exact Hive ownership") {
 		t.Fatalf("unowned remote tip was overwritten: %v", err)
 	}
@@ -663,7 +736,7 @@ func TestPushRepairBranchRefusesWrongRepositoryOrDivergentOwnedTip(t *testing.T)
 			remoteBefore := strings.TrimSpace(gitOutput(t, remote, "rev-parse", branch))
 
 			worktree := filepath.Join(t.TempDir(), "worktrees", "local")
-			if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+			if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("local\n"), 0o600); err != nil {
@@ -673,7 +746,7 @@ func TestPushRepairBranchRefusesWrongRepositoryOrDivergentOwnedTip(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = pushRepairBranchExact(context.Background(), worktree, branch, sha, "123", "repair")
+			err = pushRepairBranchExact(context.Background(), worktree, remote, branch, sha, "123", "repair")
 			if err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("unsafe remote tip was accepted: %v", err)
 			}
@@ -688,7 +761,7 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 	repository, remote := seedGitRepository(t)
 	branch := "hive/repair-owned-a1"
 	worktree := filepath.Join(t.TempDir(), "worktrees", "owned")
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, "src", "value.txt"), []byte("first\n"), 0o600); err != nil {
@@ -696,7 +769,7 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 	}
 	first, err := commitRepair(context.Background(), worktree, []string{"src/value.txt"}, "Repair value", 9, "123")
 	if err == nil {
-		err = pushRepairBranchExact(context.Background(), worktree, branch, first, "123", "repair")
+		err = pushRepairBranchExact(context.Background(), worktree, remote, branch, first, "123", "repair")
 	}
 	if err != nil {
 		t.Fatalf("initial owned push failed: sha=%s err=%v", first, err)
@@ -708,7 +781,7 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pushRepairBranchExact(context.Background(), worktree, branch, second, "123", "repair"); err != nil {
+	if err := pushRepairBranchExact(context.Background(), worktree, remote, branch, second, "123", "repair"); err != nil {
 		t.Fatalf("owned descendant push failed: %v", err)
 	}
 	if remoteHead := strings.TrimSpace(gitOutput(t, remote, "rev-parse", branch)); remoteHead != second {
@@ -717,7 +790,7 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 }
 
 func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -733,7 +806,7 @@ func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
 	}
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
-		Config:   Config{RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main"},
+		Config:   Config{RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote},
 		Provider: &healthFailureProvider{}, State: state, Lifecycle: lifecycle, GitHub: &fakePRClient{state: state},
 	}
 	finding := visualhive.FindingLifecycle{

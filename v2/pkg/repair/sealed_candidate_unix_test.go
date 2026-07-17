@@ -71,7 +71,7 @@ func TestSetsidToolWriterCannotEnterSealedRepairCommit(t *testing.T) {
 			worktree := filepath.Join(worktreeRoot, shortFingerprint(fingerprint))
 			command := repairToolHelperCommand("spawn-setsid-writer")
 			config := Config{
-				RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
+				RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 				Environment: map[string]string{
 					"HIVE_REPAIR_TEST_READY": ready, "HIVE_REPAIR_TEST_SIGNAL": signal, "HIVE_REPAIR_TEST_ACK": ack,
 					"HIVE_REPAIR_TEST_TARGET": filepath.Join(worktree, "src", "value.txt"),
@@ -114,7 +114,7 @@ func TestSetsidRetainedOutputOnFailedParentIsInfrastructure(t *testing.T) {
 
 func TestSetsidPreparationWriterAfterRestoreCannotBecomeModelBase(t *testing.T) {
 	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	stateDir := filepath.Join(t.TempDir(), "state")
 	state, err := NewStore(stateDir)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestSetsidPreparationWriterAfterRestoreCannotBecomeModelBase(t *testing.T) 
 	provider := &waitForPreparationWriterProvider{ack: ack}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
+			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			PreparationCommands: []Command{repairToolHelperCommand("spawn-setsid-post-preparation-writer")},
 			Environment: map[string]string{
 				"HIVE_REPAIR_TEST_READY": ready, "HIVE_REPAIR_TEST_ACK": ack,

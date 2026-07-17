@@ -995,6 +995,7 @@ func approvedMergedBaselineProposal(gate hivegithub.PullRequestGate) bool {
 func baselineProposalConfig(config Config, stateDir string) repair.BaselineProposalConfig {
 	return repair.BaselineProposalConfig{
 		RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(stateDir, "repair", "baseline-worktrees"), BaseBranch: config.DefaultBranch,
+		ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
 		ValidationCommands: []repair.Command{{Name: "git", Args: []string{"diff", "--check"}}}, CommandTimeout: 15 * time.Minute,
 	}
 }
@@ -1778,6 +1779,10 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 	if key == "" {
 		return nil, nil
 	}
+	baselineProtection, err := repair.InspectVisualBaselineProtection(ctx, config.CheckoutDir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect trusted visual baseline protection before repair: %w", err)
+	}
 	for _, key := range []string{key} {
 		finding := snapshot.Findings[key]
 		if finding == nil || finding.HumanReviewRequired || (finding.Status != visualhive.StatusIssueOpen && finding.Status != visualhive.StatusFixQueued && finding.Status != visualhive.StatusNeedsRevision && finding.Status != visualhive.StatusRepairRunning) || finding.IssueNumber <= 0 {
@@ -1880,7 +1885,9 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
-				Agent: repairAgent, Policy: policy, AllowedRepairPaths: allowedPaths, ValidationCommands: commands,
+				ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
+				BaselineProtection: baselineProtection,
+				Agent:              repairAgent, Policy: policy, AllowedRepairPaths: allowedPaths, ValidationCommands: commands,
 				EvidenceSummary: evidenceSummary, AttemptStartedAt: attemptStartedAt,
 				ModelTimeout: 20 * time.Minute, CommandTimeout: 15 * time.Minute,
 			},

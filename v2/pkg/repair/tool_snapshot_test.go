@@ -173,7 +173,7 @@ func TestValidationProcessTreeCannotRaceCommittedCandidate(t *testing.T) {
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			ValidationCommands: []Command{repairToolHelperCommand("spawn-background-writer")}, ModelTimeout: time.Minute, CommandTimeout: 2 * time.Second,
 		},
@@ -248,7 +248,7 @@ func TestWorkerRestoresPreparationAndValidationGeneratedArtifacts(t *testing.T) 
 	}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			PreparationCommands: []Command{repairToolHelperCommand("generate-build"), repairToolHelperCommand("generate-source")},
 			ValidationCommands:  []Command{repairToolHelperCommand("generate-report"), {Name: "git", Args: []string{"diff", "--check"}}},
@@ -278,12 +278,12 @@ func TestWorkerRestoresPreparationAndValidationGeneratedArtifacts(t *testing.T) 
 
 func TestWorkerRejectsValidatorAuthoredCandidateBytesAndRestoresModelPatch(t *testing.T) {
 	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	fingerprint := "owner/repo:validator-mutation"
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			ValidationCommands: []Command{repairToolHelperCommand("mutate-value")}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -302,7 +302,7 @@ func TestWorkerRejectsValidatorAuthoredCandidateBytesAndRestoresModelPatch(t *te
 
 func TestWorkerRejectsIgnoredValidationSourceAndRemovesIt(t *testing.T) {
 	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte("src/generated-by-tool.ts\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestWorkerRejectsIgnoredValidationSourceAndRemovesIt(t *testing.T) {
 	fingerprint := "owner/repo:ignored-validator-source"
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			ValidationCommands: []Command{repairToolHelperCommand("generate-source")}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -331,13 +331,13 @@ func TestWorkerRejectsIgnoredValidationSourceAndRemovesIt(t *testing.T) {
 
 func TestWorkerStillRejectsUnsafeModelCreatedFile(t *testing.T) {
 	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
 	provider := &unsafeModelProvider{}
 	fingerprint := "owner/repo:unsafe-model"
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
 			PreparationCommands: []Command{repairToolHelperCommand("generate-build")}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},
@@ -357,7 +357,7 @@ func TestWorkerStillRejectsUnsafeModelCreatedFile(t *testing.T) {
 }
 
 func TestToolSnapshotRestoresExactCandidateAfterStoreReload(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	if err := os.WriteFile(filepath.Join(repository, ".gitignore"), []byte(".cache/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestToolSnapshotRestoresExactCandidateAfterStoreReload(t *testing.T) {
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "snapshot")
 	branch := "hive/repair-snapshot-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(worktree, "src", "value.txt")); err != nil {
@@ -434,10 +434,10 @@ func TestToolSnapshotRestoresExactCandidateAfterStoreReload(t *testing.T) {
 }
 
 func TestToolSnapshotImmediateRestoreAcceptsOldResumedAttemptTimestamp(t *testing.T) {
-	repository, _ := seedGitRepository(t)
+	repository, remote := seedGitRepository(t)
 	worktree := filepath.Join(t.TempDir(), "worktrees", "old-resume")
 	branch := "hive/repair-old-resume-a1"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	state, _ := NewStore(filepath.Join(t.TempDir(), "state"))
@@ -484,7 +484,7 @@ func TestExactPreparationReplayRecoveryRequiresAuditedRetry(t *testing.T) {
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	worktree := filepath.Join(worktreeRoot, "recovery")
 	branch := "hive/repair-recovery-a4"
-	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	command := repairToolHelperCommand("generate-build")
@@ -515,7 +515,7 @@ HIVE_PATCH_END`
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", Policy: standardRepairPolicy(),
+			RepositoryDir: repository, WorktreeRoot: worktreeRoot, BaseBranch: "main", ExpectedRemoteURL: remote, Policy: standardRepairPolicy(),
 			AllowedRepairPaths: []string{"src/**"}, PreparationCommands: []Command{command},
 			ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}}, ModelTimeout: time.Minute, CommandTimeout: time.Minute,
 		},

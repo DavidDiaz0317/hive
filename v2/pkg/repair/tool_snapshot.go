@@ -759,8 +759,34 @@ func validateValidationToolDelta(ctx context.Context, attempt Attempt, allowedPa
 func repairPathRestricted(file string) bool {
 	normalized := strings.TrimPrefix(filepath.ToSlash(file), "./")
 	lower := strings.ToLower(normalized)
-	return strings.HasPrefix(lower, ".github/") || strings.Contains(lower, "baseline") || strings.Contains(lower, "secret") ||
-		strings.Contains(lower, "auth") || strings.HasPrefix(lower, "deploy") || strings.Contains(lower, "terraform")
+	if strings.HasPrefix(lower, ".github/") || strings.Contains(lower, "baseline") || strings.Contains(lower, "secret") || strings.Contains(lower, "auth") ||
+		strings.HasPrefix(lower, "deploy") || strings.Contains(lower, "terraform") {
+		return true
+	}
+	parts := strings.Split(lower, "/")
+	for _, part := range parts[:len(parts)-1] {
+		if strings.HasSuffix(part, "-snapshots") {
+			return true
+		}
+		switch part {
+		case "snapshot", "snapshots", "__snapshots__", "screenshot", "screenshots", "__screenshots__":
+			return true
+		}
+	}
+	name := parts[len(parts)-1]
+	if filepath.Ext(name) == ".snap" || strings.Contains(name, ".snapshot.") || strings.Contains(name, ".screenshot.") {
+		return true
+	}
+	switch filepath.Ext(lower) {
+	case ".avif", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp":
+		for _, part := range parts[:len(parts)-1] {
+			switch part {
+			case "test", "tests", "__tests__", "testdata":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func repairPathAllowed(file string, allowedPatterns []string) bool {

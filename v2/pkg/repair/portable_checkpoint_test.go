@@ -26,7 +26,7 @@ func TestValidatedPortableCheckpointResumesOnFreshRunner(t *testing.T) {
 	branch := repairBranchName(fingerprint, 1, 1)
 	originalRoot := filepath.Join(t.TempDir(), "original-worktrees")
 	originalWorktree := filepath.Join(originalRoot, shortFingerprint(fingerprint))
-	if err := prepareWorktree(ctx, repository, originalWorktree, branch, "main", ""); err != nil {
+	if err := prepareWorktree(ctx, repository, originalWorktree, branch, "main", "", remote); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(originalWorktree, "src", "value.txt"), []byte("fixed on validated runner\n"), 0o600); err != nil {
@@ -67,7 +67,7 @@ func TestValidatedPortableCheckpointResumesOnFreshRunner(t *testing.T) {
 	pulls := &fakePRClient{state: state}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: freshRepository, WorktreeRoot: freshRoot, BaseBranch: "main",
+			RepositoryDir: freshRepository, WorktreeRoot: freshRoot, BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, CommandTimeout: time.Minute,
 		},
@@ -102,7 +102,7 @@ func TestCommittedPortableCheckpointResumesBeforePushOnFreshRunner(t *testing.T)
 	lifecycle := &fakeLifecycle{}
 	worker := &Worker{
 		Config: Config{
-			RepositoryDir: repository, WorktreeRoot: originalRoot, BaseBranch: "main",
+			RepositoryDir: repository, WorktreeRoot: originalRoot, BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 			ModelTimeout: time.Minute, CommandTimeout: time.Minute,
@@ -142,7 +142,7 @@ func TestCommittedPortableCheckpointResumesBeforePushOnFreshRunner(t *testing.T)
 	pulls := &fakePRClient{state: state}
 	resumedWorker := &Worker{
 		Config: Config{
-			RepositoryDir: freshRepository, WorktreeRoot: freshRoot, BaseBranch: "main",
+			RepositoryDir: freshRepository, WorktreeRoot: freshRoot, BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 			AllowedRepairPaths: []string{"src/**"}, CommandTimeout: time.Minute,
 		},
@@ -159,7 +159,7 @@ func TestCommittedPortableCheckpointResumesBeforePushOnFreshRunner(t *testing.T)
 	if !ok || persisted.Stage != StagePROpen || result.CommitSHA != attempt.CommitSHA || pulls.calls != 1 {
 		t.Fatalf("committed checkpoint did not finish exactly on the fresh runner: result=%+v attempt=%+v calls=%d", result, persisted, pulls.calls)
 	}
-	remoteHead, err := remoteRepairBranchHead(context.Background(), filepath.Join(freshRoot, shortFingerprint(fingerprint)), attempt.Branch)
+	remoteHead, err := remoteRepairBranchHead(context.Background(), filepath.Join(freshRoot, shortFingerprint(fingerprint)), remote, attempt.Branch)
 	if err != nil || remoteHead != attempt.CommitSHA {
 		t.Fatalf("fresh runner did not push the exact committed checkpoint: remote=%s want=%s err=%v", remoteHead, attempt.CommitSHA, err)
 	}

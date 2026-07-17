@@ -42,6 +42,8 @@ type Config struct {
 	RepositoryDir       string
 	WorktreeRoot        string
 	BaseBranch          string
+	ExpectedRemoteURL   string
+	BaselineProtection  BaselineProtection
 	Agent               string
 	Policy              automation.Policy
 	PolicyLoader        func() (automation.Policy, error)
@@ -270,6 +272,18 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, fmt.Errorf("retire pushed portable repair bundle: %w", err)
 		}
 	}
+	if resumed && !recurrenceChanged {
+		switch attempt.Stage {
+		case StageValidated, StageCommitted:
+			if err := w.validateRepairPaths(ctx, attempt.Worktree, attempt.ChangedFiles); err != nil {
+				return Result{}, fmt.Errorf("resume repair checkpoint path validation: %w", err)
+			}
+		case StagePushed, StagePROpen:
+			if err := validateChangedFilesWithBaselineProtection(attempt.ChangedFiles, w.Config.AllowedRepairPaths, w.Config.BaselineProtection); err != nil {
+				return Result{}, fmt.Errorf("resume pushed repair checkpoint path validation: %w", err)
+			}
+		}
+	}
 	if resumed && !recurrenceChanged && attempt.Stage == StageValidated && attempt.LegacyUnsealedCheckpoint {
 		cause := fmt.Errorf("pre-v6 validated checkpoint has no immutable candidate identity; quarantine local bytes and require a fresh bounded model attempt")
 		return Result{}, checkpointLegacyUnsealedForFreshAttempt(w.State, &attempt, cause)
@@ -306,7 +320,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		}
 	}
 	if attempt.Stage == StagePreparing {
-		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, attempt.DiscardDirtyBranch); err != nil {
+		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, attempt.DiscardDirtyBranch, w.Config.ExpectedRemoteURL); err != nil {
 			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePreparing, err)
 		}
 		attempt.DiscardDirtyBranch = ""
@@ -488,7 +502,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			if patchErr != nil {
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, patchErr)
 			}
-			if err := validateChangedFiles(patchFiles, w.Config.AllowedRepairPaths); err != nil {
+			if err := w.validateRepairPaths(ctx, attempt.Worktree, patchFiles); err != nil {
 				return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 			}
 			if err := validateFindingScope(finding, patchFiles); err != nil {
@@ -564,7 +578,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			status, _ := runGit(ctx, attempt.Worktree, "status", "--short", "--untracked-files=all")
 			return Result{}, checkpointRetryableFailure(w.State, &attempt, fmt.Errorf("model completed without a source or test change (git status: %s)", safeExcerpt(status)))
 		}
-		if err := validateChangedFiles(files, w.Config.AllowedRepairPaths); err != nil {
+		if err := w.validateRepairPaths(ctx, attempt.Worktree, files); err != nil {
 			return Result{}, checkpointRetryableFailure(w.State, &attempt, err)
 		}
 		if err := validateFindingScope(finding, files); err != nil {
@@ -659,7 +673,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		if strings.TrimSpace(localHead) != attempt.CommitSHA {
 			return Result{}, fmt.Errorf("local repair head %s does not match checkpoint commit %s", strings.TrimSpace(localHead), attempt.CommitSHA)
 		}
-		if err := pushRepairBranchExact(ctx, attempt.Worktree, attempt.Branch, attempt.CommitSHA, finding.RepositoryID, "repair"); err != nil {
+		if err := pushRepairBranchExact(ctx, attempt.Worktree, w.Config.ExpectedRemoteURL, attempt.Branch, attempt.CommitSHA, finding.RepositoryID, "repair"); err != nil {
 			return Result{}, fmt.Errorf("push repair branch: %w", err)
 		}
 		attempt.Stage = StagePushed
@@ -1006,6 +1020,9 @@ func (w *Worker) validate(finding visualhive.FindingLifecycle) error {
 	if strings.TrimSpace(w.Config.RepositoryDir) == "" || strings.TrimSpace(w.Config.WorktreeRoot) == "" || strings.TrimSpace(w.Config.BaseBranch) == "" {
 		return fmt.Errorf("repository directory, worktree root, and base branch are required")
 	}
+	if _, err := normalizeBaselineProtection(w.Config.BaselineProtection); err != nil {
+		return fmt.Errorf("invalid visual baseline protection: %w", err)
+	}
 	if strings.TrimSpace(w.Config.Agent) != "" && !isRepairSpecialist(w.Config.Agent) {
 		return fmt.Errorf("repair agent must be one of Hive's existing persistent specialist roles")
 	}
@@ -1049,7 +1066,12 @@ func (w *Worker) authorize(finding visualhive.FindingLifecycle, action automatio
 	return nil
 }
 
-func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base, discardDirtyBranch string) error {
+func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base, discardDirtyBranch, expectedRemoteURL string) error {
+	expectedRemoteURL, err := validateExpectedRemoteURL(ctx, repositoryDir, expectedRemoteURL)
+	if err != nil {
+		return err
+	}
+	baseRefspec := "+refs/heads/" + base + ":refs/remotes/origin/" + base
 	// Repair validation must observe the repository's committed bytes, not the
 	// operator machine's global line-ending preference. In particular, a
 	// Windows core.autocrlf=true setting makes deterministic format checks report
@@ -1083,7 +1105,7 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 				return fmt.Errorf("clean failed Hive repair attempt: %w", cleanErr)
 			}
 		}
-		if _, fetchErr := runGit(ctx, repositoryDir, "fetch", "--prune", "origin", base); fetchErr != nil {
+		if _, fetchErr := runGit(ctx, repositoryDir, "fetch", "--prune", expectedRemoteURL, baseRefspec); fetchErr != nil {
 			return fmt.Errorf("fetch repair base: %w", fetchErr)
 		}
 		if _, switchErr := runGit(ctx, worktree, "switch", "-C", branch, "origin/"+base); switchErr != nil {
@@ -1094,7 +1116,7 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		}
 		return nil
 	}
-	if _, err := runGit(ctx, repositoryDir, "fetch", "--prune", "origin", base); err != nil {
+	if _, err := runGit(ctx, repositoryDir, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
 		return fmt.Errorf("fetch repair base: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
@@ -1170,16 +1192,38 @@ func changedFiles(ctx context.Context, worktree string) ([]string, error) {
 }
 
 func validateChangedFiles(files, allowedPatterns []string) error {
+	return validateChangedFilesWithBaselineProtection(files, allowedPatterns, BaselineProtection{})
+}
+
+func validateChangedFilesWithBaselineProtection(files, allowedPatterns []string, protection BaselineProtection) error {
+	protection, err := normalizeBaselineProtection(protection)
+	if err != nil {
+		return fmt.Errorf("invalid visual baseline protection: %w", err)
+	}
 	for _, file := range files {
-		normalized := strings.TrimPrefix(filepath.ToSlash(file), "./")
+		normalized, err := normalizeVisualBaselinePath(filepath.ToSlash(file))
+		if err != nil {
+			return fmt.Errorf("repair changed unsafe path %q: %w", file, err)
+		}
 		if repairPathRestricted(normalized) {
 			return fmt.Errorf("repair changed restricted path %s; explicit human authority is required", normalized)
+		}
+		if visualBaselinePathRestricted(normalized, protection) {
+			return fmt.Errorf("repair changed protected visual baseline path %s; explicit human authority is required", normalized)
 		}
 		if !repairPathAllowed(normalized, allowedPatterns) {
 			return fmt.Errorf("repair changed %s outside the configured repair allowlist", normalized)
 		}
 	}
 	return nil
+}
+
+func (w *Worker) validateRepairPaths(ctx context.Context, worktree string, files []string) error {
+	protection, err := baselineProtectionForWorktree(ctx, worktree, w.Config.BaselineProtection)
+	if err != nil {
+		return err
+	}
+	return validateChangedFilesWithBaselineProtection(files, w.Config.AllowedRepairPaths, protection)
 }
 
 func validateFindingScope(finding visualhive.FindingLifecycle, files []string) error {
@@ -1404,11 +1448,11 @@ func recoverCommittedRepair(ctx context.Context, worktree string, files []string
 	return sha, true, nil
 }
 
-func remoteRepairBranchHead(ctx context.Context, worktree, branch string) (string, error) {
+func remoteRepairBranchHead(ctx context.Context, worktree, expectedRemoteURL, branch string) (string, error) {
 	if !validHiveRepairBranch(branch) {
 		return "", fmt.Errorf("inspect remote repair branch: invalid Hive-owned branch %q", branch)
 	}
-	output, err := runGit(ctx, worktree, "ls-remote", "--heads", "origin", "refs/heads/"+branch)
+	output, err := runGit(ctx, worktree, "ls-remote", "--heads", expectedRemoteURL, "refs/heads/"+branch)
 	if err != nil {
 		return "", fmt.Errorf("inspect remote repair branch: %w", err)
 	}
@@ -1422,7 +1466,7 @@ func remoteRepairBranchHead(ctx context.Context, worktree, branch string) (strin
 	return fields[0], nil
 }
 
-func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, repositoryID, operation string) error {
+func pushRepairBranchExact(ctx context.Context, worktree, expectedRemoteURL, branch, commitSHA, repositoryID, operation string) error {
 	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
 	if !validHiveRepairBranch(branch) {
 		return fmt.Errorf("repair push requires a generated Hive-owned branch")
@@ -1441,10 +1485,14 @@ func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, rep
 	if operation != expectedOperation {
 		return fmt.Errorf("repair push operation %q does not match generated branch %s", operation, branch)
 	}
+	expectedRemoteURL, err := validateExpectedRemoteURL(ctx, worktree, expectedRemoteURL)
+	if err != nil {
+		return err
+	}
 	if err := verifyRepairCommitOwnership(ctx, worktree, commitSHA, repositoryID, operation); err != nil {
 		return err
 	}
-	remoteHead, err := remoteRepairBranchHead(ctx, worktree, branch)
+	remoteHead, err := remoteRepairBranchHead(ctx, worktree, expectedRemoteURL, branch)
 	if err != nil {
 		return err
 	}
@@ -1454,7 +1502,7 @@ func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, rep
 	if remoteHead != "" {
 		fetchedRef := "refs/hive/ownership/" + strings.ToLower(remoteHead)
 		defer func() { _, _ = runGit(context.Background(), worktree, "update-ref", "-d", fetchedRef) }()
-		if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", "origin", "refs/heads/"+branch+":"+fetchedRef); err != nil {
+		if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", expectedRemoteURL, "refs/heads/"+branch+":"+fetchedRef); err != nil {
 			return fmt.Errorf("fetch observed remote repair branch %s: %w", branch, err)
 		}
 		fetchedHead, err := runGit(ctx, worktree, "rev-parse", "--verify", fetchedRef)
@@ -1469,10 +1517,10 @@ func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, rep
 		}
 	}
 	lease := repairForceLease(branch, remoteHead)
-	if _, err := runGit(ctx, worktree, "push", lease, "origin", commitSHA+":refs/heads/"+branch); err != nil {
+	if _, err := runGit(ctx, worktree, "push", lease, expectedRemoteURL, commitSHA+":refs/heads/"+branch); err != nil {
 		return err
 	}
-	remoteHead, err = remoteRepairBranchHead(ctx, worktree, branch)
+	remoteHead, err = remoteRepairBranchHead(ctx, worktree, expectedRemoteURL, branch)
 	if err != nil {
 		return err
 	}
@@ -1480,6 +1528,60 @@ func pushRepairBranchExact(ctx context.Context, worktree, branch, commitSHA, rep
 		return fmt.Errorf("remote repair branch %s does not match pushed checkpoint %s", remoteHead, commitSHA)
 	}
 	return nil
+}
+
+func validateExpectedRemoteURL(ctx context.Context, worktree, expectedRemoteURL string) (string, error) {
+	trimmed := strings.TrimSpace(expectedRemoteURL)
+	if trimmed == "" || trimmed != expectedRemoteURL || strings.ContainsAny(expectedRemoteURL, "\r\n") {
+		return "", fmt.Errorf("repair requires one exact expected remote URL")
+	}
+	fetchURLs, err := configuredRemoteURLs(ctx, worktree, false)
+	if err != nil {
+		return "", err
+	}
+	if len(fetchURLs) != 1 {
+		return "", fmt.Errorf("repair requires exactly one configured fetch URL for origin; got %d", len(fetchURLs))
+	}
+	if fetchURLs[0] != expectedRemoteURL {
+		return "", fmt.Errorf("configured origin fetch URL does not match the exact expected remote URL")
+	}
+	pushURLs, err := configuredRemoteURLs(ctx, worktree, true)
+	if err != nil {
+		return "", err
+	}
+	if len(pushURLs) != 1 {
+		return "", fmt.Errorf("repair requires exactly one configured push URL for origin; got %d", len(pushURLs))
+	}
+	if pushURLs[0] != expectedRemoteURL {
+		return "", fmt.Errorf("configured origin push URL does not match the exact expected remote URL")
+	}
+	return expectedRemoteURL, nil
+}
+
+func configuredRemoteURLs(ctx context.Context, worktree string, push bool) ([]string, error) {
+	args := []string{"remote", "get-url"}
+	if push {
+		args = append(args, "--push")
+	}
+	args = append(args, "--all", "origin")
+	output, err := runGit(ctx, worktree, args...)
+	if err != nil {
+		kind := "fetch"
+		if push {
+			kind = "push"
+		}
+		return nil, fmt.Errorf("inspect configured origin %s URLs: %w", kind, err)
+	}
+	normalized := strings.ReplaceAll(output, "\r\n", "\n")
+	lines := strings.Split(strings.TrimSuffix(normalized, "\n"), "\n")
+	urls := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" || strings.TrimSpace(line) != line {
+			return nil, fmt.Errorf("configured origin URL is empty or contains surrounding whitespace")
+		}
+		urls = append(urls, line)
+	}
+	return urls, nil
 }
 
 func verifyRepairCommitOwnership(ctx context.Context, worktree, commitSHA, repositoryID, operation string) error {

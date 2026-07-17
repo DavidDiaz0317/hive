@@ -46,7 +46,10 @@ func (w *Worker) recoverRejectedPatchAfterPreparationContamination(ctx context.C
 		return false, nil
 	}
 	patchFiles, err := patchChangedFiles(patch)
-	if err != nil || validateChangedFiles(patchFiles, w.Config.AllowedRepairPaths) != nil || validateFindingScope(finding, patchFiles) != nil || validateFindingPatchSemantics(finding, patch) != nil {
+	if err != nil {
+		return false, nil
+	}
+	if w.validateRepairPaths(ctx, attempt.Worktree, patchFiles) != nil || validateFindingScope(finding, patchFiles) != nil || validateFindingPatchSemantics(finding, patch) != nil {
 		return false, nil
 	}
 	providerSHA, err := readOnlyCodexProviderIdentity(w.Provider)

@@ -21,6 +21,8 @@ type RefreshedBranchCheckpointRequest struct {
 	Worktree                    string
 	Branch                      string
 	RepositoryID                string
+	ExpectedRemoteURL           string
+	BaselineProtection          BaselineProtection
 	RemoteHeadSHA               string
 	BaseBranch                  string
 	BaseSHA                     string
@@ -134,16 +136,16 @@ func PrepareRefreshedRepairBranch(ctx context.Context, request RefreshedBranchCh
 	headRef := "refs/hive/refresh/head/" + strings.ToLower(request.RemoteHeadSHA)
 	baseRef := "refs/hive/refresh/base/" + strings.ToLower(request.BaseSHA)
 	defer deleteRefreshRefs(request.Worktree, headRef, baseRef)
-	if err := fetchExactRefreshRef(ctx, request.Worktree, "refs/heads/"+request.Branch, headRef, request.RemoteHeadSHA); err != nil {
+	if err := fetchExactRefreshRef(ctx, request.Worktree, request.ExpectedRemoteURL, "refs/heads/"+request.Branch, headRef, request.RemoteHeadSHA); err != nil {
 		return result, fmt.Errorf("fetch exact repair head: %w", err)
 	}
 	if err := verifyRepairCommitOwnership(ctx, request.Worktree, request.RemoteHeadSHA, request.RepositoryID, "repair"); err != nil && !request.AllowLegacyHeadAdoption {
 		return result, err
 	}
-	if err := fetchExactRefreshRef(ctx, request.Worktree, "refs/heads/"+request.BaseBranch, baseRef, request.BaseSHA); err != nil {
+	if err := fetchExactRefreshRef(ctx, request.Worktree, request.ExpectedRemoteURL, "refs/heads/"+request.BaseBranch, baseRef, request.BaseSHA); err != nil {
 		return result, fmt.Errorf("fetch exact protected base: %w", err)
 	}
-	remoteHead, err := remoteRepairBranchHead(ctx, request.Worktree, request.Branch)
+	remoteHead, err := remoteRepairBranchHead(ctx, request.Worktree, request.ExpectedRemoteURL, request.Branch)
 	if err != nil {
 		return result, err
 	}
@@ -263,10 +265,10 @@ func VerifyRefreshedRepairBranch(ctx context.Context, request RefreshedBranchChe
 	headRef := "refs/hive/refresh/verify-head/" + strings.ToLower(checkpoint.HeadSHA)
 	baseRef := "refs/hive/refresh/verify-base/" + strings.ToLower(request.BaseSHA)
 	defer deleteRefreshRefs(request.Worktree, headRef, baseRef)
-	if err := fetchExactRefreshRef(ctx, request.Worktree, "refs/heads/"+request.Branch, headRef, checkpoint.HeadSHA); err != nil {
+	if err := fetchExactRefreshRef(ctx, request.Worktree, request.ExpectedRemoteURL, "refs/heads/"+request.Branch, headRef, checkpoint.HeadSHA); err != nil {
 		return fmt.Errorf("fetch pushed repair checkpoint: %w", err)
 	}
-	if err := fetchExactRefreshRef(ctx, request.Worktree, "refs/heads/"+request.BaseBranch, baseRef, request.BaseSHA); err != nil {
+	if err := fetchExactRefreshRef(ctx, request.Worktree, request.ExpectedRemoteURL, "refs/heads/"+request.BaseBranch, baseRef, request.BaseSHA); err != nil {
 		return fmt.Errorf("fetch final protected base: %w", err)
 	}
 	if err := verifyRefreshParents(ctx, request.Worktree, checkpoint.HeadSHA, request.RemoteHeadSHA, request.BaseSHA); err != nil {
@@ -295,6 +297,9 @@ func VerifyRefreshedRepairBranch(ctx context.Context, request RefreshedBranchChe
 // PushRefreshedRepairBranchExact performs the one refresh mutation: an exact
 // force-with-lease against the old remote head. A moved head is never replaced.
 func PushRefreshedRepairBranchExact(ctx context.Context, request RefreshedBranchCheckpointRequest, checkpoint RefreshedBranchCheckpoint) error {
+	if err := validateRefreshedBranchRequest(ctx, request); err != nil {
+		return err
+	}
 	if !validGitCommitSHA(checkpoint.HeadSHA) || !strings.EqualFold(checkpoint.BaseSHA, request.BaseSHA) || checkpoint.ContributionPatchID == "" {
 		return fmt.Errorf("exact locally validated refresh checkpoint is required before push")
 	}
@@ -304,7 +309,7 @@ func PushRefreshedRepairBranchExact(ctx context.Context, request RefreshedBranch
 	if err := verifyRepairCommitOwnership(ctx, request.Worktree, checkpoint.HeadSHA, request.RepositoryID, "repair"); err != nil {
 		return err
 	}
-	remoteHead, err := remoteRepairBranchHead(ctx, request.Worktree, request.Branch)
+	remoteHead, err := remoteRepairBranchHead(ctx, request.Worktree, request.ExpectedRemoteURL, request.Branch)
 	if err != nil {
 		return err
 	}
@@ -315,10 +320,10 @@ func PushRefreshedRepairBranchExact(ctx context.Context, request RefreshedBranch
 		return fmt.Errorf("remote repair branch changed before exact refresh push: got %s, expected %s", remoteHead, request.RemoteHeadSHA)
 	}
 	lease := repairForceLease(request.Branch, request.RemoteHeadSHA)
-	if _, err := runGit(ctx, request.Worktree, "push", lease, "origin", checkpoint.HeadSHA+":refs/heads/"+request.Branch); err != nil {
+	if _, err := runGit(ctx, request.Worktree, "push", lease, request.ExpectedRemoteURL, checkpoint.HeadSHA+":refs/heads/"+request.Branch); err != nil {
 		return fmt.Errorf("push exact locally validated repair refresh: %w", err)
 	}
-	remoteHead, err = remoteRepairBranchHead(ctx, request.Worktree, request.Branch)
+	remoteHead, err = remoteRepairBranchHead(ctx, request.Worktree, request.ExpectedRemoteURL, request.Branch)
 	if err != nil || !strings.EqualFold(remoteHead, checkpoint.HeadSHA) {
 		return fmt.Errorf("remote repair branch does not match pushed refresh checkpoint %s", checkpoint.HeadSHA)
 	}
@@ -344,6 +349,16 @@ func validateRefreshedBranchRequest(ctx context.Context, request RefreshedBranch
 	if _, err := runGit(ctx, request.Worktree, "check-ref-format", "--branch", request.BaseBranch); err != nil {
 		return fmt.Errorf("invalid protected base branch %q", request.BaseBranch)
 	}
+	if _, err := validateExpectedRemoteURL(ctx, request.Worktree, request.ExpectedRemoteURL); err != nil {
+		return err
+	}
+	protection, err := baselineProtectionForWorktree(ctx, request.Worktree, request.BaselineProtection)
+	if err != nil {
+		return fmt.Errorf("validate refreshed repair baseline protection: %w", err)
+	}
+	if err := validateChangedFilesWithBaselineProtection(request.ExpectedChangedFiles, []string{"**"}, protection); err != nil {
+		return fmt.Errorf("validate refreshed repair paths: %w", err)
+	}
 	return nil
 }
 
@@ -359,8 +374,8 @@ func requireCleanOwnedRefreshWorktree(ctx context.Context, request RefreshedBran
 	return nil
 }
 
-func fetchExactRefreshRef(ctx context.Context, worktree, sourceRef, destinationRef, expectedSHA string) error {
-	if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", "origin", sourceRef+":"+destinationRef); err != nil {
+func fetchExactRefreshRef(ctx context.Context, worktree, expectedRemoteURL, sourceRef, destinationRef, expectedSHA string) error {
+	if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", expectedRemoteURL, sourceRef+":"+destinationRef); err != nil {
 		return err
 	}
 	fetched, err := runGit(ctx, worktree, "rev-parse", "--verify", destinationRef)

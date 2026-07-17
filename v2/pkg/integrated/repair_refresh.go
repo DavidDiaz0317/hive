@@ -190,6 +190,10 @@ func refreshOwnedRepairBranchIfBehind(ctx context.Context, stateDir string, conf
 	if err := invalidateRefreshMergeAuthority(integratedStore, lifecycle, config, finding, intent); err != nil {
 		return finding, false, err
 	}
+	baselineProtection, err := repair.InspectVisualBaselineProtection(ctx, config.CheckoutDir)
+	if err != nil {
+		return finding, false, fmt.Errorf("inspect trusted visual baseline protection before repair refresh: %w", err)
+	}
 	commands := repairRefreshCommands(config)
 	baseAdvances := 0
 	for intent.FinalOwnedHeadSHA == "" {
@@ -211,7 +215,7 @@ func refreshOwnedRepairBranchIfBehind(ctx context.Context, stateDir string, conf
 			}
 			if candidatePushed {
 				checkpoint := repair.RefreshedBranchCheckpoint{HeadSHA: intent.CandidateHeadSHA, BaseSHA: intent.BaseSHA, ContributionPatchID: intent.ContributionPatchID, ChangedFiles: append([]string(nil), intent.ChangedFiles...)}
-				if err := repair.VerifyRefreshedRepairBranch(ctx, refreshCheckpointRequest(config, attempt, intent, commands), checkpoint); err != nil {
+				if err := repair.VerifyRefreshedRepairBranch(ctx, refreshCheckpointRequest(config, attempt, intent, commands, baselineProtection), checkpoint); err != nil {
 					return finding, false, err
 				}
 				var syncErr error
@@ -236,7 +240,7 @@ func refreshOwnedRepairBranchIfBehind(ctx context.Context, stateDir string, conf
 		}
 		if candidatePushed {
 			checkpoint := repair.RefreshedBranchCheckpoint{HeadSHA: intent.CandidateHeadSHA, BaseSHA: intent.BaseSHA, ContributionPatchID: intent.ContributionPatchID, ChangedFiles: append([]string(nil), intent.ChangedFiles...)}
-			if err := repair.VerifyRefreshedRepairBranch(ctx, refreshCheckpointRequest(config, attempt, intent, commands), checkpoint); err != nil {
+			if err := repair.VerifyRefreshedRepairBranch(ctx, refreshCheckpointRequest(config, attempt, intent, commands, baselineProtection), checkpoint); err != nil {
 				return finding, false, err
 			}
 			intent.FinalOwnedHeadSHA = intent.CandidateHeadSHA
@@ -246,7 +250,7 @@ func refreshOwnedRepairBranchIfBehind(ctx context.Context, stateDir string, conf
 			break
 		}
 		if intent.CandidateHeadSHA == "" {
-			request := refreshCheckpointRequest(config, attempt, intent, commands)
+			request := refreshCheckpointRequest(config, attempt, intent, commands, baselineProtection)
 			if request.AllowLegacyHeadAdoption && !intent.LegacyAdoptionAudited {
 				detail := fmt.Sprintf("one-time migrated repair head adoption repo_id=%s pr=%d branch=%s head=%s base=%s files=%s", intent.RepositoryID, intent.PRNumber, intent.Branch, intent.CurrentHeadSHA, intent.BaseSHA, strings.Join(intent.ChangedFiles, ","))
 				if err := integratedStore.AuditStrict(AuditEntry{Action: "adopt_legacy_repair_head_for_refresh", Allowed: true, Repository: config.Repository, Detail: detail}); err != nil {
@@ -283,7 +287,7 @@ func refreshOwnedRepairBranchIfBehind(ctx context.Context, stateDir string, conf
 			continue // mandatory live PR/base re-read immediately before push
 		}
 		checkpoint := repair.RefreshedBranchCheckpoint{HeadSHA: intent.CandidateHeadSHA, BaseSHA: intent.BaseSHA, ContributionPatchID: intent.ContributionPatchID, ChangedFiles: append([]string(nil), intent.ChangedFiles...)}
-		if err := repair.PushRefreshedRepairBranchExact(ctx, refreshCheckpointRequest(config, attempt, intent, commands), checkpoint); err != nil {
+		if err := repair.PushRefreshedRepairBranchExact(ctx, refreshCheckpointRequest(config, attempt, intent, commands, baselineProtection), checkpoint); err != nil {
 			return finding, false, err
 		}
 		// The next iteration re-reads the exact PR after the push. A base move
@@ -358,10 +362,12 @@ func repairRefreshCommands(config Config) []repair.Command {
 	return []repair.Command{{Name: "git", Args: []string{"diff", "--check"}}}
 }
 
-func refreshCheckpointRequest(config Config, attempt repair.Attempt, intent RepairRefreshIntent, commands []repair.Command) repair.RefreshedBranchCheckpointRequest {
+func refreshCheckpointRequest(config Config, attempt repair.Attempt, intent RepairRefreshIntent, commands []repair.Command, baselineProtection repair.BaselineProtection) repair.RefreshedBranchCheckpointRequest {
 	return repair.RefreshedBranchCheckpointRequest{
 		Worktree: attempt.Worktree, Branch: intent.Branch, RepositoryID: intent.RepositoryID,
-		RemoteHeadSHA: intent.CurrentHeadSHA, BaseBranch: intent.BaseBranch, BaseSHA: intent.BaseSHA,
+		ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
+		BaselineProtection: baselineProtection,
+		RemoteHeadSHA:      intent.CurrentHeadSHA, BaseBranch: intent.BaseBranch, BaseSHA: intent.BaseSHA,
 		ExpectedChangedFiles: append([]string(nil), intent.ChangedFiles...), ExpectedContributionPatchID: intent.ContributionPatchID,
 		AllowLegacyHeadAdoption: intent.LegacyOwnershipAdoption && strings.EqualFold(intent.CurrentHeadSHA, intent.OldHeadSHA),
 		ValidationCommands:      commands, CommandTimeout: 15 * time.Minute,

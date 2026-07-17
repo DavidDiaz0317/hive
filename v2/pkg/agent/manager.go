@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -452,6 +453,7 @@ func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
 	} else {
 		cmd = exec.Command("tmux", "new-session", "-d", "-s", agent.tmuxSession, "-c", agentDir)
 	}
+	cmd.Env = m.filteredEnv(agent)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("creating tmux session for %s: %w", agent.Name, err)
 	}
@@ -475,10 +477,18 @@ func (m *Manager) ensureTmuxSession(agent *AgentProcess) error {
 			return err
 		}
 	}
-	// Strip gh/git tokens from advisory agent sessions.
+	// Strip control-plane credentials from both the tmux session environment
+	// and its already-started shell. The launch prefix repeats this boundary so
+	// an existing tmux server or later environment refresh cannot reintroduce
+	// repository-wide Hive/App credentials into non-push agents.
 	if !m.agentMode(agent).CanPush() {
-		_ = m.tmuxCmd(agent, "set-environment", "-t", agent.tmuxSession, "-u", "GH_TOKEN").Run()
-		_ = m.tmuxCmd(agent, "set-environment", "-t", agent.tmuxSession, "-u", "GITHUB_TOKEN").Run()
+		denied := ordinaryAgentControlPlaneCredentialNames()
+		for _, name := range denied {
+			_ = m.tmuxCmd(agent, "set-environment", "-t", agent.tmuxSession, "-u", name).Run()
+		}
+		if len(denied) > 0 {
+			m.tmuxSendKeysForAgent(agent, "unset "+strings.Join(denied, " "), "Enter")
+		}
 	}
 
 	m.logger.Info("tmux session created", "name", agent.Name, "session", agent.tmuxSession, "uid", agent.UID, "socket", agent.tmuxSocket)
@@ -1379,6 +1389,11 @@ func (m *Manager) buildEnvPrefix(agent *AgentProcess) string {
 		// shell, is the specialist boundary. Only the explicit pairs below reach
 		// Codex; ambient GitHub, provider, proxy, and shell credentials do not.
 		parts = append(parts, "env", "-i")
+	} else if !m.agentMode(agent).CanPush() {
+		parts = append(parts, "env")
+		for _, name := range ordinaryAgentControlPlaneCredentialNames() {
+			parts = append(parts, "-u", name)
+		}
 	}
 	for _, p := range pairs {
 		if p.Secret {
@@ -3628,24 +3643,50 @@ func (m *Manager) agentCanWrite(agent *AgentProcess) bool {
 	return m.agentMode(agent).CanPush()
 }
 
-// filteredEnv returns os.Environ() with write-capable tokens removed for advisory agents.
+// filteredEnv returns os.Environ() with control-plane credentials removed for
+// agents that cannot push.
 // COPILOT_GITHUB_TOKEN is kept for all agents (needed for AI auth); write access is
-// gated by --enable-all-github-mcp-tools flag. GH_TOKEN and GITHUB_TOKEN are stripped
-// from non-quality agents to enforce gh-wrapper and credential helper policies.
+// gated by --enable-all-github-mcp-tools flag. HIVE_AGENT_TOKEN_CACHE is also
+// retained because agentEnvPairs replaces it with the agent's scoped cache.
 func (m *Manager) filteredEnv(agent *AgentProcess) []string {
 	env := os.Environ()
 	if m.agentMode(agent).CanPush() {
 		return env
 	}
+	denied := make(map[string]bool)
+	for _, name := range ordinaryAgentControlPlaneCredentialNames() {
+		denied[name] = true
+	}
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
-		if strings.HasPrefix(e, "GH_TOKEN=") ||
-			strings.HasPrefix(e, "GITHUB_TOKEN=") {
+		name, _, _ := strings.Cut(e, "=")
+		if denied[name] {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
 	return filtered
+}
+
+func ordinaryAgentControlPlaneCredentialNames() []string {
+	names := make(map[string]bool, len(specialistGitHubCredentialNames))
+	for _, name := range specialistGitHubCredentialNames {
+		if name != "HIVE_AGENT_TOKEN_CACHE" {
+			names[name] = true
+		}
+	}
+	for _, value := range os.Environ() {
+		name, _, _ := strings.Cut(value, "=")
+		if strings.HasPrefix(name, "GH_APP_") || strings.HasPrefix(name, "GITHUB_APP_") || strings.HasPrefix(name, "HIVE_GITHUB_APP_") {
+			names[name] = true
+		}
+	}
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // embeddedTokenRe matches git remote URLs with embedded credentials:

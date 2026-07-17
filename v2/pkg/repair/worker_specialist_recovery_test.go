@@ -71,7 +71,7 @@ func TestWorkerRecoversPreUpgradeStageModelRunningOrderWithoutRecomposition(t *t
 	lifecycle := &fakeLifecycle{}
 	pulls := &fakePRClient{state: state}
 	workerConfig := Config{
-		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", Agent: "quality",
+		RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote, Agent: "quality",
 		Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
 		AllowedRepairPaths: []string{"src/**"}, ValidationCommands: []Command{{Name: "git", Args: []string{"diff", "--check"}}},
 		AttemptStartedAt: anchor, ModelTimeout: time.Minute, CommandTimeout: time.Minute,

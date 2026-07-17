@@ -383,7 +383,7 @@ func (w *Worker) restorePortableRepairCheckpoint(ctx context.Context, findingTit
 		}
 	}
 	worktree := filepath.Join(w.Config.WorktreeRoot, shortFingerprint(attempt.RepositoryFingerprint))
-	if err := prepareWorktree(ctx, w.Config.RepositoryDir, worktree, attempt.Branch, w.Config.BaseBranch, ""); err != nil {
+	if err := prepareWorktree(ctx, w.Config.RepositoryDir, worktree, attempt.Branch, w.Config.BaseBranch, "", w.Config.ExpectedRemoteURL); err != nil {
 		return fmt.Errorf("prepare fresh portable repair worktree: %w", err)
 	}
 	for ref, want := range expectedHeads {
