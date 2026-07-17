@@ -768,6 +768,11 @@ func (controller *Controller) resumeAppliedWork(
 		return result
 	}
 	for _, work := range works {
+		// Bead is the sealed lifecycle-import projection and is intentionally
+		// excluded from AdmittedVisualWork JSON. Routing and lifecycle import
+		// have consumed it before this boundary; retaining it would make the
+		// in-memory work differ from its exact durable dispatch representation.
+		work.Bead = beads.BatchInput{}
 		storageRole := router.RoleForExternalRef(work.SourceExternalRef)
 		if work.RoutingAllowed && storageRole != "" {
 			role := storageRole

@@ -225,10 +225,14 @@ func digestImportPlan(packet VerifiedPacketIdentity, works []AdmittedVisualWork)
 
 func cloneBatchInput(input beads.BatchInput) beads.BatchInput {
 	clone := input
-	clone.DependsOn = append([]string(nil), input.DependsOn...)
-	clone.Metadata = make(map[string]interface{}, len(input.Metadata))
-	for key, value := range input.Metadata {
-		clone.Metadata[key] = cloneBatchMetadataValue(value)
+	if input.DependsOn != nil {
+		clone.DependsOn = append([]string{}, input.DependsOn...)
+	}
+	if input.Metadata != nil {
+		clone.Metadata = make(map[string]interface{}, len(input.Metadata))
+		for key, value := range input.Metadata {
+			clone.Metadata[key] = cloneBatchMetadataValue(value)
+		}
 	}
 	return clone
 }
@@ -236,33 +240,51 @@ func cloneBatchInput(input beads.BatchInput) beads.BatchInput {
 func cloneBatchMetadataValue(value interface{}) interface{} {
 	switch typed := value.(type) {
 	case map[string]interface{}:
+		if typed == nil {
+			return map[string]interface{}(nil)
+		}
 		clone := make(map[string]interface{}, len(typed))
 		for key, nested := range typed {
 			clone[key] = cloneBatchMetadataValue(nested)
 		}
 		return clone
 	case map[string]string:
+		if typed == nil {
+			return map[string]string(nil)
+		}
 		clone := make(map[string]string, len(typed))
 		for key, nested := range typed {
 			clone[key] = nested
 		}
 		return clone
 	case []interface{}:
+		if typed == nil {
+			return []interface{}(nil)
+		}
 		clone := make([]interface{}, len(typed))
 		for index, nested := range typed {
 			clone[index] = cloneBatchMetadataValue(nested)
 		}
 		return clone
 	case []map[string]interface{}:
+		if typed == nil {
+			return []map[string]interface{}(nil)
+		}
 		clone := make([]map[string]interface{}, len(typed))
 		for index, nested := range typed {
 			clone[index] = cloneBatchMetadataValue(nested).(map[string]interface{})
 		}
 		return clone
 	case []string:
-		return append([]string(nil), typed...)
+		if typed == nil {
+			return []string(nil)
+		}
+		return append([]string{}, typed...)
 	case []int:
-		return append([]int(nil), typed...)
+		if typed == nil {
+			return []int(nil)
+		}
+		return append([]int{}, typed...)
 	default:
 		return value
 	}

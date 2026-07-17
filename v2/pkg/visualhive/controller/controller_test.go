@@ -97,6 +97,9 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 		SourceExternalRef: visualRef, FindingFingerprint: "finding/source", RepositoryFingerprint: repositoryFingerprint,
 		Role: "quality", RoutingReason: "verified deterministic route", RoutingAllowed: true,
 		ValidationCommands: []string{"go test ./..."},
+		Bead: beads.BatchInput{SourceID: repositoryFingerprint, ExternalRef: visualRef, DependsOn: []string{}, Metadata: map[string]interface{}{
+			"visual_hive_evidence_bytes": int64(314), "visual_hive_empty_keywords": []string{},
+		}},
 	}
 	packet := completeControllerPacket("controller-test", packetDigest)
 	work.Packet = packet
@@ -145,7 +148,7 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 		envelope.WorkIdentitySHA256 == "" || envelope.ExecutionPolicySHA256 == "" || envelope.BaseSHA != packet.BaseSHA || envelope.BaseTreeSHA == "" ||
 		len(envelope.AllowedRepairPaths) != 1 || len(envelope.ValidationCommands) != 1 || envelope.Evidence.VerificationReceipt == nil || envelope.VerificationReceiptJSON == "" ||
 		!envelope.GovernorAllowed || envelope.GovernorDecisionCode != "allowed" || envelope.Attempt != 1 || envelope.CompositionDeadline.IsZero() ||
-		envelope.SpecialistWorkOrderID != "" || envelope.SpecialistRequestSHA256 != "" {
+		envelope.SpecialistWorkOrderID != "" || envelope.SpecialistRequestSHA256 != "" || !reflect.DeepEqual(envelope.Work.Bead, beads.BatchInput{}) {
 		t.Fatalf("dispatch envelope is incomplete: %+v", envelope)
 	}
 	admitted, canonicalReceipt, err := BuildSchedulerAdmittedWork(envelope)
