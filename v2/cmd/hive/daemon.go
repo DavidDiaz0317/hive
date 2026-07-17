@@ -420,6 +420,34 @@ func (runtimeState *claimedIntegratedDaemonRuntime) Close() error {
 	return err
 }
 
+// runClaimedIntegratedOneShot acquires the same scheduler ownership used by
+// the legacy daemon before constructing its specialist Manager. This keeps the
+// supported `hive run` entry point from briefly creating a second Manager while
+// the normal Hive process owns Visual Hive work, even though RunOnce would
+// later reject on the separate production-run lease.
+func runClaimedIntegratedOneShot(
+	ctx context.Context,
+	stateDir string,
+	timeout time.Duration,
+	config integrated.Config,
+	factory integratedDaemonSpecialistFactory,
+	runner integratedDaemonCycleRunner,
+) (result integrated.RunResult, err error) {
+	if runner == nil {
+		return result, errors.New("integrated one-shot cycle runner is required")
+	}
+	runtimeState, err := claimIntegratedDaemonRuntime(stateDir, config, factory)
+	if err != nil {
+		return result, err
+	}
+	defer func() {
+		if closeErr := runtimeState.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("shutdown persistent Hive specialists: %w", closeErr))
+		}
+	}()
+	return runtimeState.RunCycle(ctx, stateDir, timeout, runner)
+}
+
 func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time.Duration, specialists *integratedSpecialistRuntime) (integrated.RunResult, error) {
 	token := resolveGitHubToken("HIVE_GITHUB_TOKEN")
 	if token == "" {

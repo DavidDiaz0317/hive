@@ -74,6 +74,41 @@ func TestNormalVisualOwnershipExcludesLegacyManagerConstructionAndCycles(t *test
 	releaseDaemonLease(reclaimed)
 }
 
+func TestNormalVisualOwnershipExcludesOneShotLegacyManagerConstruction(t *testing.T) {
+	stateDir := t.TempDir()
+	normalLease, err := claimNormalVisualWorkOwnership(stateDir, &agent.Manager{}, func(*agent.Manager) (bool, error) { return true, nil })
+	if err != nil || normalLease == nil {
+		t.Fatalf("claim normal ownership: lease=%v err=%v", normalLease, err)
+	}
+
+	constructions, cycles := 0, 0
+	factory := func(string, integrated.Config) (*integratedSpecialistRuntime, error) {
+		constructions++
+		return &integratedSpecialistRuntime{}, nil
+	}
+	runner := func(context.Context, string, time.Duration, *integratedSpecialistRuntime) (integrated.RunResult, error) {
+		cycles++
+		return integrated.RunResult{}, nil
+	}
+	if _, err := runClaimedIntegratedOneShot(context.Background(), stateDir, time.Minute, integrated.Config{}, factory, runner); !errors.Is(err, errDaemonLeaseHeld) {
+		t.Fatalf("one-shot legacy run while normal owns lease = %v", err)
+	}
+	if constructions != 0 || cycles != 0 {
+		t.Fatalf("one-shot path constructed or ran legacy Manager while normal owns it: constructions=%d cycles=%d", constructions, cycles)
+	}
+
+	releaseDaemonLease(normalLease)
+	result, err := runClaimedIntegratedOneShot(context.Background(), stateDir, time.Minute, integrated.Config{}, factory, runner)
+	if err != nil || result.SchemaVersion != "" || constructions != 1 || cycles != 1 {
+		t.Fatalf("exclusive one-shot run after normal shutdown: result=%+v constructions=%d cycles=%d err=%v", result, constructions, cycles, err)
+	}
+	reclaimed, err := claimNormalVisualWorkOwnership(stateDir, &agent.Manager{}, func(*agent.Manager) (bool, error) { return true, nil })
+	if err != nil || reclaimed == nil {
+		t.Fatalf("one-shot shutdown retained daemon ownership: lease=%v err=%v", reclaimed, err)
+	}
+	releaseDaemonLease(reclaimed)
+}
+
 func TestNormalVisualOwnershipReleasesLeaseOnConfigurationFailureOrNoRunner(t *testing.T) {
 	for _, test := range []struct {
 		name      string

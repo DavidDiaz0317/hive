@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -695,26 +694,17 @@ func runIntegratedRun(args []string) int {
 		fmt.Fprintln(os.Stderr, "Hive production run failed:", err)
 		return 1
 	}
-	specialists, err := newIntegratedSpecialistRuntime(*stateDir, durable)
-	if err != nil {
-		if *jsonOutput {
-			return encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error()})
-		}
-		fmt.Fprintln(os.Stderr, "Hive production run failed:", err)
-		return 1
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+time.Minute)
 	defer cancel()
-	options := integrated.RunOptions{StateDir: *stateDir, Timeout: *timeout, GitHub: client}
-	if specialists != nil {
-		options.Specialists = specialists.Manager
-		options.SpecialistWorkDir = specialists.WorkDir
-	}
-	result, err := integrated.RunOnce(ctx, options)
-	cleanupErr := specialists.Close()
-	if cleanupErr != nil {
-		err = errors.Join(err, fmt.Errorf("shutdown persistent Hive specialists: %w", cleanupErr))
-	}
+	result, err := runClaimedIntegratedOneShot(ctx, *stateDir, *timeout, durable, newIntegratedSpecialistRuntime,
+		func(runCtx context.Context, runStateDir string, runTimeout time.Duration, specialists *integratedSpecialistRuntime) (integrated.RunResult, error) {
+			options := integrated.RunOptions{StateDir: runStateDir, Timeout: runTimeout, GitHub: client}
+			if specialists != nil {
+				options.Specialists = specialists.Manager
+				options.SpecialistWorkDir = specialists.WorkDir
+			}
+			return integrated.RunOnce(runCtx, options)
+		})
 	if err != nil {
 		if *jsonOutput {
 			_ = encodeJSON(map[string]any{"schema_version": "hive.production-run.v1", "error": err.Error(), "partial": result})
