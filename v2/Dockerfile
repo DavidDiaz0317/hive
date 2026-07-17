@@ -196,7 +196,25 @@ EXPOSE 3001 3002 7681
 VOLUME ["/data", "/secrets"]
 
 COPY v2/deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN set -eu; \
+    runtime_scripts="/usr/local/bin/entrypoint.sh /usr/local/bin/ttyd-tmux.sh /usr/local/bin/hive-panes \
+      /usr/local/bin/gh-app-token.sh /usr/local/bin/hive-config.sh /usr/local/bin/agent-launch.sh \
+      /usr/local/bin/git-credential-hive.sh /usr/local/bin/gh \
+      $(find /opt/hive/dashboard /tmp/hive/bin -type f -name '*.sh' -print)"; \
+    runtime_shebang_files="$runtime_scripts /tmp/hive/bin/nous-sync.py /tmp/hive/bin/nous-hive-gate.py \
+      /opt/hive/dashboard/agent-activity.py /opt/hive/dashboard/build-snapshot.mjs"; \
+    runtime_text_files="$runtime_shebang_files /usr/local/etc/hive/backends.conf"; \
+    for runtime_file in $runtime_text_files; do \
+      sed -i 's/\r$//' "$runtime_file"; \
+      if grep -q "$(printf '\r')" "$runtime_file"; then \
+        echo "carriage return remains in runtime text file: $runtime_file" >&2; \
+        exit 1; \
+      fi; \
+    done; \
+    for script in $runtime_shebang_files; do \
+      test "$(head -c 2 "$script")" = '#!'; \
+    done; \
+    chmod 0555 $runtime_shebang_files
 
 # Pre-create /data/home/ subdirectories with correct ownership so the
 # permissions watcher doesn't have to create them at runtime.
