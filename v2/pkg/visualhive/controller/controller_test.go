@@ -378,15 +378,37 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 		PullRequestNumber: 37, PullRequestURL: prURL, VerdictHeadSHA: commitSHA,
 		VerdictReceiptSHA256: checkReceipt.ReceiptSHA256, VerdictStatus: "success",
 	}
-	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
-		t.Fatalf("complete specialist PR: %v", err)
+	audit.failStage = "admitted_pr_verdict_recorded"
+	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err == nil {
+		t.Fatal("completion audit failure was not returned for retry")
 	}
 	completedBead := quality.FindByExternalRef(visualRef)
-	if completedBead.Status != beads.StatusClosed || visualBeadAdmissionState(completedBead) != "admitted_pr_verdict_recorded" || completedBead.Meta("visual_hive_pr_completion_json") == "" {
+	if completedBead.Status != beads.StatusClosed || visualBeadAdmissionState(completedBead) != "admitted_pr_verdict_recorded" || completedBead.Meta("visual_hive_pr_completion_json") == "" ||
+		completedBead.Meta("visual_hive_completion_audit_id") == "" || completedBead.Metadata["visual_hive_completion_audit_recorded"] != false {
 		t.Fatalf("completed specialist bead = %+v", completedBead)
 	}
 	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
+		t.Fatalf("completion audit retry was not recovered: %v", err)
+	}
+	completedBead = quality.FindByExternalRef(visualRef)
+	if completedBead.Metadata["visual_hive_completion_audit_recorded"] != true || audit.count("admitted_pr_verdict_recorded") != 1 {
+		t.Fatalf("completion audit acknowledgement/events = metadata=%+v events=%+v", completedBead.Metadata, audit.events)
+	}
+	completionEventID := completedBead.Meta("visual_hive_completion_audit_id")
+	if err := controller.CompleteSpecialistPullRequest(visualRef, completion); err != nil {
 		t.Fatalf("ambiguous completion replay was not idempotent: %v", err)
+	}
+	if audit.count("admitted_pr_verdict_recorded") != 1 || completionEventID == "" || audit.events[len(audit.events)-1].EventID != completionEventID {
+		t.Fatalf("completion replay duplicated or lost its stable audit identity: metadata=%+v events=%+v", completedBead.Metadata, audit.events)
+	}
+	completionJSON, _ := json.Marshal(completion)
+	crossRepositoryEnvelope := cloneDispatchEnvelope(t, reserved)
+	crossRepositoryEnvelope.Work.RepositoryFingerprint = strings.Repeat("4", 64)
+	crossRepositoryJSON, _ := json.Marshal(crossRepositoryEnvelope)
+	crossRepositoryBead := &beads.Bead{Metadata: map[string]interface{}{"visual_hive_dispatch_envelope_json": string(crossRepositoryJSON)}}
+	crossRepositoryEvent, err := specialistCompletionAuditEvent(crossRepositoryBead, visualRef, completion, completionJSON)
+	if err != nil || crossRepositoryEvent.EventID == completionEventID {
+		t.Fatalf("completion audit identity was not repository-fingerprint-bound: event=%+v err=%v", crossRepositoryEvent, err)
 	}
 	different := completion
 	different.VerdictStatus = "pass"
@@ -1153,9 +1175,16 @@ func resumeAppliedForTest(
 	return controller.resumeAppliedWork(ctx, source, packet, works, router, result)
 }
 
-type controllerAuditSink struct{ events []AuditEvent }
+type controllerAuditSink struct {
+	events    []AuditEvent
+	failStage string
+}
 
 func (sink *controllerAuditSink) RecordVisualWorkAudit(_ context.Context, event AuditEvent) error {
+	if sink.failStage == event.Stage {
+		sink.failStage = ""
+		return errors.New("injected audit failure")
+	}
 	sink.events = append(sink.events, event)
 	return nil
 }
@@ -1167,6 +1196,16 @@ func (sink *controllerAuditSink) saw(stage string) bool {
 		}
 	}
 	return false
+}
+
+func (sink *controllerAuditSink) count(stage string) int {
+	count := 0
+	for _, event := range sink.events {
+		if event.Stage == stage {
+			count++
+		}
+	}
+	return count
 }
 
 func (source controllerEvidenceSource) SpecialistEvidenceIdentity(visualhive.FindingLifecycle) (agent.SpecialistEvidenceIdentity, error) {

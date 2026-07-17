@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/agent"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
@@ -49,15 +50,17 @@ func (source *normalVisualArtifactSource) Consume(workflow integrated.WorkflowRu
 }
 
 type normalVisualRepairer struct {
-	scheduler       *scheduler.Scheduler
-	manager         *agent.Manager
-	controller      *visualcontroller.Controller
-	lifecycle       *visualhive.LifecycleStore
-	github          *hivegithub.Client
-	providerCommand string
-	providerArgs    []string
-	loadConfig      func() (integrated.Config, int, error)
-	mu              sync.Mutex
+	scheduler         *scheduler.Scheduler
+	manager           *agent.Manager
+	controller        *visualcontroller.Controller
+	lifecycle         *visualhive.LifecycleStore
+	github            *hivegithub.Client
+	gitTransportToken func(context.Context) (string, error)
+	expectedRemoteURL string
+	providerCommand   string
+	providerArgs      []string
+	loadConfig        func() (integrated.Config, int, error)
+	mu                sync.Mutex
 }
 
 func (runner *normalVisualRepairer) Run(ctx context.Context, supplied visualcontroller.DispatchEnvelope) (normalservice.RepairOutcome, error) {
@@ -179,16 +182,29 @@ func (runner *normalVisualRepairer) Run(ctx context.Context, supplied visualcont
 	if normalACMM < policy.ACMMLevel {
 		policy.ACMMLevel = normalACMM
 	}
+	baselineProtection, err := repair.InspectVisualBaselineProtectionAtCommit(ctx, current.CheckoutDir, envelope.BaseSHA)
+	if err != nil {
+		return normalservice.RepairOutcome{}, fmt.Errorf("inspect exact-base visual baseline protection before normal governed repair: %w", err)
+	}
+	expectedRemoteURL := strings.TrimSpace(runner.expectedRemoteURL)
+	if expectedRemoteURL == "" {
+		expectedRemoteURL = integrated.RepositoryCloneURL(current.Repository)
+	}
 	worker := repair.Worker{
 		Config: repair.Config{
 			RepositoryDir: current.CheckoutDir, WorktreeRoot: filepath.Join(current.StateDir, "repair", "worktrees"), BaseBranch: current.DefaultBranch,
+			ExpectedRemoteURL: expectedRemoteURL, BaselineProtection: baselineProtection,
 			Agent: string(role), Policy: policy, PolicyLoader: policyLoader, RuntimeGuard: runtimeGuard,
 			AllowedRepairPaths: envelope.AllowedRepairPaths, ValidationCommands: commands, EvidenceSummary: evidenceSummary,
 			ModelTimeout: boundedVisualWorkDuration(envelope.CompositionDeadline, normalVisualRepairModelTimeout), CommandTimeout: normalVisualRepairCommandTimeout,
 		},
 		Provider: provider, State: state, Lifecycle: runner.lifecycle, GitHub: runner.github,
 	}
-	result, err := worker.Run(ctx, envelope.Finding)
+	workerCtx := ctx
+	if runner.gitTransportToken != nil {
+		workerCtx = gittransport.WithControllerTokenSource(ctx, runner.gitTransportToken)
+	}
+	result, err := worker.Run(workerCtx, envelope.Finding)
 	if err != nil {
 		return normalservice.RepairOutcome{}, err
 	}
@@ -251,6 +267,8 @@ func configureNormalVisualWorkRunner(
 	sched *scheduler.Scheduler,
 	manager *agent.Manager,
 	github *hivegithub.Client,
+	gitTransportToken func(context.Context) (string, error),
+	dashboardReady func() bool,
 	logger *slog.Logger,
 ) (*normalservice.Service, *normalVisualServiceHealthReporter, error) {
 	if configuredRuntimeOwnerIntent(installed) != runtimeOwnerNormalHive {
@@ -258,6 +276,12 @@ func configureNormalVisualWorkRunner(
 	}
 	if github == nil {
 		return nil, nil, errors.New("normal governed repair service requires the existing GitHub client")
+	}
+	if gitTransportToken == nil {
+		return nil, nil, errors.New("normal governed repair service requires a controller-owned Git transport credential source")
+	}
+	if dashboardReady == nil {
+		return nil, nil, errors.New("normal governed repair service requires the existing dashboard listener readiness probe")
 	}
 	executor, err := repair.NewCodexSpecialistChildExecutor(repair.CodexProvider{Command: installed.ProviderCommand, Prefix: installed.ProviderArgs})
 	if err != nil {
@@ -281,6 +305,7 @@ func configureNormalVisualWorkRunner(
 	source := &normalVisualArtifactSource{stateDir: installed.StateDir, timeout: normalVisualArtifactFetchTimeout, github: github}
 	repairer := &normalVisualRepairer{
 		scheduler: sched, manager: manager, controller: controller, lifecycle: lifecycle, github: github,
+		gitTransportToken: gitTransportToken, expectedRemoteURL: integrated.RepositoryCloneURL(installed.Repository),
 		providerCommand: installed.ProviderCommand, providerArgs: append([]string(nil), installed.ProviderArgs...), loadConfig: loader,
 	}
 	verdict := &normalVisualPullRequestVerifier{github: github, lifecycle: lifecycle, loadConfig: loader}
@@ -294,6 +319,9 @@ func configureNormalVisualWorkRunner(
 		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, MaxCycleDuration: maxCycle, LeaseRetry: 30 * time.Second, QuiesceInterval: 100 * time.Millisecond,
 		AcquireLease: func() (func(), error) { return integrated.AcquireNormalVisualWorkLease(installed.StateDir) },
 		ShouldQuiesce: func() (bool, error) {
+			if !dashboardReady() {
+				return true, nil
+			}
 			requested, err := integrated.PauseRequested(installed.StateDir)
 			if err != nil || requested {
 				return requested, err

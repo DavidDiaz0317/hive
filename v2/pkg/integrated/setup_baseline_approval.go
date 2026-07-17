@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
 
@@ -35,6 +36,7 @@ type ApproveSetupBaselineOptions struct {
 	ExpectedPlanDigest      string
 	Reason                  string
 	GitHub                  *hivegithub.Client
+	GitTransportToken       string
 	HostedAuthority         HostedOperatorAuthority
 }
 
@@ -86,6 +88,7 @@ type setupBaselineApprovalBinding struct {
 }
 
 func ApproveSetupBaseline(ctx context.Context, options ApproveSetupBaselineOptions) (ApproveSetupBaselineResult, error) {
+	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	result := ApproveSetupBaselineResult{SchemaVersion: setupBaselineApprovalResultSchema}
 	if options.GitHub == nil || strings.TrimSpace(options.StateDir) == "" {
 		return result, fmt.Errorf("GitHub client and persistent state directory are required")

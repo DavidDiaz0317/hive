@@ -265,7 +265,7 @@ func executeHostedOperator(ctx context.Context, stateDir string, request hostedO
 			ExpectedRepositoryID: arguments.RepositoryID, ExpectedCaptureRunID: arguments.RunID, ExpectedArtifactID: arguments.ArtifactID,
 			ExpectedPRNumber: arguments.PRNumber, ExpectedHeadSHA: arguments.HeadSHA, ExpectedBaseSHA: arguments.BaseSHA,
 			ExpectedDiffDigest: arguments.DiffDigest, ExpectedCandidateDigest: arguments.CandidateDigest, ExpectedActorID: arguments.ActorID,
-			ExpectedPlanDigest: arguments.PlanDigest, Reason: arguments.Reason, GitHub: client, HostedAuthority: authority,
+			ExpectedPlanDigest: arguments.PlanDigest, Reason: arguments.Reason, GitHub: client, GitTransportToken: os.Getenv("HIVE_GITHUB_TOKEN"), HostedAuthority: authority,
 		})
 		if result.Planned {
 			result.ApplyCommand = fmt.Sprintf("hive approve-baseline --repo-id %s --run-id %d --artifact-id %d --pr %d --head %s --base %s --diff-digest %s --candidate-digest %s --actor-id %d --plan-digest %s --reason %s --json",

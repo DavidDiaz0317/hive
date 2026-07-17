@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 )
 
 const (
@@ -146,6 +148,14 @@ func (w *Worker) withToolSnapshot(ctx context.Context, attempt *Attempt, phase s
 		return err
 	}
 	operationErr := operation()
+	// Repository Git control-state mutation is a quarantine condition. Do not
+	// invoke even read-only Git for delta inspection or snapshot restoration;
+	// the target command may have replaced the linked-worktree locator or
+	// installed executable config. The durable snapshot remains pending and a
+	// resumed Worker performs the same direct filesystem preflight first.
+	if isUnsafeRepositoryGitControlFailure(operationErr) {
+		return operationErr
+	}
 	if phase == toolSnapshotValidation {
 		if err := validateValidationToolDelta(ctx, *attempt, w.Config.AllowedRepairPaths); err != nil {
 			if operationErr != nil {
@@ -472,11 +482,7 @@ func runGitExact(ctx context.Context, dir string, args ...string) (string, error
 }
 
 func gitCommandEnvironment(extra map[string]string) []string {
-	blocked := map[string]bool{
-		"GIT_CONFIG_COUNT":   true,
-		"GIT_CONFIG_KEY_0":   true,
-		"GIT_CONFIG_VALUE_0": true,
-	}
+	blocked := map[string]bool{}
 	for key := range extra {
 		blocked[strings.ToUpper(key)] = true
 	}
@@ -495,7 +501,7 @@ func gitCommandEnvironment(extra map[string]string) []string {
 	for _, key := range keys {
 		result = append(result, key+"="+extra[key])
 	}
-	return append(result, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	return gittransport.LocalEnvironmentWithOverrides(result, extra)
 }
 
 func restoreWorktreeTree(ctx context.Context, worktree, snapshotCommit, head string, allowedPatterns []string) error {
@@ -769,7 +775,7 @@ func repairPathRestricted(file string) bool {
 			return true
 		}
 		switch part {
-		case "snapshot", "snapshots", "__snapshots__", "screenshot", "screenshots", "__screenshots__":
+		case "__snapshots__", "__screenshots__", "__image_snapshots__":
 			return true
 		}
 	}

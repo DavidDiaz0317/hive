@@ -52,6 +52,63 @@ func TestRepairRefreshRejectsProtectedVisualBaselinesWithoutBlockingPublicAssets
 	}
 }
 
+func TestPrepareRefreshProtectsBaselineRootDeclaredOnlyByExactRemoteHead(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	worktree := filepath.Join(root, "worktree")
+	if _, err := runGit(ctx, root, "init", "--bare", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, worktree, "init", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, worktree, "remote", "add", "origin", remote); err != nil {
+		t.Fatal(err)
+	}
+	writeRefreshFixture(t, worktree, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/reviewed-reference\n")
+	writeRefreshFixture(t, worktree, "public/reviewed-reference/home.png", "reviewed\n")
+	commitRefreshFixture(t, worktree, "seed reviewed baseline")
+	base := refreshGitOutput(t, worktree, "rev-parse", "HEAD")
+	trusted, err := InspectVisualBaselineProtection(ctx, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runGit(ctx, worktree, "push", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	branch := "hive/repair-new-baseline-a1"
+	if _, err := runGit(ctx, worktree, "checkout", "-b", branch); err != nil {
+		t.Fatal(err)
+	}
+	writeRefreshFixture(t, worktree, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/new-reference\n")
+	writeRefreshFixture(t, worktree, "public/new-reference/home.png", "unreviewed\n")
+	commitRefreshFixture(t, worktree, "fix: substitute baseline\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	remoteHead := refreshGitOutput(t, worktree, "rev-parse", "HEAD")
+	if _, err := runGit(ctx, worktree, "push", "origin", remoteHead+":refs/heads/"+branch); err != nil {
+		t.Fatal(err)
+	}
+	// The mutable worktree no longer contains the hostile candidate. Protection
+	// must still come from the fetched exact remote commit.
+	if _, err := runGit(ctx, worktree, "reset", "--hard", base); err != nil {
+		t.Fatal(err)
+	}
+	request := RefreshedBranchCheckpointRequest{
+		Worktree: worktree, Branch: branch, RepositoryID: "123", ExpectedRemoteURL: remote,
+		BaselineProtection: trusted, RemoteHeadSHA: remoteHead, BaseBranch: "main", BaseSHA: base,
+		ExpectedChangedFiles: []string{"public/new-reference/home.png", "visual-hive.config.yaml"},
+	}
+	if _, err := PrepareRefreshedRepairBranch(ctx, request); err == nil || !strings.Contains(err.Error(), "protected visual baseline") {
+		t.Fatalf("refresh accepted baseline root declared only by exact remote head: %v", err)
+	}
+	if got, err := remoteRepairBranchHead(ctx, worktree, remote, branch); err != nil || got != remoteHead {
+		t.Fatalf("rejected exact-head baseline changed remote state: head=%s err=%v", got, err)
+	}
+}
+
 func TestPrepareAndPushRefreshedRepairBranchUsesExactLocalBaseAndLease(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

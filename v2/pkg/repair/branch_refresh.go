@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 )
 
 const maxRepairRefreshDiffBytes = 16 << 20
@@ -152,6 +154,9 @@ func PrepareRefreshedRepairBranch(ctx context.Context, request RefreshedBranchCh
 	if !strings.EqualFold(remoteHead, request.RemoteHeadSHA) {
 		return result, fmt.Errorf("remote repair branch moved from exact reviewed head %s to %s before local refresh", request.RemoteHeadSHA, remoteHead)
 	}
+	if err := validateRefreshedBranchPathsAtCommit(ctx, request, request.RemoteHeadSHA); err != nil {
+		return result, err
+	}
 
 	if _, err := runGit(ctx, request.Worktree, "reset", "--hard", request.RemoteHeadSHA); err != nil {
 		return result, fmt.Errorf("reset owned refresh worktree to exact remote head: %w", err)
@@ -271,6 +276,9 @@ func VerifyRefreshedRepairBranch(ctx context.Context, request RefreshedBranchChe
 	if err := fetchExactRefreshRef(ctx, request.Worktree, request.ExpectedRemoteURL, "refs/heads/"+request.BaseBranch, baseRef, request.BaseSHA); err != nil {
 		return fmt.Errorf("fetch final protected base: %w", err)
 	}
+	if err := validateRefreshedBranchPathsAtCommit(ctx, request, checkpoint.HeadSHA); err != nil {
+		return err
+	}
 	if err := verifyRefreshParents(ctx, request.Worktree, checkpoint.HeadSHA, request.RemoteHeadSHA, request.BaseSHA); err != nil {
 		return err
 	}
@@ -303,6 +311,9 @@ func PushRefreshedRepairBranchExact(ctx context.Context, request RefreshedBranch
 	if !validGitCommitSHA(checkpoint.HeadSHA) || !strings.EqualFold(checkpoint.BaseSHA, request.BaseSHA) || checkpoint.ContributionPatchID == "" {
 		return fmt.Errorf("exact locally validated refresh checkpoint is required before push")
 	}
+	if err := validateRefreshedBranchPathsAtCommit(ctx, request, checkpoint.HeadSHA); err != nil {
+		return err
+	}
 	if err := verifyRefreshParents(ctx, request.Worktree, checkpoint.HeadSHA, request.RemoteHeadSHA, request.BaseSHA); err != nil {
 		return err
 	}
@@ -320,7 +331,7 @@ func PushRefreshedRepairBranchExact(ctx context.Context, request RefreshedBranch
 		return fmt.Errorf("remote repair branch changed before exact refresh push: got %s, expected %s", remoteHead, request.RemoteHeadSHA)
 	}
 	lease := repairForceLease(request.Branch, request.RemoteHeadSHA)
-	if _, err := runGit(ctx, request.Worktree, "push", lease, request.ExpectedRemoteURL, checkpoint.HeadSHA+":refs/heads/"+request.Branch); err != nil {
+	if _, err := runGitTransport(ctx, request.Worktree, request.ExpectedRemoteURL, "push", lease, request.ExpectedRemoteURL, checkpoint.HeadSHA+":refs/heads/"+request.Branch); err != nil {
 		return fmt.Errorf("push exact locally validated repair refresh: %w", err)
 	}
 	remoteHead, err = remoteRepairBranchHead(ctx, request.Worktree, request.ExpectedRemoteURL, request.Branch)
@@ -352,12 +363,23 @@ func validateRefreshedBranchRequest(ctx context.Context, request RefreshedBranch
 	if _, err := validateExpectedRemoteURL(ctx, request.Worktree, request.ExpectedRemoteURL); err != nil {
 		return err
 	}
-	protection, err := baselineProtectionForWorktree(ctx, request.Worktree, request.BaselineProtection)
+	protection, err := normalizeBaselineProtection(request.BaselineProtection)
 	if err != nil {
 		return fmt.Errorf("validate refreshed repair baseline protection: %w", err)
 	}
 	if err := validateChangedFilesWithBaselineProtection(request.ExpectedChangedFiles, []string{"**"}, protection); err != nil {
 		return fmt.Errorf("validate refreshed repair paths: %w", err)
+	}
+	return nil
+}
+
+func validateRefreshedBranchPathsAtCommit(ctx context.Context, request RefreshedBranchCheckpointRequest, commitSHA string) error {
+	protection, err := baselineProtectionForCommit(ctx, request.Worktree, commitSHA, request.BaselineProtection)
+	if err != nil {
+		return fmt.Errorf("validate exact refreshed repair baseline protection: %w", err)
+	}
+	if err := validateChangedFilesWithBaselineProtection(request.ExpectedChangedFiles, []string{"**"}, protection); err != nil {
+		return fmt.Errorf("validate exact refreshed repair paths: %w", err)
 	}
 	return nil
 }
@@ -375,7 +397,7 @@ func requireCleanOwnedRefreshWorktree(ctx context.Context, request RefreshedBran
 }
 
 func fetchExactRefreshRef(ctx context.Context, worktree, expectedRemoteURL, sourceRef, destinationRef, expectedSHA string) error {
-	if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", expectedRemoteURL, sourceRef+":"+destinationRef); err != nil {
+	if _, err := runGitTransport(ctx, worktree, expectedRemoteURL, "fetch", "--no-tags", "--force", expectedRemoteURL, sourceRef+":"+destinationRef); err != nil {
 		return err
 	}
 	fetched, err := runGit(ctx, worktree, "rev-parse", "--verify", destinationRef)
@@ -442,7 +464,7 @@ func repairContributionPatchID(ctx context.Context, worktree, fromSHA, toSHA str
 	}
 	command := exec.CommandContext(ctx, "git", "patch-id", "--stable")
 	command.Dir = worktree
-	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	command.Env = gittransport.LocalEnvironment(providerEnvironment())
 	command.Stdin = bytes.NewReader(diff)
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
@@ -459,7 +481,7 @@ func repairContributionPatchID(ctx context.Context, worktree, fromSHA, toSHA str
 func runGitBytes(ctx context.Context, dir string, limit int64, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = dir
-	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	command.Env = gittransport.LocalEnvironment(providerEnvironment())
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return nil, err

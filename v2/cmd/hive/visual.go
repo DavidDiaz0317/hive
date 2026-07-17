@@ -13,9 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/beads"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/integrated"
 	"github.com/kubestellar/hive/v2/pkg/repair"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
@@ -186,6 +188,7 @@ func runVisualLifecycleCommand(args []string) int {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 		defer cancel()
+		ctx = gittransport.WithControllerToken(ctx, token)
 		baselineProtection, protectionErr := repair.InspectVisualBaselineProtection(ctx, *repositoryDir)
 		if protectionErr != nil {
 			fmt.Fprintln(os.Stderr, "inspect trusted visual baseline protection:", protectionErr)
@@ -194,7 +197,7 @@ func runVisualLifecycleCommand(args []string) int {
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: *repositoryDir, WorktreeRoot: root, BaseBranch: strings.TrimPrefix(*targetRef, "refs/heads/"),
-				ExpectedRemoteURL:  "https://github.com/" + strings.TrimSpace(*repository) + ".git",
+				ExpectedRemoteURL:  integrated.RepositoryCloneURL(*repository),
 				BaselineProtection: baselineProtection,
 				Policy: automation.Policy{
 					ACMMLevel: *maxACMM, Mode: mode, Paused: *paused, KillSwitch: *killSwitch,

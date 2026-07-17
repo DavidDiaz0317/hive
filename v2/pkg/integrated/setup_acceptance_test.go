@@ -38,6 +38,7 @@ func TestInstalledVisualHiveBundleSetupApplyAndMergedRerunIsIdempotent(t *testin
 	}
 
 	remote := filepath.Join(root, "remote.git")
+	bindTestRepositoryCloneURL(t, remote)
 	seed := filepath.Join(root, "seed")
 	runIntegratedGit(t, root, "init", "--bare", remote)
 	runIntegratedGit(t, root, "init", "-b", "main", seed)

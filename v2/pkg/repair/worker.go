@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
@@ -31,6 +32,7 @@ type Lifecycle interface {
 
 type PullRequestClient interface {
 	UpsertRepairPullRequest(ctx context.Context, repository, branch, expectedHeadSHA, base, title, body, marker string) (hivegithub.RepairPullRequest, error)
+	InspectManagedPullRequestExact(ctx context.Context, repository, repositoryID string, number int, marker, branch, headSHA, base string) (hivegithub.ManagedPullRequestSnapshot, error)
 }
 
 type Command struct {
@@ -102,17 +104,55 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	if err := w.validate(finding); err != nil {
 		return Result{}, err
 	}
+	attempt, resumed := w.State.Get(finding.RepositoryFingerprint)
+	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
+	// Reject a stale pre-push lifecycle binding before consulting an obsolete
+	// worktree path. Portable runner migration may intentionally remove that
+	// path, and lifecycle validation is both deterministic and side-effect free.
+	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted) {
+		if err := validateResumedSideEffectCheckpoint(finding, attempt); err != nil {
+			return Result{}, err
+		}
+	}
+	controllerRepository, err := captureRepositoryGitControl(w.Config.RepositoryDir, "")
+	if err != nil {
+		return Result{}, fmt.Errorf("refuse repair with unsafe controller repository metadata: %w", err)
+	}
+	worktreeWillBeUsed := attempt.Stage != StagePushed && attempt.Stage != StagePROpen ||
+		attempt.Stage == StagePROpen && finding.Status == visualhive.StatusNeedsRevision && finding.MergeSHA == ""
+	if resumed && strings.TrimSpace(attempt.Worktree) != "" {
+		_, locatorErr := os.Lstat(filepath.Join(attempt.Worktree, ".git"))
+		if locatorErr == nil {
+			if _, err := captureRepositoryGitControl(attempt.Worktree, controllerRepository.CommonDir.Path); err != nil {
+				return Result{}, fmt.Errorf("refuse resumed repair with unsafe worktree metadata: %w", err)
+			}
+		} else if !errors.Is(locatorErr, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("refuse resumed repair with unsafe worktree metadata: %w", locatorErr)
+		} else if worktreeWillBeUsed {
+			_, rootErr := os.Lstat(attempt.Worktree)
+			missingRoot := errors.Is(rootErr, os.ErrNotExist)
+			canRecreate := missingRoot && (attempt.Stage == StagePreparing ||
+				(attempt.Stage == StageValidated || attempt.Stage == StageCommitted) && hasPortableRepairBundle(attempt) ||
+				recurrenceChanged && !hasToolSnapshot(attempt) && !attempt.PreparationCleanupPending)
+			if !canRecreate {
+				if rootErr != nil && !missingRoot {
+					return Result{}, fmt.Errorf("refuse resumed repair with unsafe worktree metadata: %w", rootErr)
+				}
+				if _, err := captureRepositoryGitControl(attempt.Worktree, controllerRepository.CommonDir.Path); err != nil {
+					return Result{}, fmt.Errorf("refuse resumed repair with unsafe worktree metadata: %w", err)
+				}
+			}
+		}
+	}
 	if err := sweepOrphanRepairRefs(ctx, w.Config.RepositoryDir, finding.Repository, w.State, time.Now().UTC().Add(-orphanRepairRefGrace)); err != nil {
 		return Result{}, err
 	}
-	attempt, resumed := w.State.Get(finding.RepositoryFingerprint)
 	if err := w.State.sweepUnreferencedPortableRepairBundles(); err != nil {
 		return Result{}, fmt.Errorf("sweep unreferenced portable repair bundles: %w", err)
 	}
 	prCreatedThisRun := false
 	specialistRecoveredThisRun := false
 	discardDirtyBranch := ""
-	recurrenceChanged := resumed && attempt.Recurrence != finding.Recurrences
 	if resumed && hasToolSnapshot(attempt) && (attempt.Stage != StageFailed || recurrenceChanged) {
 		phase := attempt.ToolSnapshotPhase
 		if err := w.restoreToolSnapshot(ctx, &attempt, true); err != nil {
@@ -257,7 +297,7 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 		(finding.Status == visualhive.StatusIssueOpen || finding.Status == visualhive.StatusFixQueued) {
 		startNewAttempt = true
 	}
-	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted || attempt.Stage == StagePushed) {
+	if resumed && !recurrenceChanged && (attempt.Stage == StageValidated || attempt.Stage == StageCommitted || attempt.Stage == StagePushed || attempt.Stage == StagePROpen && !startNewAttempt) {
 		if err := validateResumedSideEffectCheckpoint(finding, attempt); err != nil {
 			return Result{}, err
 		}
@@ -267,21 +307,28 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 			return Result{}, fmt.Errorf("restore portable repair checkpoint: %w", err)
 		}
 	}
-	if resumed && !recurrenceChanged && (attempt.Stage == StagePushed || attempt.Stage == StagePROpen) && hasPortableRepairBundle(attempt) {
-		if err := w.State.retirePortableRepairBundle(&attempt); err != nil {
-			return Result{}, fmt.Errorf("retire pushed portable repair bundle: %w", err)
-		}
-	}
 	if resumed && !recurrenceChanged {
 		switch attempt.Stage {
 		case StageValidated, StageCommitted:
 			if err := w.validateRepairPaths(ctx, attempt.Worktree, attempt.ChangedFiles); err != nil {
 				return Result{}, fmt.Errorf("resume repair checkpoint path validation: %w", err)
 			}
-		case StagePushed, StagePROpen:
-			if err := validateChangedFilesWithBaselineProtection(attempt.ChangedFiles, w.Config.AllowedRepairPaths, w.Config.BaselineProtection); err != nil {
+		case StagePushed:
+			if err := w.validatePushedRepairPaths(ctx, finding, attempt, false); err != nil {
 				return Result{}, fmt.Errorf("resume pushed repair checkpoint path validation: %w", err)
 			}
+		case StagePROpen:
+			if err := w.validatePushedRepairPaths(ctx, finding, attempt, !startNewAttempt); err != nil {
+				return Result{}, fmt.Errorf("resume pushed repair checkpoint path validation: %w", err)
+			}
+		}
+	}
+	// A pushed checkpoint's portable object closure remains the last local
+	// recovery source until its exact remote commit (and, when present, managed
+	// pull request) has been rebound above.
+	if resumed && !recurrenceChanged && (attempt.Stage == StagePushed || attempt.Stage == StagePROpen) && hasPortableRepairBundle(attempt) {
+		if err := w.State.retirePortableRepairBundle(&attempt); err != nil {
+			return Result{}, fmt.Errorf("retire pushed portable repair bundle: %w", err)
 		}
 	}
 	if resumed && !recurrenceChanged && attempt.Stage == StageValidated && attempt.LegacyUnsealedCheckpoint {
@@ -322,6 +369,9 @@ func (w *Worker) Run(ctx context.Context, finding visualhive.FindingLifecycle) (
 	if attempt.Stage == StagePreparing {
 		if err := prepareWorktree(ctx, w.Config.RepositoryDir, attempt.Worktree, attempt.Branch, w.Config.BaseBranch, attempt.DiscardDirtyBranch, w.Config.ExpectedRemoteURL); err != nil {
 			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePreparing, err)
+		}
+		if _, err := captureRepositoryGitControl(attempt.Worktree, controllerRepository.CommonDir.Path); err != nil {
+			return Result{}, checkpointResumableFailure(w.State, &attempt, FailureInfrastructure, StagePreparing, fmt.Errorf("bind prepared repair worktree Git control state: %w", err))
 		}
 		attempt.DiscardDirtyBranch = ""
 		attempt.Stage = StagePrepared
@@ -949,14 +999,38 @@ func validateResumedSideEffectCheckpoint(finding visualhive.FindingLifecycle, at
 	if !attempt.AttemptCounted || finding.RepairAttempts != attempt.Attempt {
 		return fmt.Errorf("resumed repair checkpoint attempt drift: lifecycle=%d checkpoint=%d counted=%t", finding.RepairAttempts, attempt.Attempt, attempt.AttemptCounted)
 	}
-	if finding.Status != visualhive.StatusRepairRunning || strings.TrimSpace(finding.Branch) != strings.TrimSpace(attempt.Branch) {
+	if strings.TrimSpace(finding.Branch) != strings.TrimSpace(attempt.Branch) {
 		return fmt.Errorf("resumed repair checkpoint does not match lifecycle branch/status")
 	}
 	if finding.MergeSHA != "" {
 		return fmt.Errorf("resumed repair checkpoint cannot mutate an already merged lifecycle")
 	}
-	if attempt.PRNumber > 0 && finding.PRNumber != attempt.PRNumber {
-		return fmt.Errorf("resumed repair checkpoint PR drift: lifecycle=%d checkpoint=%d", finding.PRNumber, attempt.PRNumber)
+	if attempt.Stage != StagePROpen {
+		if finding.Status != visualhive.StatusRepairRunning {
+			return fmt.Errorf("resumed repair checkpoint does not match lifecycle branch/status")
+		}
+		if attempt.PRNumber > 0 && finding.PRNumber != attempt.PRNumber {
+			return fmt.Errorf("resumed repair checkpoint PR drift: lifecycle=%d checkpoint=%d", finding.PRNumber, attempt.PRNumber)
+		}
+		return nil
+	}
+
+	if attempt.PRNumber <= 0 || strings.TrimSpace(attempt.PRURL) == "" || !validGitCommitSHA(attempt.CommitSHA) {
+		return fmt.Errorf("resumed open-PR checkpoint lacks exact PR and commit identity")
+	}
+	if finding.Status == visualhive.StatusRepairRunning {
+		if attempt.LifecyclePROpen || finding.PRNumber != 0 || finding.RepairCommitSHA != "" || finding.PRURL != "" {
+			return fmt.Errorf("resumed open-PR checkpoint is inconsistent with its pre-lifecycle checkpoint")
+		}
+		return nil
+	}
+	switch finding.Status {
+	case visualhive.StatusPROpen, visualhive.StatusChecksRunning, visualhive.StatusReady:
+	default:
+		return fmt.Errorf("resumed open-PR checkpoint does not match lifecycle status %s", finding.Status)
+	}
+	if finding.PRNumber != attempt.PRNumber || !strings.EqualFold(finding.RepairCommitSHA, attempt.CommitSHA) || finding.PRURL != attempt.PRURL {
+		return fmt.Errorf("resumed open-PR checkpoint does not match exact lifecycle PR, URL, and head")
 	}
 	return nil
 }
@@ -1072,13 +1146,8 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		return err
 	}
 	baseRefspec := "+refs/heads/" + base + ":refs/remotes/origin/" + base
-	// Repair validation must observe the repository's committed bytes, not the
-	// operator machine's global line-ending preference. In particular, a
-	// Windows core.autocrlf=true setting makes deterministic format checks report
-	// every tracked file as changed even when the model touched only one file.
-	if _, err := runGit(ctx, repositoryDir, "config", "core.autocrlf", "false"); err != nil {
-		return fmt.Errorf("configure deterministic repair line endings: %w", err)
-	}
+	// The controller Git environment forces core.autocrlf=false per child. Do
+	// not persist a setting into the operator's repository configuration.
 	if _, err := os.Stat(filepath.Join(worktree, ".git")); err == nil {
 		if err := normalizeTrackedLineEndings(ctx, worktree); err != nil {
 			return err
@@ -1105,7 +1174,7 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 				return fmt.Errorf("clean failed Hive repair attempt: %w", cleanErr)
 			}
 		}
-		if _, fetchErr := runGit(ctx, repositoryDir, "fetch", "--prune", expectedRemoteURL, baseRefspec); fetchErr != nil {
+		if _, fetchErr := runGitTransport(ctx, repositoryDir, expectedRemoteURL, "fetch", "--prune", expectedRemoteURL, baseRefspec); fetchErr != nil {
 			return fmt.Errorf("fetch repair base: %w", fetchErr)
 		}
 		if _, switchErr := runGit(ctx, worktree, "switch", "-C", branch, "origin/"+base); switchErr != nil {
@@ -1116,7 +1185,7 @@ func prepareWorktree(ctx context.Context, repositoryDir, worktree, branch, base,
 		}
 		return nil
 	}
-	if _, err := runGit(ctx, repositoryDir, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
+	if _, err := runGitTransport(ctx, repositoryDir, expectedRemoteURL, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
 		return fmt.Errorf("fetch repair base: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
@@ -1226,6 +1295,84 @@ func (w *Worker) validateRepairPaths(ctx context.Context, worktree string, files
 	return validateChangedFilesWithBaselineProtection(files, w.Config.AllowedRepairPaths, protection)
 }
 
+func (w *Worker) validatePushedRepairPaths(ctx context.Context, finding visualhive.FindingLifecycle, attempt Attempt, verifyPullRequest bool) error {
+	trusted, err := normalizeBaselineProtection(w.Config.BaselineProtection)
+	if err != nil {
+		return err
+	}
+	if !validGitCommitSHA(attempt.CommitSHA) || !validHiveRepairBranch(attempt.Branch) {
+		return fmt.Errorf("pushed repair checkpoint lacks an exact commit and owned branch")
+	}
+	expectedRemoteURL, err := validateExpectedRemoteURL(ctx, w.Config.RepositoryDir, w.Config.ExpectedRemoteURL)
+	if err != nil {
+		return err
+	}
+	remoteHead, err := remoteRepairBranchHead(ctx, w.Config.RepositoryDir, expectedRemoteURL, attempt.Branch)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(remoteHead, attempt.CommitSHA) {
+		return fmt.Errorf("remote repair branch head %s does not match pushed checkpoint %s", remoteHead, attempt.CommitSHA)
+	}
+
+	exactRef := "refs/hive/resume/baseline/" + strings.ToLower(attempt.CommitSHA)
+	defer func() { _, _ = runGit(context.Background(), w.Config.RepositoryDir, "update-ref", "-d", exactRef) }()
+	if _, err := runGitTransport(ctx, w.Config.RepositoryDir, expectedRemoteURL, "fetch", "--no-tags", "--force", expectedRemoteURL,
+		"refs/heads/"+attempt.Branch+":"+exactRef); err != nil {
+		return fmt.Errorf("fetch exact pushed repair checkpoint: %w", err)
+	}
+	fetched, err := runGit(ctx, w.Config.RepositoryDir, "rev-parse", exactRef+"^{commit}")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(fetched), attempt.CommitSHA) {
+		return fmt.Errorf("fetched repair branch does not match pushed checkpoint %s", attempt.CommitSHA)
+	}
+	if !validGitCommitSHA(attempt.CandidateParent) || !validGitCommitSHA(attempt.CandidateTree) {
+		return fmt.Errorf("pushed repair checkpoint lacks its exact sealed parent and tree")
+	}
+	if err := verifyRepairCommitOwnership(ctx, w.Config.RepositoryDir, attempt.CommitSHA, finding.RepositoryID, "repair"); err != nil {
+		return err
+	}
+	parent, err := runGit(ctx, w.Config.RepositoryDir, "rev-parse", attempt.CommitSHA+"^")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(parent), attempt.CandidateParent) {
+		return fmt.Errorf("pushed repair checkpoint commit has an unexpected parent")
+	}
+	tree, err := runGit(ctx, w.Config.RepositoryDir, "rev-parse", attempt.CommitSHA+"^{tree}")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(tree), attempt.CandidateTree) {
+		return fmt.Errorf("pushed repair checkpoint commit does not contain its sealed tree")
+	}
+	changed, err := runGitBytes(ctx, w.Config.RepositoryDir, maxRepairRefreshDiffBytes,
+		"diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", attempt.CandidateParent, attempt.CommitSHA, "--")
+	if err != nil {
+		return fmt.Errorf("inspect exact pushed repair paths: %w", err)
+	}
+	if !equalStringSets(splitGitPaths(string(changed)), attempt.ChangedFiles) {
+		return fmt.Errorf("pushed repair checkpoint paths do not match its exact remote commit")
+	}
+	protection, err := baselineProtectionForCommit(ctx, w.Config.RepositoryDir, attempt.CommitSHA, trusted)
+	if err != nil {
+		return err
+	}
+	if err := validateChangedFilesWithBaselineProtection(attempt.ChangedFiles, w.Config.AllowedRepairPaths, protection); err != nil {
+		return err
+	}
+	if !verifyPullRequest {
+		return nil
+	}
+	marker := fmt.Sprintf("<!-- hive-repair: %s -->", finding.RepositoryFingerprint)
+	pull, err := w.GitHub.InspectManagedPullRequestExact(ctx, finding.Repository, finding.RepositoryID, attempt.PRNumber,
+		marker, attempt.Branch, attempt.CommitSHA, w.Config.BaseBranch)
+	if err != nil {
+		return fmt.Errorf("rebind exact managed repair pull request: %w", err)
+	}
+	if pull.Number != attempt.PRNumber || pull.URL != attempt.PRURL || pull.State != "open" || pull.Merged ||
+		!strings.EqualFold(pull.HeadSHA, attempt.CommitSHA) || pull.HeadBranch != attempt.Branch || pull.BaseBranch != w.Config.BaseBranch {
+		return fmt.Errorf("managed repair pull request no longer matches its exact open checkpoint")
+	}
+	if !equalStringSets(pull.ChangedFiles, attempt.ChangedFiles) {
+		return fmt.Errorf("managed repair pull request paths do not match the exact pushed checkpoint")
+	}
+	return nil
+}
+
 func validateFindingScope(finding visualhive.FindingLifecycle, files []string) error {
 	if !strings.EqualFold(strings.TrimSpace(finding.IssueKind), "test_adequacy_gap") {
 		return nil
@@ -1314,6 +1461,13 @@ func runRepairCommand(ctx context.Context, worktree string, command Command, tim
 	if strings.TrimSpace(command.Name) == "" {
 		return patchEngineInfrastructureFailure(fmt.Errorf("%s command executable is required", phase))
 	}
+	controlBefore, err := captureRepositoryGitControl(worktree, "")
+	if err != nil {
+		return patchEngineInfrastructureFailure(fmt.Errorf("refuse %s command with unsafe repository Git metadata: %w", phase, err))
+	}
+	if err := rejectExecutableRepositoryGitConfig(ctx, worktree); err != nil {
+		return patchEngineInfrastructureFailure(fmt.Errorf("refuse %s command with unsafe repository Git configuration: %w", phase, err))
+	}
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -1355,6 +1509,24 @@ func runRepairCommand(ctx context.Context, worktree string, command Command, tim
 		} else {
 			err = patchEngineInfrastructureFailure(readErr)
 		}
+	}
+	controlAfter, controlErr := captureRepositoryGitControl(worktree, controlBefore.CommonDir.Path)
+	if controlErr != nil || !sameRepositoryGitControl(controlBefore, controlAfter) {
+		if controlErr == nil {
+			controlErr = unsafeRepositoryGitControlFailure(fmt.Errorf("repository Git metadata or configuration changed during the target command"))
+		}
+		failure := fmt.Errorf("%s command changed repository Git control state: %w", phase, controlErr)
+		if err != nil {
+			failure = fmt.Errorf("%s; command result: %v", failure, err)
+		}
+		return patchEngineInfrastructureFailure(failure)
+	}
+	if configErr := rejectExecutableRepositoryGitConfig(ctx, worktree); configErr != nil {
+		failure := fmt.Errorf("%s command changed repository Git execution configuration: %w", phase, configErr)
+		if err != nil {
+			failure = fmt.Errorf("%s; command result: %v", failure, err)
+		}
+		return patchEngineInfrastructureFailure(failure)
 	}
 	if err != nil {
 		failure := fmt.Errorf("%s %s failed: %w: %s", phase, command.Name, err, safeExcerpt(output.String()))
@@ -1452,7 +1624,7 @@ func remoteRepairBranchHead(ctx context.Context, worktree, expectedRemoteURL, br
 	if !validHiveRepairBranch(branch) {
 		return "", fmt.Errorf("inspect remote repair branch: invalid Hive-owned branch %q", branch)
 	}
-	output, err := runGit(ctx, worktree, "ls-remote", "--heads", expectedRemoteURL, "refs/heads/"+branch)
+	output, err := runGitTransport(ctx, worktree, expectedRemoteURL, "ls-remote", "--heads", expectedRemoteURL, "refs/heads/"+branch)
 	if err != nil {
 		return "", fmt.Errorf("inspect remote repair branch: %w", err)
 	}
@@ -1502,7 +1674,7 @@ func pushRepairBranchExact(ctx context.Context, worktree, expectedRemoteURL, bra
 	if remoteHead != "" {
 		fetchedRef := "refs/hive/ownership/" + strings.ToLower(remoteHead)
 		defer func() { _, _ = runGit(context.Background(), worktree, "update-ref", "-d", fetchedRef) }()
-		if _, err := runGit(ctx, worktree, "fetch", "--no-tags", "--force", expectedRemoteURL, "refs/heads/"+branch+":"+fetchedRef); err != nil {
+		if _, err := runGitTransport(ctx, worktree, expectedRemoteURL, "fetch", "--no-tags", "--force", expectedRemoteURL, "refs/heads/"+branch+":"+fetchedRef); err != nil {
 			return fmt.Errorf("fetch observed remote repair branch %s: %w", branch, err)
 		}
 		fetchedHead, err := runGit(ctx, worktree, "rev-parse", "--verify", fetchedRef)
@@ -1517,7 +1689,7 @@ func pushRepairBranchExact(ctx context.Context, worktree, expectedRemoteURL, bra
 		}
 	}
 	lease := repairForceLease(branch, remoteHead)
-	if _, err := runGit(ctx, worktree, "push", lease, expectedRemoteURL, commitSHA+":refs/heads/"+branch); err != nil {
+	if _, err := runGitTransport(ctx, worktree, expectedRemoteURL, "push", lease, expectedRemoteURL, commitSHA+":refs/heads/"+branch); err != nil {
 		return err
 	}
 	remoteHead, err = remoteRepairBranchHead(ctx, worktree, expectedRemoteURL, branch)
@@ -1534,6 +1706,9 @@ func validateExpectedRemoteURL(ctx context.Context, worktree, expectedRemoteURL 
 	trimmed := strings.TrimSpace(expectedRemoteURL)
 	if trimmed == "" || trimmed != expectedRemoteURL || strings.ContainsAny(expectedRemoteURL, "\r\n") {
 		return "", fmt.Errorf("repair requires one exact expected remote URL")
+	}
+	if err := rejectExecutableRepositoryGitConfig(ctx, worktree); err != nil {
+		return "", err
 	}
 	fetchURLs, err := configuredRemoteURLs(ctx, worktree, false)
 	if err != nil {
@@ -1556,6 +1731,90 @@ func validateExpectedRemoteURL(ctx context.Context, worktree, expectedRemoteURL 
 		return "", fmt.Errorf("configured origin push URL does not match the exact expected remote URL")
 	}
 	return expectedRemoteURL, nil
+}
+
+func rejectExecutableRepositoryGitConfig(ctx context.Context, worktree string) error {
+	controlBefore, err := captureRepositoryGitControl(worktree, "")
+	if err != nil {
+		return err
+	}
+	// Do not follow repository-controlled include paths while auditing them.
+	// The include/includeIf directives themselves remain visible and are
+	// rejected below; opening their targets would add another interception path.
+	output, err := runGitBytes(ctx, worktree, 1<<20, "config", "--show-scope", "--no-includes", "--null", "--name-only", "--list")
+	if err != nil {
+		return unsafeRepositoryGitControlFailure(fmt.Errorf("inspect repository local/worktree Git execution configuration: %w", err))
+	}
+	fields := strings.Split(string(output), "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%2 != 0 {
+		return unsafeRepositoryGitControlFailure(fmt.Errorf("repository Git configuration scope output is malformed"))
+	}
+	for index := 0; index < len(fields); index += 2 {
+		scope := strings.ToLower(strings.TrimSpace(fields[index]))
+		if scope != "local" && scope != "worktree" {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(fields[index+1]))
+		if repositoryGitConfigCanExecuteOrRedirect(key) {
+			return unsafeRepositoryGitControlFailure(fmt.Errorf("repository %s Git configuration contains unsafe directive %s", scope, key))
+		}
+	}
+	controlAfter, err := captureRepositoryGitControl(worktree, controlBefore.CommonDir.Path)
+	if err != nil || !sameRepositoryGitControl(controlBefore, controlAfter) {
+		if err == nil {
+			err = fmt.Errorf("repository Git metadata or configuration changed during inspection")
+		}
+		return unsafeRepositoryGitControlFailure(err)
+	}
+	return nil
+}
+
+func repositoryGitConfigCanExecuteOrRedirect(key string) bool {
+	if key == "include.path" || strings.HasPrefix(key, "includeif.") || key == "core.sshcommand" || key == "core.gitproxy" ||
+		key == "core.attributesfile" || key == "core.worktree" || key == "core.alternaterefscommand" || key == "core.askpass" ||
+		key == "core.hookspath" || key == "core.fsmonitor" || key == "core.editor" || key == "core.pager" || key == "gpg.program" ||
+		key == "uploadpack.packobjectshook" || strings.HasPrefix(key, "credential.") || strings.HasPrefix(key, "alias.") ||
+		httpTransportConfigCanRedirectOrIntercept(key) {
+		return true
+	}
+	for prefix, suffixes := range map[string][]string{
+		"filter.":    {".clean", ".smudge", ".process"},
+		"diff.":      {".command", ".textconv"},
+		"merge.":     {".driver"},
+		"url.":       {".insteadof", ".pushinsteadof"},
+		"remote.":    {".proxy", ".uploadpack", ".receivepack"},
+		"gpg.":       {".program"},
+		"submodule.": {".update"},
+	} {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		for _, suffix := range suffixes {
+			if strings.HasSuffix(key, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func httpTransportConfigCanRedirectOrIntercept(key string) bool {
+	if key == "http.extraheader" || key == "http.proxy" || key == "http.sslverify" || key == "http.sslcainfo" ||
+		key == "http.sslcert" || key == "http.sslkey" || key == "http.followredirects" || key == "http.curloptresolve" {
+		return true
+	}
+	if !strings.HasPrefix(key, "http.") {
+		return false
+	}
+	for _, suffix := range []string{".extraheader", ".proxy", ".sslverify", ".sslcainfo", ".sslcert", ".sslkey", ".followredirects", ".curloptresolve"} {
+		if strings.HasSuffix(key, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func configuredRemoteURLs(ctx context.Context, worktree string, push bool) ([]string, error) {
@@ -1637,14 +1896,33 @@ func repairCommitMessage(title string, issue int, repositoryID string) string {
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitCommand(ctx, dir, "", args...)
+}
+
+func runGitTransport(ctx context.Context, dir, remoteURL string, args ...string) (string, error) {
 	if len(args) > 0 && args[0] == "push" {
 		if err := checkpoint.BeforeMutation(ctx, "repair Git push"); err != nil {
 			return "", err
 		}
 	}
+	return runSanitizedGitTransport(ctx, dir, remoteURL, args...)
+}
+
+func runGitCommand(ctx context.Context, dir, remoteURL string, args ...string) (string, error) {
+	transportCtx := ctx
+	if remoteURL != "" {
+		var err error
+		transportCtx, err = gittransport.RefreshControllerTokenForURL(ctx, remoteURL)
+		if err != nil {
+			return "", fmt.Errorf("refresh controller Git transport credential: %w", err)
+		}
+	}
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = dir
-	command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+	command.Env = gittransport.LocalEnvironment(providerEnvironment())
+	if remoteURL != "" {
+		command.Env = gittransport.TransportEnvironmentForURL(transportCtx, providerEnvironment(), remoteURL)
+	}
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil {

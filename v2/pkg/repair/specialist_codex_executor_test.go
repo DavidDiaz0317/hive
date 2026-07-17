@@ -32,6 +32,24 @@ func TestCodexSpecialistExecutorRequiresOneExplicitModelAndSupportedHost(t *test
 	}
 }
 
+func TestOrdinaryCodexPathNeverSelectsSpecialistExactBoundary(t *testing.T) {
+	// Empty is the public Provider Health/Run signal on every host, including
+	// unsupported specialist hosts such as macOS and BSD. The later temporary
+	// root must not be able to change this decision.
+	for _, goos := range []string{"linux", "windows", "darwin", "freebsd"} {
+		if codexProposalProcessTreeRequested("") {
+			t.Fatalf("ordinary Codex invocation selected specialist process-tree containment on %s", goos)
+		}
+	}
+	if !codexProposalProcessTreeRequested(t.TempDir()) {
+		t.Fatal("explicit Manager-owned specialist root did not select exact process-tree containment")
+	}
+	if !codexSpecialistExactHealthRequired("linux", false) || codexSpecialistExactHealthRequired("darwin", false) ||
+		codexSpecialistExactHealthRequired("freebsd", false) || codexSpecialistExactHealthRequired("linux", true) {
+		t.Fatal("specialist-only nested health selection drifted into ordinary or unsupported-host behavior")
+	}
+}
+
 func TestCodexSpecialistExecutorAuthorizationIsExactAndSingleConsumer(t *testing.T) {
 	authorizationID := "codex-auth-" + strings.Repeat("c", 64)
 	providerSHA := strings.Repeat("a", 64)
@@ -199,5 +217,30 @@ func TestCodexSpecialistConfigurationDigestBindsExecutableAttestationModelAndCap
 		if err != nil || digest == base {
 			t.Fatalf("executor identity component was not digest-bound: value=%v digest=%q err=%v", value, digest, err)
 		}
+	}
+}
+
+func TestCodexSpecialistForceReapIsIdempotentAfterExactWaitProof(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	waits := 0
+	running := &codexRunningProcess{
+		pid: 42, providerSHA256: strings.Repeat("a", 64),
+		wait: func() error {
+			waits++
+			return nil
+		},
+		cancel: cancel, commandContext: ctx,
+		stdout: &codexHardLimitBuffer{limit: codexStdoutHardLimit},
+		stderr: &codexHardLimitBuffer{limit: codexStderrHardLimit},
+	}
+	process := &codexSpecialistChildProcess{process: running, providerSHA256: strings.Repeat("a", 64)}
+	if err := process.ForceReap(context.Background()); err != nil {
+		t.Fatalf("first exact reap proof failed: %v", err)
+	}
+	if err := process.ForceReap(context.Background()); err != nil {
+		t.Fatalf("idempotent exact reap proof failed: %v", err)
+	}
+	if waits != 1 {
+		t.Fatalf("exact process wait ran %d times; want one", waits)
 	}
 }

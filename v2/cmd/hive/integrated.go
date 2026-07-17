@@ -116,7 +116,7 @@ func runIntegratedAuthorizerTransfer(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	result, err := integrated.RunAuthorizerTransfer(ctx, integrated.AuthorizerTransferOptions{
-		StateDir: *stateDir, NewAuthorizer: *newAuthorizer, Reason: *reason, Cancel: *cancelTransfer, GitHub: client,
+		StateDir: *stateDir, NewAuthorizer: *newAuthorizer, Reason: *reason, Cancel: *cancelTransfer, GitHub: client, GitTransportToken: token,
 	})
 	if wasRunning {
 		if _, startErr := ensureIntegratedDaemonStarted(*stateDir, restartInterval); startErr != nil {
@@ -461,7 +461,7 @@ func runIntegratedApproveBaseline(args []string) int {
 	result, err := integrated.ApproveSetupBaseline(ctx, integrated.ApproveSetupBaselineOptions{
 		StateDir: *stateDir, PlanOnly: *planOnly, ExpectedRepositoryID: *repositoryID, ExpectedCaptureRunID: *runID, ExpectedArtifactID: *artifactID,
 		ExpectedPRNumber: *prNumber, ExpectedHeadSHA: *headSHA, ExpectedBaseSHA: *baseSHA, ExpectedDiffDigest: *diffDigest,
-		ExpectedCandidateDigest: *candidateDigest, ExpectedActorID: *actorID, ExpectedPlanDigest: *planDigest, Reason: *reason, GitHub: client,
+		ExpectedCandidateDigest: *candidateDigest, ExpectedActorID: *actorID, ExpectedPlanDigest: *planDigest, Reason: *reason, GitHub: client, GitTransportToken: token,
 	})
 	if err != nil {
 		if *jsonOutput {
@@ -600,7 +600,7 @@ func runIntegratedManagement(command string, args []string) int {
 	result, err := integrated.RunManagement(ctx, integrated.ManagementOptions{
 		Operation: integrated.ManagementOperation(command), StateDir: *stateDir, VisualHiveRef: visualRef,
 		VisualHiveCommand: managementRuntimeCommand, VisualHiveArgs: managementRuntimeArgs,
-		DeleteState: *deleteState, Cancel: *cancelPending, GitHub: client,
+		DeleteState: *deleteState, Cancel: *cancelPending, GitHub: client, GitTransportToken: token,
 	})
 	if err != nil {
 		shouldRestart := shouldRestartManagementScheduler(command, *stateDir)
@@ -698,7 +698,7 @@ func runIntegratedRun(args []string) int {
 	defer cancel()
 	result, err := runClaimedIntegratedOneShot(ctx, *stateDir, *timeout, durable, newIntegratedSpecialistRuntime,
 		func(runCtx context.Context, runStateDir string, runTimeout time.Duration, specialists *integratedSpecialistRuntime) (integrated.RunResult, error) {
-			options := integrated.RunOptions{StateDir: runStateDir, Timeout: runTimeout, GitHub: client}
+			options := integrated.RunOptions{StateDir: runStateDir, Timeout: runTimeout, GitHub: client, GitTransportToken: token}
 			if specialists != nil {
 				options.Specialists = specialists.Manager
 				options.SpecialistWorkDir = specialists.WorkDir
@@ -934,7 +934,7 @@ func runSetupCommand(args []string) int {
 		DirectBootstrap: *directBootstrap, AdoptReviewedBaselines: *adoptReviewedBaselines,
 		ExpectedSeedSHA: *expectedSeedSHA, ReviewedBaselineDigest: *reviewedBaselineDigest,
 		VisualHiveCommand: *visualCommand, VisualHiveArgs: append([]string(nil), visualArgs...),
-		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client,
+		VisualHiveRepo: *visualRepo, VisualHiveRef: *visualRef, GitHub: client, GitTransportToken: token,
 		MaxActiveIssues:        *maxActiveIssues,
 		MaxRepairAttempts:      *maxRepairAttempts,
 		AllowedAutoMergePaths:  append([]string(nil), autoMergePaths...),

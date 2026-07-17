@@ -172,7 +172,7 @@ func ResumeAfterBaselineApproval(ctx context.Context, config BaselineProposalCon
 		return Attempt{}, err
 	}
 	baseRefspec := "+refs/heads/" + config.BaseBranch + ":refs/remotes/origin/" + config.BaseBranch
-	if _, err := runGit(ctx, attempt.Worktree, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
+	if _, err := runGitTransport(ctx, attempt.Worktree, expectedRemoteURL, "fetch", "--prune", expectedRemoteURL, baseRefspec); err != nil {
 		return Attempt{}, fmt.Errorf("fetch approved baseline: %w", err)
 	}
 	mergeMessage := fmt.Sprintf("test(visual): sync approved baselines\n\nHive-Repository-ID: %s\nHive-Operation: repair", strings.TrimSpace(finding.RepositoryID))

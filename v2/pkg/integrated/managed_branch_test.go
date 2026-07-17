@@ -49,7 +49,7 @@ func TestPushManagedBranchRefusesUnownedRemoteBranch(t *testing.T) {
 	runIntegratedGit(t, seed, "push", "origin", branch)
 	runIntegratedGit(t, seed, "fetch", "origin")
 	localSHA := strings.TrimSpace(integratedGitOutput(t, seed, "rev-parse", "HEAD"))
-	err := pushManagedBranch(context.Background(), seed, branch, "123", "setup", localSHA)
+	err := pushManagedBranch(context.Background(), seed, "owner/repo", branch, "123", "setup", localSHA)
 	if err == nil || !strings.Contains(err.Error(), "lacks exact Hive ownership") {
 		t.Fatalf("unowned remote managed-name branch was overwritten: %v", err)
 	}

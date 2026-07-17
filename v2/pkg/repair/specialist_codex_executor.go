@@ -64,6 +64,9 @@ func (executor *CodexSpecialistChildExecutor) Check(ctx context.Context) (agent.
 	if err != nil {
 		return agent.SpecialistChildExecutorIdentity{}, err
 	}
+	if err := verifyCodexSpecialistExactProcessTree(ctx, executor.provider, attestation); err != nil {
+		return agent.SpecialistChildExecutorIdentity{}, fmt.Errorf("Codex specialist exact process-tree health check failed: %w", err)
+	}
 	configurationSHA256, err := codexSpecialistConfigurationDigest(attestation.Command.SHA256, attestation.IdentitySHA256, attestation.ContainmentHelper, model)
 	if err != nil {
 		return agent.SpecialistChildExecutorIdentity{}, err
@@ -137,6 +140,31 @@ func codexSpecialistContainmentHostSupported(goos string) bool {
 	return goos == "linux" || goos == "windows"
 }
 
+func verifyCodexSpecialistExactProcessTree(ctx context.Context, provider CodexProvider, attestation *codexProviderIdentityAttestation) error {
+	if !codexSpecialistExactHealthRequired(runtime.GOOS, codexProviderIsTestExecutable(provider.Command)) {
+		return nil
+	}
+	sealed, err := attestation.sealForRun()
+	if err != nil {
+		return fmt.Errorf("seal exact specialist health executables: %w", err)
+	}
+	defer sealed.cleanupSeal()
+	privateRuntime, err := prepareCodexPrivateRuntime(sealed, provider.Command, "")
+	if err != nil {
+		return fmt.Errorf("prepare exact specialist health runtime: %w", err)
+	}
+	defer privateRuntime.cleanup()
+	securedProvider := sealed.provider()
+	securedProvider.runtimeEnvironment = privateRuntime.environment
+	return verifyCodexPlatformContainmentWithExactProcessTree(
+		ctx, securedProvider.Command, securedProvider.commandEnvironment(), sealed.SealedContainmentHelper,
+	)
+}
+
+func codexSpecialistExactHealthRequired(goos string, testExecutable bool) bool {
+	return goos == "linux" && !testExecutable
+}
+
 func (executor *CodexSpecialistChildExecutor) Start(ctx context.Context, request agent.SpecialistChildExecutionRequest) (agent.SpecialistChildProcess, error) {
 	if executor == nil {
 		return nil, errors.New("Codex specialist executor is nil")
@@ -178,6 +206,27 @@ func (process *codexSpecialistChildProcess) Wait() (agent.SpecialistChildExecuti
 	return agent.SpecialistChildExecutionResult{
 		Response: []byte(result.Output), TurnID: process.turnID, CompletedAt: time.Now().UTC(),
 	}, nil
+}
+
+func (process *codexSpecialistChildProcess) ForceReap(ctx context.Context) error {
+	if process == nil || process.process == nil {
+		return errors.New("Codex specialist child process is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	process.process.cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _ = process.process.WaitProvider()
+		done <- process.process.ReapError()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func explicitCodexProviderModel(arguments []string) (string, error) {

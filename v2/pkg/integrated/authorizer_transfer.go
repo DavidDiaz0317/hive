@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
@@ -61,11 +62,12 @@ type AuthorizerTransferIntent struct {
 }
 
 type AuthorizerTransferOptions struct {
-	StateDir      string
-	NewAuthorizer string
-	Reason        string
-	Cancel        bool
-	GitHub        *hivegithub.Client
+	StateDir          string
+	NewAuthorizer     string
+	Reason            string
+	Cancel            bool
+	GitHub            *hivegithub.Client
+	GitTransportToken string
 }
 
 type AuthorizerTransferResult struct {
@@ -185,6 +187,7 @@ func validSetupAuthorizationContext(value string) bool {
 }
 
 func RunAuthorizerTransfer(ctx context.Context, options AuthorizerTransferOptions) (AuthorizerTransferResult, error) {
+	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	result := AuthorizerTransferResult{SchemaVersion: "hive.setup-authorizer-transfer.v1"}
 	options.StateDir = strings.TrimSpace(options.StateDir)
 	options.NewAuthorizer = strings.TrimSpace(options.NewAuthorizer)
@@ -371,7 +374,7 @@ func resumeAuthorizerTransfer(ctx context.Context, options AuthorizerTransferOpt
 		if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPush); err != nil {
 			return fail(err)
 		}
-		if err := pushManagedBranch(ctx, config.CheckoutDir, intent.Branch, config.RepositoryID, string(OperationAuthorizerTransfer), intent.HeadSHA); err != nil {
+		if err := pushManagedBranch(ctx, config.CheckoutDir, config.Repository, intent.Branch, config.RepositoryID, string(OperationAuthorizerTransfer), intent.HeadSHA); err != nil {
 			return fail(err)
 		}
 		if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPR); err != nil {

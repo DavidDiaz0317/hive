@@ -519,7 +519,7 @@ func runIntegratedDaemonCycle(ctx context.Context, stateDir string, timeout time
 		}
 		return integrated.RunResult{}, fmt.Errorf("readiness check %s failed: %s", check.Name, check.Message)
 	}
-	options := integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client}
+	options := integrated.RunOptions{StateDir: stateDir, Timeout: timeout, GitHub: client, GitTransportToken: token}
 	if specialists != nil {
 		options.Specialists = specialists.Manager
 		options.SpecialistWorkDir = specialists.WorkDir

@@ -44,7 +44,9 @@ func authorizeManagedSetupPullRequest(ctx context.Context, store *Store, client 
 		strings.TrimSpace(live.GetHTMLURL()) == "" || (strings.TrimSpace(pullURL) != "" && live.GetHTMLURL() != strings.TrimSpace(pullURL)) {
 		return result, fmt.Errorf("setup pull request no longer matches its exact same-repository branch/head/base identity")
 	}
-	if _, err := git(ctx, checkout, "fetch", "--no-tags", "origin", config.DefaultBranch); err != nil {
+	remoteURL := RepositoryCloneURL(config.Repository)
+	refspec := "+refs/heads/" + config.DefaultBranch + ":refs/remotes/origin/" + config.DefaultBranch
+	if _, err := gitTransport(ctx, checkout, remoteURL, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
 		return result, fmt.Errorf("fetch exact setup authorization base: %w", err)
 	}
 	fetchedBase, err := git(ctx, checkout, "rev-parse", "origin/"+config.DefaultBranch)

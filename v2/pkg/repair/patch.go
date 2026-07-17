@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 )
 
 type patchEngineInfrastructureError struct{ cause error }
@@ -117,7 +119,7 @@ func applyModelPatch(ctx context.Context, worktree, patchText string) error {
 	} {
 		command := exec.CommandContext(ctx, "git", args...)
 		command.Dir = worktree
-		command.Env = append(providerEnvironment(), "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
+		command.Env = gittransport.LocalEnvironment(providerEnvironment())
 		command.Stdin = strings.NewReader(patchText)
 		var output limitedBuffer
 		command.Stdout, command.Stderr = &output, &output
@@ -315,11 +317,7 @@ func patchGitEnvironment(indexFile string) []string {
 		}
 		filtered = append(filtered, pair)
 	}
-	filtered = append(filtered, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.interactive", "GIT_CONFIG_VALUE_0=false")
-	if indexFile != "" {
-		filtered = append(filtered, "GIT_INDEX_FILE="+indexFile)
-	}
-	return filtered
+	return gittransport.LocalEnvironmentWithOverrides(filtered, map[string]string{"GIT_INDEX_FILE": indexFile})
 }
 
 func splitModelPatchHunks(patchText string) ([]string, error) {

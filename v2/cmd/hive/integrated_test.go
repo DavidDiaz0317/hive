@@ -258,6 +258,7 @@ func TestResolveSetupVisualHiveUsesPackagedManifestPinForPlanAndApply(t *testing
 
 func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T) {
 	const visualRef = "3e8e02bf676d702a658cf2426f78229126175578"
+	const canonicalRemote = "https://github.com/owner/repo.git"
 	t.Setenv("VISUAL_HIVE_REF", "")
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
@@ -313,6 +314,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 		t.Fatal(err)
 	}
 	runSetupPlanTestGit(t, root, "clone", "--origin", "origin", remote, checkout)
+	runSetupPlanTestGit(t, checkout, "remote", "set-url", "origin", canonicalRemote)
 	stateOwner, _ := json.Marshal(map[string]any{"schema_version": "hive.state-owner.v1", "repository": "owner/repo", "repository_id": "123"})
 	if err := os.WriteFile(filepath.Join(stateDir, ".hive-state-owner.json"), append(stateOwner, '\n'), 0o600); err != nil {
 		t.Fatal(err)
@@ -321,6 +323,7 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	if err := os.WriteFile(filepath.Join(checkout, ".git", "hive-checkout-owner.json"), append(checkoutOwner, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	proxyRecord := installSetupPlanGitProxy(t, canonicalRemote, remote)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -341,6 +344,9 @@ func TestSetupPlanCLIResolvesAndEmitsInstalledVisualHiveDependency(t *testing.T)
 	_ = reader.Close()
 	if readErr != nil {
 		t.Fatal(readErr)
+	}
+	if _, err := os.Stat(proxyRecord); err != nil {
+		t.Fatalf("canonical setup transport did not use the local Git fixture: %v", err)
 	}
 	if code != 0 {
 		t.Fatalf("setup --plan exit = %d, output=%s", code, output)
@@ -425,4 +431,91 @@ func runSetupPlanTestGit(t *testing.T, dir string, args ...string) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
 	}
+}
+
+func TestSetupPlanGitProxyProcess(t *testing.T) {
+	if os.Getenv("HIVE_SETUP_PLAN_GIT_PROXY") != "1" {
+		return
+	}
+	separator := -1
+	for index, argument := range os.Args {
+		if argument == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		os.Exit(124)
+	}
+	canonical := os.Getenv("HIVE_SETUP_PLAN_CANONICAL_REMOTE")
+	local := os.Getenv("HIVE_SETUP_PLAN_LOCAL_REMOTE")
+	arguments := append([]string(nil), os.Args[separator+1:]...)
+	rewritten := false
+	for index, argument := range arguments {
+		if argument == canonical {
+			arguments[index] = local
+			rewritten = true
+		}
+	}
+	if rewritten && canonical != local {
+		for index, argument := range arguments {
+			if argument == "protocol.https.allow=always" {
+				arguments[index] = "protocol.file.allow=always"
+			}
+		}
+	}
+	if rewritten {
+		if err := os.WriteFile(os.Getenv("HIVE_SETUP_PLAN_GIT_PROXY_RECORD"), []byte("local\n"), 0o600); err != nil {
+			os.Exit(123)
+		}
+	}
+	command := exec.Command(os.Getenv("HIVE_SETUP_PLAN_REAL_GIT"), arguments...)
+	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := command.Run(); err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			os.Exit(exit.ExitCode())
+		}
+		os.Exit(127)
+	}
+	os.Exit(0)
+}
+
+func installSetupPlanGitProxy(t *testing.T, canonicalRemote, localRemote string) string {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	name := "git"
+	var script string
+	if runtime.GOOS == "windows" {
+		name += ".cmd"
+		script = fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestSetupPlanGitProxyProcess -- %%*\r\n", executable)
+	} else {
+		script = fmt.Sprintf("#!/bin/sh\nexec %s -test.run=TestSetupPlanGitProxyProcess -- \"$@\"\n", setupPlanShellQuote(executable))
+	}
+	proxy := filepath.Join(bin, name)
+	if err := os.WriteFile(proxy, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(proxy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(t.TempDir(), "canonical-transport-used")
+	t.Setenv("HIVE_SETUP_PLAN_GIT_PROXY", "1")
+	t.Setenv("HIVE_SETUP_PLAN_REAL_GIT", realGit)
+	t.Setenv("HIVE_SETUP_PLAN_CANONICAL_REMOTE", canonicalRemote)
+	t.Setenv("HIVE_SETUP_PLAN_LOCAL_REMOTE", localRemote)
+	t.Setenv("HIVE_SETUP_PLAN_GIT_PROXY_RECORD", record)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return record
+}
+
+func setupPlanShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

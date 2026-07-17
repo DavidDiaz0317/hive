@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -267,20 +266,13 @@ func runHostedCycleCommand(args []string) int {
 	}
 	operationCtx := checkpoint.WithCallback(ctx, manager.Callback)
 	var operationErr error
-	if *operation == "cycle" {
-		removeGitCredential, credentialErr := installHostedGitTransportCredential(operationCtx, *targetCheckout, os.Getenv("HIVE_GITHUB_TOKEN"))
-		if credentialErr != nil {
-			return fail(credentialErr)
-		}
-		defer removeGitCredential()
-	}
 	switch *operation {
 	case "cycle":
 		if config.Paused && *operation == "cycle" {
 			result.Paused, result.Skipped = true, true
 			break
 		}
-		run, runErr := integrated.RunOnce(operationCtx, integrated.RunOptions{StateDir: runtimeRoot, Timeout: 50 * time.Minute, GitHub: hostedGitHubClient()})
+		run, runErr := integrated.RunOnce(operationCtx, integrated.RunOptions{StateDir: runtimeRoot, Timeout: 50 * time.Minute, GitHub: hostedGitHubClient(), GitTransportToken: os.Getenv("HIVE_GITHUB_TOKEN")})
 		result.Run, operationErr = &run, runErr
 	case "pause", "resume":
 		updated, pauseErr := integrated.SetPaused(operationCtx, runtimeRoot, *operation == "pause")
@@ -485,34 +477,6 @@ func validateHostedPolicyContext(config integrated.Config) error {
 
 func hostedGitHubClient() *hivegithub.Client {
 	return hivegithub.NewClient(os.Getenv("HIVE_GITHUB_TOKEN"), "", nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
-}
-
-// installHostedGitTransportCredential gives only Hive's ephemeral target Git
-// common directory an authenticated transport header. It does not affect the
-// separately checked-out state branch, and target code is never executed.
-func installHostedGitTransportCredential(ctx context.Context, checkout, token string) (func(), error) {
-	token = strings.TrimSpace(token)
-	checkout = strings.TrimSpace(checkout)
-	if token == "" || checkout == "" {
-		return nil, errors.New("hosted Git transport token is missing")
-	}
-	const key = "http.https://github.com/.extraheader"
-	query := exec.CommandContext(ctx, "git", "-C", checkout, "config", "--local", "--get-all", key)
-	if output, err := query.Output(); err == nil || len(output) != 0 {
-		return nil, errors.New("hosted target checkout already contains a Git transport credential")
-	} else if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
-		return nil, errors.New("inspect hosted target Git transport")
-	}
-	header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
-	install := exec.CommandContext(ctx, "git", "-C", checkout, "config", "--local", "--add", key, header)
-	if err := install.Run(); err != nil {
-		return nil, errors.New("configure ephemeral hosted Git transport")
-	}
-	return func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = exec.CommandContext(cleanupCtx, "git", "-C", checkout, "config", "--local", "--unset-all", key).Run()
-	}, nil
 }
 
 func beginHostedRequest(root, id, operation string, runID, runAttempt uint64, now time.Time) (hostedRequestPreparation, error) {

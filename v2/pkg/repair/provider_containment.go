@@ -27,6 +27,15 @@ func verifyCodexPlatformContainment(ctx context.Context, codexCommand string) er
 }
 
 func verifyCodexPlatformContainmentWithEnvironment(ctx context.Context, codexCommand string, environment []string) error {
+	return verifyCodexPlatformContainmentWithExactProcessTree(ctx, codexCommand, environment, codexProviderFileIdentity{})
+}
+
+// verifyCodexPlatformContainmentWithExactProcessTree exercises Codex's real
+// inner sandbox underneath the same sealed outer process-tree boundary used by
+// governed proposal children. This is a no-model health check: a host whose
+// user/PID namespace or AppArmor policy rejects nested Bubblewrap fails before
+// a specialist authorization can be issued.
+func verifyCodexPlatformContainmentWithExactProcessTree(ctx context.Context, codexCommand string, environment []string, helper codexProviderFileIdentity) error {
 	root, err := os.MkdirTemp("", "hive-codex-containment-")
 	if err != nil {
 		return fmt.Errorf("create Codex containment probe root: %w", err)
@@ -72,13 +81,13 @@ func verifyCodexPlatformContainmentWithEnvironment(ctx context.Context, codexCom
 		return err
 	}
 
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "read", readPath, "", containmentProbeReadBlocked, environment); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "read", readPath, "", containmentProbeReadBlocked, environment, helper); err != nil {
 		return err
 	}
 	if actual, err := os.ReadFile(readPath); err != nil || string(actual) != string(readValue) {
 		return fmt.Errorf("Codex containment read probe changed or removed its sentinel")
 	}
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "write", writePath, "", containmentProbeWriteBlocked, environment); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "write", writePath, "", containmentProbeWriteBlocked, environment, helper); err != nil {
 		return err
 	}
 	if actual, err := os.ReadFile(writePath); err != nil || string(actual) != string(writeValue) {
@@ -90,7 +99,7 @@ func verifyCodexPlatformContainmentWithEnvironment(ctx context.Context, codexCom
 		return fmt.Errorf("create Codex containment loopback listener: %w", err)
 	}
 	defer listener.Close()
-	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "network", "", listener.Addr().String(), containmentProbeNetworkBlocked, environment); err != nil {
+	if err := runCodexContainmentProbe(ctx, codexCommand, binRoot, probePath, "network", "", listener.Addr().String(), containmentProbeNetworkBlocked, environment, helper); err != nil {
 		return err
 	}
 	if tcp, ok := listener.(*net.TCPListener); ok {
@@ -104,7 +113,7 @@ func verifyCodexPlatformContainmentWithEnvironment(ctx context.Context, codexCom
 	return nil
 }
 
-func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath, mode, target, address, expectedMarker string, environment []string) error {
+func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath, mode, target, address, expectedMarker string, environment []string, helper codexProviderFileIdentity) error {
 	args := []string{"sandbox", "-C", cwd}
 	args = append(args, codexNoFilesPermissionArgs()...)
 	args = append(args,
@@ -123,7 +132,17 @@ func runCodexContainmentProbe(ctx context.Context, codexCommand, cwd, probePath,
 	command.Env = containmentProbeEnvironment(mode, target, address, cwd, environment)
 	var stdout, stderr limitedBuffer
 	command.Stdout, command.Stderr = &stdout, &stderr
-	err := command.Run()
+	var err error
+	if helper.Path != "" {
+		wait, startErr := startExactRepairProcessTree(ctx, command, helper)
+		if startErr != nil {
+			err = startErr
+		} else {
+			err = wait()
+		}
+	} else {
+		err = command.Run()
+	}
 	output := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
 	if strings.Contains(output, "HIVE_CONTAINMENT_") && !strings.Contains(output, expectedMarker) {
 		return fmt.Errorf("Codex %s containment probe reported an access violation", mode)

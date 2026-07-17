@@ -75,6 +75,92 @@ type fakeSpecialistChildProcess struct {
 	turnID   string
 }
 
+type hungForceReapSpecialistProcess struct {
+	release chan struct{}
+	once    sync.Once
+	forced  atomic.Bool
+}
+
+type failedReapSpecialistProcess struct {
+	err    error
+	forced *atomic.Bool
+}
+
+func (process failedReapSpecialistProcess) PID() int { return 9402 }
+func (process failedReapSpecialistProcess) ProviderSHA256() string {
+	return strings.Repeat("b", 64)
+}
+func (process failedReapSpecialistProcess) Wait() (SpecialistChildExecutionResult, error) {
+	return SpecialistChildExecutionResult{}, errors.New("provider failed")
+}
+func (process failedReapSpecialistProcess) ForceReap(context.Context) error {
+	if process.forced != nil {
+		process.forced.Store(true)
+	}
+	return process.err
+}
+
+func (process *hungForceReapSpecialistProcess) PID() int { return 9401 }
+func (process *hungForceReapSpecialistProcess) ProviderSHA256() string {
+	return strings.Repeat("a", 64)
+}
+
+func TestSpecialistChildShutdownAttemptsEveryExactReapAfterFailure(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	firstForced, secondForced := &atomic.Bool{}, &atomic.Bool{}
+	firstErr := errors.New("first containment failure")
+	children := map[SpecialistRole]*specialistChildSession{
+		SpecialistQuality: {
+			taskID: "swo-" + strings.Repeat("c", 64), role: SpecialistQuality, launched: true, done: done, cancel: func() {},
+			process: failedReapSpecialistProcess{err: firstErr, forced: firstForced},
+		},
+		SpecialistCIMaintainer: {
+			taskID: "swo-" + strings.Repeat("d", 64), role: SpecialistCIMaintainer, launched: true, done: done, cancel: func() {},
+			process: failedReapSpecialistProcess{forced: secondForced},
+		},
+	}
+	err := (&Manager{specialistChildren: children}).ShutdownSpecialistChildren(context.Background())
+	if !errors.Is(err, firstErr) || !firstForced.Load() || !secondForced.Load() {
+		t.Fatalf("shutdown did not attempt every exact child reap: err=%v first=%t second=%t", err, firstForced.Load(), secondForced.Load())
+	}
+}
+
+func TestSpecialistChildShutdownCoversProcessThatAppearsDuringLaunch(t *testing.T) {
+	process := &hungForceReapSpecialistProcess{release: make(chan struct{})}
+	child := &specialistChildSession{
+		taskID: "swo-" + strings.Repeat("e", 64), role: SpecialistQuality,
+		launchDone: make(chan struct{}), cancel: func() {}, done: make(chan struct{}),
+	}
+	manager := &Manager{specialistChildren: map[SpecialistRole]*specialistChildSession{SpecialistQuality: child}}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		child.mu.Lock()
+		child.launched, child.process = true, process
+		child.mu.Unlock()
+		child.launchOnce.Do(func() { close(child.launchDone) })
+		_, _ = process.Wait()
+		child.doneOnce.Do(func() { close(child.done) })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := manager.ShutdownSpecialistChildren(ctx); err != nil {
+		t.Fatalf("shutdown missed process appearing during Start: %v", err)
+	}
+	if !process.forced.Load() {
+		t.Fatal("shutdown did not force-reap process that appeared during Start")
+	}
+}
+func (process *hungForceReapSpecialistProcess) Wait() (SpecialistChildExecutionResult, error) {
+	<-process.release
+	return SpecialistChildExecutionResult{}, context.Canceled
+}
+func (process *hungForceReapSpecialistProcess) ForceReap(context.Context) error {
+	process.forced.Store(true)
+	process.once.Do(func() { close(process.release) })
+	return nil
+}
+
 func newFakeSpecialistChildProcess(pid int, provider string) *fakeSpecialistChildProcess {
 	return &fakeSpecialistChildProcess{pid: pid, provider: provider, done: make(chan fakeSpecialistChildCompletion, 1)}
 }
@@ -102,6 +188,56 @@ func (process *fakeSpecialistChildProcess) completeWithTurn(response, turnID str
 
 func (process *fakeSpecialistChildProcess) fail(err error) {
 	process.done <- fakeSpecialistChildCompletion{err: err}
+}
+
+func (process *fakeSpecialistChildProcess) ForceReap(context.Context) error {
+	if process.ctx == nil {
+		return errors.New("fake specialist child has no launch context")
+	}
+	<-process.ctx.Done()
+	return nil
+}
+
+func TestSpecialistChildShutdownForceReapsHungExactChildBeforeSuccess(t *testing.T) {
+	process := &hungForceReapSpecialistProcess{release: make(chan struct{})}
+	child := &specialistChildSession{
+		taskID: "swo-" + strings.Repeat("a", 64), role: SpecialistQuality,
+		process: process, launched: true, cancel: func() {}, done: make(chan struct{}),
+	}
+	manager := &Manager{specialistChildren: map[SpecialistRole]*specialistChildSession{SpecialistQuality: child}}
+	go func() {
+		_, _ = process.Wait()
+		child.doneOnce.Do(func() { close(child.done) })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := manager.ShutdownSpecialistChildren(ctx); err != nil {
+		t.Fatalf("force-reap shutdown failed: %v", err)
+	}
+	if !process.forced.Load() {
+		t.Fatal("shutdown did not force-reap the hung exact specialist child")
+	}
+	select {
+	case <-child.done:
+	default:
+		t.Fatal("shutdown returned before hung specialist child completion was verified")
+	}
+}
+
+func TestSpecialistChildShutdownDoesNotTreatClosedDoneAsReapProof(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	containmentErr := errors.New("process-tree containment was not proved")
+	child := &specialistChildSession{
+		taskID: "swo-" + strings.Repeat("b", 64), role: SpecialistQuality,
+		process: failedReapSpecialistProcess{err: containmentErr}, launched: true,
+		cancel: func() {}, done: done,
+	}
+	manager := &Manager{specialistChildren: map[SpecialistRole]*specialistChildSession{SpecialistQuality: child}}
+	err := manager.ShutdownSpecialistChildren(context.Background())
+	if !errors.Is(err, containmentErr) {
+		t.Fatalf("shutdown released ownership without exact reap proof: %v", err)
+	}
 }
 
 func testSpecialistChildIdentity(backend string) SpecialistChildExecutorIdentity {

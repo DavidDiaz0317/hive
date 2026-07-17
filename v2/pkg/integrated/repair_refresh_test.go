@@ -343,18 +343,14 @@ func setupIntegratedRefreshRepository(t *testing.T) (remote, worktree, oldHead, 
 	writeRefreshRepoFile(t, worktree, "visual-hive.config.yaml", "project: {}\n")
 	commitRefreshRepo(t, worktree, "fix: visual config\n\nHive-Repository-ID: 123\nHive-Operation: repair")
 	oldHead = refreshRepoOutput(t, worktree, "rev-parse", "HEAD")
-	if _, err := git(ctx, worktree, "push", "origin", oldHead+":refs/heads/hive/repair-finding-a10"); err != nil {
-		t.Fatal(err)
-	}
+	runIntegratedGit(t, worktree, "push", "origin", oldHead+":refs/heads/hive/repair-finding-a10")
 	if _, err := git(ctx, worktree, "checkout", "main"); err != nil {
 		t.Fatal(err)
 	}
 	writeRefreshRepoFile(t, worktree, "base.txt", "advanced\n")
 	commitRefreshRepo(t, worktree, "advance base")
 	baseSHA = refreshRepoOutput(t, worktree, "rev-parse", "HEAD")
-	if _, err := git(ctx, worktree, "push", "origin", baseSHA+":refs/heads/main"); err != nil {
-		t.Fatal(err)
-	}
+	runIntegratedGit(t, worktree, "push", "origin", baseSHA+":refs/heads/main")
 	if _, err := git(ctx, worktree, "checkout", "hive/repair-finding-a10"); err != nil {
 		t.Fatal(err)
 	}

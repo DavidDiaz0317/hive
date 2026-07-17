@@ -387,9 +387,9 @@ func inspectDirectBootstrapRecoveryTarget(ctx context.Context, client *hivegithu
 	if err := validateDirectBootstrapRemoteBinding(ctx, config.CheckoutDir, config.Repository, config.DefaultBranch); err != nil {
 		return "", err
 	}
-	remoteURL := strings.TrimSpace(setupRepositoryCloneURL(config.Repository))
+	remoteURL := RepositoryCloneURL(config.Repository)
 	refspec := "+refs/heads/" + config.DefaultBranch + ":refs/remotes/origin/" + config.DefaultBranch
-	if _, err := git(ctx, config.CheckoutDir, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+	if _, err := gitTransport(ctx, config.CheckoutDir, remoteURL, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
 		return "", fmt.Errorf("refresh direct-bootstrap recovery head: %w", err)
 	}
 	remoteHead, err := git(ctx, config.CheckoutDir, "rev-parse", "--verify", "refs/remotes/origin/"+config.DefaultBranch)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,27 +54,8 @@ func TestValidateHostedTargetCheckoutRequiresExactWorkflowSHA(t *testing.T) {
 	if err := validateHostedTargetCheckout(ctx, repository, strings.Repeat("f", 40)); err == nil {
 		t.Fatal("mismatched hosted target SHA was accepted")
 	}
-}
-
-func TestInstallHostedGitTransportCredentialIsEphemeralAndCheckoutLocal(t *testing.T) {
-	repository := filepath.Join(t.TempDir(), "repository")
-	if output, err := exec.Command("git", "init", repository).CombinedOutput(); err != nil {
-		t.Fatalf("git init: %v: %s", err, output)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	restore, err := installHostedGitTransportCredential(ctx, repository, "secret-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	value, err := exec.Command("git", "-C", repository, "config", "--local", "--get", "http.https://github.com/.extraheader").Output()
-	want := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:secret-token"))
-	if err != nil || strings.TrimSpace(string(value)) != want {
-		t.Fatal("hosted Git transport header is incorrect")
-	}
-	restore()
 	if _, err := exec.Command("git", "-C", repository, "config", "--local", "--get", "http.https://github.com/.extraheader").Output(); err == nil {
-		t.Fatal("hosted Git transport leaked its credential after cleanup")
+		t.Fatal("hosted target validation persisted a transport credential in the checkout")
 	}
 }
 

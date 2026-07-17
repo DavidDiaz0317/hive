@@ -14,6 +14,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/agent"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/beads"
@@ -27,6 +28,7 @@ type RunOptions struct {
 	StateDir          string
 	Timeout           time.Duration
 	GitHub            *hivegithub.Client
+	GitTransportToken string
 	Specialists       repair.SpecialistDispatcher
 	SpecialistWorkDir string
 }
@@ -81,6 +83,7 @@ func (e *staleWorkflowHeadError) Error() string {
 }
 
 func RunOnce(ctx context.Context, options RunOptions) (RunResult, error) {
+	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	result := RunResult{SchemaVersion: "hive.production-run.v1", StartedAt: time.Now().UTC()}
 	if options.GitHub == nil || options.StateDir == "" {
 		return result, fmt.Errorf("GitHub client and persistent state directory are required")
@@ -995,7 +998,7 @@ func approvedMergedBaselineProposal(gate hivegithub.PullRequestGate) bool {
 func baselineProposalConfig(config Config, stateDir string) repair.BaselineProposalConfig {
 	return repair.BaselineProposalConfig{
 		RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(stateDir, "repair", "baseline-worktrees"), BaseBranch: config.DefaultBranch,
-		ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
+		ExpectedRemoteURL:  RepositoryCloneURL(config.Repository),
 		ValidationCommands: []repair.Command{{Name: "git", Args: []string{"diff", "--check"}}}, CommandTimeout: 15 * time.Minute,
 	}
 }
@@ -1885,7 +1888,7 @@ func runEligibleRepairs(ctx context.Context, config Config, lifecycle *visualhiv
 		worker := repair.Worker{
 			Config: repair.Config{
 				RepositoryDir: config.CheckoutDir, WorktreeRoot: filepath.Join(config.StateDir, "repair", "worktrees"), BaseBranch: config.DefaultBranch,
-				ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
+				ExpectedRemoteURL:  RepositoryCloneURL(config.Repository),
 				BaselineProtection: baselineProtection,
 				Agent:              repairAgent, Policy: policy, AllowedRepairPaths: allowedPaths, ValidationCommands: commands,
 				EvidenceSummary: evidenceSummary, AttemptStartedAt: attemptStartedAt,

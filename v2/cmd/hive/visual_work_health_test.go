@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"runtime"
 	"strings"
@@ -16,7 +19,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/visualhive/normalservice"
 )
 
-func TestNormalVisualServiceLeaseWithoutHealthIsNotReady(t *testing.T) {
+func TestNormalVisualServiceLeaseWithoutDashboardHTTPProofIsNotReady(t *testing.T) {
 	stateDir := t.TempDir()
 	lease, err := claimNormalVisualDaemonLease(stateDir)
 	if err != nil {
@@ -25,14 +28,14 @@ func TestNormalVisualServiceLeaseWithoutHealthIsNotReady(t *testing.T) {
 	defer releaseDaemonLease(lease)
 
 	status := inspectNormalVisualServiceHealth(stateDir, "owner/repo", time.Minute, time.Now().UTC())
-	if !status.DashboardReady || status.ServiceReady || status.HealthExists {
+	if status.DashboardReady || status.ServiceReady || status.HealthExists {
 		t.Fatalf("lease-only readiness = %+v", status)
 	}
-	if !strings.Contains(status.Message, "has not initialized") {
+	if !strings.Contains(status.Message, "has not proven HTTP readiness") {
 		t.Fatalf("lease-only message = %q", status.Message)
 	}
 	checks := normalVisualServiceDoctorChecks(status)
-	if len(checks) != 2 || checks[0].Name != "normal_hive_dashboard" || !checks[0].OK || checks[1].Name != "normal_visual_service" || checks[1].OK {
+	if len(checks) != 2 || checks[0].Name != "normal_hive_dashboard" || checks[0].OK || checks[1].Name != "normal_visual_service" || checks[1].OK {
 		t.Fatalf("lease-only doctor checks = %+v", checks)
 	}
 }
@@ -293,6 +296,15 @@ func TestNormalVisualServiceOwnerIntentAndStaleOwnerRecoveryStayOnOrdinaryHive(t
 
 func testNormalVisualHealthReporter(t *testing.T, stateDir, repository string, poll time.Duration) *normalVisualServiceHealthReporter {
 	t.Helper()
+	readyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	t.Cleanup(readyServer.Close)
+	listenerPort := readyServer.Listener.Addr().(*net.TCPAddr).Port
+	if _, err := writeNormalVisualDashboardReady(stateDir, repository, listenerPort, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 	reporter, err := newNormalVisualServiceHealthReporter(stateDir, repository, poll, 30*time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

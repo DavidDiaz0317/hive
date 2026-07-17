@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 )
 
 const normalVisualServiceHealthSchema = "hive.normal-visual-service-health.v1"
+const normalVisualDashboardReadySchema = "hive.normal-visual-dashboard-ready.v1"
 
 const (
 	normalVisualServiceDefaultPoll = 5 * time.Minute
@@ -28,7 +30,23 @@ const (
 	normalVisualServiceClockSkew   = 30 * time.Second
 	normalVisualServiceMaxCycleCap = 4 * time.Hour
 	maxNormalVisualHealthBytes     = 64 << 10
+	maxNormalVisualDashboardBytes  = 16 << 10
 )
+
+// normalVisualDashboardReady is an observation bound to the existing ordinary
+// Hive ownership generation. It is written only after the dashboard socket has
+// bound and served an HTTP request, and removed when that listener stops.
+type normalVisualDashboardReady struct {
+	SchemaVersion         string    `json:"schema_version"`
+	Generation            string    `json:"generation"`
+	PID                   int       `json:"pid"`
+	LeaseAcquiredAt       time.Time `json:"lease_acquired_at"`
+	StateDir              string    `json:"state_dir"`
+	Repository            string    `json:"repository"`
+	LeaseExecutableSHA256 string    `json:"lease_executable_sha256"`
+	ListenerPort          int       `json:"listener_port"`
+	ReadyAt               time.Time `json:"ready_at"`
+}
 
 // normalVisualServiceHealth is a liveness record, not an ownership record.
 // The OS-locked daemon.lease remains the sole ownership proof. This record is
@@ -245,8 +263,116 @@ func normalVisualServiceHealthPath(stateDir string) string {
 	return filepath.Join(stateDir, "visual-hive", "normal-service", "health.json")
 }
 
+func normalVisualDashboardReadyPath(stateDir string) string {
+	return filepath.Join(stateDir, "visual-hive", "normal-service", "dashboard-ready.json")
+}
+
+func writeNormalVisualDashboardReady(stateDir, repository string, listenerPort int, now time.Time) (normalVisualDashboardReady, error) {
+	owner, live := readNormalVisualDaemonLease(stateDir)
+	if !live {
+		return normalVisualDashboardReady{}, errors.New("ordinary Hive ownership lease is not live")
+	}
+	root, err := filepath.Abs(strings.TrimSpace(stateDir))
+	if err != nil {
+		return normalVisualDashboardReady{}, err
+	}
+	repository = strings.TrimSpace(repository)
+	if repository == "" || listenerPort <= 0 || listenerPort > 65535 || now.IsZero() {
+		return normalVisualDashboardReady{}, errors.New("dashboard readiness requires repository, listener, and timestamp bindings")
+	}
+	marker := normalVisualDashboardReady{
+		SchemaVersion: normalVisualDashboardReadySchema, Generation: normalVisualServiceGeneration(owner, root, repository),
+		PID: owner.PID, LeaseAcquiredAt: owner.AcquiredAt.UTC(), StateDir: root, Repository: repository,
+		LeaseExecutableSHA256: strings.ToLower(strings.TrimSpace(owner.ExecutableSHA256)), ListenerPort: listenerPort, ReadyAt: now.UTC(),
+	}
+	if err := writeNormalVisualOwnerJSON(normalVisualDashboardReadyPath(root), ".dashboard-ready-*.tmp", marker); err != nil {
+		return normalVisualDashboardReady{}, err
+	}
+	return marker, nil
+}
+
+func removeNormalVisualDashboardReady(stateDir, generation string) error {
+	marker, exists, err := readNormalVisualDashboardReady(stateDir)
+	if err != nil || !exists {
+		return err
+	}
+	if strings.TrimSpace(generation) == "" || marker.Generation != generation {
+		return nil
+	}
+	err = os.Remove(normalVisualDashboardReadyPath(stateDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func readNormalVisualDashboardReady(stateDir string) (normalVisualDashboardReady, bool, error) {
+	path := normalVisualDashboardReadyPath(stateDir)
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return normalVisualDashboardReady{}, false, nil
+	}
+	if err != nil {
+		return normalVisualDashboardReady{}, false, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxNormalVisualDashboardBytes+1))
+	if err != nil {
+		return normalVisualDashboardReady{}, false, err
+	}
+	if len(data) > maxNormalVisualDashboardBytes {
+		return normalVisualDashboardReady{}, false, errors.New("normal dashboard readiness exceeds its size bound")
+	}
+	var marker normalVisualDashboardReady
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return normalVisualDashboardReady{}, false, err
+	}
+	return marker, true, nil
+}
+
+func validNormalVisualDashboardReady(marker normalVisualDashboardReady, owner normalVisualDaemonLease, stateDir, repository string) bool {
+	root, err := filepath.Abs(strings.TrimSpace(stateDir))
+	if err != nil {
+		return false
+	}
+	return marker.SchemaVersion == normalVisualDashboardReadySchema && marker.Generation == normalVisualServiceGeneration(owner, owner.StateDir, repository) &&
+		marker.PID == owner.PID && marker.LeaseAcquiredAt.Equal(owner.AcquiredAt) && sameSpecialistRuntimePath(marker.StateDir, root) &&
+		strings.EqualFold(strings.TrimSpace(marker.Repository), strings.TrimSpace(repository)) &&
+		strings.EqualFold(strings.TrimSpace(marker.LeaseExecutableSHA256), strings.TrimSpace(owner.ExecutableSHA256)) &&
+		marker.ListenerPort > 0 && marker.ListenerPort <= 65535 && !marker.ReadyAt.IsZero()
+}
+
+func probeNormalVisualDashboardHTTP(listenerPort int) bool {
+	if listenerPort <= 0 || listenerPort > 65535 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/health", listenerPort), nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+	defer client.CloseIdleConnections()
+	response, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false
+	}
+	var payload struct {
+		Status string `json:"status"`
+	}
+	return json.NewDecoder(io.LimitReader(response.Body, 4<<10)).Decode(&payload) == nil && payload.Status == "ok"
+}
+
 func writeNormalVisualServiceHealth(stateDir string, health normalVisualServiceHealth) error {
-	path := normalVisualServiceHealthPath(stateDir)
+	return writeNormalVisualOwnerJSON(normalVisualServiceHealthPath(stateDir), ".health-*.tmp", health)
+}
+
+func writeNormalVisualOwnerJSON(path, temporaryPattern string, value interface{}) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
@@ -254,11 +380,11 @@ func writeNormalVisualServiceHealth(stateDir string, health normalVisualServiceH
 	if err := os.Chmod(directory, 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(health, "", "  ")
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(directory, ".health-*.tmp")
+	temporary, err := os.CreateTemp(directory, temporaryPattern)
 	if err != nil {
 		return err
 	}
@@ -311,11 +437,29 @@ func readNormalVisualServiceHealth(stateDir string) (normalVisualServiceHealth, 
 
 func inspectNormalVisualServiceHealth(stateDir, repository string, poll time.Duration, now time.Time) normalVisualServiceHealthAssessment {
 	owner, recordPresent, live := normalVisualDaemonObserved(stateDir)
-	assessment := normalVisualServiceHealthAssessment{OwnerRecordPresent: recordPresent, DashboardReady: live, Owner: owner}
+	assessment := normalVisualServiceHealthAssessment{OwnerRecordPresent: recordPresent, Owner: owner}
 	if !live {
 		assessment.Message = "ordinary Hive/dashboard is not live; restart the ordinary Hive/dashboard process (do not run hive start)"
 		return assessment
 	}
+	dashboardReady, dashboardExists, dashboardErr := readNormalVisualDashboardReady(stateDir)
+	if dashboardErr != nil {
+		assessment.Message = "ordinary Hive dashboard listener readiness is unreadable; restart the ordinary Hive/dashboard process"
+		return assessment
+	}
+	if !dashboardExists {
+		assessment.Message = "ordinary Hive dashboard listener has not proven HTTP readiness; restart the ordinary Hive/dashboard process"
+		return assessment
+	}
+	if !validNormalVisualDashboardReady(dashboardReady, owner, stateDir, repository) {
+		assessment.Message = "ordinary Hive dashboard listener readiness does not match the live owner generation; restart the ordinary Hive/dashboard process"
+		return assessment
+	}
+	if !probeNormalVisualDashboardHTTP(dashboardReady.ListenerPort) {
+		assessment.Message = "ordinary Hive dashboard listener failed its live HTTP readiness probe; restart the ordinary Hive/dashboard process"
+		return assessment
+	}
+	assessment.DashboardReady = true
 	health, exists, err := readNormalVisualServiceHealth(stateDir)
 	assessment.Health, assessment.HealthExists = health, exists
 	if err != nil {
@@ -396,9 +540,9 @@ func inspectNormalVisualServiceHealth(stateDir, repository string, poll time.Dur
 func normalVisualServiceDoctorChecks(assessment normalVisualServiceHealthAssessment) []doctorCheck {
 	dashboardMessage := "ordinary Hive/dashboard owns this repository runtime"
 	if assessment.DashboardReady {
-		dashboardMessage = fmt.Sprintf("ordinary Hive/dashboard ownership is live in pid %d; legacy scheduler is intentionally inactive", assessment.Owner.PID)
+		dashboardMessage = fmt.Sprintf("ordinary Hive/dashboard listener is HTTP-ready in pid %d; legacy scheduler is intentionally inactive", assessment.Owner.PID)
 	} else {
-		dashboardMessage = "ordinary Hive/dashboard is the configured runtime owner but is not live; restart ordinary Hive/dashboard (do not run hive start)"
+		dashboardMessage = "ordinary Hive/dashboard is the configured runtime owner but its listener is not ready; restart ordinary Hive/dashboard (do not run hive start)"
 	}
 	return []doctorCheck{
 		{Name: "normal_hive_dashboard", OK: assessment.DashboardReady, Message: dashboardMessage},

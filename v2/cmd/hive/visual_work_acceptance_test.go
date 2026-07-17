@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/agent"
 	"github.com/kubestellar/hive/v2/pkg/beads"
 	"github.com/kubestellar/hive/v2/pkg/config"
@@ -144,9 +145,14 @@ func TestNormalVisualWorkVerticalAcceptance(t *testing.T) {
 		client: githubClient, installed: installed, fixtures: []acceptanceSourceFixture{firstFixture, secondFixture}, destination: filepath.Join(stateDir, "visual-hive", "artifacts"),
 		loseFirstConsumeResponse: true,
 	}
+	transportCalls := 0
 	repairer := &normalVisualRepairer{
 		scheduler: sched, manager: manager, controller: controller, lifecycle: lifecycle, github: githubClient,
-		providerCommand: installed.ProviderCommand, providerArgs: append([]string(nil), installed.ProviderArgs...),
+		providerCommand: installed.ProviderCommand, providerArgs: append([]string(nil), installed.ProviderArgs...), expectedRemoteURL: remote,
+		gitTransportToken: func(context.Context) (string, error) {
+			transportCalls++
+			return "normal-controller-private-token", nil
+		},
 		loadConfig: func() (integrated.Config, int, error) { return installed, manager.GetACMMLevel(), nil },
 	}
 	verifier := &normalVisualPullRequestVerifier{
@@ -173,6 +179,9 @@ func TestNormalVisualWorkVerticalAcceptance(t *testing.T) {
 	}
 	first := api.Snapshot()
 	checks, starts, childRequest := executor.Snapshot()
+	if transportCalls != 0 || executor.SawControllerGitToken() {
+		t.Fatalf("normal Git transport scope drifted: controller resolutions=%d child_received_token=%t", transportCalls, executor.SawControllerGitToken())
+	}
 	if source.FetchCalls() != 1 || intake.Imports() != 1 || len(gov.AdmissionHistory()) != 1 || issues.Creates() != 1 ||
 		checks != 2 || starts != 1 || first.PRCreates != 1 || first.PREdits != 0 || first.PRHeadSHA == "" || first.PRBranch == "" ||
 		countAcceptanceRepairBranches(t, remote) != 1 || source.ConsumeCalls() != 0 || intake.Completions() != 0 {
@@ -436,11 +445,12 @@ func (client *acceptanceIssueClient) Creates() int {
 }
 
 type acceptanceContainedExecutor struct {
-	mu       sync.Mutex
-	identity agent.SpecialistChildExecutorIdentity
-	checks   int
-	starts   int
-	request  agent.SpecialistChildExecutionRequest
+	mu                    sync.Mutex
+	identity              agent.SpecialistChildExecutorIdentity
+	checks                int
+	starts                int
+	request               agent.SpecialistChildExecutionRequest
+	sawControllerGitToken bool
 }
 
 func (executor *acceptanceContainedExecutor) Check(context.Context) (agent.SpecialistChildExecutorIdentity, error) {
@@ -452,7 +462,7 @@ func (executor *acceptanceContainedExecutor) Check(context.Context) (agent.Speci
 	return identity, nil
 }
 
-func (executor *acceptanceContainedExecutor) Start(_ context.Context, request agent.SpecialistChildExecutionRequest) (agent.SpecialistChildProcess, error) {
+func (executor *acceptanceContainedExecutor) Start(ctx context.Context, request agent.SpecialistChildExecutionRequest) (agent.SpecialistChildProcess, error) {
 	order, lease, err := decodeAcceptanceContainedPrompt(request.Prompt)
 	if err != nil {
 		return nil, err
@@ -470,6 +480,7 @@ func (executor *acceptanceContainedExecutor) Start(_ context.Context, request ag
 	executor.mu.Lock()
 	executor.starts++
 	executor.request = request
+	executor.sawControllerGitToken = executor.sawControllerGitToken || gittransport.HasControllerToken(ctx)
 	pid := 31000 + executor.starts
 	executor.mu.Unlock()
 	return acceptanceContainedProcess{pid: pid, provider: request.ProviderSHA256, result: agent.SpecialistChildExecutionResult{
@@ -493,6 +504,16 @@ func (process acceptanceContainedProcess) PID() int               { return proce
 func (process acceptanceContainedProcess) ProviderSHA256() string { return process.provider }
 func (process acceptanceContainedProcess) Wait() (agent.SpecialistChildExecutionResult, error) {
 	return process.result, nil
+}
+
+func (executor *acceptanceContainedExecutor) SawControllerGitToken() bool {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return executor.sawControllerGitToken
+}
+
+func (process acceptanceContainedProcess) ForceReap(context.Context) error {
+	return nil
 }
 
 type acceptanceSpecialistModelResult struct {

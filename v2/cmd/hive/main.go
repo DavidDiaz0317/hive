@@ -128,6 +128,7 @@ func main() {
 
 	var ghClient *github.Client
 	var appAuth *github.AppAuth
+	var normalGitTransportToken func(context.Context) (string, error)
 	if cfg.GitHub.AppID != 0 && cfg.GitHub.InstallationID != 0 {
 		keyFile := cfg.GitHub.KeyFile
 		if envKey := os.Getenv("GH_APP_KEY_FILE"); envKey != "" {
@@ -144,6 +145,7 @@ func main() {
 		}
 		logger.Info("using GitHub App authentication", "app_id", cfg.GitHub.AppID)
 		ghClient = github.NewClientFromApp(appAuth, cfg.Project.Org, cfg.Project.Repos, logger)
+		normalGitTransportToken = appAuth.Token
 
 		if cfg.GitHub.DocsInstallationID != 0 {
 			docsAuth, err := github.NewAppAuthWithCache(
@@ -187,6 +189,7 @@ func main() {
 			os.Exit(1)
 		}
 		ghClient = github.NewClient(ghToken, cfg.Project.Org, cfg.Project.Repos, logger, cfg.GitHub.ResolvedAPIURL())
+		normalGitTransportToken = func(context.Context) (string, error) { return ghToken, nil }
 	}
 	if len(cfg.Governor.Labels.Exempt) > 0 {
 		ghClient.SetExemptLabels(cfg.Governor.Labels.Exempt)
@@ -333,7 +336,13 @@ func main() {
 	}
 	agentMgr := agent.NewManager(cfg.EnabledAgents(), logger, projectCtx)
 	var normalVisualWorkOwnership *os.File
+	var normalVisualDashboardReadiness *normalVisualDashboardGate
 	defer shutdownOrdinaryVisualRuntime(cancel, agentMgr, func() {
+		if normalVisualDashboardReadiness != nil {
+			if err := normalVisualDashboardReadiness.Stop(); err != nil {
+				logger.Warn("remove normal Visual Hive dashboard readiness", "error", err)
+			}
+		}
 		releaseDaemonLease(normalVisualWorkOwnership)
 	}, logger)
 	configCoordinator := dashboard.NewConfigCoordinator(cfg, gov, agentMgr)
@@ -585,25 +594,31 @@ func main() {
 				logger.Info("normal Visual Hive intake initialized", "repository", installed.Repository)
 				logger.Info("normal Visual Hive intake does not own repair polling for the current installed config", "repository", installed.Repository, "runtime_owner", configuredRuntimeOwnerIntent(installed))
 			} else {
-				ownership, runnerErr := claimNormalVisualWorkOwnership(installed.StateDir, agentMgr, func(ordinaryManager *agent.Manager) (bool, error) {
-					runner, health, configureErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, ordinaryManager, ghClient, logger)
-					if configureErr != nil || runner == nil {
-						return false, configureErr
+				candidateDashboardReadiness, readinessErr := newNormalVisualDashboardGate(dashSrv, installed.StateDir, installed.Repository)
+				if readinessErr != nil {
+					logger.Warn("normal Visual Hive dashboard readiness unavailable", "error", readinessErr)
+				} else {
+					ownership, runnerErr := claimNormalVisualWorkOwnership(installed.StateDir, agentMgr, func(ordinaryManager *agent.Manager) (bool, error) {
+						runner, health, configureErr := configureNormalVisualWorkRunner(installed, service, lifecycle, sched, ordinaryManager, ghClient, normalGitTransportToken, candidateDashboardReadiness.Ready, logger)
+						if configureErr != nil || runner == nil {
+							return false, configureErr
+						}
+						normalVisualWorkRunner = runner
+						normalVisualWorkHealthWriter = health
+						return true, nil
+					})
+					if runnerErr != nil {
+						if errors.Is(runnerErr, errDaemonLeaseHeld) {
+							logger.Warn("normal Visual Hive governed repair service held because the legacy scheduler owns this repository; stop it and restart normal Hive for a controlled transition", "repository", installed.Repository)
+						} else {
+							logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
+						}
+					} else if ownership != nil {
+						normalVisualWorkService = service
+						normalVisualWorkOwnership = ownership
+						normalVisualDashboardReadiness = candidateDashboardReadiness
+						logger.Info("normal Visual Hive intake and governed repair service initialized with exclusive ordinary-Manager ownership", "repository", installed.Repository)
 					}
-					normalVisualWorkRunner = runner
-					normalVisualWorkHealthWriter = health
-					return true, nil
-				})
-				if runnerErr != nil {
-					if errors.Is(runnerErr, errDaemonLeaseHeld) {
-						logger.Warn("normal Visual Hive governed repair service held because the legacy scheduler owns this repository; stop it and restart normal Hive for a controlled transition", "repository", installed.Repository)
-					} else {
-						logger.Warn("normal Visual Hive governed repair service unavailable", "error", runnerErr)
-					}
-				} else if ownership != nil {
-					normalVisualWorkService = service
-					normalVisualWorkOwnership = ownership
-					logger.Info("normal Visual Hive intake and governed repair service initialized with exclusive ordinary-Manager ownership", "repository", installed.Repository)
 				}
 			}
 		}
@@ -1335,7 +1350,13 @@ func main() {
 	}
 
 	go func() {
-		if err := dashSrv.Start(); err != nil {
+		err := dashSrv.Start()
+		if normalVisualDashboardReadiness != nil {
+			if stopErr := normalVisualDashboardReadiness.Stop(); stopErr != nil {
+				logger.Warn("remove stopped normal Visual Hive dashboard readiness", "error", stopErr)
+			}
+		}
+		if err != nil {
 			logger.Error("dashboard server failed", "error", err)
 		}
 	}()
@@ -1683,9 +1704,24 @@ func main() {
 		logger.Info("fast agent status enabled", "interval_seconds", cfg.Dashboard.AgentPollIntervalS)
 	}
 
-	dashSrv.MarkReady()
+	dashboardHTTPReady := false
+	dashboardReadyContext, cancelDashboardReady := context.WithTimeout(ctx, 5*time.Second)
+	if err := dashSrv.WaitForHTTP(dashboardReadyContext); err != nil {
+		logger.Error("dashboard listener did not become HTTP-ready; ordinary Hive continues without dashboard readiness", "error", err)
+	} else if !dashSrv.MarkReadyIfListening() {
+		logger.Error("dashboard listener stopped before readiness could be committed; ordinary Hive continues without dashboard readiness")
+	} else {
+		dashboardHTTPReady = true
+	}
+	cancelDashboardReady()
 	if normalVisualWorkRunner != nil {
-		if normalVisualWorkHealthWriter == nil {
+		if !dashboardHTTPReady {
+			logger.Error("normal Visual Hive service will not start without the existing dashboard HTTP listener")
+		} else if normalVisualDashboardReadiness == nil {
+			logger.Error("normal Visual Hive service will not start without dashboard readiness binding")
+		} else if err := normalVisualDashboardReadiness.Activate(time.Now().UTC()); err != nil {
+			logger.Error("normal Visual Hive service will not start without generation-bound dashboard readiness", "error", err)
+		} else if normalVisualWorkHealthWriter == nil {
 			logger.Error("normal Visual Hive service will not start without its health writer")
 		} else if err := normalVisualWorkHealthWriter.Initialize(); err != nil {
 			logger.Error("normal Visual Hive service will not start without a generation-bound health record", "error", err)

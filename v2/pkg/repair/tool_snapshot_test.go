@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -38,6 +39,26 @@ func TestRepairToolMutationHelperProcess(t *testing.T) {
 		write(filepath.Join("reports", "test-output.json"), "{\"ok\":true}\n")
 	case "mutate-value":
 		write(filepath.Join("src", "value.txt"), "validator-authored\n")
+	case "install-git-filter":
+		if output, err := exec.Command("git", "config", "--local", "filter.hiveprobe.clean", "malicious-filter").CombinedOutput(); err != nil {
+			_, _ = os.Stderr.Write(output)
+			os.Exit(11)
+		}
+	case "replace-git-locator":
+		if err := os.Mkdir("attacker.git", 0o700); err != nil {
+			os.Exit(12)
+		}
+		write(".git", "gitdir: attacker.git\n")
+	case "replace-git-backlink":
+		locator, err := os.ReadFile(".git")
+		if err != nil {
+			os.Exit(13)
+		}
+		gitDir := strings.TrimSpace(strings.TrimPrefix(string(locator), "gitdir:"))
+		if gitDir == "" {
+			os.Exit(14)
+		}
+		write(filepath.Join(gitDir, "gitdir"), filepath.Join("wrong", ".git")+"\n")
 	case "spawn-background-writer":
 		child := exec.Command(os.Args[0], "-test.run=^TestRepairToolMutationHelperProcess$", "--", "delayed-write-long")
 		child.Dir = "."
@@ -175,7 +196,10 @@ func TestValidationProcessTreeCannotRaceCommittedCandidate(t *testing.T) {
 		Config: Config{
 			RepositoryDir: repository, WorktreeRoot: filepath.Join(t.TempDir(), "worktrees"), BaseBranch: "main", ExpectedRemoteURL: remote,
 			Policy: standardRepairPolicy(), AllowedRepairPaths: []string{"src/**"},
-			ValidationCommands: []Command{repairToolHelperCommand("spawn-background-writer")}, ModelTimeout: time.Minute, CommandTimeout: 2 * time.Second,
+			// Leave process-tree startup its full bounded resume window before the
+			// validation deadline fires; loaded Windows hosts can otherwise kill the
+			// suspended helper while its primary thread is being enumerated.
+			ValidationCommands: []Command{repairToolHelperCommand("spawn-background-writer")}, ModelTimeout: time.Minute, CommandTimeout: 5 * time.Second,
 		},
 		Provider: &patchProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: &fakePRClient{state: state},
 	}
@@ -219,6 +243,92 @@ func (p *unsafeModelProvider) Run(_ context.Context, worktree, _ string) (Provid
 
 func repairToolHelperCommand(mode string) Command {
 	return Command{Name: os.Args[0], Args: []string{"-test.run=^TestRepairToolMutationHelperProcess$", "--", mode}}
+}
+
+func TestRepairCommandRejectsGitExecutionConfigurationInstalledByTool(t *testing.T) {
+	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
+	repository, _ := seedGitRepository(t)
+	err := runRepairCommand(context.Background(), repository, repairToolHelperCommand("install-git-filter"), time.Minute, nil, "validation")
+	if err == nil || !isPatchEngineInfrastructureFailure(err) || !strings.Contains(err.Error(), "filter.hiveprobe.clean") {
+		t.Fatalf("tool-installed Git execution configuration was not fail-closed: %v", err)
+	}
+}
+
+func TestToolSnapshotQuarantinesUnsafeGitConfigWithoutGitRestore(t *testing.T) {
+	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
+	repository, remote := seedGitRepository(t)
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	branch := "hive/repair-config-quarantine-a1"
+	if err := prepareWorktree(context.Background(), repository, worktree, branch, "main", "", remote); err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: "owner/repo:config-quarantine", Attempt: 1,
+		Branch: branch, Worktree: worktree, Stage: StagePrepared, Provider: "test", StartedAt: time.Now().UTC(),
+	}
+	if err := state.Put(attempt); err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{Config: Config{AllowedRepairPaths: []string{"src/**"}, CommandTimeout: time.Minute}, State: state}
+	err = worker.withToolSnapshot(context.Background(), &attempt, toolSnapshotPreparation, 1, func() error {
+		return runRepairCommand(context.Background(), worktree, repairToolHelperCommand("install-git-filter"), time.Minute, nil, "preparation")
+	})
+	if err == nil || !isUnsafeRepositoryGitControlFailure(err) {
+		t.Fatalf("unsafe Git config mutation was not quarantined: %v", err)
+	}
+	persisted, ok := state.Get(attempt.RepositoryFingerprint)
+	if !ok || !hasToolSnapshot(persisted) || !hasToolSnapshot(attempt) {
+		t.Fatalf("unsafe Git config mutation triggered Git restoration or retired its durable guard: persisted=%+v in_memory=%+v", persisted, attempt)
+	}
+	config, readErr := os.ReadFile(filepath.Join(worktree, ".git"))
+	if readErr == nil && bytes.Contains(config, []byte("filter.hiveprobe.clean")) {
+		t.Fatal("linked-worktree locator was mistaken for config")
+	}
+	commonConfig := filepath.Join(repository, ".git", "config")
+	data, readErr := os.ReadFile(commonConfig)
+	if readErr != nil || !bytes.Contains(bytes.ToLower(data), []byte("filter \"hiveprobe\"")) {
+		t.Fatalf("unsafe config was unexpectedly Git-restored instead of quarantined: %v %q", readErr, data)
+	}
+	worker.Config.RepositoryDir = repository
+	worker.Config.WorktreeRoot = filepath.Join(t.TempDir(), "worktrees")
+	worker.Config.BaseBranch = "main"
+	worker.Config.ExpectedRemoteURL = remote
+	worker.Provider = &healthFailureProvider{}
+	worker.Lifecycle = &fakeLifecycle{}
+	worker.GitHub = &fakePRClient{}
+	finding := standardRepairFinding(attempt.RepositoryFingerprint)
+	if _, resumeErr := worker.Run(context.Background(), finding); resumeErr == nil || !isUnsafeRepositoryGitControlFailure(resumeErr) {
+		t.Fatalf("resumed Worker reached Git recovery despite unsafe common config: %v", resumeErr)
+	}
+	if resumed, ok := state.Get(attempt.RepositoryFingerprint); !ok || !hasToolSnapshot(resumed) {
+		t.Fatalf("resumed unsafe-config preflight mutated its pending recovery guard: %+v", resumed)
+	}
+}
+
+func TestRepairCommandRejectsLinkedWorktreeMetadataLocatorReplacement(t *testing.T) {
+	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
+	repository, _ := seedGitRepository(t)
+	worktree := filepath.Join(t.TempDir(), "linked-worktree")
+	runCommand(t, repository, "git", "worktree", "add", "-b", "hive/repair-locator-proof-a1", worktree, "HEAD")
+	err := runRepairCommand(context.Background(), worktree, repairToolHelperCommand("replace-git-locator"), time.Minute, nil, "validation")
+	if err == nil || !isPatchEngineInfrastructureFailure(err) || !isUnsafeRepositoryGitControlFailure(err) || !strings.Contains(err.Error(), "Git control") {
+		t.Fatalf("worktree Git metadata replacement was not quarantined before controller Git: %v", err)
+	}
+}
+
+func TestRepairCommandRejectsLinkedWorktreeGitDirBacklinkReplacement(t *testing.T) {
+	t.Setenv("GO_WANT_REPAIR_TOOL_MUTATION_HELPER", "1")
+	repository, _ := seedGitRepository(t)
+	worktree := filepath.Join(t.TempDir(), "linked-worktree")
+	runCommand(t, repository, "git", "worktree", "add", "-b", "hive/repair-backlink-proof-a1", worktree, "HEAD")
+	err := runRepairCommand(context.Background(), worktree, repairToolHelperCommand("replace-git-backlink"), time.Minute, nil, "validation")
+	if err == nil || !isPatchEngineInfrastructureFailure(err) || !isUnsafeRepositoryGitControlFailure(err) || !strings.Contains(err.Error(), "Git control") {
+		t.Fatalf("linked-worktree Git directory backlink replacement was not quarantined: %v", err)
+	}
 }
 
 func standardRepairFinding(fingerprint string) visualhive.FindingLifecycle {

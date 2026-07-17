@@ -59,10 +59,13 @@ type SpecialistChildExecutionResult struct {
 
 // SpecialistChildProcess represents one distinct contained process identity.
 // Wait must include process-group/job descendant cleanup before it returns.
+// ForceReap is idempotent and must independently report whether exact
+// descendant cleanup was proved, including after Wait has already returned.
 type SpecialistChildProcess interface {
 	PID() int
 	ProviderSHA256() string
 	Wait() (SpecialistChildExecutionResult, error)
+	ForceReap(context.Context) error
 }
 
 // SpecialistChildExecutor is implemented by the repair package's adapter over
@@ -78,19 +81,22 @@ type SpecialistChildDispatcherOptions struct {
 }
 
 type specialistChildSession struct {
-	taskID   string
-	role     SpecialistRole
-	identity SpecialistSessionIdentity
-	request  SpecialistDispatchRequest
-	root     string
-	cancel   context.CancelFunc
-	process  SpecialistChildProcess
-	launched bool
-	done     chan struct{}
-	doneOnce sync.Once
-	response SpecialistTaskResponse
-	dispatch SpecialistDispatchResult
-	err      error
+	mu         sync.Mutex
+	taskID     string
+	role       SpecialistRole
+	identity   SpecialistSessionIdentity
+	request    SpecialistDispatchRequest
+	root       string
+	cancel     context.CancelFunc
+	process    SpecialistChildProcess
+	launched   bool
+	launchDone chan struct{}
+	launchOnce sync.Once
+	done       chan struct{}
+	doneOnce   sync.Once
+	response   SpecialistTaskResponse
+	dispatch   SpecialistDispatchResult
+	err        error
 }
 
 const (
@@ -290,11 +296,16 @@ func (m *Manager) dispatchSpecialistChildTask(ctx context.Context, request Speci
 	}
 	child := &specialistChildSession{
 		taskID: request.TaskID, role: request.Specialist, identity: identity,
-		request: request, done: make(chan struct{}),
+		request: request, launchDone: make(chan struct{}), done: make(chan struct{}),
 	}
 	childCtx, cancel := context.WithDeadline(context.Background(), request.Order.Deadline)
 	child.cancel = cancel
 	m.mu.Lock()
+	if m.specialistsDown {
+		m.mu.Unlock()
+		cancel()
+		return SpecialistDispatchResult{}, errors.New("specialist child dispatcher is shut down")
+	}
 	if existing := m.specialistChildren[request.Specialist]; existing != nil {
 		if existing.taskID != request.TaskID || existing.identity.SessionID != request.SessionID || existing.request.RequestSHA256 != request.RequestSHA256 {
 			m.mu.Unlock()
@@ -359,7 +370,11 @@ func (m *Manager) dispatchSpecialistChildTask(ctx context.Context, request Speci
 		m.failUnlaunchedSpecialistChild(child, err)
 		return SpecialistDispatchResult{}, err
 	}
+	child.mu.Lock()
 	child.launched = true
+	child.process = process
+	child.mu.Unlock()
+	child.launchOnce.Do(func() { close(child.launchDone) })
 	m.mu.RLock()
 	parentPID := 0
 	if parent := m.agents[request.AgentName]; parent != nil {
@@ -368,7 +383,6 @@ func (m *Manager) dispatchSpecialistChildTask(ctx context.Context, request Speci
 	m.mu.RUnlock()
 	if process == nil || process.PID() <= 0 || parentPID > 0 && process.PID() == parentPID || !strings.EqualFold(process.ProviderSHA256(), request.ProviderSHA256) {
 		cancel()
-		child.process = process
 		child.err = errors.New("contained child returned an invalid distinct process identity")
 		if process == nil {
 			child.doneOnce.Do(func() { close(child.done) })
@@ -380,7 +394,6 @@ func (m *Manager) dispatchSpecialistChildTask(ctx context.Context, request Speci
 		}
 		return SpecialistDispatchResult{}, fmt.Errorf("%w: invalid child process identity", ErrSpecialistTaskDeliveryAmbiguous)
 	}
-	child.process = process
 	started, startedErr := newSpecialistChildStarted(intent, process.PID())
 	if startedErr == nil {
 		startedErr = writeSpecialistChildDocument(filepath.Join(sessionRoot, "started.json"), started)
@@ -572,6 +585,11 @@ func (m *Manager) failUnlaunchedSpecialistChild(child *specialistChildSession, e
 		child.cancel()
 	}
 	child.err = err
+	child.launchOnce.Do(func() {
+		if child.launchDone != nil {
+			close(child.launchDone)
+		}
+	})
 	m.mu.Lock()
 	if m.specialistChildren[child.role] == child {
 		delete(m.specialistChildren, child.role)
@@ -726,10 +744,12 @@ func (m *Manager) recoverSpecialistChild(role SpecialistRole) (*specialistChildS
 		}
 		done := make(chan struct{})
 		close(done)
+		launchDone := make(chan struct{})
+		close(launchDone)
 		identity := intent.Identity
 		identity.ExecutorAuthorizationID = intent.AuthorizationID
 		recovered = &specialistChildSession{
-			taskID: intent.TaskID, role: role, identity: identity, root: childRoot, done: done,
+			taskID: intent.TaskID, role: role, identity: identity, root: childRoot, launchDone: launchDone, done: done,
 			response: spool.Response,
 			dispatch: SpecialistDispatchResult{SpecialistSessionIdentity: identity, Started: true, Reused: true},
 		}
@@ -1009,28 +1029,88 @@ func (m *Manager) ShutdownSpecialistChildren(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	m.mu.RLock()
+	m.mu.Lock()
+	m.specialistsDown = true
 	children := make([]*specialistChildSession, 0, len(m.specialistChildren))
 	for _, child := range m.specialistChildren {
 		children = append(children, child)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	for _, child := range children {
 		if child.cancel != nil {
 			child.cancel()
 		}
 	}
+	normalCtx := ctx
+	normalCancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		normalCtx, normalCancel = context.WithTimeout(ctx, 10*time.Second)
+	}
+	defer normalCancel()
+	for _, child := range children {
+		launchDone := child.launchDone
+		if launchDone != nil {
+			select {
+			case <-launchDone:
+			case <-normalCtx.Done():
+				break
+			}
+		}
+		if normalCtx.Err() != nil {
+			break
+		}
+		select {
+		case <-child.done:
+		case <-normalCtx.Done():
+			break
+		}
+		if normalCtx.Err() != nil {
+			break
+		}
+	}
+	forceCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var shutdownErr error
+	// ForceReap is an idempotent proof operation, not merely a fallback kill.
+	// Attempt it for every launched child, including children whose done channel
+	// already closed, before considering parent ownership releasable.
+	for _, child := range children {
+		launchResolved := child.launchDone == nil
+		if child.launchDone != nil {
+			select {
+			case <-child.launchDone:
+				launchResolved = true
+			default:
+			}
+		}
+		if !launchResolved {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("specialist child %s launch did not resolve before bounded shutdown", child.taskID))
+			continue
+		}
+		child.mu.Lock()
+		launched, process := child.launched, child.process
+		child.mu.Unlock()
+		if launched {
+			if process == nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("launched specialist child %s has no exact process for shutdown proof", child.taskID))
+				continue
+			}
+			if err := process.ForceReap(forceCtx); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("prove exact specialist child %s was reaped: %w", child.taskID, err))
+			}
+		}
+	}
 	for _, child := range children {
 		select {
 		case <-child.done:
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-forceCtx.Done():
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("specialist child %s remained live after exact force reap: %w", child.taskID, forceCtx.Err()))
 		}
 	}
 	// Intent, started marker, and any complete response spool are durable
 	// transport evidence. Shutdown never removes them; successful broker
 	// consumption is represented by the exact content-bound consumed marker.
-	return nil
+	return shutdownErr
 }
 
 func cleanupSpecialistChildRoot(parent, root string) error {

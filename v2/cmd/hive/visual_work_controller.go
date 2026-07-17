@@ -28,6 +28,10 @@ func (sink dashboardVisualWorkAudit) RecordVisualWorkAudit(_ context.Context, ev
 	if event.Decision != nil {
 		detail += fmt.Sprintf(" decision=%s request=%s", event.Decision.Code, event.Decision.RequestSHA256)
 	}
+	if strings.TrimSpace(event.EventID) != "" {
+		_, err := sink.server.AuditLogOnce(event.EventID, "governor", "visual_work", detail, "")
+		return err
+	}
 	sink.server.AuditLog("governor", "visual_work", detail, "")
 	return nil
 }

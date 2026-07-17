@@ -181,8 +181,11 @@ func (f *fakeLifecycle) RecordAuthorization(_ string, action string, allowed boo
 }
 
 type fakePRClient struct {
-	calls int
-	state *Store
+	calls        int
+	inspectCalls int
+	state        *Store
+	inspect      *hivegithub.ManagedPullRequestSnapshot
+	inspectErr   error
 }
 
 func (f *fakePRClient) UpsertRepairPullRequest(_ context.Context, _, branch, _, _, _, _, _ string) (hivegithub.RepairPullRequest, error) {
@@ -197,6 +200,32 @@ func (f *fakePRClient) UpsertRepairPullRequest(_ context.Context, _, branch, _, 
 		}
 	}
 	return hivegithub.RepairPullRequest{Number: 17, URL: "https://example.test/pull/17", HeadSHA: head}, nil
+}
+
+func (f *fakePRClient) InspectManagedPullRequestExact(_ context.Context, _, _ string, number int, _, branch, headSHA, base string) (hivegithub.ManagedPullRequestSnapshot, error) {
+	f.inspectCalls++
+	if f.inspectErr != nil {
+		return hivegithub.ManagedPullRequestSnapshot{}, f.inspectErr
+	}
+	if f.inspect != nil {
+		return *f.inspect, nil
+	}
+	files := []string(nil)
+	url := "https://example.test/pull/17"
+	if f.state != nil {
+		for _, attempt := range f.state.Snapshot().Attempts {
+			if attempt != nil && attempt.Branch == branch {
+				files = append(files, attempt.ChangedFiles...)
+				if attempt.PRURL != "" {
+					url = attempt.PRURL
+				}
+				break
+			}
+		}
+	}
+	return hivegithub.ManagedPullRequestSnapshot{
+		Number: number, URL: url, State: "open", HeadBranch: branch, HeadSHA: headSHA, BaseBranch: base, ChangedFiles: files,
+	}, nil
 }
 
 func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
@@ -236,6 +265,12 @@ func TestWorkerCreatesRealBranchCommitPushAndPRAndResumes(t *testing.T) {
 	if strings.TrimSpace(remoteContent) != "fixed" {
 		t.Fatalf("remote branch was not pushed: %q", remoteContent)
 	}
+	finding.Status = visualhive.StatusPROpen
+	finding.RepairAttempts = 1
+	finding.Branch = result.Branch
+	finding.RepairCommitSHA = result.CommitSHA
+	finding.PRNumber = result.PRNumber
+	finding.PRURL = result.PRURL
 	resumed, err := worker.Run(context.Background(), finding)
 	if err != nil {
 		t.Fatal(err)
@@ -608,7 +643,6 @@ func TestValidateChangedFilesRejectsSensitivePaths(t *testing.T) {
 		"src/auth/token.ts",
 		"deploy/app.yml",
 		"src/components/Button.snapshot.tsx",
-		"artifacts/screenshots/failure.txt",
 		"e2e/dashboard.spec.ts-snapshots/home.png",
 		"tests/foo.snap",
 		"tests/fixtures/render.png",
@@ -618,7 +652,7 @@ func TestValidateChangedFilesRejectsSensitivePaths(t *testing.T) {
 			t.Fatalf("expected %s to require review", file)
 		}
 	}
-	for _, file := range []string{"public/logo.png", "src/assets/product-photo.jpg", "src/snapshot-service.ts"} {
+	for _, file := range []string{"public/logo.png", "src/assets/product-photo.jpg", "src/snapshot-service.ts", "src/snapshot/serializer.go", "src/screenshots/service.ts", "artifacts/screenshots/failure.txt"} {
 		if err := validateChangedFiles([]string{file}, []string{"**"}); err != nil {
 			t.Fatalf("ordinary public raster asset %s should remain repair-eligible: %v", file, err)
 		}
@@ -780,6 +814,7 @@ func TestLimitedBufferPreservesValidationFailureTail(t *testing.T) {
 
 func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 	repository, remote := seedGitRepository(t)
+	runCommand(t, repository, "git", "config", "--local", "core.autocrlf", "true")
 	worktree := filepath.Join(t.TempDir(), "worktrees", "attempt")
 	if err := prepareWorktree(context.Background(), repository, worktree, "hive/repair-test-a1", "main", "", remote); err != nil {
 		t.Fatal(err)
@@ -806,8 +841,8 @@ func TestPrepareWorktreeCleansOnlyPersistedFailedAttemptBranch(t *testing.T) {
 	if branch := strings.TrimSpace(gitOutput(t, worktree, "branch", "--show-current")); branch != "hive/repair-test-a2" {
 		t.Fatalf("worktree branch = %q, want attempt 2", branch)
 	}
-	if autocrlf := strings.TrimSpace(gitOutput(t, worktree, "config", "--get", "core.autocrlf")); autocrlf != "false" {
-		t.Fatalf("repair worktree core.autocrlf = %q, want false", autocrlf)
+	if autocrlf := strings.TrimSpace(gitOutput(t, worktree, "config", "--get", "core.autocrlf")); autocrlf != "true" {
+		t.Fatalf("repair controller persisted a line-ending config mutation: got %q want original true", autocrlf)
 	}
 }
 
@@ -854,7 +889,9 @@ func seedGitRepository(t *testing.T) (string, string) {
 	runCommand(t, seed, "git", "remote", "add", "origin", remote)
 	runCommand(t, seed, "git", "push", "-u", "origin", "main")
 	clone := filepath.Join(root, "clone")
-	runCommand(t, root, "git", "clone", "--branch", "main", remote, clone)
+	// Test fixtures must not inherit the operator's global core.autocrlf value:
+	// contained repair Git commands intentionally ignore user configuration.
+	runCommand(t, root, "git", "-c", "core.autocrlf=false", "clone", "--branch", "main", remote, clone)
 	return clone, remote
 }
 

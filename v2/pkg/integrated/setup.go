@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
@@ -48,6 +50,12 @@ var (
 	directBootstrapSafeName = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 	setupRepositoryCloneURL = func(repository string) string { return "https://github.com/" + repository + ".git" }
 )
+
+// RepositoryCloneURL returns the canonical exact Git transport URL used by
+// setup and every governed repair path for the same repository identity.
+func RepositoryCloneURL(repository string) string {
+	return strings.TrimSpace(setupRepositoryCloneURL(strings.TrimSpace(repository)))
+}
 
 type packageScriptInvocation struct {
 	Name      string
@@ -98,6 +106,7 @@ type SetupOptions struct {
 	AutoMergePathsExplicit bool
 	AutoMergeRiskExplicit  bool
 	GitHub                 *hivegithub.Client
+	GitTransportToken      string
 	Policy                 automation.Policy
 }
 
@@ -106,6 +115,7 @@ type setupPRClient interface {
 }
 
 func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
+	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	if options.ExecutionMode == "" {
 		options.ExecutionMode = ExecutionLocal
 	}
@@ -255,7 +265,9 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupBranch); err != nil {
 		return result, err
 	}
-	if _, err := git(ctx, checkout, "fetch", "--prune", "origin", defaultBranch); err != nil {
+	remoteURL := RepositoryCloneURL(options.Repository)
+	defaultRefspec := "+refs/heads/" + defaultBranch + ":refs/remotes/origin/" + defaultBranch
+	if _, err := gitTransport(ctx, checkout, remoteURL, "fetch", "--prune", "--no-recurse-submodules", remoteURL, defaultRefspec); err != nil {
 		return result, err
 	}
 	if _, err := git(ctx, checkout, "switch", "-C", branch, "origin/"+defaultBranch); err != nil {
@@ -513,7 +525,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		if err := authorizeSetup(store, options.Policy, options.Repository, automation.ActionSetupPush); err != nil {
 			return result, err
 		}
-		if err := pushManagedBranch(ctx, checkout, branch, inspection.RepositoryID, "setup", sha); err != nil {
+		if err := pushManagedBranch(ctx, checkout, options.Repository, branch, inspection.RepositoryID, "setup", sha); err != nil {
 			return result, err
 		}
 	}
@@ -900,7 +912,7 @@ func managedCommitTrailers(repositoryID, operation string) string {
 	return fmt.Sprintf("Hive-Repository-ID: %s\nHive-Operation: %s", strings.TrimSpace(repositoryID), strings.ToLower(strings.TrimSpace(operation)))
 }
 
-func pushManagedBranch(ctx context.Context, checkout, branch, repositoryID, operation, localSHA string) error {
+func pushManagedBranch(ctx context.Context, checkout, repository, branch, repositoryID, operation, localSHA string) error {
 	remoteRef := "refs/remotes/origin/" + branch
 	remoteSHA, remoteErr := git(ctx, checkout, "rev-parse", "--verify", remoteRef)
 	remoteSHA = strings.TrimSpace(remoteSHA)
@@ -919,7 +931,8 @@ func pushManagedBranch(ctx context.Context, checkout, branch, repositoryID, oper
 	if localSHA == "" {
 		return fmt.Errorf("exact local commit SHA is required before pushing managed branch %s", branch)
 	}
-	if _, err := git(ctx, checkout, "push", lease, "origin", localSHA+":refs/heads/"+branch); err != nil {
+	remoteURL := RepositoryCloneURL(repository)
+	if _, err := gitTransport(ctx, checkout, remoteURL, "push", lease, remoteURL, localSHA+":refs/heads/"+branch); err != nil {
 		return fmt.Errorf("push exact managed branch %s: %w", branch, err)
 	}
 	return nil
@@ -1026,7 +1039,7 @@ func validateDirectBootstrapRemoteBinding(ctx context.Context, checkout, reposit
 	if lines := nonEmptyLines(remotes); len(lines) != 1 || lines[0] != "origin" {
 		return fmt.Errorf("direct bootstrap requires exactly one canonical origin remote")
 	}
-	expected := strings.TrimSpace(setupRepositoryCloneURL(repository))
+	expected := RepositoryCloneURL(repository)
 	for _, arguments := range [][]string{{"remote", "get-url", "--all", "origin"}, {"remote", "get-url", "--push", "--all", "origin"}} {
 		value, readErr := git(ctx, checkout, arguments...)
 		if readErr != nil {
@@ -1041,7 +1054,7 @@ func validateDirectBootstrapRemoteBinding(ctx context.Context, checkout, reposit
 	if err != nil || strings.TrimSpace(fetch) != "+refs/heads/*:refs/remotes/origin/*" {
 		return fmt.Errorf("direct bootstrap requires the canonical origin fetch refspec")
 	}
-	heads, err := git(ctx, checkout, "ls-remote", "--heads", expected)
+	heads, err := gitTransport(ctx, checkout, expected, "ls-remote", "--heads", expected)
 	if err != nil {
 		return fmt.Errorf("list direct-bootstrap remote heads: %w", err)
 	}
@@ -1053,7 +1066,7 @@ func validateDirectBootstrapRemoteBinding(ctx context.Context, checkout, reposit
 	if len(fields) != 2 || fields[1] != "refs/heads/"+defaultBranch || !immutableCommit.MatchString(strings.ToLower(fields[0])) {
 		return fmt.Errorf("direct bootstrap remote branch inventory is not the exact default branch")
 	}
-	tags, err := git(ctx, checkout, "ls-remote", "--tags", expected)
+	tags, err := gitTransport(ctx, checkout, expected, "ls-remote", "--tags", expected)
 	if err != nil {
 		return fmt.Errorf("list direct-bootstrap remote tags: %w", err)
 	}
@@ -1074,9 +1087,9 @@ func pushDirectBootstrapDefaultBranch(ctx context.Context, checkout, repository,
 	if err := validateDirectBootstrapRemoteBinding(ctx, checkout, repository, defaultBranch); err != nil {
 		return err
 	}
-	remoteURL := strings.TrimSpace(setupRepositoryCloneURL(repository))
+	remoteURL := RepositoryCloneURL(repository)
 	refspec := "+refs/heads/" + defaultBranch + ":refs/remotes/origin/" + defaultBranch
-	if _, err := git(ctx, checkout, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+	if _, err := gitTransport(ctx, checkout, remoteURL, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
 		return fmt.Errorf("refresh direct-bootstrap exact base: %w", err)
 	}
 	remoteSHA, err := git(ctx, checkout, "rev-parse", "--verify", "refs/remotes/origin/"+defaultBranch)
@@ -1092,10 +1105,10 @@ func pushDirectBootstrapDefaultBranch(ctx context.Context, checkout, repository,
 		return fmt.Errorf("direct-bootstrap commit must be one exact child of the reviewed seed base")
 	}
 	lease := "--force-with-lease=refs/heads/" + defaultBranch + ":" + baseSHA
-	if _, err := git(ctx, checkout, "push", lease, remoteURL, headSHA+":refs/heads/"+defaultBranch); err != nil {
+	if _, err := gitTransport(ctx, checkout, remoteURL, "push", lease, remoteURL, headSHA+":refs/heads/"+defaultBranch); err != nil {
 		return fmt.Errorf("push exact direct-bootstrap default branch: %w", err)
 	}
-	if _, err := git(ctx, checkout, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+	if _, err := gitTransport(ctx, checkout, remoteURL, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
 		return fmt.Errorf("refresh direct-bootstrap pushed head: %w", err)
 	}
 	remoteSHA, err = git(ctx, checkout, "rev-parse", "--verify", "refs/remotes/origin/"+defaultBranch)
@@ -1730,7 +1743,8 @@ func ensureCheckoutWithLegacy(ctx context.Context, repository, checkout string, 
 		if err := os.MkdirAll(filepath.Dir(checkout), 0o700); err != nil {
 			return "", err
 		}
-		if _, err := git(ctx, filepath.Dir(checkout), "clone", "--origin", "origin", setupRepositoryCloneURL(repository), checkout); err != nil {
+		remoteURL := RepositoryCloneURL(repository)
+		if _, err := gitTransport(ctx, filepath.Dir(checkout), remoteURL, "clone", "--origin", "origin", remoteURL, checkout); err != nil {
 			return "", fmt.Errorf("clone target repository: %w", err)
 		}
 		if err := writeManagedCheckoutOwner(checkout, repository); err != nil {
@@ -1740,7 +1754,8 @@ func ensureCheckoutWithLegacy(ctx context.Context, repository, checkout string, 
 	if _, err := validateManagedCheckoutBeforeGitWithLegacy(checkout, repository, legacy); err != nil {
 		return "", fmt.Errorf("validate exact managed checkout ownership before Git synchronization: %w", err)
 	}
-	if _, err := git(ctx, checkout, "fetch", "--prune", "origin"); err != nil {
+	remoteURL := RepositoryCloneURL(repository)
+	if _, err := gitTransport(ctx, checkout, remoteURL, "fetch", "--prune", "--no-recurse-submodules", remoteURL, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return "", err
 	}
 	ref, err := git(ctx, checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
@@ -3085,13 +3100,17 @@ func enrichRemoteInspection(ctx context.Context, client *hivegithub.Client, repo
 }
 
 func git(ctx context.Context, dir string, args ...string) (string, error) {
-	if len(args) > 0 && args[0] == "push" {
-		if err := checkpoint.BeforeMutation(ctx, "Git push"); err != nil {
+	if operation := localGitOperation(args); operation == "clone" || operation == "fetch" || operation == "push" || operation == "ls-remote" {
+		return "", fmt.Errorf("network-capable Git operation %q must use the explicit authenticated transport boundary", operation)
+	}
+	if localGitOperationCanExecuteRepositoryConfig(args) {
+		if _, err := inspectControllerGitConfig(ctx, dir, false); err != nil {
 			return "", err
 		}
 	}
 	command := exec.CommandContext(ctx, "git", args...)
-	command.Dir, command.Env = dir, safeEnvironment()
+	command.Dir = dir
+	command.Env = gittransport.LocalEnvironment(safeEnvironment())
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Run(); err != nil {
@@ -3100,9 +3119,297 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 	return output.String(), nil
 }
 
+type controllerGitConfigSnapshot struct {
+	present bool
+	digest  [sha256.Size]byte
+}
+
+// gitTransport is the only authenticated Git boundary in the integrated
+// package. The caller must supply the exact canonical URL as an argument to a
+// bounded network operation; target-controlled remote names are never used.
+func gitTransport(ctx context.Context, dir, remoteURL string, args ...string) (string, error) {
+	operation, configDir, localRemote, err := validateGitTransportRequest(dir, remoteURL, args)
+	if err != nil {
+		return "", err
+	}
+	before, err := inspectControllerGitConfig(ctx, configDir, true)
+	if err != nil {
+		return "", fmt.Errorf("validate repository Git config before %s: %w", operation, err)
+	}
+	if operation == "push" {
+		if err := checkpoint.BeforeMutation(ctx, "Git push"); err != nil {
+			return "", err
+		}
+	}
+
+	commandArgs := []string{"-c", "protocol.allow=never"}
+	if localRemote {
+		commandArgs = append(commandArgs, "-c", "protocol.file.allow=always")
+	} else {
+		commandArgs = append(commandArgs, "-c", "protocol.https.allow=always")
+	}
+	commandArgs = append(commandArgs,
+		"-c", "http.sslVerify=true",
+		"-c", "http.followRedirects=false",
+		"-c", "http.proxy=",
+	)
+	commandArgs = append(commandArgs, args...)
+	transportCtx := ctx
+	if !localRemote {
+		transportCtx, err = gittransport.RefreshControllerToken(ctx)
+		if err != nil {
+			return "", fmt.Errorf("refresh authenticated Git credential for %s: %w", operation, err)
+		}
+	}
+	command := exec.CommandContext(transportCtx, "git", commandArgs...)
+	command.Dir = dir
+	command.Env = gittransport.TransportEnvironmentForURL(transportCtx, safeEnvironment(), remoteURL)
+	var output bytes.Buffer
+	command.Stdout, command.Stderr = &output, &output
+	runErr := command.Run()
+
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	after, auditErr := inspectControllerGitConfig(auditCtx, configDir, true)
+	cancel()
+	if auditErr != nil {
+		return output.String(), fmt.Errorf("revalidate repository Git config after %s: %w", operation, auditErr)
+	}
+	if before.present && (!after.present || before.digest != after.digest) {
+		return output.String(), fmt.Errorf("repository Git config changed during authenticated %s", operation)
+	}
+	if runErr != nil {
+		return output.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), runErr, safeOutput(output.String()))
+	}
+	return output.String(), nil
+}
+
+func validateGitTransportRequest(dir, remoteURL string, args []string) (operation, configDir string, localRemote bool, err error) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" || strings.ContainsAny(remoteURL, "\r\n\x00") || len(args) < 2 {
+		return "", "", false, fmt.Errorf("authenticated Git transport requires an exact bounded remote URL and operation")
+	}
+	operation = strings.ToLower(strings.TrimSpace(args[0]))
+	if operation != "clone" && operation != "fetch" && operation != "push" && operation != "ls-remote" {
+		return "", "", false, fmt.Errorf("authenticated Git transport refuses operation %q", operation)
+	}
+	remoteCount, remoteIndex := 0, -1
+	for index, argument := range args {
+		if strings.ContainsAny(argument, "\r\n\x00") {
+			return "", "", false, fmt.Errorf("authenticated Git transport refuses an unsafe argument")
+		}
+		lower := strings.ToLower(argument)
+		for _, forbidden := range []string{"--config", "--upload-pack", "--receive-pack", "--exec"} {
+			if lower == forbidden || strings.HasPrefix(lower, forbidden+"=") {
+				return "", "", false, fmt.Errorf("authenticated Git transport refuses helper override %q", argument)
+			}
+		}
+		if argument == remoteURL {
+			remoteCount++
+			remoteIndex = index
+		}
+	}
+	if remoteCount != 1 || remoteIndex <= 0 {
+		return "", "", false, fmt.Errorf("authenticated Git %s must use the exact explicit remote URL once", operation)
+	}
+	localRemote, err = validateExplicitGitRemoteURL(remoteURL)
+	if err != nil {
+		return "", "", false, err
+	}
+	configDir = dir
+	if operation == "clone" {
+		if remoteIndex != len(args)-2 || !filepath.IsAbs(args[len(args)-1]) {
+			return "", "", false, fmt.Errorf("authenticated Git clone requires one exact absolute destination after the remote URL")
+		}
+		configDir = filepath.Clean(args[len(args)-1])
+	}
+	return operation, configDir, localRemote, nil
+}
+
+func validateExplicitGitRemoteURL(remoteURL string) (bool, error) {
+	if filepath.IsAbs(remoteURL) {
+		return true, nil
+	}
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" {
+		return false, fmt.Errorf("authenticated Git transport requires a credential-free canonical GitHub HTTPS URL")
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || parts[0] == "." || parts[0] == ".." || !strings.HasSuffix(parts[1], ".git") || strings.TrimSuffix(parts[1], ".git") == "" {
+		return false, fmt.Errorf("authenticated Git transport URL does not identify one exact GitHub repository")
+	}
+	return false, nil
+}
+
+func inspectControllerGitConfig(ctx context.Context, dir string, transport bool) (controllerGitConfigSnapshot, error) {
+	snapshot := controllerGitConfigSnapshot{}
+	metadata, err := os.Lstat(filepath.Join(dir, ".git"))
+	if os.IsNotExist(err) {
+		return snapshot, nil
+	}
+	if err != nil {
+		return snapshot, err
+	}
+	if metadata.Mode()&os.ModeSymlink != 0 {
+		return snapshot, fmt.Errorf("repository Git metadata must not be a symbolic link")
+	}
+	snapshot.present = true
+	hasher := sha256.New()
+	localRaw, localEntries, err := readRawControllerGitConfig(ctx, dir, "--local")
+	if err != nil {
+		return controllerGitConfigSnapshot{}, err
+	}
+	worktreeEnabled, err := rawWorktreeConfigEnabled(localEntries)
+	if err != nil {
+		return controllerGitConfigSnapshot{}, err
+	}
+	scopes := []struct {
+		name    string
+		raw     []byte
+		entries []controllerGitConfigEntry
+	}{{name: "--local", raw: localRaw, entries: localEntries}}
+	if worktreeEnabled {
+		worktreeRaw, worktreeEntries, readErr := readRawControllerGitConfig(ctx, dir, "--worktree")
+		if readErr != nil {
+			return controllerGitConfigSnapshot{}, readErr
+		}
+		scopes = append(scopes, struct {
+			name    string
+			raw     []byte
+			entries []controllerGitConfigEntry
+		}{name: "--worktree", raw: worktreeRaw, entries: worktreeEntries})
+	} else {
+		scopes = append(scopes, struct {
+			name    string
+			raw     []byte
+			entries []controllerGitConfigEntry
+		}{name: "--worktree-disabled", raw: []byte("absent\x00")})
+	}
+	for _, scope := range scopes {
+		_, _ = hasher.Write([]byte(scope.name))
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write(scope.raw)
+		for _, entry := range scope.entries {
+			if unsafeGitExecutionConfig(entry.key, entry.value) || (transport && unsafeGitTransportConfigKey(entry.key)) {
+				return controllerGitConfigSnapshot{}, fmt.Errorf("repository Git config key %q is unsafe for controller execution", entry.key)
+			}
+		}
+	}
+	copy(snapshot.digest[:], hasher.Sum(nil))
+	return snapshot, nil
+}
+
+type controllerGitConfigEntry struct {
+	key   string
+	value string
+}
+
+func readRawControllerGitConfig(ctx context.Context, dir, scope string) ([]byte, []controllerGitConfigEntry, error) {
+	command := exec.CommandContext(ctx, "git", "config", scope, "--no-includes", "--null", "--list")
+	command.Dir = dir
+	command.Env = gittransport.LocalEnvironment(safeEnvironment())
+	var output bytes.Buffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Run(); err != nil {
+		return nil, nil, fmt.Errorf("read raw %s Git config: %w: %s", strings.TrimPrefix(scope, "--"), err, safeOutput(output.String()))
+	}
+	raw := append([]byte(nil), output.Bytes()...)
+	return raw, parseRawGitConfigRecords(raw), nil
+}
+
+func parseRawGitConfigRecords(raw []byte) []controllerGitConfigEntry {
+	entries := []controllerGitConfigEntry{}
+	for _, record := range bytes.Split(raw, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		key, value, found := bytes.Cut(record, []byte{'\n'})
+		if !found {
+			value = nil
+		}
+		entries = append(entries, controllerGitConfigEntry{key: strings.ToLower(strings.TrimSpace(string(key))), value: string(value)})
+	}
+	return entries
+}
+
+func rawWorktreeConfigEnabled(entries []controllerGitConfigEntry) (bool, error) {
+	enabled := false
+	for _, entry := range entries {
+		if entry.key != "extensions.worktreeconfig" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(entry.value)) {
+		case "true", "yes", "on", "1":
+			enabled = true
+		case "false", "no", "off", "0":
+			enabled = false
+		default:
+			return false, fmt.Errorf("repository Git config has invalid extensions.worktreeConfig value")
+		}
+	}
+	return enabled, nil
+}
+
+func unsafeGitExecutionConfig(key, value string) bool {
+	lowerValue := strings.ToLower(strings.TrimSpace(value))
+	if key == "include.path" || strings.HasPrefix(key, "includeif.") || strings.HasPrefix(key, "credential.") ||
+		key == "core.attributesfile" || key == "core.worktree" || key == "core.alternaterefscommand" || key == "core.hookspath" ||
+		key == "core.askpass" || key == "core.sshcommand" || key == "core.gitproxy" || key == "core.editor" || key == "core.fsmonitor" ||
+		key == "sequence.editor" || key == "interactive.difffilter" || key == "diff.external" || key == "extensions.partialclone" ||
+		(strings.HasPrefix(key, "gpg.") && strings.HasSuffix(key, ".program")) || key == "gpg.program" {
+		return true
+	}
+	if key == "core.bare" && lowerValue != "false" && lowerValue != "no" && lowerValue != "off" && lowerValue != "0" {
+		return true
+	}
+	if strings.HasPrefix(key, "submodule.") && strings.HasSuffix(key, ".update") && strings.HasPrefix(strings.TrimSpace(value), "!") {
+		return true
+	}
+	if strings.HasPrefix(key, "remote.") && (strings.HasSuffix(key, ".promisor") || strings.HasSuffix(key, ".partialclonefilter")) {
+		return true
+	}
+	return (strings.HasPrefix(key, "filter.") && (strings.HasSuffix(key, ".clean") || strings.HasSuffix(key, ".smudge") || strings.HasSuffix(key, ".process"))) ||
+		(strings.HasPrefix(key, "diff.") && (strings.HasSuffix(key, ".command") || strings.HasSuffix(key, ".textconv"))) ||
+		(strings.HasPrefix(key, "merge.") && strings.HasSuffix(key, ".driver"))
+}
+
+func unsafeGitTransportConfigKey(key string) bool {
+	if key == "include.path" || strings.HasPrefix(key, "includeif.") || strings.HasPrefix(key, "url.") || strings.HasPrefix(key, "http.") ||
+		strings.HasPrefix(key, "credential.") || strings.HasPrefix(key, "protocol.") || key == "core.sshcommand" || key == "core.gitproxy" || key == "core.askpass" {
+		return true
+	}
+	if strings.HasPrefix(key, "remote.") {
+		for _, suffix := range []string{".pushurl", ".proxy", ".proxyauthmethod", ".uploadpack", ".receivepack", ".vcs"} {
+			if strings.HasSuffix(key, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func localGitOperationCanExecuteRepositoryConfig(args []string) bool {
+	switch localGitOperation(args) {
+	case "add", "commit", "diff", "checkout", "switch", "reset", "merge", "update-index":
+		return true
+	default:
+		return false
+	}
+}
+
+func localGitOperation(args []string) string {
+	for index := 0; index < len(args); index++ {
+		if args[index] == "-c" && index+1 < len(args) {
+			index++
+			continue
+		}
+		return strings.ToLower(strings.TrimSpace(args[index]))
+	}
+	return ""
+}
+
 func safeEnvironment() []string {
 	secret := regexp.MustCompile(`(?i)(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)`)
-	executionAffecting := regexp.MustCompile(`(?i)^(NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|CDPATH|GIT_CONFIG.*|GIT_EXTERNAL_DIFF|GIT_SSH|GIT_SSH_COMMAND|NPM_CONFIG_.*|COREPACK_.*|PNPM_HOME|YARN_.*)$`)
+	executionAffecting := regexp.MustCompile(`(?i)^(NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|SHELLOPTS|CDPATH|GIT_.*|NPM_CONFIG_.*|COREPACK_.*|PNPM_HOME|YARN_.*)$`)
 	result := []string{"GIT_TERMINAL_PROMPT=0"}
 	for _, pair := range os.Environ() {
 		name, _, _ := strings.Cut(pair, "=")

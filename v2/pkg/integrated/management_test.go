@@ -286,6 +286,7 @@ func TestDeleteManagedStatePreservesUnrelatedProjectBytes(t *testing.T) {
 func TestEnsureCheckoutAlwaysReturnsToRemoteDefault(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
+	bindTestRepositoryCloneURL(t, remote)
 	runIntegratedGit(t, root, "init", "--bare", remote)
 	seed := filepath.Join(root, "seed")
 	runIntegratedGit(t, root, "init", "-b", "main", seed)

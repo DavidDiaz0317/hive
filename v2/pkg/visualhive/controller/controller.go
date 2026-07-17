@@ -43,6 +43,7 @@ type RoleState interface {
 }
 
 type AuditEvent struct {
+	EventID               string
 	Stage                 string
 	SourceExternalRef     string
 	RepositoryFingerprint string
@@ -388,7 +389,7 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
 	completion = normalizeSpecialistPullRequestCompletion(completion)
-	_, existingBead, err := controller.findVisualBeadLocked(sourceExternalRef)
+	existingStore, existingBead, err := controller.findVisualBeadLocked(sourceExternalRef)
 	if err != nil {
 		return err
 	}
@@ -409,7 +410,7 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 		if existing != completion {
 			return errors.New("specialist PR was already completed with different exact bytes")
 		}
-		return nil
+		return controller.recordSpecialistCompletionAudit(existingStore, existingBead, sourceExternalRef, existing)
 	}
 	if err := controller.refreshRuntimeConfigLocked(context.Background()); err != nil {
 		return err
@@ -436,14 +437,82 @@ func (controller *Controller) CompleteSpecialistPullRequest(sourceExternalRef st
 	if err != nil {
 		return err
 	}
-	return store.CloseWithUpdate(bead.ID, func(value *beads.Bead) {
+	auditEvent, err := specialistCompletionAuditEvent(bead, sourceExternalRef, completion, encoded)
+	if err != nil {
+		return err
+	}
+	if err := store.CloseWithUpdate(bead.ID, func(value *beads.Bead) {
 		if value.Metadata == nil {
 			value.Metadata = map[string]interface{}{}
 		}
 		value.Metadata["visual_hive_admission_state"] = "admitted_pr_verdict_recorded"
 		value.Metadata["visual_hive_stage_detail"] = "exact-head PR verdict recorded; no merge or resolution authority granted"
 		value.Metadata["visual_hive_pr_completion_json"] = string(encoded)
-	})
+		value.Metadata["visual_hive_completion_audit_id"] = auditEvent.EventID
+		value.Metadata["visual_hive_completion_audit_recorded"] = false
+	}); err != nil {
+		return err
+	}
+	return controller.recordSpecialistCompletionAudit(store, bead, sourceExternalRef, completion)
+}
+
+func (controller *Controller) recordSpecialistCompletionAudit(store *beads.Store, bead *beads.Bead, sourceExternalRef string, completion SpecialistPullRequestCompletion) error {
+	encoded, err := json.Marshal(completion)
+	if err != nil {
+		return err
+	}
+	event, err := specialistCompletionAuditEvent(bead, sourceExternalRef, completion, encoded)
+	if err != nil {
+		return err
+	}
+	storedID, _ := bead.Metadata["visual_hive_completion_audit_id"].(string)
+	if storedID != "" && storedID != event.EventID {
+		return errors.New("durable specialist PR completion audit identity is corrupt")
+	}
+	if value, exists := bead.Metadata["visual_hive_completion_audit_recorded"]; exists {
+		recorded, valid := value.(bool)
+		if !valid {
+			return errors.New("durable specialist PR completion audit state is corrupt")
+		}
+		if recorded {
+			if storedID != event.EventID {
+				return errors.New("durable specialist PR completion audit identity is unavailable")
+			}
+			return nil
+		}
+	}
+	if err := controller.recordAudit(context.Background(), event); err != nil {
+		return fmt.Errorf("record exact-head specialist PR completion audit: %w", err)
+	}
+	if err := store.Update(bead.ID, func(value *beads.Bead) {
+		if value.Metadata == nil {
+			value.Metadata = map[string]interface{}{}
+		}
+		value.Metadata["visual_hive_completion_audit_id"] = event.EventID
+		value.Metadata["visual_hive_completion_audit_recorded"] = true
+	}); err != nil {
+		return fmt.Errorf("persist exact-head specialist PR completion audit acknowledgement: %w", err)
+	}
+	return nil
+}
+
+func specialistCompletionAuditEvent(bead *beads.Bead, sourceExternalRef string, completion SpecialistPullRequestCompletion, encoded []byte) (AuditEvent, error) {
+	envelope, ok := visualDispatchEnvelope(bead)
+	if !ok || strings.TrimSpace(envelope.Work.RepositoryFingerprint) == "" {
+		return AuditEvent{}, errors.New("durable specialist PR completion audit binding is unavailable")
+	}
+	canonical := append([]byte(strings.TrimSpace(envelope.Work.RepositoryFingerprint)+"\n"+strings.TrimSpace(sourceExternalRef)+"\n"), encoded...)
+	digest := sha256.Sum256(canonical)
+	return AuditEvent{
+		EventID:               "visual-work-completion:" + hex.EncodeToString(digest[:]),
+		Stage:                 "admitted_pr_verdict_recorded",
+		SourceExternalRef:     strings.TrimSpace(sourceExternalRef),
+		RepositoryFingerprint: envelope.Work.RepositoryFingerprint,
+		Detail: fmt.Sprintf(
+			"work_order=%s pr=%d branch=%s exact_head=%s receipt=%s verdict=%s no_merge_authority=true",
+			completion.WorkOrderID, completion.PullRequestNumber, completion.Branch, completion.CommitSHA, completion.VerdictReceiptSHA256, completion.VerdictStatus,
+		),
+	}, nil
 }
 
 func readyFindingMatchesSpecialistCompletion(finding visualhive.FindingLifecycle, envelope DispatchEnvelope, completion SpecialistPullRequestCompletion) bool {

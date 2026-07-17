@@ -48,6 +48,14 @@ func sealedTreeGuardStateError(attempt Attempt) error {
 	if !validGitCommitSHA(attempt.CandidateTree) || !validGitCommitSHA(attempt.CandidateParent) {
 		return fmt.Errorf("candidate tree or parent is invalid")
 	}
+	guardAny := attempt.CandidateGuardRef != "" || attempt.CandidateGuardCommit != "" || attempt.CandidateGuardBinding != "" || attempt.CandidateGuardKind != ""
+	// After the exact commit has been created, retain its sealed parent/tree as
+	// durable remote-recovery evidence while retiring the temporary guard ref.
+	// The commit object itself now anchors that identity.
+	if !guardAny && (attempt.Stage == StageCommitted || attempt.Stage == StagePushed || attempt.Stage == StagePROpen ||
+		attempt.Stage == StageNoChange && attempt.PRNumber > 0) && validGitCommitSHA(attempt.CommitSHA) {
+		return nil
+	}
 	// While validation is running, its durable tool snapshot ref is already the
 	// candidate guard; restore atomically transfers those exact fields below.
 	if attempt.CandidateGuardRef == "" && hasToolSnapshot(attempt) && attempt.ToolSnapshotPhase == toolSnapshotValidation {
@@ -417,6 +425,9 @@ func commitSealedRepair(ctx context.Context, worktree, branch string, attempt At
 	if err := validateSealedCandidate(ctx, worktree, attempt); err != nil {
 		return "", err
 	}
+	if err := rejectExecutableRepositoryGitConfig(ctx, worktree); err != nil {
+		return "", fmt.Errorf("refuse sealed commit with unsafe repository Git configuration: %w", err)
+	}
 	currentBranch, err := runGit(ctx, worktree, "branch", "--show-current")
 	if err != nil || strings.TrimSpace(currentBranch) != branch {
 		return "", fmt.Errorf("repair branch changed before sealed commit")
@@ -483,7 +494,19 @@ func (w *Worker) releaseSealedTreeGuards(ctx context.Context, attempt *Attempt) 
 		{attempt.ModelBaseGuardKind, attempt.ModelBaseGuardRef, attempt.ModelBaseGuardCommit, attempt.ModelBaseGuardBinding},
 		{attempt.CandidateGuardKind, attempt.CandidateGuardRef, attempt.CandidateGuardCommit, attempt.CandidateGuardBinding},
 	}
-	clearSealedCandidate(attempt)
+	// The model-base identity and all temporary guard refs can be retired after
+	// commit. CandidateParent/CandidateTree must survive through pushed/PR-open
+	// recovery so Hive can rebind the remote commit exactly after a crash.
+	attempt.ModelBaseTree = ""
+	attempt.ModelBaseParent = ""
+	attempt.ModelBaseGuardRef = ""
+	attempt.ModelBaseGuardCommit = ""
+	attempt.ModelBaseGuardBinding = ""
+	attempt.ModelBaseGuardKind = ""
+	attempt.CandidateGuardRef = ""
+	attempt.CandidateGuardCommit = ""
+	attempt.CandidateGuardBinding = ""
+	attempt.CandidateGuardKind = ""
 	if err := w.State.Put(*attempt); err != nil {
 		return fmt.Errorf("release durable sealed-tree references: %w", err)
 	}

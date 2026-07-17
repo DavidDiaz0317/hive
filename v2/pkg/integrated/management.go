@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
@@ -33,6 +34,7 @@ type ManagementOptions struct {
 	DeleteState       bool
 	Cancel            bool
 	GitHub            *hivegithub.Client
+	GitTransportToken string
 }
 
 type ManagementResult struct {
@@ -60,6 +62,7 @@ type ManagementResult struct {
 }
 
 func RunManagement(ctx context.Context, options ManagementOptions) (ManagementResult, error) {
+	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	result := ManagementResult{SchemaVersion: "hive.management.v1", Operation: options.Operation}
 	if options.GitHub == nil || strings.TrimSpace(options.StateDir) == "" {
 		return result, fmt.Errorf("GitHub client and persistent state directory are required")
@@ -322,7 +325,7 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 	if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPush); err != nil {
 		return result, err
 	}
-	if err := pushManagedBranch(ctx, config.CheckoutDir, branch, config.RepositoryID, string(options.Operation), result.CommitSHA); err != nil {
+	if err := pushManagedBranch(ctx, config.CheckoutDir, config.Repository, branch, config.RepositoryID, string(options.Operation), result.CommitSHA); err != nil {
 		return result, err
 	}
 	if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPR); err != nil {

@@ -193,6 +193,12 @@ func TestWorkerRecoversPreUpgradeStageModelRunningOrderWithoutRecomposition(t *t
 	receiptSHA := receipt.ReceiptSHA256
 	proposalSHA := receipt.UnifiedDiffSHA256
 	proposalBytes := string(proposal)
+	finding.Status = visualhive.StatusPROpen
+	finding.RepairAttempts = 1
+	finding.Branch = result.Branch
+	finding.RepairCommitSHA = result.CommitSHA
+	finding.PRNumber = result.PRNumber
+	finding.PRURL = result.PRURL
 	third, err := secondWorker.Run(context.Background(), finding)
 	if err != nil || !third.Resumed || pulls.calls != 1 || lifecycle.prOpens != 1 || secondDispatcher.inspectCalls != 1 || len(secondDispatcher.dispatchCalls) != 0 {
 		t.Fatalf("idempotent rerun = %+v, %v pulls=%d lifecycle_pr_opens=%d inspect=%d dispatch=%d", third, err, pulls.calls, lifecycle.prOpens, secondDispatcher.inspectCalls, len(secondDispatcher.dispatchCalls))

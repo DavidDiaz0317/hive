@@ -95,6 +95,10 @@ func startRepairProcessTree(ctx context.Context, command *exec.Cmd) (func() erro
 	}, nil
 }
 
+func startExactRepairProcessTree(ctx context.Context, command *exec.Cmd, _ codexProviderFileIdentity) (func() error, error) {
+	return startRepairProcessTree(ctx, command)
+}
+
 // Every repair command is assigned before resume to a kill-on-close Job
 // Object. Process exit or a Hive crash therefore closes the last job handle
 // and terminates every contained descendant, so snapshot restoration does not

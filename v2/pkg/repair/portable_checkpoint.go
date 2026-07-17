@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -383,8 +384,22 @@ func (w *Worker) restorePortableRepairCheckpoint(ctx context.Context, findingTit
 		}
 	}
 	worktree := filepath.Join(w.Config.WorktreeRoot, shortFingerprint(attempt.RepositoryFingerprint))
+	controllerRepository, err := captureRepositoryGitControl(w.Config.RepositoryDir, "")
+	if err != nil {
+		return fmt.Errorf("inspect controller repository before portable repair restore: %w", err)
+	}
+	if _, statErr := os.Lstat(worktree); statErr == nil {
+		if _, err := captureRepositoryGitControl(worktree, controllerRepository.CommonDir.Path); err != nil {
+			return fmt.Errorf("refuse unsafe existing portable repair worktree: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect portable repair worktree destination: %w", statErr)
+	}
 	if err := prepareWorktree(ctx, w.Config.RepositoryDir, worktree, attempt.Branch, w.Config.BaseBranch, "", w.Config.ExpectedRemoteURL); err != nil {
 		return fmt.Errorf("prepare fresh portable repair worktree: %w", err)
+	}
+	if _, err := captureRepositoryGitControl(worktree, controllerRepository.CommonDir.Path); err != nil {
+		return fmt.Errorf("bind restored portable repair worktree Git control state: %w", err)
 	}
 	for ref, want := range expectedHeads {
 		if _, err := runGit(ctx, worktree, "fetch", "--no-tags", path, ref); err != nil {

@@ -78,6 +78,7 @@ type codexRunningProcess struct {
 	waitOnce       sync.Once
 	result         ProviderResult
 	err            error
+	reapErr        error
 }
 
 func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, attestation *codexProviderIdentityAttestation, prompt string, structured bool, root string) (*codexRunningProcess, error) {
@@ -100,6 +101,10 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 			_ = sealed.cleanupSeal()
 		}
 	}()
+	// Capture caller intent before an ordinary invocation replaces an empty root
+	// with its private temporary directory. Only the Manager-owned specialist
+	// proposal path supplies a root and selects the exact outer process tree.
+	exactProposalProcessTree := codexProposalProcessTreeRequested(root)
 	ownedRoot := false
 	if root == "" {
 		root, err = os.MkdirTemp("", "hive-codex-provider-run-")
@@ -212,7 +217,16 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 		}
 		return nil, fmt.Errorf("Codex executable identity changed immediately before launch: %w", err)
 	}
-	wait, err := startRepairProcessTree(commandCtx, command)
+	var wait func() error
+	if exactProposalProcessTree && !(runtime.GOOS == "linux" && codexProviderIsTestExecutable(provider.Command)) {
+		// The governed proposal child needs a kernel-backed exact descendant
+		// fence. Production Linux uses the attested/sealed Bubblewrap PID
+		// namespace; Windows uses a kill-on-close Job Object. Native test
+		// providers model Codex directly and retain the ordinary test boundary.
+		wait, err = startExactRepairProcessTree(commandCtx, command, sealed.SealedContainmentHelper)
+	} else {
+		wait, err = startRepairProcessTree(commandCtx, command)
+	}
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
 	if err != nil {
@@ -238,6 +252,10 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 	}, nil
 }
 
+func codexProposalProcessTreeRequested(explicitRoot string) bool {
+	return explicitRoot != ""
+}
+
 func (process *codexRunningProcess) PID() int { return process.pid }
 
 func (process *codexRunningProcess) ProviderSHA256() string { return process.providerSHA256 }
@@ -250,6 +268,13 @@ func (process *codexRunningProcess) WaitProvider() (ProviderResult, error) {
 			finishCodexOutputDrain(process.stdoutRead, process.stdoutDrain, "stdout"),
 			finishCodexOutputDrain(process.stderrRead, process.stderrDrain, "stderr"),
 		)
+		if isPatchEngineInfrastructureFailure(waitErr) {
+			process.reapErr = errors.Join(process.reapErr, waitErr)
+		}
+		// A bounded output drain is also part of the descendant-liveness
+		// proof: retained inherited handles mean process-tree cleanup was not
+		// demonstrated even if the provider leader already exited.
+		process.reapErr = errors.Join(process.reapErr, drainErr)
 		stdout, stdoutOverflow := process.stdout.snapshot()
 		stderr, stderrOverflow := process.stderr.snapshot()
 		cleanupErr := errors.Join(drainErr, process.cleanup())
@@ -280,6 +305,14 @@ func (process *codexRunningProcess) WaitProvider() (ProviderResult, error) {
 		}
 	})
 	return process.result, process.err
+}
+
+func (process *codexRunningProcess) ReapError() error {
+	if process == nil {
+		return errors.New("Codex process is unavailable")
+	}
+	_, _ = process.WaitProvider()
+	return process.reapErr
 }
 
 func finishCodexOutputDrain(reader *os.File, done <-chan error, name string) error {

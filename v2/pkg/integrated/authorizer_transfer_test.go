@@ -284,6 +284,7 @@ func newAuthorizerTransferFixture(t *testing.T) *authorizerTransferFixture {
 	t.Helper()
 	root := t.TempDir()
 	fixture := &authorizerTransferFixture{t: t, stateDir: filepath.Join(root, "state"), remote: filepath.Join(root, "remote.git"), currentID: 456, current: "setup-operator", prState: "open"}
+	bindTestRepositoryCloneURL(t, fixture.remote)
 	runIntegratedGit(t, root, "init", "--bare", fixture.remote)
 	seed := filepath.Join(root, "seed")
 	runIntegratedGit(t, root, "init", "-b", "main", seed)
@@ -298,7 +299,7 @@ func newAuthorizerTransferFixture(t *testing.T) *authorizerTransferFixture {
 		SchemaVersion: ConfigSchema, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
 		Coverage: CoverageComprehensive, Automation: AutomationAdvisory, Provider: "codex", ProviderCommand: os.Args[0],
 		ExecutionMode: ExecutionLocal,
-		ACMMLevel: 2, MaxActiveIssues: 5, MaxRepairAttempts: 3, VisualHive: true,
+		ACMMLevel:     2, MaxActiveIssues: 5, MaxRepairAttempts: 3, VisualHive: true,
 		VisualHiveRepo: "owner/visual-hive", VisualHiveRef: strings.Repeat("a", 40), VisualHiveConfigDigest: hex.EncodeToString(visualDigest[:]),
 		TestCommands: [][]string{{"node", "--test"}}, AllowedRepairPaths: []string{"**/*.test.*"},
 		CheckoutDir: checkout, StateDir: fixture.stateDir, SetupBranch: "hive/setup-123", SetupAuthorizationActorID: 456,

@@ -365,7 +365,7 @@ func repairRefreshCommands(config Config) []repair.Command {
 func refreshCheckpointRequest(config Config, attempt repair.Attempt, intent RepairRefreshIntent, commands []repair.Command, baselineProtection repair.BaselineProtection) repair.RefreshedBranchCheckpointRequest {
 	return repair.RefreshedBranchCheckpointRequest{
 		Worktree: attempt.Worktree, Branch: intent.Branch, RepositoryID: intent.RepositoryID,
-		ExpectedRemoteURL:  setupRepositoryCloneURL(config.Repository),
+		ExpectedRemoteURL:  RepositoryCloneURL(config.Repository),
 		BaselineProtection: baselineProtection,
 		RemoteHeadSHA:      intent.CurrentHeadSHA, BaseBranch: intent.BaseBranch, BaseSHA: intent.BaseSHA,
 		ExpectedChangedFiles: append([]string(nil), intent.ChangedFiles...), ExpectedContributionPatchID: intent.ContributionPatchID,

@@ -5,15 +5,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/kubestellar/hive/v2/internal/gittransport"
 	"github.com/kubestellar/hive/v2/pkg/automation"
+	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 	"github.com/kubestellar/hive/v2/pkg/visualhive"
 )
+
+func TestRepairLocalGitFilterHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_REPAIR_FILTER_HELPER") != "1" {
+		return
+	}
+	leaked := false
+	for _, pair := range os.Environ() {
+		name, value, _ := strings.Cut(pair, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "GIT_CONFIG_VALUE_") && strings.Contains(strings.ToUpper(value), "AUTHORIZATION: BASIC ") {
+			leaked = true
+		}
+	}
+	result := "credentialless\n"
+	if leaked {
+		result = "transport-authority-leaked\n"
+	}
+	if err := os.WriteFile(os.Getenv("HIVE_TEST_FILTER_SENTINEL"), []byte(result), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(os.Stdout, os.Stdin); err != nil {
+		t.Fatal(err)
+	}
+}
 
 type healthFailureProvider struct {
 	fail bool
@@ -554,16 +581,28 @@ func TestResumedSideEffectStagesRequireExactLifecycleBinding(t *testing.T) {
 
 func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
 	repository, remote := seedGitRepository(t)
+	branch := "hive/repair-empty-head-a1"
+	runCommand(t, repository, "git", "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "src/value.txt")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "fix: value\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	commitSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	candidateParent := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^"))
+	candidateTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^{tree}"))
+	runCommand(t, repository, "git", "push", "origin", commitSHA+":refs/heads/"+branch)
+	runCommand(t, repository, "git", "checkout", "main")
 	state, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	fingerprint := "owner/repo:empty-pr-head"
-	branch := "hive/repair-empty-head-a1"
 	attempt := Attempt{
 		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Attempt: 1, AttemptCounted: true,
 		Branch: branch, Worktree: t.TempDir(), Stage: StagePushed, Provider: "test-model",
-		CommitSHA: strings.Repeat("a", 40), ChangedFiles: []string{"src/value.txt"}, StartedAt: time.Now().UTC(),
+		CommitSHA: commitSHA, CandidateParent: candidateParent, CandidateTree: candidateTree,
+		ChangedFiles: []string{"src/value.txt"}, StartedAt: time.Now().UTC(),
 	}
 	if err := state.Put(attempt); err != nil {
 		t.Fatal(err)
@@ -587,6 +626,154 @@ func TestPushedCheckpointRejectsPullRequestWithoutExactHeadSHA(t *testing.T) {
 	persisted, _ := state.Get(fingerprint)
 	if pulls.calls != 1 || persisted.Stage != StagePushed || persisted.PRNumber != 0 {
 		t.Fatalf("unbound PR response mutated durable readiness: attempt=%+v calls=%d", persisted, pulls.calls)
+	}
+}
+
+func TestPushedCheckpointProtectsBaselineRootDeclaredOnlyByRemoteCommit(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	writeBaselineProtectionFile(t, repository, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/reviewed-reference\n")
+	writeBaselineProtectionFile(t, repository, "public/reviewed-reference/home.png", "reviewed\n")
+	runCommand(t, repository, "git", "add", ".")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "seed reviewed baseline")
+	runCommand(t, repository, "git", "push", "origin", "main")
+	trusted, err := InspectVisualBaselineProtection(context.Background(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "hive/repair-remote-baseline-a1"
+	runCommand(t, repository, "git", "checkout", "-b", branch)
+	writeBaselineProtectionFile(t, repository, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/new-reference\n")
+	writeBaselineProtectionFile(t, repository, "public/new-reference/home.png", "unreviewed\n")
+	runCommand(t, repository, "git", "add", ".")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "fix: substitute baseline\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	commitSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	candidateParent := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^"))
+	candidateTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^{tree}"))
+	runCommand(t, repository, "git", "push", "origin", commitSHA+":refs/heads/"+branch)
+	runCommand(t, repository, "git", "checkout", "main")
+
+	state, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := "owner/repo:remote-baseline"
+	if err := state.Put(Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Attempt: 1, AttemptCounted: true, LifecycleStarted: true,
+		Branch: branch, Worktree: t.TempDir(), Stage: StagePushed, Provider: "test-model", CommitSHA: commitSHA,
+		CandidateParent: candidateParent, CandidateTree: candidateTree,
+		ChangedFiles: []string{"public/new-reference/home.png", "visual-hive.config.yaml"}, StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pulls := &fakePRClient{state: state}
+	lifecycle := &fakeLifecycle{}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote,
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"**"}, BaselineProtection: trusted,
+		},
+		Provider: &healthFailureProvider{}, State: state, Lifecycle: lifecycle, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: fingerprint, RepairAttempts: 1,
+		Status: visualhive.StatusRepairRunning, Branch: branch, Title: "Repair value", Body: "broken", IssueKind: "functional",
+		Severity: "high", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "protected visual baseline") {
+		t.Fatalf("pushed checkpoint accepted baseline root declared only by exact remote commit: %v", err)
+	}
+	if pulls.calls != 0 || len(lifecycle.decisions) != 0 {
+		t.Fatalf("rejected pushed baseline performed side effects: pulls=%d decisions=%v", pulls.calls, lifecycle.decisions)
+	}
+}
+
+func TestRepairPushRejectsRepositoryControlledPrePushHook(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	branch := "hive/repair-hook-proof-a1"
+	runCommand(t, repository, "git", "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", ".")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "fix: value\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	commitSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	hooks := filepath.Join(repository, "attacker-hooks")
+	if err := os.MkdirAll(hooks, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hooks, "pre-push"), []byte("#!/bin/sh\ntouch hook-ran\nexit 99\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "config", "--local", "core.hooksPath", hooks)
+	if err := pushRepairBranchExact(context.Background(), repository, remote, branch, commitSHA, "123", "repair"); err == nil || !strings.Contains(err.Error(), "core.hookspath") {
+		t.Fatalf("controller-owned push did not reject repository hook config: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repository, "hook-ran")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repository-controlled pre-push hook executed: %v", err)
+	}
+}
+
+func TestExpectedRemoteRejectsUnsafeWorktreeScopedGitConfiguration(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	runCommand(t, repository, "git", "config", "--local", "extensions.worktreeConfig", "true")
+	runCommand(t, repository, "git", "config", "--worktree", "filter.hiveprobe.process", "malicious-filter")
+	if _, err := validateExpectedRemoteURL(context.Background(), repository, remote); err == nil || !strings.Contains(err.Error(), "worktree") || !strings.Contains(err.Error(), "filter.hiveprobe.process") {
+		t.Fatalf("unsafe worktree-scoped Git configuration was not rejected: %v", err)
+	}
+}
+
+func TestExpectedRemoteRejectsBareWorktreeConfiguration(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	runCommand(t, repository, "git", "config", "--local", "core.bare", "true")
+	if _, err := validateExpectedRemoteURL(context.Background(), repository, remote); err == nil || !strings.Contains(err.Error(), "core.bare") {
+		t.Fatalf("core.bare=true was not rejected before controller Git: %v", err)
+	}
+}
+
+func TestCredentiallessLocalTransportDisablesTargetUploadPackHook(t *testing.T) {
+	repository, _ := seedGitRepository(t)
+	runCommand(t, repository, "git", "config", "--local", "uploadpack.packObjectsHook", "hive-malicious-upload-pack-hook-that-does-not-exist")
+	transport := filepath.Join(t.TempDir(), "transport.git")
+	if _, err := runGitCommand(context.Background(), t.TempDir(), "", "init", "--bare", transport); err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	if _, err := runGitCommand(context.Background(), transport, "", "fetch", "--no-tags", "--force", repository, "+"+head+":refs/hive/test/import"); err != nil {
+		t.Fatalf("target upload-pack hook was not disabled by command-scoped controller config: %v", err)
+	}
+	if imported, err := runGitCommand(context.Background(), transport, "", "rev-parse", "--verify", "refs/hive/test/import^{commit}"); err != nil || !strings.EqualFold(strings.TrimSpace(imported), head) {
+		t.Fatalf("credentialless local transport imported wrong commit: %q err=%v", imported, err)
+	}
+}
+
+func TestLocalGitFilterCannotReceiveControllerTransportAuthority(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	sentinel := filepath.Join(t.TempDir(), "filter-environment")
+	t.Setenv("GO_WANT_REPAIR_FILTER_HELPER", "1")
+	t.Setenv("HIVE_TEST_FILTER_SENTINEL", sentinel)
+	executable := os.Args[0]
+	if runtime.GOOS == "windows" {
+		executable = filepath.ToSlash(executable)
+	}
+	filter := fmt.Sprintf("\"%s\" -test.run=^TestRepairLocalGitFilterHelperProcess$", executable)
+	runCommand(t, repository, "git", "config", "--local", "filter.hiveprobe.clean", filter)
+	if err := os.WriteFile(filepath.Join(repository, ".gitattributes"), []byte("src/value.txt filter=hiveprobe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("filter probe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := gittransport.WithControllerToken(context.Background(), "private-controller-token")
+	if _, err := runGit(ctx, repository, "add", ".gitattributes", "src/value.txt"); err != nil {
+		t.Fatalf("credentialless local Git probe: %v", err)
+	}
+	data, err := os.ReadFile(sentinel)
+	if err != nil || strings.TrimSpace(string(data)) != "credentialless" {
+		t.Fatalf("repository filter observed controller transport authority: %q err=%v", data, err)
+	}
+	if _, err := validateExpectedRemoteURL(ctx, repository, remote); err == nil || !strings.Contains(err.Error(), "filter.hiveprobe.clean") {
+		t.Fatalf("repository executable filter config was not rejected before transport: %v", err)
 	}
 }
 
@@ -791,6 +978,18 @@ func TestPushRepairBranchAdvancesOwnedAncestorWithExactLease(t *testing.T) {
 
 func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
 	repository, remote := seedGitRepository(t)
+	branch := "hive/repair-pr-a1"
+	runCommand(t, repository, "git", "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "src/value.txt")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "fix: value\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	commitSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	candidateParent := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^"))
+	candidateTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^{tree}"))
+	runCommand(t, repository, "git", "push", "origin", commitSHA+":refs/heads/"+branch)
+	runCommand(t, repository, "git", "checkout", "main")
 	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -798,8 +997,9 @@ func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
 	fingerprint := "owner/repo:pr-lifecycle-crash"
 	attempt := Attempt{
 		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Attempt: 1, AttemptCounted: true,
-		Branch: "hive/repair-pr-a1", Worktree: t.TempDir(), Stage: StagePROpen, Provider: "test-model",
-		CommitSHA: strings.Repeat("a", 40), PRNumber: 17, PRURL: "https://example.test/pull/17", StartedAt: time.Now().UTC(),
+		Branch: branch, Worktree: t.TempDir(), Stage: StagePROpen, Provider: "test-model",
+		CommitSHA: commitSHA, CandidateParent: candidateParent, CandidateTree: candidateTree, ChangedFiles: []string{"src/value.txt"},
+		PRNumber: 17, PRURL: "https://example.test/pull/17", StartedAt: time.Now().UTC(),
 	}
 	if err := state.Put(attempt); err != nil {
 		t.Fatal(err)
@@ -822,6 +1022,59 @@ func TestPROpenLifecycleCheckpointReconcilesAfterCrash(t *testing.T) {
 	reconciled, _ := state.Get(fingerprint)
 	if !reconciled.LifecyclePROpen || lifecycle.prOpens != 0 || result.PRNumber != 17 {
 		t.Fatalf("already-recorded PR lifecycle was duplicated or not checkpointed: %+v opens=%d result=%+v", reconciled, lifecycle.prOpens, result)
+	}
+}
+
+func TestPROpenCheckpointRejectsLiveHeadDriftWithBaselineProtectionDisabled(t *testing.T) {
+	repository, remote := seedGitRepository(t)
+	branch := "hive/repair-pr-drift-a1"
+	runCommand(t, repository, "git", "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("fixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCommand(t, repository, "git", "add", "src/value.txt")
+	runCommand(t, repository, "git", "-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-m", "fix: value\n\nHive-Repository-ID: 123\nHive-Operation: repair")
+	commitSHA := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	candidateParent := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^"))
+	candidateTree := strings.TrimSpace(gitOutput(t, repository, "rev-parse", commitSHA+"^{tree}"))
+	runCommand(t, repository, "git", "push", "origin", commitSHA+":refs/heads/"+branch)
+	runCommand(t, repository, "git", "checkout", "main")
+
+	state, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := "owner/repo:pr-live-drift"
+	attempt := Attempt{
+		Repository: "owner/repo", RepositoryFingerprint: fingerprint, Attempt: 1, AttemptCounted: true, LifecyclePROpen: true,
+		Branch: branch, Worktree: t.TempDir(), Stage: StagePROpen, Provider: "test-model", CommitSHA: commitSHA,
+		CandidateParent: candidateParent, CandidateTree: candidateTree, ChangedFiles: []string{"src/value.txt"},
+		PRNumber: 17, PRURL: "https://example.test/pull/17", StartedAt: time.Now().UTC(),
+	}
+	if err := state.Put(attempt); err != nil {
+		t.Fatal(err)
+	}
+	pulls := &fakePRClient{state: state, inspect: &hivegithub.ManagedPullRequestSnapshot{
+		Number: 17, URL: attempt.PRURL, State: "open", HeadBranch: branch, HeadSHA: strings.Repeat("f", 40), BaseBranch: "main", ChangedFiles: attempt.ChangedFiles,
+	}}
+	worker := &Worker{
+		Config: Config{
+			RepositoryDir: repository, WorktreeRoot: t.TempDir(), BaseBranch: "main", ExpectedRemoteURL: remote,
+			Policy:             automation.Policy{ACMMLevel: 5, Mode: automation.ModeRepairPR, AllowedRepositories: []string{"owner/repo"}, MaxRepairAttempts: 3},
+			AllowedRepairPaths: []string{"src/**"},
+		},
+		Provider: &healthFailureProvider{}, State: state, Lifecycle: &fakeLifecycle{}, GitHub: pulls,
+	}
+	finding := visualhive.FindingLifecycle{
+		Repository: "owner/repo", RepositoryID: "123", RepositoryFingerprint: fingerprint, RepairAttempts: 1,
+		Status: visualhive.StatusPROpen, Branch: branch, RepairCommitSHA: commitSHA, PRNumber: 17, PRURL: attempt.PRURL,
+		Title: "Repair value", Body: "broken", IssueKind: "functional", Severity: "high", IssueNumber: 9, IssueURL: "https://example.test/issues/9",
+	}
+	if _, err := worker.Run(context.Background(), finding); err == nil || !strings.Contains(err.Error(), "managed repair pull request") {
+		t.Fatalf("disabled-baseline open PR accepted live head drift: %v", err)
+	}
+	if pulls.inspectCalls != 1 {
+		t.Fatalf("disabled-baseline open PR was not rebound exactly: inspect calls=%d", pulls.inspectCalls)
 	}
 }
 

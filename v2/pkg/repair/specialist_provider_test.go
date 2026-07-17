@@ -82,6 +82,10 @@ func (process *managerBackedSpecialistProcess) Wait() (agent.SpecialistChildExec
 	return process.result, nil
 }
 
+func (process *managerBackedSpecialistProcess) ForceReap(context.Context) error {
+	return nil
+}
+
 func decodeManagerBackedSpecialistPrompt(prompt string) (agent.SpecialistWorkOrder, agent.SpecialistLease, error) {
 	const orderMarker = "CONTROLLER_BOUND_WORK_ORDER_JSON\n"
 	const leaseMarker = "\nCONTROLLER_BOUND_LEASE_JSON\n"

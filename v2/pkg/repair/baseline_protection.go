@@ -40,6 +40,9 @@ func InspectVisualBaselineProtection(ctx context.Context, repositoryDir string) 
 	if strings.TrimSpace(repositoryDir) == "" {
 		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: repository directory is required")
 	}
+	if _, err := captureRepositoryGitControl(repositoryDir, ""); err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: unsafe repository Git control state: %w", err)
+	}
 
 	configPath := filepath.Join(repositoryDir, "visual-hive.config.yaml")
 	info, err := os.Lstat(configPath)
@@ -58,31 +61,9 @@ func InspectVisualBaselineProtection(ctx context.Context, repositoryDir string) 
 		if int64(len(data)) != info.Size() {
 			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: visual-hive.config.yaml changed while it was read")
 		}
-		var config struct {
-			Visual struct {
-				SnapshotDir string `yaml:"snapshotDir"`
-			} `yaml:"visual"`
-		}
-		decoder := yaml.NewDecoder(bytes.NewReader(data))
-		if decodeErr := decoder.Decode(&config); decodeErr != nil {
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: parse config: %w", decodeErr)
-		}
-		var trailing any
-		if decodeErr := decoder.Decode(&trailing); decodeErr != io.EOF {
-			if decodeErr == nil {
-				decodeErr = fmt.Errorf("multiple YAML documents are not supported")
-			}
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: parse config: %w", decodeErr)
-		}
-		snapshotDir := config.Visual.SnapshotDir
-		if snapshotDir == "" {
-			snapshotDir = ".visual-hive/snapshots"
-		} else if strings.TrimSpace(snapshotDir) != snapshotDir {
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: visual.snapshotDir contains surrounding whitespace")
-		}
-		normalized, normalizeErr := normalizeVisualBaselinePath(snapshotDir)
+		normalized, normalizeErr := visualBaselineRootFromConfig(data)
 		if normalizeErr != nil {
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: invalid visual.snapshotDir: %w", normalizeErr)
+			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: %w", normalizeErr)
 		}
 		result.Roots = append(result.Roots, normalized)
 	case os.IsNotExist(err):
@@ -97,22 +78,119 @@ func InspectVisualBaselineProtection(ctx context.Context, repositoryDir string) 
 	if err != nil {
 		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: list repository files: %w", err)
 	}
+	if err := collectVisualBaselineFiles(&result, listing); err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: %w", err)
+	}
+	return normalizeBaselineProtection(result)
+}
+
+// InspectVisualBaselineProtectionAtCommit derives protection from immutable Git
+// objects at one exact commit. It never consults the mutable worktree or index.
+func InspectVisualBaselineProtectionAtCommit(ctx context.Context, repositoryDir, commitSHA string) (BaselineProtection, error) {
+	result := BaselineProtection{Enforced: true}
+	if strings.TrimSpace(repositoryDir) == "" || !validGitCommitSHA(commitSHA) {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: repository directory and exact commit are required")
+	}
+	if _, err := captureRepositoryGitControl(repositoryDir, ""); err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: unsafe repository Git control state: %w", err)
+	}
+	commitSHA = strings.ToLower(commitSHA)
+	treeEntry, err := runGitBytes(ctx, repositoryDir, maxVisualBaselinePathBytes+256,
+		"ls-tree", "-z", commitSHA, "--", "visual-hive.config.yaml")
+	if err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: read config identity: %w", err)
+	}
+	if len(treeEntry) > 0 {
+		objectID, parseErr := exactVisualConfigObject(treeEntry)
+		if parseErr != nil {
+			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: %w", parseErr)
+		}
+		data, readErr := runGitBytes(ctx, repositoryDir, maxVisualHiveConfigBytes, "cat-file", "blob", objectID)
+		if readErr != nil {
+			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: read config: %w", readErr)
+		}
+		root, normalizeErr := visualBaselineRootFromConfig(data)
+		if normalizeErr != nil {
+			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: %w", normalizeErr)
+		}
+		result.Roots = append(result.Roots, root)
+	}
+
+	listing, err := runGitBytes(ctx, repositoryDir, maxVisualBaselineListingBytes,
+		"ls-tree", "-r", "-z", "--name-only", commitSHA, "--")
+	if err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: list repository files: %w", err)
+	}
+	if err := collectVisualBaselineFiles(&result, listing); err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection at commit: %w", err)
+	}
+	return normalizeBaselineProtection(result)
+}
+
+func exactVisualConfigObject(entry []byte) (string, error) {
+	parts := bytes.Split(entry, []byte{0})
+	if len(parts) != 2 || len(parts[1]) != 0 {
+		return "", fmt.Errorf("visual-hive.config.yaml has an ambiguous tree identity")
+	}
+	metadata, name, found := bytes.Cut(parts[0], []byte{'\t'})
+	fields := strings.Fields(string(metadata))
+	if !found || string(name) != "visual-hive.config.yaml" || len(fields) != 3 ||
+		(fields[0] != "100644" && fields[0] != "100755") || fields[1] != "blob" || !validGitCommitSHA(fields[2]) {
+		return "", fmt.Errorf("visual-hive.config.yaml must be one regular Git blob")
+	}
+	return strings.ToLower(fields[2]), nil
+}
+
+func visualBaselineRootFromConfig(data []byte) (string, error) {
+	if len(data) > maxVisualHiveConfigBytes {
+		return "", fmt.Errorf("visual-hive.config.yaml exceeds %d bytes", maxVisualHiveConfigBytes)
+	}
+	var config struct {
+		Visual struct {
+			SnapshotDir string `yaml:"snapshotDir"`
+		} `yaml:"visual"`
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&config); err != nil {
+		return "", fmt.Errorf("parse config: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple YAML documents are not supported")
+		}
+		return "", fmt.Errorf("parse config: %w", err)
+	}
+	snapshotDir := config.Visual.SnapshotDir
+	if snapshotDir == "" {
+		snapshotDir = ".visual-hive/snapshots"
+	} else if strings.TrimSpace(snapshotDir) != snapshotDir {
+		return "", fmt.Errorf("visual.snapshotDir contains surrounding whitespace")
+	}
+	normalized, err := normalizeVisualBaselinePath(snapshotDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid visual.snapshotDir: %w", err)
+	}
+	return normalized, nil
+}
+
+func collectVisualBaselineFiles(result *BaselineProtection, listing []byte) error {
 	for _, raw := range bytes.Split(listing, []byte{0}) {
 		if len(raw) == 0 {
 			continue
 		}
-		file, normalizeErr := normalizeVisualBaselinePath(string(raw))
-		if normalizeErr != nil {
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: invalid repository path: %w", normalizeErr)
+		file, err := normalizeVisualBaselinePath(string(raw))
+		if err != nil {
+			return fmt.Errorf("invalid repository path: %w", err)
 		}
-		if visualBaselineConventionFile(file) || visualBaselinePathRestricted(file, result) {
+		if visualBaselineConventionFile(file) || visualBaselinePathRestricted(file, *result) {
 			result.Files = append(result.Files, file)
 		}
 		if len(result.Files) > maxVisualBaselineProtectedPath {
-			return BaselineProtection{}, fmt.Errorf("inspect visual baseline protection: more than %d protected files", maxVisualBaselineProtectedPath)
+			return fmt.Errorf("more than %d protected files", maxVisualBaselineProtectedPath)
 		}
 	}
-	return normalizeBaselineProtection(result)
+	return nil
 }
 
 func normalizeBaselineProtection(protection BaselineProtection) (BaselineProtection, error) {
@@ -164,6 +242,21 @@ func baselineProtectionForWorktree(ctx context.Context, worktree string, trusted
 	candidate, err := InspectVisualBaselineProtection(ctx, worktree)
 	if err != nil {
 		return BaselineProtection{}, fmt.Errorf("inspect candidate visual baseline protection: %w", err)
+	}
+	return mergeBaselineProtection(normalized, candidate)
+}
+
+func baselineProtectionForCommit(ctx context.Context, repositoryDir, commitSHA string, trusted BaselineProtection) (BaselineProtection, error) {
+	normalized, err := normalizeBaselineProtection(trusted)
+	if err != nil {
+		return BaselineProtection{}, err
+	}
+	if !normalized.Enforced {
+		return normalized, nil
+	}
+	candidate, err := InspectVisualBaselineProtectionAtCommit(ctx, repositoryDir, commitSHA)
+	if err != nil {
+		return BaselineProtection{}, fmt.Errorf("inspect exact candidate visual baseline protection: %w", err)
 	}
 	return mergeBaselineProtection(normalized, candidate)
 }

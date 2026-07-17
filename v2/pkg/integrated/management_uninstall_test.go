@@ -463,6 +463,7 @@ func newUninstallFixtureWithManagedSetup(t *testing.T, seedManagedSetup bool) *u
 	t.Helper()
 	root := t.TempDir()
 	fixture := &uninstallFixture{stateDir: filepath.Join(root, "state"), remote: filepath.Join(root, "remote.git"), files: sortedUniquePaths(managedSetupFiles(true)), diff: "exact cleanup diff\n"}
+	bindTestRepositoryCloneURL(t, fixture.remote)
 	runIntegratedGit(t, root, "init", "--bare", fixture.remote)
 	seed := filepath.Join(root, "seed")
 	runIntegratedGit(t, root, "init", "-b", "main", seed)

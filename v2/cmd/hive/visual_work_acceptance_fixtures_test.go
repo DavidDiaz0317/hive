@@ -70,10 +70,19 @@ func seedAcceptanceRepository(t *testing.T) (string, string, string) {
 	if err := os.MkdirAll(filepath.Join(repository, "src"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(repository, "public", "reviewed-reference"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(repository, "src", "value.txt"), []byte("broken\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	acceptanceGit(t, repository, "add", "src/value.txt")
+	if err := os.WriteFile(filepath.Join(repository, "visual-hive.config.yaml"), []byte("visual:\n  snapshotDir: public/reviewed-reference\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "public", "reviewed-reference", "home.png"), []byte("reviewed-baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	acceptanceGit(t, repository, "add", "src/value.txt", "visual-hive.config.yaml", "public/reviewed-reference/home.png")
 	acceptanceGit(t, repository, "commit", "-m", "seed broken value")
 	acceptanceGit(t, repository, "remote", "add", "origin", remote)
 	acceptanceGit(t, repository, "push", "-u", "origin", "main")

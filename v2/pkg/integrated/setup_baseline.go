@@ -522,7 +522,7 @@ func publishPreparedSetupBaselineProposal(ctx context.Context, store *Store, con
 	if err := authorizeSetup(store, integratedPolicy(config), config.Repository, automation.ActionSetupPush); err != nil {
 		return intent, err
 	}
-	if err := pushManagedBranch(ctx, config.CheckoutDir, branch, config.RepositoryID, setupBaselineOperation, head); err != nil {
+	if err := pushManagedBranch(ctx, config.CheckoutDir, config.Repository, branch, config.RepositoryID, setupBaselineOperation, head); err != nil {
 		return intent, err
 	}
 	body := fmt.Sprintf("%s\n\nHive captured %d PNG baselines on GitHub-hosted Linux at exact default head `%s`; this PR contains only the %d missing or changed candidates.\n\n- Capture run: %s\n- Artifact ID: `%d`\n- Full capture digest: `%s`\n- Review delta digest: `%s`\n\nHive will not remove the hold or merge until the recorded setup authorizer approves every exact binding through `hive approve-baseline`.\n", marker, len(intent.CaptureCandidates), intent.CaptureHeadSHA, len(paths), intent.CaptureRunURL, intent.ArtifactID, intent.CaptureCandidateDigest, intent.CandidateDigest)

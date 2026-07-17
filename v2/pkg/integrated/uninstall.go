@@ -266,7 +266,7 @@ func completePreparedUninstall(ctx context.Context, options ManagementOptions, s
 		if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPush); err != nil {
 			return result, err
 		}
-		if err := pushManagedBranch(ctx, config.CheckoutDir, intent.Branch, config.RepositoryID, string(OperationUninstall), intent.CleanupCommitSHA); err != nil {
+		if err := pushManagedBranch(ctx, config.CheckoutDir, config.Repository, intent.Branch, config.RepositoryID, string(OperationUninstall), intent.CleanupCommitSHA); err != nil {
 			return result, err
 		}
 		if err := authorizeSetup(store, policy, config.Repository, automation.ActionSetupPR); err != nil {

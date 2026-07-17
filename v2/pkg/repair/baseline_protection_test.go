@@ -58,6 +58,24 @@ func TestResumedRepairUnionsTrustedAndCandidateVisualBaselineRoots(t *testing.T)
 	}
 }
 
+func TestVisualBaselineProtectionAtCommitIgnoresMutableWorktreeConfig(t *testing.T) {
+	repository := seedBaselineProtectionRepository(t, "public/reviewed-reference")
+	reviewedCommit := strings.TrimSpace(gitOutput(t, repository, "rev-parse", "HEAD"))
+	writeBaselineProtectionFile(t, repository, "visual-hive.config.yaml", "visual:\n  snapshotDir: public/unreviewed-reference\n")
+	writeBaselineProtectionFile(t, repository, "public/unreviewed-reference/home.png", "unreviewed baseline\n")
+
+	protection, err := InspectVisualBaselineProtectionAtCommit(context.Background(), repository, reviewedCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsFoldedPath(protection.Roots, "public/reviewed-reference") || containsFoldedPath(protection.Roots, "public/unreviewed-reference") {
+		t.Fatalf("exact commit protection consulted mutable worktree config: %+v", protection)
+	}
+	if !containsFoldedPath(protection.Files, "public/reviewed-reference/home.png") || containsFoldedPath(protection.Files, "public/unreviewed-reference/home.png") {
+		t.Fatalf("exact commit protection consulted mutable worktree files: %+v", protection)
+	}
+}
+
 func seedBaselineProtectionRepository(t *testing.T, snapshotDir string) string {
 	t.Helper()
 	repository := t.TempDir()
