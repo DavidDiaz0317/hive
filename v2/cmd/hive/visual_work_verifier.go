@@ -27,6 +27,7 @@ type normalVisualVerifiedPullRequest interface {
 }
 
 type normalVisualPullRequestFetcher func(context.Context, hivegithub.VisualHivePullRequestBundleRequest) (normalVisualVerifiedPullRequest, error)
+type normalVisualPullRequestStateInspector func(context.Context, string, string, int, string, string, string, string) (hivegithub.ManagedPullRequestSnapshot, error)
 
 // normalVisualPullRequestVerifier is the sole post-Worker verdict adapter. It
 // discovers and verifies the exact GitHub run/artifacts through pkg/github,
@@ -38,6 +39,7 @@ type normalVisualPullRequestVerifier struct {
 	lifecycle    *visualhive.LifecycleStore
 	loadConfig   func() (integrated.Config, int, error)
 	fetch        normalVisualPullRequestFetcher
+	inspectState normalVisualPullRequestStateInspector
 	actionsAppID func(context.Context) (int64, error)
 }
 
@@ -55,7 +57,7 @@ func (verifier *normalVisualPullRequestVerifier) VerifyPullRequest(ctx context.C
 	}
 	finding, exists := verifier.lifecycle.Finding(request.RepositoryFingerprint)
 	if !exists || !strings.EqualFold(finding.Repository, current.Repository) || finding.RepositoryID != current.RepositoryID ||
-		finding.PRNumber != request.PullRequestNumber || finding.Branch != request.HeadBranch || !strings.EqualFold(finding.RepairCommitSHA, request.HeadSHA) ||
+		finding.PRNumber != request.PullRequestNumber || finding.PRURL != request.PullRequestURL || finding.Branch != request.HeadBranch || !strings.EqualFold(finding.RepairCommitSHA, request.HeadSHA) ||
 		(finding.Status != visualhive.StatusPROpen && finding.Status != visualhive.StatusChecksRunning && finding.Status != visualhive.StatusNeedsRevision && finding.Status != visualhive.StatusReady) {
 		return normalservice.PullRequestVerdictReceipt{}, errors.New("exact-head verifier request does not match the existing Worker PR lifecycle")
 	}
@@ -107,6 +109,84 @@ func (verifier *normalVisualPullRequestVerifier) VerifyPullRequest(ctx context.C
 	}, nil
 }
 
+// ObservePullRequestState reuses Hive's existing exact managed-PR inspector as
+// a read-only repository-wide WIP gate. It cannot merge, close, relabel, or
+// otherwise mutate the Worker PR.
+func (verifier *normalVisualPullRequestVerifier) ObservePullRequestState(ctx context.Context, request normalservice.PullRequestStateRequest) (normalservice.PullRequestStateObservation, error) {
+	if verifier == nil || verifier.lifecycle == nil || verifier.loadConfig == nil {
+		return normalservice.PullRequestStateObservation{}, errors.New("normal Visual Hive exact PR state observer is not configured")
+	}
+	current, normalACMM, err := verifier.loadConfig()
+	if err != nil {
+		return normalservice.PullRequestStateObservation{}, err
+	}
+	if _, _, err := validateNormalVisualPullRequestRequest(current, normalACMM, request.PullRequestVerdictRequest); err != nil {
+		return normalservice.PullRequestStateObservation{}, err
+	}
+	finding, exists := verifier.lifecycle.Finding(request.RepositoryFingerprint)
+	if !exists || !readyFindingMatchesPullRequestState(finding, current, request) {
+		return normalservice.PullRequestStateObservation{}, errors.New("PR state request does not match the existing Ready Worker PR and sealed receipt")
+	}
+	marker := "<!-- hive-repair: " + request.RepositoryFingerprint + " -->"
+	snapshot, err := verifier.inspectPullRequestState(ctx, current.Repository, current.RepositoryID, request.PullRequestNumber, marker, request.HeadBranch, request.HeadSHA, request.BaseBranch)
+	if err != nil {
+		return normalservice.PullRequestStateObservation{}, err
+	}
+	if snapshot.Number != request.PullRequestNumber || snapshot.URL != request.PullRequestURL || snapshot.HeadBranch != request.HeadBranch ||
+		!strings.EqualFold(snapshot.HeadSHA, request.HeadSHA) || snapshot.BaseBranch != request.BaseBranch {
+		return normalservice.PullRequestStateObservation{}, errors.New("live Worker PR state differs from its exact durable identity")
+	}
+	state := strings.ToLower(strings.TrimSpace(snapshot.State))
+	switch state {
+	case "open":
+		if snapshot.Merged {
+			return normalservice.PullRequestStateObservation{}, errors.New("live Worker PR is simultaneously open and merged")
+		}
+		return normalservice.PullRequestStateObservation{State: state, Open: true}, nil
+	case "closed":
+		return normalservice.PullRequestStateObservation{State: state, Merged: snapshot.Merged}, nil
+	default:
+		return normalservice.PullRequestStateObservation{}, errors.New("live Worker PR returned an unsupported state")
+	}
+}
+
+func readyFindingMatchesPullRequestState(finding visualhive.FindingLifecycle, current integrated.Config, request normalservice.PullRequestStateRequest) bool {
+	receipt := finding.LastPullRequestCheckReceipt
+	if finding.Status != visualhive.StatusReady || receipt == nil || request.VerdictReceiptSHA256 == "" ||
+		!strings.EqualFold(finding.Repository, current.Repository) || finding.RepositoryID != current.RepositoryID ||
+		finding.PRNumber != request.PullRequestNumber || finding.PRURL != request.PullRequestURL || finding.Branch != request.HeadBranch ||
+		!strings.EqualFold(finding.RepairCommitSHA, request.HeadSHA) || receipt.ReceiptSHA256 != request.VerdictReceiptSHA256 {
+		return false
+	}
+	identity := receipt.Identity
+	if identity.SchemaVersion != visualhive.PullRequestCheckReceiptSchema || identity.Authority != (visualhive.PullRequestCheckAuthority{CheckEvidenceOnly: true}) ||
+		!strings.EqualFold(identity.Source.Repository, current.Repository) || identity.Source.RepositoryID != current.RepositoryID || identity.Source.PullRequest != request.PullRequestNumber ||
+		!strings.EqualFold(identity.Source.Base.Repository, current.Repository) || identity.Source.Base.RepositoryID != current.RepositoryID ||
+		identity.Source.Base.Ref != request.BaseBranch || identity.Source.Base.SHA != request.BaseSHA ||
+		!strings.EqualFold(identity.Source.Head.Repository, current.Repository) || identity.Source.Head.RepositoryID != current.RepositoryID ||
+		identity.Source.Head.Ref != request.HeadBranch || identity.Source.Head.SHA != request.HeadSHA ||
+		identity.Workflow.Name != normalVisualPullRequestWorkflowName || identity.Workflow.Path != normalVisualPullRequestWorkflowPath || identity.Workflow.Event != "pull_request" ||
+		identity.Producer.GitCommit != hivegithub.VisualHivePullRequestProducerCommit || identity.Check.State != "success" || identity.Check.Conclusion != "success" || identity.ReplayKey == "" {
+		return false
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(encoded)
+	return receipt.ReceiptSHA256 == hex.EncodeToString(digest[:])
+}
+
+func (verifier *normalVisualPullRequestVerifier) inspectPullRequestState(ctx context.Context, repository, repositoryID string, number int, marker, branch, headSHA, base string) (hivegithub.ManagedPullRequestSnapshot, error) {
+	if verifier.inspectState != nil {
+		return verifier.inspectState(ctx, repository, repositoryID, number, marker, branch, headSHA, base)
+	}
+	if verifier.github == nil {
+		return hivegithub.ManagedPullRequestSnapshot{}, errors.New("normal Visual Hive GitHub client is unavailable")
+	}
+	return verifier.github.InspectManagedPullRequestExact(ctx, repository, repositoryID, number, marker, branch, headSHA, base)
+}
+
 func (verifier *normalVisualPullRequestVerifier) resolveActionsAppID(ctx context.Context) (int64, error) {
 	if verifier.actionsAppID != nil {
 		return verifier.actionsAppID(ctx)
@@ -138,7 +218,7 @@ func validateNormalVisualPullRequestRequest(current integrated.Config, normalACM
 	}
 	if !current.VisualHive || current.Paused || (current.Automation != integrated.AutomationRepairPR && current.Automation != integrated.AutomationAutoMerge) ||
 		!strings.EqualFold(request.Repository, current.Repository) || request.RepositoryFingerprint != strings.ToLower(strings.TrimSpace(request.RepositoryFingerprint)) ||
-		len(request.RepositoryFingerprint) != sha256.Size*2 || request.PullRequestNumber <= 0 || strings.TrimSpace(request.IdempotencyKey) == "" ||
+		len(request.RepositoryFingerprint) != sha256.Size*2 || request.PullRequestNumber <= 0 || strings.TrimSpace(request.PullRequestURL) == "" || request.PullRequestURL != strings.TrimSpace(request.PullRequestURL) || strings.TrimSpace(request.IdempotencyKey) == "" ||
 		request.BaseBranch != current.DefaultBranch || request.BaseBranch != strings.TrimSpace(request.BaseBranch) || request.HeadBranch == "" || request.HeadBranch != strings.TrimSpace(request.HeadBranch) ||
 		!exactNormalVisualGitCommit(request.BaseSHA) || !exactNormalVisualGitCommit(request.HeadSHA) || strings.TrimSpace(current.StateDir) == "" {
 		return 0, 0, errors.New("normal Visual Hive verdict request lacks exact installed repository, PR, branch, base, head, or policy identity")

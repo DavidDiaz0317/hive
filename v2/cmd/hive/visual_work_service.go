@@ -276,9 +276,25 @@ func configureNormalVisualWorkRunner(
 	verdict := &normalVisualPullRequestVerifier{github: github, lifecycle: lifecycle, loadConfig: loader}
 	poll := time.Duration(installed.RunIntervalSeconds) * time.Second
 	service, err := normalservice.New(normalservice.Options{
-		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, LeaseRetry: 30 * time.Second,
+		StateDir: filepath.Join(installed.StateDir, "visual-hive"), PollInterval: poll, LeaseRetry: 30 * time.Second, QuiesceInterval: 100 * time.Millisecond,
 		AcquireLease: func() (func(), error) { return integrated.AcquireNormalVisualWorkLease(installed.StateDir) },
-		Source:       source, Intake: controller, Repairer: repairer,
+		ShouldQuiesce: func() (bool, error) {
+			requested, err := integrated.PauseRequested(installed.StateDir)
+			if err != nil || requested {
+				return requested, err
+			}
+			current, _, err := loader()
+			if err != nil {
+				return true, err
+			}
+			// A replacement authoritative state root must start its own service;
+			// this runner must not retain or resume ownership of the old root.
+			if !sameSpecialistRuntimePath(current.StateDir, installed.StateDir) {
+				return true, nil
+			}
+			return current.Paused, nil
+		},
+		Source: source, Intake: controller, Repairer: repairer, PullRequestState: verdict,
 		// The verifier applies only its opaque check-evidence capability. The
 		// service/controller still own completion and workflow consumption; no
 		// merge, baseline, issue-resolution, or repository-write authority exists.

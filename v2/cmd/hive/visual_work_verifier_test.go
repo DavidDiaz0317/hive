@@ -39,7 +39,7 @@ func TestNormalVisualPullRequestVerifierAppliesOnlyExactSealedCheckEvidence(t *t
 	}
 	receipt, err := verifier.VerifyPullRequest(context.Background(), normalservice.PullRequestVerdictRequest{
 		IdempotencyKey: "workflow:order", Repository: "owner/repo", RepositoryFingerprint: fingerprint,
-		PullRequestNumber: 7, HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+		PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,10 +76,144 @@ func TestNormalVisualPullRequestVerifierRejectsReceiptDriftBeforeLifecycleApply(
 	}
 	_, err := verifier.VerifyPullRequest(context.Background(), normalservice.PullRequestVerdictRequest{
 		IdempotencyKey: "workflow:order", Repository: "owner/repo", RepositoryFingerprint: fingerprint,
-		PullRequestNumber: 7, HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+		PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
 	})
 	if err == nil || !strings.Contains(err.Error(), "differs from the exact installed Worker PR") || verified.applyCalls != 0 {
 		t.Fatalf("drifted receipt reached lifecycle apply: err=%v verified=%+v", err, verified)
+	}
+}
+
+func TestNormalVisualPullRequestStateObserverReusesExactReadOnlyManagedPRInspection(t *testing.T) {
+	fingerprint := strings.Repeat("f", 64)
+	baseSHA, headSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	sealedReceipt := normalVisualVerifierSnapshot(t, baseSHA, headSHA)
+	lifecycle := writeNormalVisualReadyVerifierLifecycle(t, fingerprint, headSHA, sealedReceipt)
+	config := integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(),
+		VisualHive: true, Automation: integrated.AutomationRepairPR, ACMMLevel: 5,
+	}
+	request := normalservice.PullRequestStateRequest{
+		PullRequestVerdictRequest: normalservice.PullRequestVerdictRequest{
+			IdempotencyKey: "workflow:order", Repository: config.Repository, RepositoryFingerprint: fingerprint,
+			PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+		},
+		VerdictReceiptSHA256: sealedReceipt.ReceiptSHA256,
+	}
+	state, merged, calls := "open", false, 0
+	verifier := &normalVisualPullRequestVerifier{
+		lifecycle: lifecycle, loadConfig: func() (integrated.Config, int, error) { return config, 5, nil },
+		inspectState: func(_ context.Context, repository, repositoryID string, number int, marker, branch, head, base string) (hivegithub.ManagedPullRequestSnapshot, error) {
+			calls++
+			if repository != config.Repository || repositoryID != config.RepositoryID || number != request.PullRequestNumber ||
+				marker != "<!-- hive-repair: "+fingerprint+" -->" || branch != request.HeadBranch || head != request.HeadSHA || base != request.BaseBranch {
+				t.Fatalf("state inspection lost exact durable PR identity: repo=%s id=%s number=%d marker=%q branch=%s head=%s base=%s", repository, repositoryID, number, marker, branch, head, base)
+			}
+			return hivegithub.ManagedPullRequestSnapshot{
+				Number: number, URL: request.PullRequestURL, State: state, Merged: merged,
+				HeadBranch: branch, HeadSHA: head, BaseBranch: base,
+			}, nil
+		},
+	}
+	observation, err := verifier.ObservePullRequestState(context.Background(), request)
+	if err != nil || !observation.Open || observation.Merged || observation.State != "open" {
+		t.Fatalf("open exact PR observation = %+v err=%v", observation, err)
+	}
+	state, merged = "closed", true
+	observation, err = verifier.ObservePullRequestState(context.Background(), request)
+	if err != nil || observation.Open || !observation.Merged || observation.State != "closed" || calls != 2 {
+		t.Fatalf("merged exact PR observation = %+v calls=%d err=%v", observation, calls, err)
+	}
+}
+
+func TestNormalVisualPullRequestStateObserverRejectsNonReadyOrDriftedSealedLifecycle(t *testing.T) {
+	fingerprint := strings.Repeat("f", 64)
+	baseSHA, headSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	valid := normalVisualVerifierSnapshot(t, baseSHA, headSHA)
+	drifted := valid
+	drifted.Identity.Source.Head.SHA = strings.Repeat("c", 40)
+	driftedBytes, err := json.Marshal(drifted.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedDigest := sha256.Sum256(driftedBytes)
+	drifted.ReceiptSHA256 = hex.EncodeToString(driftedDigest[:])
+	cases := []struct {
+		name    string
+		status  visualhive.LifecycleStatus
+		receipt *visualhive.PullRequestCheckReceiptSnapshot
+		digest  string
+	}{
+		{name: "not Ready", status: visualhive.StatusPROpen, receipt: &valid, digest: valid.ReceiptSHA256},
+		{name: "missing receipt", status: visualhive.StatusReady, receipt: nil, digest: valid.ReceiptSHA256},
+		{name: "ledger digest drift", status: visualhive.StatusReady, receipt: &valid, digest: strings.Repeat("0", 64)},
+		{name: "sealed head drift", status: visualhive.StatusReady, receipt: &drifted, digest: drifted.ReceiptSHA256},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			lifecycle := writeNormalVisualVerifierLifecycleState(t, fingerprint, headSHA, test.status, test.receipt)
+			config := integrated.Config{
+				Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(),
+				VisualHive: true, Automation: integrated.AutomationRepairPR, ACMMLevel: 5,
+			}
+			inspections := 0
+			verifier := &normalVisualPullRequestVerifier{
+				lifecycle: lifecycle, loadConfig: func() (integrated.Config, int, error) { return config, 5, nil },
+				inspectState: func(context.Context, string, string, int, string, string, string, string) (hivegithub.ManagedPullRequestSnapshot, error) {
+					inspections++
+					return hivegithub.ManagedPullRequestSnapshot{}, nil
+				},
+			}
+			_, observeErr := verifier.ObservePullRequestState(context.Background(), normalservice.PullRequestStateRequest{
+				PullRequestVerdictRequest: normalservice.PullRequestVerdictRequest{
+					IdempotencyKey: "workflow:order", Repository: config.Repository, RepositoryFingerprint: fingerprint,
+					PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+				},
+				VerdictReceiptSHA256: test.digest,
+			})
+			if observeErr == nil || !strings.Contains(observeErr.Error(), "Ready Worker PR and sealed receipt") || inspections != 0 {
+				t.Fatalf("unsealed lifecycle reached live PR inspection: err=%v inspections=%d", observeErr, inspections)
+			}
+		})
+	}
+}
+
+func TestNormalVisualPullRequestStateObserverRejectsLiveIdentityAndStateDrift(t *testing.T) {
+	fingerprint := strings.Repeat("f", 64)
+	baseSHA, headSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	sealedReceipt := normalVisualVerifierSnapshot(t, baseSHA, headSHA)
+	config := integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(),
+		VisualHive: true, Automation: integrated.AutomationRepairPR, ACMMLevel: 5,
+	}
+	request := normalservice.PullRequestStateRequest{
+		PullRequestVerdictRequest: normalservice.PullRequestVerdictRequest{
+			IdempotencyKey: "workflow:order", Repository: config.Repository, RepositoryFingerprint: fingerprint,
+			PullRequestNumber: 7, PullRequestURL: "https://example.test/pr/7", HeadBranch: "hive/repair-proof", HeadSHA: headSHA, BaseBranch: "main", BaseSHA: baseSHA,
+		},
+		VerdictReceiptSHA256: sealedReceipt.ReceiptSHA256,
+	}
+	for name, mutate := range map[string]func(*hivegithub.ManagedPullRequestSnapshot){
+		"URL":           func(snapshot *hivegithub.ManagedPullRequestSnapshot) { snapshot.URL = "https://example.test/pr/8" },
+		"head":          func(snapshot *hivegithub.ManagedPullRequestSnapshot) { snapshot.HeadSHA = strings.Repeat("c", 40) },
+		"unknown state": func(snapshot *hivegithub.ManagedPullRequestSnapshot) { snapshot.State = "unknown" },
+		"open merged":   func(snapshot *hivegithub.ManagedPullRequestSnapshot) { snapshot.Merged = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			lifecycle := writeNormalVisualReadyVerifierLifecycle(t, fingerprint, headSHA, sealedReceipt)
+			verifier := &normalVisualPullRequestVerifier{
+				lifecycle: lifecycle, loadConfig: func() (integrated.Config, int, error) { return config, 5, nil },
+				inspectState: func(context.Context, string, string, int, string, string, string, string) (hivegithub.ManagedPullRequestSnapshot, error) {
+					snapshot := hivegithub.ManagedPullRequestSnapshot{
+						Number: 7, URL: request.PullRequestURL, State: "open", HeadBranch: request.HeadBranch, HeadSHA: request.HeadSHA, BaseBranch: request.BaseBranch,
+					}
+					mutate(&snapshot)
+					return snapshot, nil
+				},
+			}
+			if _, err := verifier.ObservePullRequestState(context.Background(), request); err == nil {
+				t.Fatal("drifted live Worker PR state was accepted")
+			}
+		})
 	}
 }
 
@@ -100,13 +234,22 @@ func (verified *fakeNormalVisualVerifiedPullRequest) ApplyCheckEvidence(_ *visua
 }
 
 func writeNormalVisualVerifierLifecycle(t *testing.T, fingerprint, headSHA string) *visualhive.LifecycleStore {
+	return writeNormalVisualVerifierLifecycleState(t, fingerprint, headSHA, visualhive.StatusPROpen, nil)
+}
+
+func writeNormalVisualReadyVerifierLifecycle(t *testing.T, fingerprint, headSHA string, receipt visualhive.PullRequestCheckReceiptSnapshot) *visualhive.LifecycleStore {
+	return writeNormalVisualVerifierLifecycleState(t, fingerprint, headSHA, visualhive.StatusReady, &receipt)
+}
+
+func writeNormalVisualVerifierLifecycleState(t *testing.T, fingerprint, headSHA string, status visualhive.LifecycleStatus, receipt *visualhive.PullRequestCheckReceiptSnapshot) *visualhive.LifecycleStore {
 	t.Helper()
 	dir := t.TempDir()
 	state := visualhive.LifecycleState{
 		SchemaVersion: visualhive.LifecycleSchema, UpdatedAt: time.Now().UTC(),
 		Findings: map[string]*visualhive.FindingLifecycle{fingerprint: {
 			Repository: "owner/repo", RepositoryID: "123", Fingerprint: "finding", RepositoryFingerprint: fingerprint,
-			Status: visualhive.StatusPROpen, Branch: "hive/repair-proof", RepairCommitSHA: headSHA, PRNumber: 7,
+			Status: status, Branch: "hive/repair-proof", RepairCommitSHA: headSHA, PRNumber: 7, PRURL: "https://example.test/pr/7",
+			LastPullRequestCheckReceipt: receipt,
 		}},
 		ReplayKeys: map[string]string{}, Outbox: []*visualhive.OutboxEntry{},
 	}

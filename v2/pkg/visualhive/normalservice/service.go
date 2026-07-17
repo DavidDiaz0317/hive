@@ -26,6 +26,7 @@ const ledgerSchema = "hive.normal-visual-work.v4"
 var (
 	ErrFinalVerdictPending = errors.New("exact-head pull-request verdict is pending")
 	ErrNoDispatch          = errors.New("verified packet produced no currently launchable specialist dispatch")
+	ErrOpenPullRequest     = errors.New("existing Worker pull request remains open")
 )
 
 type ArtifactSource interface {
@@ -55,6 +56,7 @@ type PullRequestVerdictRequest struct {
 	Repository            string
 	RepositoryFingerprint string
 	PullRequestNumber     int
+	PullRequestURL        string
 	HeadBranch            string
 	HeadSHA               string
 	BaseBranch            string
@@ -75,19 +77,39 @@ type PullRequestVerdictVerifier interface {
 	VerifyPullRequest(context.Context, PullRequestVerdictRequest) (PullRequestVerdictReceipt, error)
 }
 
+type PullRequestStateObservation struct {
+	State  string
+	Open   bool
+	Merged bool
+}
+
+type PullRequestStateRequest struct {
+	PullRequestVerdictRequest
+	VerdictReceiptSHA256 string
+}
+
+type PullRequestStateObserver interface {
+	ObservePullRequestState(context.Context, PullRequestStateRequest) (PullRequestStateObservation, error)
+}
+
 type LeaseAcquirer func() (func(), error)
 
+type QuiescenceProbe func() (bool, error)
+
 type Options struct {
-	StateDir     string
-	PollInterval time.Duration
-	LeaseRetry   time.Duration
-	AcquireLease LeaseAcquirer
-	Source       ArtifactSource
-	Intake       Intake
-	Repairer     Repairer
-	Verdict      PullRequestVerdictVerifier
-	Logger       *slog.Logger
-	OnCycle      func(error)
+	StateDir         string
+	PollInterval     time.Duration
+	LeaseRetry       time.Duration
+	QuiesceInterval  time.Duration
+	AcquireLease     LeaseAcquirer
+	ShouldQuiesce    QuiescenceProbe
+	Source           ArtifactSource
+	Intake           Intake
+	Repairer         Repairer
+	Verdict          PullRequestVerdictVerifier
+	PullRequestState PullRequestStateObserver
+	Logger           *slog.Logger
+	OnCycle          func(error)
 }
 
 // Service is a bounded sequential reconciler, not another queue or manager.
@@ -99,8 +121,8 @@ type Service struct {
 }
 
 func New(options Options) (*Service, error) {
-	if strings.TrimSpace(options.StateDir) == "" || options.AcquireLease == nil || options.Source == nil || options.Intake == nil || options.Repairer == nil {
-		return nil, errors.New("normal Visual Hive service requires state, lease, source, intake, and Worker repairer")
+	if strings.TrimSpace(options.StateDir) == "" || options.AcquireLease == nil || options.ShouldQuiesce == nil || options.Source == nil || options.Intake == nil || options.Repairer == nil || options.PullRequestState == nil {
+		return nil, errors.New("normal Visual Hive service requires state, lease, quiescence probe, source, intake, Worker repairer, and exact pull-request state observer")
 	}
 	root, err := filepath.Abs(options.StateDir)
 	if err != nil {
@@ -113,6 +135,9 @@ func New(options Options) (*Service, error) {
 	if options.LeaseRetry <= 0 {
 		options.LeaseRetry = 30 * time.Second
 	}
+	if options.QuiesceInterval <= 0 {
+		options.QuiesceInterval = 100 * time.Millisecond
+	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
@@ -122,35 +147,152 @@ func New(options Options) (*Service, error) {
 	return &Service{options: options}, nil
 }
 
-// Run claims lifetime ownership before touching workflow state. Lease
-// contention is an idle condition and cannot block the ordinary Governor loop,
-// because this method is intended to run in its own bounded goroutine.
+// Run claims exclusive ownership before touching workflow state and retains it
+// for the whole active epoch, including idle polling. A pause request cancels
+// the in-flight cycle; only after that cycle unwinds does Run release ownership
+// and remain lease-free until the durable configuration resumes. This excludes
+// legacy production writers without blocking pause/setup/retry management.
 func (service *Service) Run(ctx context.Context) {
 	if service == nil {
 		return
 	}
-	var release func()
-	for release == nil {
-		claimed, err := service.options.AcquireLease()
-		if err == nil {
-			release = claimed
-			break
+	for {
+		quiesced, err := service.options.ShouldQuiesce()
+		if err != nil {
+			service.report(fmt.Errorf("inspect normal Visual Hive quiescence: %w", err))
+			if !waitForContext(ctx, service.options.LeaseRetry) {
+				return
+			}
+			continue
 		}
-		service.report(err)
-		select {
-		case <-ctx.Done():
+		if quiesced {
+			if !waitForContext(ctx, service.options.QuiesceInterval) {
+				return
+			}
+			continue
+		}
+		release, err := service.options.AcquireLease()
+		if err == nil && release == nil {
+			err = errors.New("normal Visual Hive lease acquirer returned no release function")
+		}
+		if err != nil {
+			service.report(err)
+			if !waitForContext(ctx, service.options.LeaseRetry) {
+				return
+			}
+			continue
+		}
+		// Close the check/acquire race before any workflow state is touched.
+		quiesced, err = service.options.ShouldQuiesce()
+		if err != nil || quiesced {
+			release()
+			if err != nil {
+				service.report(fmt.Errorf("inspect claimed normal Visual Hive epoch: %w", err))
+			}
+			interval := service.options.QuiesceInterval
+			if err != nil {
+				interval = service.options.LeaseRetry
+			}
+			if !waitForContext(ctx, interval) {
+				return
+			}
+			continue
+		}
+		service.runLeaseEpoch(ctx, release)
+		if ctx.Err() != nil {
 			return
-		case <-time.After(service.options.LeaseRetry):
 		}
 	}
-	defer release()
+}
+
+type quiescenceResult struct {
+	err error
+}
+
+func (service *Service) runLeaseEpoch(ctx context.Context, release func()) {
+	epochCtx, cancel := context.WithCancel(ctx)
+	result := make(chan quiescenceResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(result)
+		service.watchQuiescence(epochCtx, cancel, result)
+	}()
+	defer func() {
+		cancel()
+		<-done
+		release()
+	}()
+
 	for {
-		err := service.RunCycle(ctx)
+		err := service.RunCycle(epochCtx)
+		if ctx.Err() != nil {
+			return
+		}
+		if epochCtx.Err() != nil {
+			if err != nil && !errors.Is(err, context.Canceled) {
+				service.report(err)
+			}
+			select {
+			case status, ok := <-result:
+				if ok && status.err != nil {
+					service.report(fmt.Errorf("monitor normal Visual Hive quiescence: %w", status.err))
+				}
+			case <-ctx.Done():
+			}
+			return
+		}
 		service.report(err)
+		timer := time.NewTimer(service.options.PollInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return
+		case status, ok := <-result:
+			stopTimer(timer)
+			if ok && status.err != nil {
+				service.report(fmt.Errorf("monitor normal Visual Hive quiescence: %w", status.err))
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (service *Service) watchQuiescence(ctx context.Context, cancel context.CancelFunc, result chan<- quiescenceResult) {
+	ticker := time.NewTicker(service.options.QuiesceInterval)
+	defer ticker.Stop()
+	for {
+		quiesced, err := service.options.ShouldQuiesce()
+		if err != nil || quiesced {
+			result <- quiescenceResult{err: err}
+			cancel()
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(service.options.PollInterval):
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer stopTimer(timer)
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer != nil && !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }
@@ -159,7 +301,7 @@ func (service *Service) report(err error) {
 	if service.options.OnCycle != nil {
 		service.options.OnCycle(err)
 	}
-	if err != nil && !errors.Is(err, ErrNoDispatch) && !errors.Is(err, ErrFinalVerdictPending) && !errors.Is(err, integrated.ErrRunInProgress) {
+	if err != nil && !errors.Is(err, ErrNoDispatch) && !errors.Is(err, ErrFinalVerdictPending) && !errors.Is(err, ErrOpenPullRequest) && !errors.Is(err, integrated.ErrRunInProgress) {
 		service.options.Logger.Warn("normal Visual Hive cycle held", "error", err)
 	}
 }
@@ -175,6 +317,18 @@ func (service *Service) RunCycle(ctx context.Context) error {
 		return err
 	}
 	if exists && ledger.Consumed {
+		if ledger.PullRequestNumber > 0 {
+			observation, err := service.options.PullRequestState.ObservePullRequestState(ctx, pullRequestStateRequest(ledger))
+			if err != nil {
+				return err
+			}
+			if err := validatePullRequestStateObservation(observation); err != nil {
+				return err
+			}
+			if observation.Open {
+				return ErrOpenPullRequest
+			}
+		}
 		if err := service.clearLedger(); err != nil {
 			return err
 		}
@@ -288,11 +442,7 @@ func (service *Service) RunCycle(ctx context.Context) error {
 	if _, err := service.options.Intake.RevalidateSpecialistBoundary(ledger.SourceExternalRef, ledger.WorkOrderID, ledger.RequestSHA256); err != nil {
 		return err
 	}
-	receipt, err := service.options.Verdict.VerifyPullRequest(ctx, PullRequestVerdictRequest{
-		IdempotencyKey: ledger.WorkflowKey + ":" + ledger.WorkOrderID, Repository: ledger.Repository,
-		RepositoryFingerprint: ledger.RepositoryFingerprint, PullRequestNumber: ledger.PullRequestNumber,
-		HeadBranch: ledger.Branch, HeadSHA: ledger.CommitSHA, BaseBranch: ledger.BaseBranch, BaseSHA: ledger.BaseSHA,
-	})
+	receipt, err := service.options.Verdict.VerifyPullRequest(ctx, pullRequestVerdictRequest(ledger))
 	if err != nil {
 		return err
 	}
@@ -307,6 +457,29 @@ func (service *Service) RunCycle(ctx context.Context) error {
 		return err
 	}
 	return service.finish(ctx, ledger)
+}
+
+func pullRequestVerdictRequest(ledger workLedger) PullRequestVerdictRequest {
+	return PullRequestVerdictRequest{
+		IdempotencyKey: ledger.WorkflowKey + ":" + ledger.WorkOrderID, Repository: ledger.Repository,
+		RepositoryFingerprint: ledger.RepositoryFingerprint, PullRequestNumber: ledger.PullRequestNumber, PullRequestURL: ledger.PullRequestURL,
+		HeadBranch: ledger.Branch, HeadSHA: ledger.CommitSHA, BaseBranch: ledger.BaseBranch, BaseSHA: ledger.BaseSHA,
+	}
+}
+
+func pullRequestStateRequest(ledger workLedger) PullRequestStateRequest {
+	return PullRequestStateRequest{PullRequestVerdictRequest: pullRequestVerdictRequest(ledger), VerdictReceiptSHA256: ledger.VerdictReceiptSHA256}
+}
+
+func validatePullRequestStateObservation(observation PullRequestStateObservation) error {
+	observation.State = strings.ToLower(strings.TrimSpace(observation.State))
+	if observation.State == "open" && observation.Open && !observation.Merged {
+		return nil
+	}
+	if observation.State == "closed" && !observation.Open {
+		return nil
+	}
+	return errors.New("exact Worker pull-request observer returned an inconsistent state")
 }
 
 func (service *Service) finish(_ context.Context, ledger workLedger) error {
