@@ -1,9 +1,11 @@
 # Visual Hive normal-service reconciliation
 
-Status: fork-local composed vertical through one Worker-owned pull request and
-one sealed exact-head verdict receipt, 2026-07-16. No live GitHub demo has been
-claimed. Production activation remains held pending the privileged Linux
-isolation proof, bounded local gates, review, and a disposable-repository demo.
+Status: fork-local working vertical through one Governor-admitted, Worker-owned
+pull request and one sealed exact-head verdict receipt, 2026-07-16. The
+privileged Linux isolation proof, bounded local gates, replay proof, and
+independent review have passed. No live GitHub demo has been claimed;
+production activation remains held pending a no-merge disposable-repository
+demo with real GitHub scheduling and the real contained Codex executor.
 
 The normative product contract is
 `docs/visual-hive-integration-contract.md`. This document records the actual
@@ -54,12 +56,18 @@ capabilities.
 
 ### Service ownership and transport
 
-- `integrated.AcquireNormalVisualWorkLease` retains the same OS-backed
-  production-run lock used by the legacy integrated runtime for the complete
-  service lifetime. The legacy and normal runtimes therefore cannot consume
-  the same workflow concurrently.
-- Lease contention is an idle retry in a dedicated goroutine. The normal
-  Governor loop, persistent agents, and dashboard remain independent.
+- The normal daemon claims the existing OS-backed `daemon.lease` before it
+  configures the ordinary Manager for Visual Hive. The legacy daemon and
+  one-shot `hive run` claim the same ownership before constructing their
+  specialist runtime, so two Managers cannot be configured for the same
+  repository state.
+- `integrated.AcquireNormalVisualWorkLease` claims the existing production-run
+  lock only for an active, unpaused service epoch. Pause or incompatible config
+  change cancels and unwinds the cycle, releases that production lease, and
+  remains lease-free until normal operation resumes. Daemon ownership remains
+  held so a second Manager still cannot appear during the pause.
+- Production-lease contention is an idle retry in a dedicated goroutine. The
+  normal Governor loop, persistent agents, and dashboard remain independent.
 - `integrated.FetchNormalVisualWork` reuses installed setup verification,
   exact correlated workflow dispatch/resume, job/run/artifact verification,
   full v3 source fetch, producer pin, and live installed-workflow head check.
@@ -164,7 +172,7 @@ the same durable order/proposal/PR; it cannot create a second model side effect.
 Controller completion is exact-byte idempotent, including the crash window
 after bead close but before the service saved `completion_recorded`.
 
-## Exact-head verdict: composed, activation still held
+## Exact-head verdict: composed and locally proven; live activation held
 
 The production normal-service option is no longer `nil`. Its adapter uses the
 reviewed `FetchAndVerifyVisualHivePullRequestBundle` primitive and can apply
@@ -202,14 +210,19 @@ mistaken for permission to complete, merge, resolve, or update a baseline.
 Capturing red telemetry without granting completion authority is later work,
 not a prerequisite for the first working repair proof.
 
-The remaining P0 proof is operational rather than a missing adapter: run the
-privileged hostile-producer isolation test on `ubuntu-latest`, complete bounded
-local gates, review this composition, and execute it against a disposable fork
-with merging disabled. Windows unit and fake-integration tests cannot prove
-Linux UID/mount isolation by themselves.
+The privileged hostile-producer isolation test passed in an ephemeral Linux
+environment with distinct service identities and the root-owned evidence seal.
+The remaining critical-path proof is operational rather than a missing
+adapter: execute the same composition against a disposable repository with
+real GitHub workflow metadata, artifacts, and contained Codex execution while
+merging remains disabled.
 
-## Fake/no-GitHub proof currently passing
+## Local/no-GitHub proof currently passing
 
+- daemon ownership is claimed before ordinary-Manager configuration and blocks
+  both the legacy daemon and one-shot legacy Manager factory;
+- pause/config quiescence releases the production lease only after an active
+  cycle unwinds, then reacquires it on resume without duplicating work;
 - lifetime ownership contention performs no fetch/import/Worker work;
 - a no-dispatch pause/WIP/green path runs no proposal or PR;
 - crash after one Worker PR side effect recovers through the same controller
@@ -233,6 +246,24 @@ Linux UID/mount isolation by themselves.
   readiness restart, guard rerun, or redispatch;
 - source composition uses a real temporary Git repository and returns bytes
   from the sealed tree even after the checkout changes.
+- the genuine vertical test fetches untrusted bundle ZIP/API bytes through the
+  production source verifier, imports through the real Controller and
+  Governor, composes policy/project/knowledge through the real Scheduler,
+  dispatches through the existing ordinary Manager and specialist provider,
+  and lets the real Worker create exactly one branch and pull request in a
+  local bare Git remote;
+- the same vertical applies a production-verified PR-v3 check-only receipt at
+  the exact Worker head, injects a lost consume response, restarts without a
+  second fetch/admission/model/PR/verdict effect, blocks the next packet while
+  the exact PR is open, and releases only after read-only observation of its
+  closure;
+- no persistent parent agent, PR edit, merge, baseline write, or lifecycle
+  resolution occurs in that proof.
+
+The local GitHub API, source dispatch/consume, issue writer, contained model
+response, and wiki search endpoint are bounded test substitutes. This proof
+does not claim live GitHub scheduling, real Codex behavior, or race-detector
+coverage; CGO is disabled in the current Windows environment.
 
 Existing controller tests additionally cover live pause, automation downgrade,
 role disable/re-enable, nested role-capability drift, Governor mode/cadence
@@ -266,6 +297,10 @@ bypasses the existing Governor, Scheduler, Manager, mailbox, or Worker owners.
 Focused commands passing at this checkpoint:
 
 ```text
+go test ./cmd/hive -run '^TestNormalVisualWorkVerticalAcceptance$' -count=3 -timeout 210s
+go test ./cmd/hive -count=1 -timeout 210s
+go test ./pkg/visualhive -count=1 -timeout 180s
+go test ./pkg/visualhive/controller -count=1 -timeout 180s
 go test ./pkg/visualhive/normalservice -count=1
 go test ./pkg/visualhive/controller -run '^TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending$' -count=1
 go test ./cmd/hive -run '^TestNormalVisualPullRequestVerifier' -count=1
@@ -280,24 +315,23 @@ go test -run '^$' ./cmd/hive ./pkg/repair ./pkg/visualhive/controller ./pkg/visu
 
 A combined full run of the touched packages passed `cmd/hive`, `pkg/github`,
 `pkg/visualhive`, `pkg/visualhive/controller`,
-`pkg/visualhive/normalservice`, and `pkg/internal/visualhivepr`. The unrelated
-`pkg/integrated` uninstall fixture blocked in a Git subprocess and hit the
+`pkg/visualhive/normalservice`, and `pkg/internal/visualhivepr`. The vertical
+acceptance passed three consecutive times. The unrelated `pkg/integrated`
+uninstall fixture previously blocked in a Windows Git subprocess and hit the
 240-second package timeout; the focused Visual Hive/integration selection above
 passed. A full integrated-package pass is therefore not claimed.
 
 ## Remaining path to a working demo
 
-1. Run the privileged Linux hostile-producer isolation proof from the pinned
-   producer/verifier composition and retain its exact logs.
-2. Run all remaining bounded local Hive gates and the fake end-to-end
-   normal-service proof; investigate the unrelated Windows uninstall-fixture
-   timeout separately rather than weakening the Visual Hive boundary.
-3. Review the composed commits and use a disposable fork/private real-code
-   repository with `repair-pr`, a
+1. Use a disposable fork/private real-code repository with `repair-pr`, a
    dedicated state root/dashboard port, reviewed healthy baseline, and no
-   merge. Record exact SHAs, run/artifact IDs, admission, `swo-*`, Worker PR,
-   verdict receipt, replay counts, and unrelated normal cadence.
-4. Only after that succeeds, repeat against a KubeStellar Console fork with a
+   merge. Run the real GitHub workflow and contained Codex executor. Record
+   exact SHAs, run/artifact IDs, admission, `swo-*`, Worker PR, verdict receipt,
+   replay counts, and unrelated normal cadence.
+2. Confirm the live PR remains open, a second packet cannot create another PR,
+   ordinary Hive cadence/dashboard behavior continues, and restart reuses the
+   same durable work before manually closing the disposable PR.
+3. Only after that succeeds, repeat against a KubeStellar Console fork with a
    dedicated namespaced Hive built from this Hive fork. Preserve Console's
    Auto-QA, test generation, visual regression, trust workflows, existing
    checks, and production Hive. Leave every demo PR unmerged.
@@ -325,6 +359,15 @@ not on this critical path.
 | `7bf4bc84` | controller-owned deterministic deferral of every unselected finding |
 | `7c5e9249` | exact PR evidence verifier and sealed check-evidence capability |
 | `dd3cff1e` | production adapter, ledger v4 exact identity, and sealed-only completion |
+| `170a905a` | sealed verdict-path reconciliation record |
+| `3e090b8f` | audited immutable Visual Hive producer pin |
+| `c9f20c28` | privileged Linux cross-principal evidence-seal proof |
+| `aeadfe78` | daemon-wide ownership before ordinary-Manager Visual configuration |
+| `100d31ae` | pause-safe active-epoch lease and exact one-open-PR gate |
+| `e6ec0e77` | one-shot legacy Manager exclusion under the same daemon ownership |
+| `abfdca0b` | exact merged-successor recovery for a consumed normal-service ledger |
+| `13331d55` | sealed import clone fidelity and import-only bead boundary fix |
+| `e372db54` | genuine local Governor-to-Worker-to-verdict vertical acceptance proof |
 
 These commits are checkpoints in the isolated fork branch, not release or
 upstream claims.
