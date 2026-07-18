@@ -371,6 +371,10 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
         shell: bash
         run: |
 %s
+      - name: Prepare isolated Visual Hive evidence root
+        shell: bash
+        run: |
+%s
       - name: Run target-facing Visual Hive collection
         id: target_visual_pipeline
         continue-on-error: true
@@ -520,7 +524,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10), isolatedTrustedTooling,
 		indentWorkflowShell(prepareIsolatedVisualEvidenceRuntimeShell(pullRequest), 10), captureScope,
 		indentWorkflowShell(isolatedTargetDependencyShell(true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
-		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), targetPipelineEnv, evidenceLauncherPrefix, modeArgs, sealIdentityEnv,
+		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), indentWorkflowShell(prepareIsolatedVisualEvidenceRootShell(), 10), targetPipelineEnv, evidenceLauncherPrefix, modeArgs, sealIdentityEnv,
 		isolatedTargetAccount, isolatedEvidenceAccount, isolatedTargetAccount, isolatedEvidenceAccount,
 		isolatedTargetAccount, isolatedEvidenceAccount, indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10),
 		isolatedTargetAccount, isolatedEvidenceAccount, "$HIVE_TARGET_HEAD_SHA",
@@ -1999,12 +2003,33 @@ sudo -u ` + isolatedEvidenceAccount + ` -- test ! -w "$evidence_launcher"
 
 func prepareIsolatedVisualEvidenceRootShell() string {
 	return `set -euo pipefail
-evidence_root="$GITHUB_WORKSPACE/.visual-hive"
-if [ -e "$evidence_root" ] || [ -L "$evidence_root" ]; then
-  sudo rm -rf --one-file-system -- "$evidence_root"
+test -n "${HIVE_TARGET_WORKSPACE:-}"
+evidence_root="$HIVE_TARGET_WORKSPACE/.visual-hive"
+sudo git -c safe.directory="$HIVE_TARGET_WORKSPACE" -C "$HIVE_TARGET_WORKSPACE" clean -ffdx -- .visual-hive
+if [ -L "$evidence_root" ]; then
+  echo "Tracked Visual Hive evidence root is a symbolic link" >&2
+  exit 1
 fi
-test ! -e "$evidence_root"
+if [ -e "$evidence_root" ] && [ ! -d "$evidence_root" ]; then
+  echo "Tracked Visual Hive evidence root is not a directory" >&2
+  exit 1
+fi
+if [ -d "$evidence_root" ] && sudo find "$evidence_root" -type l -print -quit | grep -q .; then
+  echo "Tracked Visual Hive evidence contains a symbolic link" >&2
+  exit 1
+fi
+if [ -d "$evidence_root" ] && sudo find "$evidence_root" ! -type d ! -type f -print -quit | grep -q .; then
+  echo "Tracked Visual Hive evidence contains a non-regular entry" >&2
+  exit 1
+fi
+if [ -e "$evidence_root/node_modules" ] || [ -L "$evidence_root/node_modules" ]; then
+  echo "Tracked Visual Hive evidence reserves the runtime node_modules path" >&2
+  exit 1
+fi
 sudo install -d -o ` + isolatedEvidenceAccount + ` -g ` + isolatedEvidenceAccount + ` -m 0700 "$evidence_root" "$evidence_root/node_modules"
+sudo chown -R ` + isolatedEvidenceAccount + `:` + isolatedEvidenceAccount + ` "$evidence_root"
+sudo find "$evidence_root" -type d -exec chmod 0700 {} +
+sudo find "$evidence_root" -type f -exec chmod 0600 {} +
 test "$(stat -c '%u:%g:%a' "$evidence_root")" = "$(id -u ` + isolatedEvidenceAccount + `):$(id -g ` + isolatedEvidenceAccount + `):700"
 if sudo -u ` + isolatedTargetAccount + ` -- test -r "$evidence_root" || sudo -u ` + isolatedTargetAccount + ` -- test -w "$evidence_root" || sudo -u ` + isolatedTargetAccount + ` -- test -x "$evidence_root"; then
   echo "Target principal can access the protected evidence root" >&2
@@ -2364,10 +2389,8 @@ elif [ -f requirements.txt ]; then
 fi`
 	trustedBrowserBefore := ""
 	trustedBrowserAfter := ""
-	evidenceRootAfter := ""
 	targetEnvironment := isolatedTargetEnvPrefix()
 	if includeTrustedBrowser {
-		evidenceRootAfter = prepareIsolatedVisualEvidenceRootShell()
 		trustedBrowserBefore = `tooling_playwright="` + isolatedTrustedTooling + `/node_modules/@playwright/test/cli.js"
 trusted_browser_path="` + isolatedTrustedRoot + `/playwright-${GITHUB_RUN_ID}"
 target_browser_staging="` + isolatedTargetRoot + `/playwright-staging-${GITHUB_RUN_ID}"
@@ -2476,8 +2499,7 @@ while IFS= read -r -d '' playwright_cli; do
 done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.git/*' -print0 | sort -z)
 HIVE_TARGET_DEPENDENCIES
 %s
-%s
-`, trustedBrowserBefore, targetEnvironment, targetInstall, pythonInstall, trustedBrowserAfter, evidenceRootAfter)
+`, trustedBrowserBefore, targetEnvironment, targetInstall, pythonInstall, trustedBrowserAfter)
 }
 
 func trustedBrowserHandoffVerificationShell() string {

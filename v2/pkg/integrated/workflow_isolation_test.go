@@ -602,6 +602,65 @@ func TestGeneratedPullRequestExecutionUsesDistinctEvidenceAuthority(t *testing.T
 	}
 }
 
+func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.T) {
+	production := workflow(isolationWorkflowConfig())
+	workflows := []struct {
+		name      string
+		generated string
+		job       string
+	}{
+		{name: "production", generated: production, job: visualExecutionJobName},
+		{name: "setup-baseline-capture", generated: production, job: setupBaselineCaptureJobID},
+		{name: "pull-request", generated: pullRequestWorkflow(isolationWorkflowConfig()), job: visualExecutionJobName},
+	}
+	const prepareStepName = "Prepare isolated Visual Hive evidence root"
+	const scopedClean = `sudo git -c safe.directory="$HIVE_TARGET_WORKSPACE" -C "$HIVE_TARGET_WORKSPACE" clean -ffdx -- .visual-hive`
+	for _, workflow := range workflows {
+		t.Run(workflow.name, func(t *testing.T) {
+			execution := parseIsolatedWorkflow(t, workflow.generated).Jobs[workflow.job]
+			preflightIndex := -1
+			prepareIndex := -1
+			collectionIndex := -1
+			prepareCount := 0
+			prepareRun := ""
+			for index, step := range execution.Steps {
+				switch step.Name {
+				case "Install target dependencies in isolated account":
+					if strings.Contains(step.Run, scopedClean) || strings.Contains(step.Run, `evidence_root="$HIVE_TARGET_WORKSPACE/.visual-hive"`) {
+						t.Fatal("dependency installation still prepares the protected evidence root")
+					}
+				case "Verify sealed Playwright browser handoff":
+					preflightIndex = index
+				case prepareStepName:
+					prepareIndex = index
+					prepareCount++
+					prepareRun = step.Run
+				case "Run target-facing Visual Hive collection":
+					collectionIndex = index
+				}
+			}
+			if prepareCount != 1 || preflightIndex+1 != prepareIndex || prepareIndex+1 != collectionIndex {
+				t.Fatalf("evidence preparation is not one distinct step immediately between browser verification and collection: preflight=%d prepare=%d collection=%d count=%d", preflightIndex, prepareIndex, collectionIndex, prepareCount)
+			}
+			for _, required := range []string{
+				`evidence_root="$HIVE_TARGET_WORKSPACE/.visual-hive"`,
+				scopedClean,
+				`sudo find "$evidence_root" -type l -print -quit`,
+				`sudo find "$evidence_root" ! -type d ! -type f -print -quit`,
+				`sudo chown -R hive-evidence:hive-evidence "$evidence_root"`,
+				`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`,
+			} {
+				if !strings.Contains(prepareRun, required) {
+					t.Fatalf("evidence preparation step is missing %q", required)
+				}
+			}
+			if strings.Contains(prepareRun, `evidence_root="$GITHUB_WORKSPACE/.visual-hive"`) || strings.Contains(prepareRun, "rm -rf") {
+				t.Fatalf("evidence preparation does not preserve the tracked evidence tree:\n%s", prepareRun)
+			}
+		})
+	}
+}
+
 func TestTrustedCollectorNodeCannotBeShadowedByTargetPath(t *testing.T) {
 	bash := workflowBash(t)
 	root := t.TempDir()
