@@ -372,7 +372,7 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 	for _, required := range []string{
 		"sudo -u hive-target -- env -i", "sudo chown -R root:root .git", "sudo chmod -R a-w .git",
 		"sudo chown root:root visual-hive.config.yaml", "sudo chmod 0444 visual-hive.config.yaml",
-		"git diff --no-ext-diff --no-textconv --exit-code -- .", "HIVE_VISUAL_HIVE_CLI_SHA", "test ! -w \"$VISUAL_HIVE_CLI\"",
+		`sudo git -c safe.directory="$GITHUB_WORKSPACE" diff --no-ext-diff --no-textconv --exit-code -- .`, "HIVE_VISUAL_HIVE_CLI_SHA", "test ! -w \"$VISUAL_HIVE_CLI\"",
 		"HIVE_TRUSTED_NODE_SHA", `"$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`, `sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_NODE"`,
 		"hive.visual-runner-outcome.v1", ".visual-hive/hive-runner-outcome.json", "visual-hive-raw-${{ github.run_id }}",
 		`runner_pipeline_exit="$RUNNER_TEMP/hive-visual-pipeline-exit-${GITHUB_RUN_ID}.txt"`,
@@ -386,6 +386,11 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 	for name, generated := range map[string]string{"production": production, "pull-request": pullRequest} {
 		if !strings.Contains(generated, "id: seal_raw_evidence") {
 			t.Fatalf("%s workflow does not bind upload to the successful evidence-seal step", name)
+		}
+		execution := workflowJobText(parseIsolatedWorkflow(t, generated).Jobs[visualExecutionJobName])
+		privilegedDiff := `sudo git -c safe.directory="$GITHUB_WORKSPACE" diff --no-ext-diff --no-textconv --exit-code -- .`
+		if count := strings.Count(execution, privilegedDiff); count != 2 {
+			t.Fatalf("%s workflow has %d protected-evidence source checks, want 2", name, count)
 		}
 	}
 	for _, forbidden := range []string{"visual-hive-evidence-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "--authoritative-for-resolution"} {
@@ -1143,6 +1148,10 @@ func TestPullRequestPresentIssuesFilterPreservesMetadataAndRejectsAbsence(t *tes
 }
 
 func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.T) {
+	protectedEvidencePrune := `find "$HIVE_TARGET_WORKSPACE" -path "$HIVE_TARGET_WORKSPACE/.visual-hive" -prune -o -path '*/node_modules/@playwright/test/cli.js'`
+	if !strings.Contains(trustedBrowserHandoffVerificationShell(), protectedEvidencePrune) {
+		t.Fatal("post-protection browser verification does not prune the protected evidence root")
+	}
 	for name, value := range map[string]string{"production": workflow(isolationWorkflowConfig()), "pull-request": pullRequestWorkflow(isolationWorkflowConfig())} {
 		execution := workflowJobText(parseIsolatedWorkflow(t, value).Jobs[visualExecutionJobName])
 		for _, invariant := range []string{
@@ -1153,7 +1162,7 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 			`sudo find "$target_browser_staging" -type l -print -quit`,
 			`sudo find "$target_browser_staging" ! -type d ! -type f -print -quit`,
 			`sudo du -sb "$target_browser_staging"`,
-			`sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/`,
+			`sudo cp -a --update=none "$target_browser_staging"/. "$trusted_browser_path"/`,
 			`sudo chown -R root:root "$trusted_browser_path"`,
 			`sudo find "$trusted_browser_path" -type d -exec chmod a+rx,a-w {} +`,
 			`sudo find "$trusted_browser_path" -type f -exec chmod a+r,a-w {} +`,
@@ -1164,6 +1173,7 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 			`Target Playwright runtime lacks a sealed executable binding`,
 			`runtime.chromium.launch({ headless: true })`,
 			`Target Playwright runtime could not launch its exact sealed headless browser`,
+			protectedEvidencePrune,
 			`Trusted Playwright browser executable is missing before Visual Hive execution`,
 			`PLAYWRIGHT_BROWSERS_PATH="$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"`,
 			`test "$(sha256sum "$HIVE_TRUSTED_BROWSER_EXECUTABLE" | cut -d ' ' -f 1)" = "$HIVE_TRUSTED_BROWSER_SHA"`,
@@ -1177,6 +1187,9 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 		}
 		if strings.Contains(execution, `PLAYWRIGHT_BROWSERS_PATH=/home/hive-target/.cache/ms-playwright HIVE_TARGET_PROCESS=1 "$HIVE_TRUSTED_NODE"`) {
 			t.Fatalf("%s Visual collector still accepts the target-owned browser cache", name)
+		}
+		if strings.Contains(execution, `sudo cp -a --no-clobber`) {
+			t.Fatalf("%s browser handoff still uses the failing legacy no-clobber mode", name)
 		}
 		if !strings.Contains(value, "permissions:\n      contents: read\n      actions: read") || strings.Contains(execution, "contents: write") || strings.Contains(execution, "id-token: write") {
 			t.Fatalf("%s browser provisioning changed the read-only target-execution permissions", name)

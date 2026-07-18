@@ -443,7 +443,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
             echo "Pinned browser preparation did not complete" >&2
           fi
           test "$(git rev-parse HEAD)" = "%s"
-          git diff --no-ext-diff --no-textconv --exit-code -- .
+          sudo git -c safe.directory="$GITHUB_WORKSPACE" diff --no-ext-diff --no-textconv --exit-code -- .
           sudo umount "$target_workspace"
           cleanup_trusted_browser
           if mountpoint -q "$target_workspace"; then
@@ -2312,7 +2312,7 @@ func verifyAndSealTargetCheckoutShell() string {
 	return fmt.Sprintf(`set -euo pipefail
 sudo pkill -KILL -u %s 2>/dev/null || true
 test "$(git rev-parse HEAD)" = "$HIVE_TARGET_HEAD_SHA"
-git diff --no-ext-diff --no-textconv --exit-code -- .
+sudo git -c safe.directory="$GITHUB_WORKSPACE" diff --no-ext-diff --no-textconv --exit-code -- .
 while IFS= read -r -d '' tracked; do
   if [ -L "$tracked" ]; then
     sudo chown -h root:root -- "$tracked"
@@ -2409,7 +2409,7 @@ if sudo find "$target_browser_staging" ! -type d ! -type f -print -quit | grep -
 fi
 test "$(sudo find "$target_browser_staging" -type f | wc -l)" -le 10000
 test "$(sudo du -sb "$target_browser_staging" | cut -f 1)" -le 2147483648
-sudo cp -a --no-clobber "$target_browser_staging"/. "$trusted_browser_path"/
+sudo cp -a --update=none "$target_browser_staging"/. "$trusted_browser_path"/
 sudo rm -rf -- "$target_browser_staging"
 test ! -e "$target_browser_staging"
 sudo chown -R root:root "$trusted_browser_path"
@@ -2522,7 +2522,7 @@ while IFS= read -r -d '' playwright_cli; do
     echo "Target Playwright runtime could not launch its exact sealed headless browser: $playwright_cli (PLAYWRIGHT_BROWSERS_PATH=$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH)" >&2
     exit 1
   fi
-done < <(find "$HIVE_TARGET_WORKSPACE" -path '*/node_modules/@playwright/test/cli.js' -not -path '*/.git/*' -print0 | sort -z)
+done < <(find "$HIVE_TARGET_WORKSPACE" -path "$HIVE_TARGET_WORKSPACE/.visual-hive" -prune -o -path '*/node_modules/@playwright/test/cli.js' -not -path '*/.git/*' -print0 | sort -z)
 `
 }
 
