@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"gopkg.in/yaml.v3"
 )
 
 // debounceDelay is the time to wait after a file change event before
@@ -57,11 +56,13 @@ func (w *Watcher) ProgrammaticSave(candidate *Config) error {
 	if candidate == nil {
 		return fmt.Errorf("cannot save nil config")
 	}
-	data, err := yaml.Marshal(candidate)
+	data, err := candidate.persistencePayload()
 	if err != nil {
-		return fmt.Errorf("marshaling config for watcher digest: %w", err)
+		return fmt.Errorf("preparing config for watcher persistence: %w", err)
 	}
-	return w.programmaticSave(digestBytes(data), candidate.Save)
+	return w.programmaticSave(digestBytes(data), func() error {
+		return candidate.savePersistenceBytes(data)
+	})
 }
 
 func (w *Watcher) programmaticSave(expectedDigest string, save func() error) error {

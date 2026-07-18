@@ -161,11 +161,13 @@ type isolatedWorkflowJob struct {
 	If    string            `yaml:"if"`
 	Needs workflowNeedsList `yaml:"needs"`
 	Steps []struct {
-		Name string         `yaml:"name"`
-		If   string         `yaml:"if"`
-		Uses string         `yaml:"uses"`
-		Run  string         `yaml:"run"`
-		With map[string]any `yaml:"with"`
+		ID   string            `yaml:"id"`
+		Name string            `yaml:"name"`
+		If   string            `yaml:"if"`
+		Uses string            `yaml:"uses"`
+		Run  string            `yaml:"run"`
+		Env  map[string]string `yaml:"env"`
+		With map[string]any    `yaml:"with"`
 	} `yaml:"steps"`
 }
 
@@ -234,6 +236,71 @@ func TestGeneratedWorkflowsUseCanonicalYAMLWhitespace(t *testing.T) {
 	if !strings.Contains(workflows["pull_request"], `HIVE_UNINSTALL_REQUIRED_FILES: "[]"`) ||
 		strings.Contains(workflows["pull_request"], `HIVE_UNINSTALL_REQUIRED_FILES: '[]'`) {
 		t.Fatal("pull-request workflow does not use the canonical empty JSON array scalar")
+	}
+}
+
+func TestGeneratedWorkflowLongRunScalarsContainNoGitHubExpressions(t *testing.T) {
+	const githubExpressionLengthLimit = 21000
+	longRunScalars := 0
+	for workflowName, generated := range map[string]string{
+		"production":   workflow(isolationWorkflowConfig()),
+		"pull-request": pullRequestWorkflow(isolationWorkflowConfig()),
+	} {
+		document := parseIsolatedWorkflow(t, generated)
+		for jobName, job := range document.Jobs {
+			for stepIndex, step := range job.Steps {
+				if len(step.Run) <= githubExpressionLengthLimit {
+					continue
+				}
+				longRunScalars++
+				if strings.Contains(step.Run, "${{") {
+					t.Fatalf("%s workflow job %q step %d (%q) embeds a GitHub expression in a %d-byte run scalar", workflowName, jobName, stepIndex, step.Name, len(step.Run))
+				}
+			}
+		}
+	}
+	if longRunScalars == 0 {
+		t.Fatal("regression did not inspect any run scalar above GitHub's expression-length limit")
+	}
+}
+
+func TestGeneratedWorkflowSealStepBindsExactHeadOutsideLongRunScalar(t *testing.T) {
+	production := workflow(isolationWorkflowConfig())
+	tests := []struct {
+		name         string
+		generated    string
+		jobName      string
+		expectedHead string
+	}{
+		{name: "production", generated: production, jobName: visualExecutionJobName, expectedHead: "${{ github.sha }}"},
+		{name: "setup-baseline", generated: production, jobName: setupBaselineCaptureJobID, expectedHead: "${{ github.sha }}"},
+		{name: "pull-request", generated: pullRequestWorkflow(isolationWorkflowConfig()), jobName: visualExecutionJobName, expectedHead: "${{ github.event.pull_request.head.sha }}"},
+	}
+	const comparison = `test "$(git rev-parse HEAD)" = "$HIVE_TARGET_HEAD_SHA"`
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := parseIsolatedWorkflow(t, test.generated)
+			job, exists := document.Jobs[test.jobName]
+			if !exists {
+				t.Fatalf("generated workflow is missing job %q", test.jobName)
+			}
+			for _, step := range job.Steps {
+				if step.ID != "seal_raw_evidence" {
+					continue
+				}
+				if got := step.Env["HIVE_TARGET_HEAD_SHA"]; got != test.expectedHead {
+					t.Fatalf("seal step HIVE_TARGET_HEAD_SHA = %q, want %q", got, test.expectedHead)
+				}
+				if got := strings.Count(step.Run, comparison); got != 2 {
+					t.Fatalf("seal step contains %d quoted exact-head comparisons, want 2", got)
+				}
+				if strings.Contains(step.Run, "${{") {
+					t.Fatal("seal step embeds a GitHub expression in its long run scalar")
+				}
+				return
+			}
+			t.Fatal("generated workflow is missing the seal_raw_evidence step")
+		})
 	}
 }
 

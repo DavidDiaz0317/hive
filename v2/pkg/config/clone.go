@@ -14,6 +14,10 @@ func (c *Config) Clone() *Config {
 	}
 
 	cloned := *c
+	cloned.persistenceProvenance = slices.Clone(c.persistenceProvenance)
+	for index := range cloned.persistenceProvenance {
+		cloned.persistenceProvenance[index].path = slices.Clone(c.persistenceProvenance[index].path)
+	}
 	cloned.Project.Repos = slices.Clone(c.Project.Repos)
 	if c.Project.OpenPRs != nil {
 		openPRs := *c.Project.OpenPRs

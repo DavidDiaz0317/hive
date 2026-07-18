@@ -237,7 +237,8 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 	modeArgs := "--mode full --ci --continue-on-error --skip-install"
 	captureScope := ""
 	targetPipelineEnv := ""
-	sealIdentityEnv := ""
+	sealIdentityEnv := `          HIVE_TARGET_HEAD_SHA: ${{ github.sha }}
+`
 	evidenceLauncherPrefix := isolatedVisualEvidenceLauncherPrefix(false)
 	runnerAttestation := ""
 	finalEnforcement := `          if [[ "$HIVE_TARGET_PIPELINE_OUTCOME" != "success" && "$HIVE_TARGET_PIPELINE_OUTCOME" != "failure" ]]; then
@@ -522,9 +523,9 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), targetPipelineEnv, evidenceLauncherPrefix, modeArgs, sealIdentityEnv,
 		isolatedTargetAccount, isolatedEvidenceAccount, isolatedTargetAccount, isolatedEvidenceAccount,
 		isolatedTargetAccount, isolatedEvidenceAccount, indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10),
-		isolatedTargetAccount, isolatedEvidenceAccount, checkoutRef,
+		isolatedTargetAccount, isolatedEvidenceAccount, "$HIVE_TARGET_HEAD_SHA",
 		isolatedTargetAccount, isolatedEvidenceAccount, isolatedTargetAccount, isolatedEvidenceAccount,
-		indentWorkflowShell(validateIsolatedVisualEvidenceBeforeSealShell(), 10), checkoutRef, runnerAttestation,
+		indentWorkflowShell(validateIsolatedVisualEvidenceBeforeSealShell(), 10), "$HIVE_TARGET_HEAD_SHA", runnerAttestation,
 		indentWorkflowShell(sealIsolatedVisualEvidenceShell(), 10), uploadArtifactActionSHA, rawArtifact,
 		indentWorkflowShell(finalEnforcement, 10))
 }
