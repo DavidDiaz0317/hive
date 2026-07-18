@@ -537,9 +537,9 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	}
 	marker := "<!-- hive-setup: " + strings.ToLower(options.Repository) + " -->"
 	body := setupPRBody(marker, plan)
-	priorSetupPRNumber, priorSetupHeadSHA := 0, ""
-	if hasPrior {
-		priorSetupPRNumber, priorSetupHeadSHA = prior.SetupPRNumber, prior.SetupHeadSHA
+	priorSetupPRNumber, priorSetupHeadSHA, priorIdentityErr := priorSetupPullRequestIdentity(prior, hasPrior)
+	if priorIdentityErr != nil {
+		return result, priorIdentityErr
 	}
 	pull, err := options.GitHub.UpsertSetupPullRequest(ctx, options.Repository, branch, sha, defaultBranch, "Install Hive + Visual Hive production automation", body, marker, priorSetupPRNumber, priorSetupHeadSHA)
 	if err != nil {
@@ -878,6 +878,28 @@ func verifyVisualHiveCoverageProfile(data []byte, expected string) error {
 func exactCommitPin(expected, actual string) bool {
 	expected, actual = strings.ToLower(strings.TrimSpace(expected)), strings.ToLower(strings.TrimSpace(actual))
 	return len(expected) == 40 && expected == actual
+}
+
+func priorSetupPullRequestIdentity(prior Config, hasPrior bool) (int, string, error) {
+	if !hasPrior {
+		return 0, "", nil
+	}
+	if prior.SetupPRNumber != 0 {
+		return prior.SetupPRNumber, prior.SetupHeadSHA, nil
+	}
+	if prior.SetupPRURL != "" {
+		return 0, "", fmt.Errorf("prior setup state has a pull request URL without a pull request number")
+	}
+	if strings.TrimSpace(prior.SetupHeadSHA) == "" {
+		return 0, "", nil
+	}
+	directBootstrap := prior.DefaultBranch != "" && prior.SetupBranch == prior.DefaultBranch &&
+		immutableCommit.MatchString(strings.ToLower(strings.TrimSpace(prior.SetupHeadSHA))) &&
+		normalizedExecutionMode(prior.ExecutionMode) == ExecutionLocal && prior.Automation == AutomationRepairPR && prior.VisualHive
+	if !directBootstrap {
+		return 0, "", fmt.Errorf("prior setup state has a head without a pull request but is not an exact direct-bootstrap installation")
+	}
+	return 0, "", nil
 }
 
 func stagedTreeMatchesRemoteBranch(ctx context.Context, checkout, branch string) (bool, string, error) {
