@@ -602,6 +602,14 @@ func TestGeneratedPullRequestExecutionUsesDistinctEvidenceAuthority(t *testing.T
 	}
 }
 
+func TestGeneratedEvidenceLauncherUsesPrivateUmask(t *testing.T) {
+	generated := prepareIsolatedVisualEvidenceRuntimeShell(true)
+	launcherPrefix := "HIVE_EVIDENCE_LAUNCHER'\n#!" + isolatedTargetBash + "\nset -euo pipefail\numask 077\n"
+	if !strings.Contains(generated, launcherPrefix) {
+		t.Fatal("isolated evidence launcher does not force private permissions for newly collected evidence")
+	}
+}
+
 func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.T) {
 	production := workflow(isolationWorkflowConfig())
 	workflows := []struct {

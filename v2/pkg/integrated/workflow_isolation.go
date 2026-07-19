@@ -1946,6 +1946,7 @@ HIVE_TARGET_SHELL
 cat > "$evidence_launcher_source" <<'HIVE_EVIDENCE_LAUNCHER'
 #!` + isolatedTargetBash + `
 set -euo pipefail
+umask 077
 test "$(id -u)" = "0"
 test "$#" -ge 1
 for name in HIVE_TARGET_WORKSPACE HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH; do
