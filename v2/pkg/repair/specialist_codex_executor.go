@@ -39,7 +39,7 @@ func NewCodexSpecialistChildExecutor(provider CodexProvider) (*CodexSpecialistCh
 	if strings.TrimSpace(provider.Command) == "" {
 		return nil, errors.New("Codex specialist executor requires a provider command")
 	}
-	model, err := explicitCodexProviderModel(provider.Prefix)
+	model, err := CodexSpecialistProviderModel(provider.Prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func (executor *CodexSpecialistChildExecutor) Check(ctx context.Context) (agent.
 	if !codexSpecialistContainmentHostSupported(runtime.GOOS) {
 		return agent.SpecialistChildExecutorIdentity{}, fmt.Errorf("unsupported Codex containment host %q", runtime.GOOS)
 	}
-	model, err := explicitCodexProviderModel(executor.provider.Prefix)
+	model, err := CodexSpecialistProviderModel(executor.provider.Prefix)
 	if err != nil {
 		return agent.SpecialistChildExecutorIdentity{}, err
 	}
@@ -229,7 +229,13 @@ func (process *codexSpecialistChildProcess) ForceReap(ctx context.Context) error
 	}
 }
 
-func explicitCodexProviderModel(arguments []string) (string, error) {
+// CodexSpecialistProviderModel returns the single explicitly configured Codex
+// model. An empty result means no model was supplied; malformed or duplicate
+// model options fail closed.
+func CodexSpecialistProviderModel(arguments []string) (string, error) {
+	if err := validateCodexProviderPrefix(arguments); err != nil {
+		return "", err
+	}
 	model := ""
 	for index := 0; index < len(arguments); index++ {
 		argument := strings.TrimSpace(arguments[index])

@@ -197,8 +197,25 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 		return fmt.Errorf("setup baseline rebind intent is required")
 	}
 	source := rebind.Source
-	if source.CaptureRunID > 0 {
-		if err := cancelSetupBaselineCaptureRunExact(ctx, client, source); err != nil {
+	dispatch, dispatchExists, err := store.LoadWorkflowDispatchIntent()
+	if err != nil {
+		return err
+	}
+	if dispatchExists && dispatch.Operation == setupBaselineWorkflowOperation {
+		if dispatch.CorrelationID != source.CaptureCorrelation {
+			return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+		}
+		if source.CaptureRunID > 0 && dispatch.RunID > 0 && source.CaptureRunID != dispatch.RunID {
+			return fmt.Errorf("obsolete setup baseline source and acknowledged dispatch have different exact run IDs")
+		}
+	}
+	captureRetired := source.CaptureCorrelation != "" && containsExact(source.RetiredCaptureCorrelations, source.CaptureCorrelation)
+	if source.CaptureRunID > 0 && !captureRetired {
+		var acknowledged *WorkflowDispatchIntent
+		if dispatchExists && dispatch.Operation == setupBaselineWorkflowOperation && dispatch.RunID == source.CaptureRunID && !dispatch.DispatchAcknowledgedAt.IsZero() {
+			acknowledged = &dispatch
+		}
+		if err := cancelSetupBaselineCaptureRunExactBound(ctx, client, source, acknowledged); err != nil {
 			return err
 		}
 	}
@@ -212,10 +229,6 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 			return fmt.Errorf("delete exact obsolete setup baseline branch: %w", err)
 		}
 	}
-	dispatch, dispatchExists, err := store.LoadWorkflowDispatchIntent()
-	if err != nil {
-		return err
-	}
 	if dispatchExists && dispatch.Operation == "production" {
 		if err := retireTerminalProductionDispatchForSetupRebind(ctx, store, client, rebind, dispatch); err != nil {
 			return err
@@ -225,6 +238,9 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 	if dispatchExists {
 		if dispatch.Operation != setupBaselineWorkflowOperation || dispatch.CorrelationID != source.CaptureCorrelation {
 			return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+		}
+		if source.CaptureRunID > 0 && dispatch.RunID > 0 && source.CaptureRunID != dispatch.RunID {
+			return fmt.Errorf("obsolete setup baseline source and acknowledged dispatch have different exact run IDs")
 		}
 		if source.CaptureRunID == 0 {
 			candidateRunID := dispatch.RunID
@@ -243,12 +259,21 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 				if source.CaptureRunURL == "" {
 					source.CaptureRunURL = fmt.Sprintf("https://github.com/%s/actions/runs/%d", source.Repository, candidateRunID)
 				}
-				source.DispatchAcknowledgedAt = time.Now().UTC()
+				source.DispatchAcknowledgedAt = dispatch.DispatchAcknowledgedAt
+				if source.DispatchAcknowledgedAt.IsZero() {
+					// Older servers do not acknowledge with a run ID. In that path
+					// candidateRunID came from exact correlation discovery above.
+					source.DispatchAcknowledgedAt = time.Now().UTC()
+				}
 				rebind.Source = source
 				if err := store.SaveSetupBaselineRebindIntent(*rebind); err != nil {
 					return fmt.Errorf("bind discovered obsolete setup baseline run before cancellation: %w", err)
 				}
-				if err := cancelSetupBaselineCaptureRunExact(ctx, client, source); err != nil {
+				var acknowledged *WorkflowDispatchIntent
+				if dispatch.RunID == candidateRunID && !dispatch.DispatchAcknowledgedAt.IsZero() {
+					acknowledged = &dispatch
+				}
+				if err := cancelSetupBaselineCaptureRunExactBound(ctx, client, source, acknowledged); err != nil {
 					return err
 				}
 			}
@@ -370,6 +395,14 @@ func cancelSetupBaselineCaptureRunExact(ctx context.Context, client *hivegithub.
 }
 
 func cancelSetupBaselineCaptureRunExactWithTiming(ctx context.Context, client *hivegithub.Client, source SetupBaselineIntent, pollInterval, timeout time.Duration) error {
+	return cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx, client, source, nil, pollInterval, timeout)
+}
+
+func cancelSetupBaselineCaptureRunExactBound(ctx context.Context, client *hivegithub.Client, source SetupBaselineIntent, dispatch *WorkflowDispatchIntent) error {
+	return cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx, client, source, dispatch, 250*time.Millisecond, 20*time.Second)
+}
+
+func cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx context.Context, client *hivegithub.Client, source SetupBaselineIntent, dispatch *WorkflowDispatchIntent, pollInterval, timeout time.Duration) error {
 	owner, repo, ok := strings.Cut(source.Repository, "/")
 	if !ok || owner == "" || repo == "" || client == nil || client.GoGitHub() == nil || pollInterval <= 0 || timeout <= 0 {
 		return fmt.Errorf("exact setup baseline capture cancellation requires GitHub access")
@@ -381,7 +414,7 @@ func cancelSetupBaselineCaptureRunExactWithTiming(ctx context.Context, client *h
 		}
 		return fmt.Errorf("inspect exact obsolete setup baseline run %d: %w", source.CaptureRunID, err)
 	}
-	if !exactSetupBaselineCaptureRun(run, source) {
+	if !exactSetupBaselineCaptureRunForCancellation(run, source, dispatch) {
 		return fmt.Errorf("obsolete setup baseline workflow run no longer matches its exact durable identity")
 	}
 	if strings.EqualFold(run.GetStatus(), "completed") {
@@ -390,9 +423,16 @@ func cancelSetupBaselineCaptureRunExactWithTiming(ctx context.Context, client *h
 	response, err = client.GoGitHub().Actions.CancelWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
 	if response != nil && response.StatusCode == http.StatusConflict {
 		live, _, liveErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
-		if liveErr == nil && exactSetupBaselineCaptureRun(live, source) && strings.EqualFold(live.GetStatus(), "completed") {
+		if liveErr != nil {
+			return fmt.Errorf("reinspect exact obsolete setup baseline run %d after cancellation conflict: %w", source.CaptureRunID, liveErr)
+		}
+		if !exactSetupBaselineCaptureRunForCancellation(live, source, dispatch) {
+			return fmt.Errorf("obsolete setup baseline workflow run changed identity after cancellation conflict")
+		}
+		if strings.EqualFold(live.GetStatus(), "completed") {
 			return nil
 		}
+		response, err = forceCancelWorkflowRunByID(ctx, client, owner, repo, source.CaptureRunID)
 	}
 	if err != nil && (response == nil || response.StatusCode != http.StatusAccepted) {
 		return fmt.Errorf("cancel exact obsolete setup baseline run %d: %w", source.CaptureRunID, err)
@@ -404,7 +444,7 @@ func cancelSetupBaselineCaptureRunExactWithTiming(ctx context.Context, client *h
 	for {
 		live, _, readErr := client.GoGitHub().Actions.GetWorkflowRunByID(waitCtx, owner, repo, source.CaptureRunID)
 		if readErr == nil {
-			if !exactSetupBaselineCaptureRun(live, source) {
+			if !exactSetupBaselineCaptureRunForCancellation(live, source, dispatch) {
 				return fmt.Errorf("obsolete setup baseline workflow run changed identity during cancellation")
 			}
 			if strings.EqualFold(live.GetStatus(), "completed") {
@@ -419,10 +459,39 @@ func cancelSetupBaselineCaptureRunExactWithTiming(ctx context.Context, client *h
 	}
 }
 
+func forceCancelWorkflowRunByID(ctx context.Context, client *hivegithub.Client, owner, repo string, runID int64) (*gh.Response, error) {
+	endpoint := fmt.Sprintf("repos/%s/%s/actions/runs/%d/force-cancel", owner, repo, runID)
+	request, err := client.GoGitHub().NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.GoGitHub().Do(ctx, request, nil)
+}
+
 func exactSetupBaselineCaptureRun(run *gh.WorkflowRun, source SetupBaselineIntent) bool {
 	return run != nil && run.GetID() == source.CaptureRunID && strings.EqualFold(run.GetRepository().GetFullName(), source.Repository) &&
 		strings.EqualFold(run.GetHeadSHA(), source.CaptureHeadSHA) && run.GetEvent() == "workflow_dispatch" &&
 		run.GetPath() == visualHiveProductionWorkflowPath && run.GetDisplayTitle() == workflowDispatchDisplayTitle(source.CaptureCorrelation)
+}
+
+func exactSetupBaselineCaptureRunForCancellation(run *gh.WorkflowRun, source SetupBaselineIntent, dispatch *WorkflowDispatchIntent) bool {
+	if exactSetupBaselineCaptureRun(run, source) {
+		return true
+	}
+	if run == nil || dispatch == nil || validateWorkflowDispatchIntent(*dispatch) != nil || dispatch.Operation != setupBaselineWorkflowOperation ||
+		dispatch.DispatchAcknowledgedAt.IsZero() || dispatch.RunID <= 0 || source.CaptureRunID != dispatch.RunID ||
+		source.CaptureCorrelation != dispatch.CorrelationID || source.Repository != dispatch.Repository || source.RepositoryID != dispatch.RepositoryID ||
+		source.DefaultBranch != dispatch.Ref || dispatch.WorkflowFile != "hive-visual-hive.yml" {
+		return false
+	}
+	missing, err := exactWorkflowRunBindingState(run, *dispatch)
+	if err != nil || len(missing) != 1 || missing[0] != "display_title" || run.GetDisplayTitle() != visualHiveProductionWorkflowName {
+		return false
+	}
+	return run.GetName() == visualHiveProductionWorkflowName && run.GetWorkflowID() > 0 &&
+		run.GetPath() == visualHiveProductionWorkflowPath && strings.EqualFold(run.GetHeadSHA(), source.CaptureHeadSHA) &&
+		strings.EqualFold(run.GetRepository().GetFullName(), source.Repository) && run.GetRepository().GetID() > 0 &&
+		strconv.FormatInt(run.GetRepository().GetID(), 10) == strings.TrimSpace(source.RepositoryID)
 }
 
 func completeSetupBaselineRebind(store *Store, config Config) error {

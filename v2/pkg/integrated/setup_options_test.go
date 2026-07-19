@@ -164,6 +164,37 @@ func TestUsesNormalHiveRuntimeMatchesExecutionAuthority(t *testing.T) {
 	}
 }
 
+func TestNormalHiveProviderModelIsDefaultedAndValidatedBeforeSetup(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		options   SetupOptions
+		wantArgs  []string
+		wantError bool
+	}{
+		{name: "local repair default", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex"}, wantArgs: []string{"--model=gpt-5.6-sol"}},
+		{name: "local auto merge default", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationAutoMerge, Provider: "CODEX"}, wantArgs: []string{"--model=gpt-5.6-sol"}},
+		{name: "explicit model preserved", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--color", "never", "--model", "custom-model"}}, wantArgs: []string{"--color", "never", "--model", "custom-model"}},
+		{name: "hosted unchanged", options: SetupOptions{ExecutionMode: ExecutionHosted, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex"}},
+		{name: "issues unchanged", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationIssues, Provider: "codex"}},
+		{name: "non Codex normal owner", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "other"}, wantError: true},
+		{name: "missing model value", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--model"}}, wantError: true},
+		{name: "duplicate model", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--model=one", "--model=two"}}, wantError: true},
+		{name: "valid explicit options gain default", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--disable", "feature"}}, wantArgs: []string{"--disable", "feature", "--model=gpt-5.6-sol"}},
+		{name: "unreviewed option", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--model=one", "--bogus"}}, wantError: true},
+		{name: "positional payload", options: SetupOptions{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR, Provider: "codex", ProviderArgs: []string{"--model=one", "exec"}}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NormalizeNormalHiveProvider(test.options)
+			if (err != nil) != test.wantError {
+				t.Fatalf("normalize error=%v wantError=%t", err, test.wantError)
+			}
+			if !test.wantError && strings.Join(got.ProviderArgs, "\x00") != strings.Join(test.wantArgs, "\x00") {
+				t.Fatalf("provider args=%v, want %v", got.ProviderArgs, test.wantArgs)
+			}
+		})
+	}
+}
+
 func TestManagedQuickstartAndRequiredActionsDistinguishRuntimeOwner(t *testing.T) {
 	const stateDir = "/var/lib/hive/console-fork"
 	tests := []struct {

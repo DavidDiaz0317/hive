@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v72/github"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
 
@@ -1301,6 +1302,215 @@ func TestSetupBaselineCaptureCancellationWaitsForExactTerminalRun(t *testing.T) 
 	}
 	if cancels != 1 || reads < 3 {
 		t.Fatalf("cancellation did not wait for exact terminal run: cancels=%d reads=%d", cancels, reads)
+	}
+}
+
+func TestSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceholder(t *testing.T) {
+	head, correlation, now := strings.Repeat("a", 40), strings.Repeat("b", 64), time.Now().UTC()
+	reads, cancels, forceCancels := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/77":
+			reads++
+			status, conclusion := "queued", ""
+			if forceCancels > 0 {
+				status, conclusion = "completed", "cancelled"
+			}
+			_, _ = fmt.Fprintf(writer, `{"id":77,"workflow_id":12,"name":%q,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":%q,"conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, head, status, conclusion)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/cancel":
+			cancels++
+			http.Error(writer, `{"message":"run cannot be cancelled"}`, http.StatusConflict)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/force-cancel":
+			forceCancels++
+			writer.WriteHeader(http.StatusAccepted)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	source := SetupBaselineIntent{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", CaptureRunID: 77, CaptureHeadSHA: head, CaptureCorrelation: correlation}
+	dispatch, err := newWorkflowDispatchIntentForOperation(Config{Repository: source.Repository, RepositoryID: source.RepositoryID}, "hive-visual-hive.yml", source.DefaultBranch, setupBaselineWorkflowOperation, correlation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now.Add(time.Second)
+	dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = source.CaptureRunID, "https://example.test/runs/77", now.Add(2*time.Second)
+	dispatch.RequestDigest, err = workflowDispatchRequestDigest(dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cancelSetupBaselineCaptureRunExactBoundWithTiming(context.Background(), client, source, &dispatch, time.Millisecond, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cancels != 1 || forceCancels != 1 || reads < 3 {
+		t.Fatalf("exact fallback calls: reads=%d cancel=%d force-cancel=%d", reads, cancels, forceCancels)
+	}
+}
+
+func TestSetupBaselineRebindRetiresAcknowledgedStaticPlaceholderByExactRunID(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now, head, correlation := time.Now().UTC(), strings.Repeat("a", 40), strings.Repeat("b", 64)
+	emptyDigest := emptySetupBaselineCandidateDigest(t)
+	config := Config{SchemaVersion: ConfigSchema, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: stateDir,
+		Coverage: CoverageComprehensive, Automation: AutomationRepairPR, Provider: "codex", SetupAuthorizationActorID: 42,
+		SetupPRNumber: 7, SetupPRURL: "https://example.test/pull/7", SetupHeadSHA: head, VisualHiveConfigDigest: strings.Repeat("c", 64),
+		SetupBaselineContractDigest: strings.Repeat("d", 64), SetupBaselineInitialDigest: emptyDigest}
+	baseline := SetupBaselineIntent{SchemaVersion: SetupBaselineSchema, Phase: SetupBaselineDispatched, Repository: config.Repository, RepositoryID: config.RepositoryID,
+		DefaultBranch: config.DefaultBranch, AuthorizerID: config.SetupAuthorizationActorID, SetupPRNumber: config.SetupPRNumber, SetupPRURL: config.SetupPRURL,
+		SetupHeadSHA: head, VisualHiveConfigDigest: config.VisualHiveConfigDigest, ScreenshotContractDigest: config.SetupBaselineContractDigest,
+		InitialBaselineDigest: emptyDigest, CaptureCorrelation: correlation, CaptureHeadSHA: head, DispatchAttemptedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := store.SaveSetupBaselineIntent(baseline); err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := newWorkflowDispatchIntentForOperation(config, "hive-visual-hive.yml", "main", setupBaselineWorkflowOperation, correlation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now.Add(time.Second)
+	dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = 77, "https://example.test/runs/77", now.Add(2*time.Second)
+	if err := store.SaveWorkflowDispatchIntent(dispatch); err != nil {
+		t.Fatal(err)
+	}
+	dispatch, _, _ = store.LoadWorkflowDispatchIntent()
+	reads, cancels, unexpected := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/77":
+			reads++
+			status, conclusion := "queued", ""
+			if cancels > 0 {
+				status, conclusion = "completed", "cancelled"
+			}
+			_, _ = fmt.Fprintf(writer, `{"id":77,"workflow_id":12,"name":%q,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":%q,"conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, head, status, conclusion)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/cancel":
+			cancels++
+			writer.WriteHeader(http.StatusAccepted)
+		default:
+			unexpected++
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	changed := config
+	changed.VisualHiveConfigDigest = strings.Repeat("e", 64)
+	if err := reconcileActiveSetupBaselineReconfiguration(context.Background(), store, changed, head, false, client); err != nil {
+		t.Fatal(err)
+	}
+	rebind, exists, err := store.LoadSetupBaselineRebindIntent()
+	if err != nil || !exists || rebind.Phase != SetupBaselineRebindResourcesRetired || rebind.Source.CaptureRunID != dispatch.RunID ||
+		!rebind.Source.DispatchAcknowledgedAt.Equal(dispatch.DispatchAcknowledgedAt) || !containsExact(rebind.Source.RetiredCaptureCorrelations, correlation) {
+		t.Fatalf("static placeholder was not retired exactly: exists=%t rebind=%+v err=%v", exists, rebind, err)
+	}
+	if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
+		t.Fatalf("terminal exact placeholder dispatch remained active: exists=%t err=%v", exists, err)
+	}
+	if cancels != 1 || reads < 2 || unexpected != 0 {
+		t.Fatalf("retirement used the wrong GitHub path: reads=%d cancels=%d unexpected=%d", reads, cancels, unexpected)
+	}
+	readsAfterRetirement := reads
+	// Simulate a crash after the durable correlation tombstone and dispatch
+	// deletion but before the outer resources-retired transition is saved.
+	rebind.Phase, rebind.ResourcesRetiredAt = SetupBaselineRebindPrepared, time.Time{}
+	if err := store.SaveSetupBaselineRebindIntent(rebind); err != nil {
+		t.Fatal(err)
+	}
+	if err := retireSetupBaselineRebindResources(context.Background(), store, client, &rebind); err != nil {
+		t.Fatalf("tombstoned cancellation was not replay-safe: %v", err)
+	}
+	if reads != readsAfterRetirement || cancels != 1 || unexpected != 0 {
+		t.Fatalf("tombstoned cancellation repeated GitHub work: reads=%d cancels=%d unexpected=%d", reads, cancels, unexpected)
+	}
+	if err := reconcileActiveSetupBaselineReconfiguration(context.Background(), store, changed, head, false, client); err != nil {
+		t.Fatal(err)
+	}
+	if cancels != 1 || unexpected != 0 {
+		t.Fatalf("replayed rebind repeated external work: cancels=%d unexpected=%d", cancels, unexpected)
+	}
+}
+
+func TestAcknowledgedStaticSetupBaselineRunRequiresExactCancellationBinding(t *testing.T) {
+	now, head, correlation := time.Now().UTC(), strings.Repeat("a", 40), strings.Repeat("b", 64)
+	source := SetupBaselineIntent{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", CaptureCorrelation: correlation, CaptureHeadSHA: head, CaptureRunID: 77}
+	dispatch, err := newWorkflowDispatchIntentForOperation(Config{Repository: source.Repository, RepositoryID: source.RepositoryID}, "hive-visual-hive.yml", source.DefaultBranch, setupBaselineWorkflowOperation, correlation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now.Add(time.Second)
+	dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = source.CaptureRunID, "https://example.test/runs/77", now.Add(2*time.Second)
+	dispatch.RequestDigest, err = workflowDispatchRequestDigest(dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRun := func() *gh.WorkflowRun {
+		return &gh.WorkflowRun{ID: gh.Ptr(int64(77)), WorkflowID: gh.Ptr(int64(12)), Name: gh.Ptr(visualHiveProductionWorkflowName),
+			DisplayTitle: gh.Ptr(visualHiveProductionWorkflowName), Path: gh.Ptr(visualHiveProductionWorkflowPath), Event: gh.Ptr("workflow_dispatch"),
+			HeadBranch: gh.Ptr("main"), HeadSHA: gh.Ptr(head), Repository: &gh.Repository{ID: gh.Ptr(int64(123)), FullName: gh.Ptr("owner/repo")}}
+	}
+	if !exactSetupBaselineCaptureRunForCancellation(baseRun(), source, &dispatch) {
+		t.Fatal("exact acknowledged static placeholder was rejected")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*gh.WorkflowRun, *SetupBaselineIntent, *WorkflowDispatchIntent)
+	}{
+		{name: "run id", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.ID = gh.Ptr(int64(78))
+		}},
+		{name: "source dispatch run mismatch", mutate: func(_ *gh.WorkflowRun, source *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			source.CaptureRunID = 78
+		}},
+		{name: "repository name", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.Repository.FullName = gh.Ptr("owner/other")
+		}},
+		{name: "repository id", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.Repository.ID = gh.Ptr(int64(999))
+		}},
+		{name: "workflow name", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.Name = gh.Ptr("Other")
+		}},
+		{name: "workflow id", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.WorkflowID = gh.Ptr(int64(0))
+		}},
+		{name: "workflow path", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.Path = gh.Ptr(".github/workflows/other.yml")
+		}},
+		{name: "event", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.Event = gh.Ptr("push")
+		}},
+		{name: "branch", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.HeadBranch = gh.Ptr("other")
+		}},
+		{name: "head", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.HeadSHA = gh.Ptr(strings.Repeat("c", 40))
+		}},
+		{name: "arbitrary title", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.DisplayTitle = gh.Ptr("unrelated")
+		}},
+		{name: "empty title", mutate: func(run *gh.WorkflowRun, _ *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			run.DisplayTitle = gh.Ptr("")
+		}},
+		{name: "missing acknowledgement", mutate: func(_ *gh.WorkflowRun, _ *SetupBaselineIntent, dispatch *WorkflowDispatchIntent) {
+			dispatch.DispatchAcknowledgedAt = time.Time{}
+		}},
+		{name: "correlation", mutate: func(_ *gh.WorkflowRun, source *SetupBaselineIntent, _ *WorkflowDispatchIntent) {
+			source.CaptureCorrelation = strings.Repeat("d", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, candidateSource, candidateDispatch := baseRun(), source, dispatch
+			test.mutate(run, &candidateSource, &candidateDispatch)
+			if exactSetupBaselineCaptureRunForCancellation(run, candidateSource, &candidateDispatch) {
+				t.Fatal("inexact static placeholder was accepted for cancellation")
+			}
+		})
 	}
 }
 

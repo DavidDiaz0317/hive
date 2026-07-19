@@ -199,6 +199,9 @@ func specialistModelFromProviderArgs(arguments []string) (string, error) {
 		}
 		model = value
 	}
+	if model == "" {
+		return "", errors.New("persistent Hive specialists require one explicit Codex --model provider argument")
+	}
 	return model, nil
 }
 

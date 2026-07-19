@@ -759,7 +759,7 @@ func runSetupCommand(args []string) int {
 	var visualArgs stringListFlag
 	var autoMergePaths stringListFlag
 	var autoMergeRisks stringListFlag
-	flags.Var(&providerArgs, "provider-arg", "repair provider launcher argument; repeatable")
+	flags.Var(&providerArgs, "provider-arg", "repair provider launcher argument; repeatable (normal local repair defaults to --model=gpt-5.6-sol)")
 	flags.Var(&visualArgs, "visual-hive-arg", "Visual Hive launcher argument before the CLI subcommand; repeatable")
 	flags.Var(&autoMergePaths, "auto-merge-path", "repository-relative glob eligible for autonomous merge; repeatable (default: test-only paths)")
 	flags.Var(&autoMergeRisks, "auto-merge-risk", "eligible risk tier: automatic, low, medium, or restricted; repeatable (default: automatic)")
@@ -830,6 +830,15 @@ func runSetupCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "setup failed: --runtime must be hosted or local")
 		return 2
 	}
+	normalizedProvider, normalizeProviderErr := integrated.NormalizeNormalHiveProvider(integrated.SetupOptions{
+		Provider: *provider, ProviderArgs: append([]string(nil), providerArgs...), ExecutionMode: executionMode,
+		VisualHive: *visualHive, Automation: automationMode,
+	})
+	if normalizeProviderErr != nil {
+		fmt.Fprintln(os.Stderr, "setup failed:", normalizeProviderErr)
+		return 2
+	}
+	providerArgs = append(providerArgs[:0], normalizedProvider.ProviderArgs...)
 	hostedSchedule := ""
 	releaseIdentity := installedReleaseIdentity{}
 	if executionMode == integrated.ExecutionHosted {

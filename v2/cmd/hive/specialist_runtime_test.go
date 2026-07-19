@@ -124,7 +124,6 @@ func TestSpecialistModelFromProviderArgsIsNarrowAndDeterministic(t *testing.T) {
 		args []string
 		want string
 	}{
-		{nil, ""},
 		{[]string{"--model", "gpt-5"}, "gpt-5"},
 		{[]string{"--model=gpt-5.1"}, "gpt-5.1"},
 	} {
@@ -133,7 +132,7 @@ func TestSpecialistModelFromProviderArgsIsNarrowAndDeterministic(t *testing.T) {
 			t.Fatalf("args %v = %q, %v; want %q", test.args, got, err, test.want)
 		}
 	}
-	for _, args := range [][]string{{"--model"}, {"--model", "a", "--model=b"}, {"--disable", "sandbox"}, {"exec"}} {
+	for _, args := range [][]string{nil, {"--model"}, {"--model", "a", "--model=b"}, {"--disable", "sandbox"}, {"exec"}} {
 		if _, err := specialistModelFromProviderArgs(args); err == nil {
 			t.Errorf("unsafe provider args were accepted: %v", args)
 		}
@@ -162,6 +161,7 @@ func testIntegratedSpecialistConfig(t *testing.T, stateDir string) integrated.Co
 	return integrated.Config{
 		Repository: "example/proof", StateDir: stateDir, ExecutionMode: integrated.ExecutionLocal,
 		Automation: integrated.AutomationRepairPR, Provider: "codex", ProviderCommand: provider, ACMMLevel: 6,
+		ProviderArgs: []string{"--model=gpt-5.6-sol"},
 	}
 }
 

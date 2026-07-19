@@ -26,6 +26,7 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	"github.com/kubestellar/hive/v2/pkg/checkpoint"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
+	"github.com/kubestellar/hive/v2/pkg/repair"
 	"gopkg.in/yaml.v3"
 )
 
@@ -41,6 +42,7 @@ const (
 	directBootstrapMaxBaseline  = 20 << 20
 	directBootstrapMaxTotal     = 500 << 20
 	directBootstrapMaxPathBytes = 512
+	defaultNormalCodexModel     = "gpt-5.6-sol"
 )
 
 var (
@@ -118,6 +120,11 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 	ctx = gittransport.WithControllerToken(ctx, options.GitTransportToken)
 	if options.ExecutionMode == "" {
 		options.ExecutionMode = ExecutionLocal
+	}
+	var err error
+	options, err = NormalizeNormalHiveProvider(options)
+	if err != nil {
+		return SetupResult{}, err
 	}
 	if options.RunInterval == 0 {
 		options.RunInterval = 15 * time.Minute
@@ -571,6 +578,27 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		return result, err
 	}
 	return result, nil
+}
+
+// NormalizeNormalHiveProvider returns the exact provider binding used by both
+// setup preflight and the installed ordinary Hive repair runtime.
+func NormalizeNormalHiveProvider(options SetupOptions) (SetupOptions, error) {
+	owner := Config{ExecutionMode: normalizedExecutionMode(options.ExecutionMode), VisualHive: options.VisualHive, Automation: options.Automation}
+	if !UsesNormalHiveRuntime(owner) {
+		return options, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(options.Provider), "codex") {
+		return options, fmt.Errorf("normal governed repair runtime requires the Codex provider, got %q", options.Provider)
+	}
+	model, err := repair.CodexSpecialistProviderModel(options.ProviderArgs)
+	if err != nil {
+		return options, fmt.Errorf("normal governed repair runtime provider model: %w", err)
+	}
+	if model != "" {
+		return options, nil
+	}
+	options.ProviderArgs = append(append([]string(nil), options.ProviderArgs...), "--model="+defaultNormalCodexModel)
+	return options, nil
 }
 
 func publicSetupConfig(config Config) *Config {

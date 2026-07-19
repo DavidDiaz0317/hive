@@ -52,7 +52,7 @@ func TestDirectBootstrapInstallsExactDefaultHeadWithoutSetupPullRequest(t *testi
 	stateDir := filepath.Join(root, "hive-direct-state")
 	options := SetupOptions{
 		Repository: "owner/repo", Coverage: CoverageEssential, Automation: AutomationRepairPR,
-		Provider: "test", ProviderCommand: os.Args[0], ExecutionMode: ExecutionLocal,
+		Provider: "codex", ProviderCommand: os.Args[0], ExecutionMode: ExecutionLocal,
 		RunInterval: time.Minute, VisualHive: true, StateDir: stateDir, Apply: true,
 		DirectBootstrap: true, ExpectedSeedSHA: seedSHA, Start: false,
 		VisualHiveCommand: node, VisualHiveArgs: []string{entrypoint},
@@ -70,6 +70,13 @@ func TestDirectBootstrapInstallsExactDefaultHeadWithoutSetupPullRequest(t *testi
 	}
 	if result.Config.SetupBranch != "main" || result.Config.SetupPRNumber != 0 || result.Config.SetupPRURL != "" || result.Config.SetupHeadSHA != result.CommitSHA {
 		t.Fatalf("direct-bootstrap durable setup identity = %+v", result.Config)
+	}
+	if strings.Join(result.Config.ProviderArgs, "\x00") != "--model=gpt-5.6-sol" {
+		t.Fatalf("direct-bootstrap setup did not persist the normalized provider model: %v", result.Config.ProviderArgs)
+	}
+	options, err = NormalizeNormalHiveProvider(options)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if got := strings.TrimSpace(integratedGitOutput(t, remote, "rev-parse", "refs/heads/main")); got != result.CommitSHA {
 		t.Fatalf("default head = %s, want %s", got, result.CommitSHA)
@@ -246,7 +253,7 @@ targets: []
 	stateDir := filepath.Join(root, "hive-direct-reviewed-state")
 	options := SetupOptions{
 		Repository: "owner/repo", Coverage: CoverageEssential, Automation: AutomationRepairPR,
-		Provider: "test", ProviderCommand: os.Args[0], ExecutionMode: ExecutionLocal,
+		Provider: "codex", ProviderCommand: os.Args[0], ProviderArgs: []string{"--model=gpt-5.6-sol"}, ExecutionMode: ExecutionLocal,
 		RunInterval: time.Minute, VisualHive: true, StateDir: stateDir, Apply: true,
 		DirectBootstrap: true, AdoptReviewedBaselines: true, ExpectedSeedSHA: seedSHA,
 		ReviewedBaselineDigest: reviewedDigest, Start: false,

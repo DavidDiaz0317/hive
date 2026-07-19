@@ -17,6 +17,8 @@ func TestCodexSpecialistExecutorRequiresOneExplicitModelAndSupportedHost(t *test
 		{Command: "codex"},
 		{Command: "codex", Prefix: []string{"--model"}},
 		{Command: "codex", Prefix: []string{"--model", "one", "--model=two"}},
+		{Command: "codex", Prefix: []string{"--model=one", "--bogus"}},
+		{Command: "codex", Prefix: []string{"--model=one", "exec"}},
 	} {
 		if _, err := NewCodexSpecialistChildExecutor(provider); err == nil {
 			t.Fatalf("unsafe executor model configuration was accepted: %+v", provider)
