@@ -608,6 +608,10 @@ func TestGeneratedEvidenceLauncherUsesPrivateUmask(t *testing.T) {
 	if !strings.Contains(generated, launcherPrefix) {
 		t.Fatal("isolated evidence launcher does not force private permissions for newly collected evidence")
 	}
+	postDropExec := "exec /usr/bin/sudo -n -u " + isolatedEvidenceAccount + ` -- /usr/bin/env -i -C "$HIVE_TARGET_WORKSPACE" "${evidence_environment[@]}" ` + isolatedTargetBash + ` --noprofile --norc -c 'umask 077; exec "$@"' hive-visual-evidence "$@"`
+	if !strings.Contains(generated, postDropExec) {
+		t.Fatal("isolated evidence launcher does not restore its private umask after sudo changes principal")
+	}
 }
 
 func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.T) {

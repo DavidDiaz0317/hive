@@ -1981,7 +1981,7 @@ for name in GITHUB_ACTIONS GITHUB_REPOSITORY GITHUB_HEAD_REF GITHUB_BASE_REF GIT
     evidence_environment+=("$name=${!name}")
   fi
 done
-exec /usr/bin/sudo -n -u ` + isolatedEvidenceAccount + ` -- /usr/bin/env -i -C "$HIVE_TARGET_WORKSPACE" "${evidence_environment[@]}" "$@"
+exec /usr/bin/sudo -n -u ` + isolatedEvidenceAccount + ` -- /usr/bin/env -i -C "$HIVE_TARGET_WORKSPACE" "${evidence_environment[@]}" ` + isolatedTargetBash + ` --noprofile --norc -c 'umask 077; exec "$@"' hive-visual-evidence "$@"
 HIVE_EVIDENCE_LAUNCHER
 sudo install -o root -g root -m 0555 "$target_shell_source" "$target_shell"
 sudo install -o root -g root -m 0555 "$evidence_launcher_source" "$evidence_launcher"
