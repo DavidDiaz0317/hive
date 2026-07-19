@@ -1348,21 +1348,29 @@ func buildSetupPlan(options SetupOptions, inspection RepositoryInspection) Setup
 		AllowedAutoMergeRisk:  append([]automation.RiskTier(nil), options.AllowedAutoMergeRisk...),
 		TestingLayers:         layersForCoverage(options.Coverage),
 		FilesToManage:         managedFiles,
-		RequiredActions:       setupRequiredActions(options.Automation, options.ExecutionMode, options.DirectBootstrap),
+		RequiredActions:       setupRequiredActions(options),
 		Warnings:              warnings, ReadOnly: true,
 	}
 }
 
-func setupRequiredActions(automation Automation, mode ExecutionMode, directBootstrap bool) []string {
+func setupRequiredActions(options SetupOptions) []string {
 	actions := []string{"Review and merge the exact setup PR"}
-	if directBootstrap {
+	if options.DirectBootstrap {
 		actions = []string{"Confirm the target is a new private disposable repository and explicitly authorize one exact leased default-branch bootstrap commit"}
 	}
-	if automation == AutomationAutoMerge {
-		actions = append(actions, "Complete the setup PR and trusted setup run to activate exact-App-bound protection; a requested scheduler starts only after all non-scheduler doctor checks are green, or run hive start explicitly later")
+	if options.Automation == AutomationAutoMerge {
+		actions = append(actions, "Complete the setup PR and trusted setup run to activate exact-App-bound protection before any lifecycle write")
 	}
-	if mode == ExecutionHosted {
+	ownerConfig := Config{ExecutionMode: options.ExecutionMode, VisualHive: options.VisualHive, Automation: options.Automation}
+	if UsesNormalHiveRuntime(ownerConfig) {
+		actions = append(actions,
+			fmt.Sprintf("Configure the existing ordinary Hive/dashboard process with the exact HIVE_STATE_DIR %q and ensure its normal project scope includes %s", options.StateDir, options.Repository),
+			"Confirm the existing dashboard listener is HTTP-ready, then restart ordinary Hive/dashboard; do not use hive run or hive start for this runtime, and use hive stop only when status or doctor directs stale legacy-scheduler cleanup",
+		)
+	} else if options.ExecutionMode == ExecutionHosted {
 		actions = append(actions, "Confirm the hosted controller completes with signed durable state; the bootstrap computer may then be removed")
+	} else {
+		actions = append(actions, "Start or resume the legacy local scheduler only after the exact managed setup is installed and doctor prerequisites are green")
 	}
 	return append(actions, "Run hive doctor and confirm production_ready=true")
 }
@@ -3090,11 +3098,23 @@ func containsValue(values []string, target string) bool {
 }
 
 func quickstart(config Config, inspection RepositoryInspection) string {
+	normalOwner := UsesNormalHiveRuntime(config)
 	activation := ""
 	if config.Automation == AutomationAutoMerge {
-		activation = "\n\nAuto-merge protection uses two-phase activation: merge the exact managed setup/upgrade PR first. The next started Hive run verifies the installed files and exact production workflow path/event/head, completes both `visual-hive-production` and the actively guarded `visual-hive` eligibility seed on the current default head, and only then creates or verifies strict protection with the PR `visual-hive` context bound to the GitHub Actions App ID. Merge gating accepts that context only from `.github/workflows/visual-hive-pr.yml` on the exact pull-request head. No issue, repair, or merge lifecycle write occurs before activation."
+		nextCycle := "next started Hive run"
+		if normalOwner {
+			nextCycle = "next ordinary Hive cycle after the existing service restarts"
+		}
+		activation = fmt.Sprintf("\n\nAuto-merge protection uses two-phase activation: merge the exact managed setup/upgrade PR first. The %s verifies the installed files and exact production workflow path/event/head, completes both `visual-hive-production` and the actively guarded `visual-hive` eligibility seed on the current default head, and only then creates or verifies strict protection with the PR `visual-hive` context bound to the GitHub Actions App ID. Merge gating accepts that context only from `.github/workflows/visual-hive-pr.yml` on the exact pull-request head. No issue, repair, or merge lifecycle write occurs before activation.", nextCycle)
 	}
-	return fmt.Sprintf("# Hive + Visual Hive\n\nThis repository is managed by Hive with `%s` coverage and `%s` automation authority. Visual Hive runs deterministic checks; Hive alone owns issues, repair branches, pull requests, merges, and closure. Hive keeps at most %d managed findings active as GitHub issues at once and permits at most %d bounded repair attempts per finding; every additional finding remains durable as a bead until capacity is available.%s\n\n## Operator commands\n\nHive automatically selects this repository's isolated persistent state. Run:\n\n```sh\nhive doctor --json\nhive status --json\nhive run --json\nhive start --json\nhive stop --json\nhive pause\nhive resume\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --plan --json\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --base EXACT_BASE_SHA --diff-digest EXACT_DIFF_SHA256 --reason \"reviewed exact path-held repair\" --json\nhive revoke-merge-approval --reason \"review withdrawn\" --json\nhive retry-repair --finding FINGERPRINT --recurrence N --attempt N --failure-class infrastructure --failure-id FAILURE_ID --reason \"dependency restored\" --json\n```\n\nIf status reports `workflow_dispatch_recovery`, use its exact `revoke_plan_command` (preferred for uncertain transport) or `retry_plan_command`; never delete the dispatch state manually.\n\nDefault branch: `%s`. Detected languages: %s.\n", config.Coverage, config.Automation, config.MaxActiveIssues, config.MaxRepairAttempts, activation, config.DefaultBranch, strings.Join(inspection.Languages, ", "))
+	runtimeGuidance := "Hive automatically selects this repository's isolated persistent state."
+	commands := "hive doctor --json\nhive status --json\nhive run --json\nhive start --json\nhive stop --json\nhive pause\nhive resume\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --plan --json\nhive approve-merge --pr NUMBER --head EXACT_HEAD_SHA --base EXACT_BASE_SHA --diff-digest EXACT_DIFF_SHA256 --reason \"reviewed exact path-held repair\" --json\nhive revoke-merge-approval --reason \"review withdrawn\" --json\nhive retry-repair --finding FINGERPRINT --recurrence N --attempt N --failure-class infrastructure --failure-id FAILURE_ID --reason \"dependency restored\" --json"
+	if normalOwner {
+		stateDir := shellQuote(config.StateDir)
+		runtimeGuidance = fmt.Sprintf("The existing ordinary Hive/dashboard process owns this local Visual Hive repair runtime. Configure that same process with the exact `HIVE_STATE_DIR=%s`, ensure its normal project scope includes `%s`, and confirm its existing dashboard listener is HTTP-ready before restarting ordinary Hive/dashboard. Do not use `hive run` or `hive start` for normal operation. Use `hive stop` only when `hive status` or `hive doctor` directs cleanup of a stale legacy scheduler; it does not stop ordinary Hive/dashboard.", config.StateDir, config.Repository)
+		commands = fmt.Sprintf("hive doctor --state-dir %s --json\nhive status --state-dir %s --json\nhive pause --state-dir %s --json\nhive resume --state-dir %s --json\nhive approve-merge --state-dir %s --pr NUMBER --head EXACT_HEAD_SHA --plan --json\nhive approve-merge --state-dir %s --pr NUMBER --head EXACT_HEAD_SHA --base EXACT_BASE_SHA --diff-digest EXACT_DIFF_SHA256 --reason \"reviewed exact path-held repair\" --json\nhive revoke-merge-approval --state-dir %s --reason \"review withdrawn\" --json\nhive retry-repair --state-dir %s --finding FINGERPRINT --recurrence N --attempt N --failure-class infrastructure --failure-id FAILURE_ID --reason \"dependency restored\" --json", stateDir, stateDir, stateDir, stateDir, stateDir, stateDir, stateDir, stateDir)
+	}
+	return fmt.Sprintf("# Hive + Visual Hive\n\nThis repository is managed by Hive with `%s` coverage and `%s` automation authority. Visual Hive runs deterministic checks; Hive alone owns issues, repair branches, pull requests, merges, and closure. Hive keeps at most %d managed findings active as GitHub issues at once and permits at most %d bounded repair attempts per finding; every additional finding remains durable as a bead until capacity is available.%s\n\n## Operator commands\n\n%s Run:\n\n```sh\n%s\n```\n\nIf status reports `workflow_dispatch_recovery`, use its exact `revoke_plan_command` (preferred for uncertain transport) or `retry_plan_command`; never delete the dispatch state manually.\n\nDefault branch: `%s`. Detected languages: %s.\n", config.Coverage, config.Automation, config.MaxActiveIssues, config.MaxRepairAttempts, activation, runtimeGuidance, commands, config.DefaultBranch, strings.Join(inspection.Languages, ", "))
 }
 
 func setupPRBody(marker string, plan SetupPlan) string {

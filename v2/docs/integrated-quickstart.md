@@ -67,7 +67,7 @@ An explicit install directory must be an absolute, dedicated Hive leaf; filesyst
 
 The Linux `~/.local/bin/hive` and `~/.local/bin/visual-hive` launchers and the `${CODEX_HOME:-~/.codex}/skills/hive` directory are protected by the same ownership rule. Hive replaces them only when each launcher points to the exact recognized active distribution and the skill has an exact packaged inventory. A same-named script, directory, modified skill, symlink, or junction is preserved and installation stops with the path to move aside. On Windows, use `-NoCodexSkill` if you intentionally want to retain a different skill with that name; on Linux, set `CODEX_HOME` to a clean location.
 
-This integrated product is released and installed from the maintained `DavidDiaz0317/hive` fork only. The commands above intentionally bind provenance to that repository. Do not publish integrated tags or assets to, push integration branches to, or open integration pull requests against `kubestellar/hive`; its deployment instructions are retained only for the legacy service. A different fork is a different trust root and must use its own exact repository in every download, attestation, and installer argument.
+The currently published integrated product is released and installed from the maintained `DavidDiaz0317/hive` fork. The commands above intentionally bind provenance to that repository, and integrated tags, assets, or installer attestations must not be published from a different trust root. Source changes may follow the upstream project's normal reviewed contribution path without changing that release boundary. A different release repository is a different trust root and must use its own exact repository in every download, attestation, and installer argument.
 
 Hosted `advisory` and `issues` automation do not require a model credential. Before the first hosted `repair-pr` or `auto-merge` setup, expose `OPENAI_API_KEY` only to the setup process if the repository does not already contain an Actions secret with that name. Hive encrypts the value with GitHub's repository public key and creates the secret exactly once; it never reads, returns, logs, or rotates an existing secret. If the secret already exists, setup reuses its metadata and no local value is required. The generated workflow installs and verifies the exact reviewed native `codex-cli 0.144.1` artifact on each fresh runner.
 
@@ -106,6 +106,20 @@ Coverage controls test depth. Automation controls GitHub write authority; the tw
 | `auto-merge` | Yes | Full issue lifecycle | Same as `repair-pr` | Hive only, and only after every deterministic, exact-head, protection, path, risk, hold, budget, and post-validation gate passes |
 
 `repair-pr` is the "open PRs only" level. A denied action is a hard policy stop, not a silent fallback to a lower level. At every level Hive remains the only lifecycle writer; Visual Hive's standalone publishers must stay disabled.
+
+### Existing ordinary Hive/dashboard runtime
+
+For `--runtime local` with Visual Hive `repair-pr` or `auto-merge` authority, the existing ordinary Hive/dashboard owns local Visual Hive repair cadence through its existing Governor, Scheduler, roles, policies, knowledge primer, Manager, mailbox, Worker, dashboard, and lifecycle. Hive does not create the mutually exclusive legacy scheduler for this mode.
+
+Use one exact persistent state directory during setup:
+
+```bash
+hive setup --repo OWNER/REPOSITORY --coverage comprehensive --automation repair-pr --provider codex --visual-hive --runtime local --state-dir /exact/hive-state --start --json
+```
+
+Configure that same ordinary Hive process with the exact `HIVE_STATE_DIR` value, ensure its normal project scope contains `OWNER/REPOSITORY`, and keep its existing dashboard listener HTTP-ready. After the managed setup is installed, restart the existing ordinary Hive/dashboard process through its normal Docker, Kubernetes, or service deployment. Use `hive doctor --state-dir /exact/hive-state --json` and `hive status --state-dir /exact/hive-state --json` to verify it. Do not use `hive run` or `hive start` for normal operation in this ownership mode. Use `hive stop` only when status or doctor directs cleanup of a stale legacy scheduler; it does not stop ordinary Hive/dashboard.
+
+For a KubeStellar Console fork test, use the fork repository, a dedicated normal Hive config/data root/state directory/dashboard port, and `repair-pr` authority. Preserve every existing Console workflow and leave the governed repair PR unmerged. This does not require or authorize any write to upstream Console or its production Hive.
 
 The inspection selects `npm`, `pnpm`, or Yarn from the nearest committed ancestor lockfile for each package root and rejects ambiguous same-scope locks. The installer handles independent lockless package roots separately, avoids reinstalling children owned by an ancestor lock, and chooses the immutable/frozen Yarn flag from the resolved Yarn major version. For comprehensive coverage, Hive prefers a repository-authored aggregate such as `test:all` only when a strict unconditional `run SCRIPT && ...` graph reaches every selected terminal test. The only semantic substitution is a Vitest coverage leaf whose normalized command is byte-for-byte the unit leaf after removing coverage-only flags. Hive then runs that aggregate once instead of duplicating its browser and smoke suites; if proof fails, it retains the explicit commands.
 
@@ -198,6 +212,8 @@ If GitHub accepts no response at all, Hive cannot distinguish a rejected request
 
 ## Operate
 
+For hosted installations and legacy local `advisory`/`issues` scheduler installations:
+
 ```bash
 hive doctor --json
 hive status --json
@@ -223,11 +239,22 @@ hive rollback --json
 hive uninstall --json
 ```
 
+For a local Visual Hive `repair-pr`/`auto-merge` installation owned by ordinary Hive/dashboard, pass its exact state directory to operator commands:
+
+```bash
+hive doctor --state-dir /exact/hive-state --json
+hive status --state-dir /exact/hive-state --json
+hive pause --state-dir /exact/hive-state --json
+hive resume --state-dir /exact/hive-state --json
+```
+
+Restart the existing ordinary Hive/dashboard deployment to start or replace that runtime. Do not use the mutually exclusive legacy `hive run` or `hive start` path. Use `hive stop` only for status-directed stale legacy-scheduler cleanup, not to stop ordinary Hive/dashboard.
+
 If GitHub updates the cleanup branch or strict-base snapshot before merge, use the exact `cancel_command` returned by uninstall/status instead of editing local state or weakening checks. Cancellation authenticates the recorded numeric authorizer, closes only the exact unmerged same-repository PR with its recorded number, URL, transaction marker, head branch, and base branch, and deletes the managed ref only when its current head is the original Hive commit or a proven descendant. It is restart-safe after partial API failure, restores the prior setup PR identity, and deliberately leaves automation paused. Run `hive resume` explicitly to resume the old installation, or run `hive uninstall` again to create a fresh cleanup transaction.
 
 For hosted installations, `hive status` and `hive doctor` verify the exact managed workflow bytes, state branch and state-secret metadata, controller run identities, lack of overlap, latest completed cycle, freshness, and exact current default-branch head. They also report hosted setup-baseline state, durable rebind cleanup, held repairs, approval/merge intent, and supported recovery commands. A production-ready hosted installation has no scheduler PID because no local scheduler exists. `hive run`, `start`, `stop`, `pause`, `resume`, and recovery operations dispatch the managed controller with a bounded idempotency key; GitHub Actions concurrency prevents overlapping controller mutations. `pause` durably denies lifecycle writes while retaining cadence and state, `resume` restores only the configured authority, and `recover` resumes the same durable lifecycle instead of creating duplicate records.
 
-The managed controller is both scheduled and manually dispatchable. Each fresh GitHub-hosted runner restores the authenticated state from the dedicated state branch, checks the exact repository/release/workflow identity and parent sequence, performs the operation, and compare-and-swap checkpoints the next signed state. The bootstrap computer can be turned off after setup. `--runtime local` is the explicit compatibility path for installations that still need the legacy OS scheduler.
+The managed controller is both scheduled and manually dispatchable. Each fresh GitHub-hosted runner restores the authenticated state from the dedicated state branch, checks the exact repository/release/workflow identity and parent sequence, performs the operation, and compare-and-swap checkpoints the next signed state. The bootstrap computer can be turned off after setup. With `--runtime local`, Visual Hive `repair-pr`/`auto-merge` uses the existing ordinary Hive/dashboard owner described above; local `advisory`/`issues` retains the legacy OS scheduler compatibility path.
 
 Coverage, automation, issue-limit, and retry-limit changes regenerate the managed repository configuration and workflow through the same single reviewed setup PR path. They are not local-only switches.
 

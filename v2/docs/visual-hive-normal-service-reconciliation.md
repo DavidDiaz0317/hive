@@ -1,30 +1,29 @@
 # Visual Hive normal-service reconciliation
 
-Status: fork-local working vertical through one Governor-admitted, Worker-owned
-pull request and one sealed exact-head verdict receipt, 2026-07-16. The
-privileged Linux isolation proof, bounded local gates, replay proof, and
-independent review have passed. No live GitHub demo has been claimed;
-production activation remains held pending a no-merge disposable-repository
-demo with real GitHub scheduling and the real contained Codex executor.
+Status: live private disposable-repository vertical complete, 2026-07-19, on
+exact Hive `45ff9ab54723baee41410875eec1fa7dbb64911d` and Visual Hive
+`3015c9e7cc7b357bbd4f5551b115fb7b7f4847ec`. A healthy ordinary cadence,
+prepared one-line defect, one Governor-admitted Worker repair PR, sealed
+exact-head verdict, and duplicate-free ordinary Hive restart/replay all passed.
+The repair PR remains open and unmerged. KubeStellar Console fork P0 and any
+release or upstream promotion remain separate later steps.
 
 The normative product contract is
 `docs/visual-hive-integration-contract.md`. This document records the actual
-implementation and remaining proof; it does not grant additional authority.
+implementation and proof boundary; it does not grant additional authority.
 
 ## Safety and source boundary
 
-All implementation and tests in this checkpoint ran only in the isolated Hive
-fork worktree:
+Implementation and tests remain on the exact authorized local Hive integration
+worktree for branch `dd`. Source integration authority is limited to that branch; it
+does not extend to Hive `main` or any other Hive branch.
 
-`C:\Users\david\OneDrive\Documents\vh-worktrees\hive-normal-service-integration`
-
-Branch: `codex/vh-normal-service-integration`.
-
-No upstream/real Hive or KubeStellar Console checkout, remote, workflow, issue,
-pull request, or production state was changed. The immutable Visual Hive
-producer reference currently under review is
-`3eab7d48fb36f0c84fcd72cab43a0b4fa6dbbd65` (tree
-`373a845aa7cb0b70cd9cba28189e8eda63d3d369`) in the separate
+The live proof changed only the private disposable repository
+`DavidDiaz0317/visual-hive-ai-hpc-proof-20260719-v10`. No Hive upstream branch,
+Hive `main`, KubeStellar Console checkout/remote/workflow/issue/PR, or production
+Hive state was changed. The immutable Visual Hive PR producer is
+`3015c9e7cc7b357bbd4f5551b115fb7b7f4847ec` (tree
+`678c4632833786bf419df8e48a8c92ef51a65807`) in the separate
 `vis-proof-harness` worktree. It is a producer input, not a Hive commit, and
 must not be cherry-picked into Hive.
 
@@ -172,7 +171,7 @@ the same durable order/proposal/PR; it cannot create a second model side effect.
 Controller completion is exact-byte idempotent, including the crash window
 after bead close but before the service saved `completion_recorded`.
 
-## Exact-head verdict: composed and locally proven; live activation held
+## Exact-head verdict: composed, locally proven, and live-proven
 
 The production normal-service option is no longer `nil`. Its adapter uses the
 reviewed `FetchAndVerifyVisualHivePullRequestBundle` primitive and can apply
@@ -180,7 +179,7 @@ only the opaque `verified.ApplyCheckEvidence(store, fingerprint)` capability.
 The verifier and adapter now enforce all of the following:
 
 1. The PR evidence producer is pinned to
-   `3eab7d48fb36f0c84fcd72cab43a0b4fa6dbbd65`. The target and evidence services
+   `3015c9e7cc7b357bbd4f5551b115fb7b7f4847ec`. The target and evidence services
    use distinct UIDs; the evidence root is root-owned mode `0700`; and the
    authenticated root binding uses a root-only random key.
 2. Both service identities are killed and quiesced before verification. The
@@ -212,10 +211,10 @@ not a prerequisite for the first working repair proof.
 
 The privileged hostile-producer isolation test passed in an ephemeral Linux
 environment with distinct service identities and the root-owned evidence seal.
-The remaining critical-path proof is operational rather than a missing
-adapter: execute the same composition against a disposable repository with
-real GitHub workflow metadata, artifacts, and contained Codex execution while
-merging remains disabled.
+The private v10 proof then exercised the same composition with real GitHub
+workflow metadata, content-addressed artifacts, and the contained Codex
+executor while merge authority remained disabled. Its exact runs, repair PR,
+and duplicate-free restart are recorded below.
 
 ## Local/no-GitHub proof currently passing
 
@@ -261,9 +260,11 @@ merging remains disabled.
   resolution occurs in that proof.
 
 The local GitHub API, source dispatch/consume, issue writer, contained model
-response, and wiki search endpoint are bounded test substitutes. This proof
-does not claim live GitHub scheduling, real Codex behavior, or race-detector
-coverage; CGO is disabled in the current Windows environment.
+response, and wiki search endpoint remain bounded test substitutes. Those
+fixtures do not by themselves establish live GitHub scheduling or real Codex
+behavior; the private v10 proof below supplies that operational evidence. The
+local fixtures do not claim race-detector coverage, and CGO remains disabled in
+the Windows host environment.
 
 Existing controller tests additionally cover live pause, automation downgrade,
 role disable/re-enable, nested role-capability drift, Governor mode/cadence
@@ -313,28 +314,46 @@ go test ./pkg/repair -run '^(TestSpecialistProviderProposalIsBrokeredAndComplete
 go test -run '^$' ./cmd/hive ./pkg/repair ./pkg/visualhive/controller ./pkg/visualhive/normalservice ./pkg/integrated
 ```
 
-A combined full run of the touched packages passed `cmd/hive`, `pkg/github`,
-`pkg/visualhive`, `pkg/visualhive/controller`,
-`pkg/visualhive/normalservice`, and `pkg/internal/visualhivepr`. The vertical
-acceptance passed three consecutive times. The unrelated `pkg/integrated`
-uninstall fixture previously blocked in a Windows Git subprocess and hit the
-240-second package timeout; the focused Visual Hive/integration selection above
-passed. A full integrated-package pass is therefore not claimed.
+The vertical acceptance passed three consecutive times. Exact Hive
+`45ff9ab54723baee41410875eec1fa7dbb64911d` subsequently passed every Go package
+in a clean, read-only, privileged Linux clone using a serialized main shard and
+one fresh isolated tmux-resume shard; full `go vet ./...` also passed. The split
+kept an installed-image ACMM fallback fixture out of source-unit discovery and
+prevented leaked asynchronous tmux activity from one concurrency test from
+interfering with the immediately following resume test. Both affected paths
+passed in their intended isolated environments; no product failure was hidden.
 
-## Remaining path to a working demo
+## Completed live disposable-repository proof
 
-1. Use a disposable fork/private real-code repository with `repair-pr`, a
-   dedicated state root/dashboard port, reviewed healthy baseline, and no
-   merge. Run the real GitHub workflow and contained Codex executor. Record
-   exact SHAs, run/artifact IDs, admission, `swo-*`, Worker PR, verdict receipt,
-   replay counts, and unrelated normal cadence.
-2. Confirm the live PR remains open, a second packet cannot create another PR,
-   ordinary Hive cadence/dashboard behavior continues, and restart reuses the
-   same durable work before manually closing the disposable PR.
-3. Only after that succeeds, repeat against a KubeStellar Console fork with a
-   dedicated namespaced Hive built from this Hive fork. Preserve Console's
-   Auto-QA, test generation, visual regression, trust workflows, existing
-   checks, and production Hive. Leave every demo PR unmerged.
+The private v10 proof exercised the product through its ordinary user path:
+
+1. Normal Hive/dashboard became healthy and completed cadence run
+   [`29689343229`](https://github.com/DavidDiaz0317/visual-hive-ai-hpc-proof-20260719-v10/actions/runs/29689343229)
+   at exact installed setup head `db3190b6e558e5e4495860c96aefd320adcb7bc4`.
+2. The prepared one-line defect was committed as
+   `25c7deaa254d7d53bc1812663c6cc8f7d2788f26`; its exact-head production run
+   [`29689756141`](https://github.com/DavidDiaz0317/visual-hive-ai-hpc-proof-20260719-v10/actions/runs/29689756141)
+   produced the deterministic finding and one Hive issue.
+3. Existing Governor/Scheduler/Manager/mailbox/Worker ownership created exactly
+   one unmerged repair PR,
+   [`#3`](https://github.com/DavidDiaz0317/visual-hive-ai-hpc-proof-20260719-v10/pull/3),
+   on branch `hive/repair-32ccc1d99d33-a1` at exact head
+   `d3c8c51287697db5beb27ce95518d1f4fb831d44`.
+4. Exact-head Visual Hive PR run
+   [`29689952857`](https://github.com/DavidDiaz0317/visual-hive-ai-hpc-proof-20260719-v10/actions/runs/29689952857)
+   completed successfully with the audited producer. The separate
+   `pull_request_target` event remained skipped and executed no PR code.
+5. One ordinary Hive service restart/replay reused the same durable issue, work
+   order, model attempt, branch, PR, and exact head. It created no duplicate
+   bead, work order, model call, branch, or PR, and the dashboard/cadence owner
+   remained the existing ordinary Hive process.
+
+The next product test is the contract's KubeStellar Console **fork-only** P0:
+use a dedicated namespaced ordinary Hive built from exact `dd`, the Console
+fork as both PR base and head repository, separate state/data/dashboard
+identity, and `repair-pr` authority. Preserve Console Auto-QA, test generation,
+visual regression, trust workflows, existing checks, and its production Hive.
+Leave every demo PR unmerged. Upstream Console and Hive `main` remain read-only.
 
 Release packaging, new roles, new dashboards, baseline automation, broad tool
 creation, direct Visual Hive writes, and Console `kc-agent`/MCP integration are
@@ -368,6 +387,8 @@ not on this critical path.
 | `abfdca0b` | exact merged-successor recovery for a consumed normal-service ledger |
 | `13331d55` | sealed import clone fidelity and import-only bead boundary fix |
 | `e372db54` | genuine local Governor-to-Worker-to-verdict vertical acceptance proof |
+| `bd0c6700` | integrated governed Visual Hive runtime on exact `dd` lineage |
+| `45ff9ab5` | production and audited PR pins verified separately; v10 exact-head producer |
 
-These commits are checkpoints in the isolated fork branch, not release or
-upstream claims.
+These commits are checkpoints on exact `dd`, not a release, merge, or claim
+that Hive `main` or upstream Console changed.

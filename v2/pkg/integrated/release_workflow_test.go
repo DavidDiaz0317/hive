@@ -362,7 +362,10 @@ func TestIntegratedQuickstartDocumentsResolvedSetupDependency(t *testing.T) {
 		t.Fatal(err)
 	}
 	quickstart := string(data)
-	for _, invariant := range []string{"same installed release manifest used by apply", "`visual_hive_repository`", "immutable `visual_hive_ref`", "`repository@commit`"} {
+	for _, invariant := range []string{
+		"same installed release manifest used by apply", "`visual_hive_repository`", "immutable `visual_hive_ref`", "`repository@commit`",
+		"ordinary Hive/dashboard owns local Visual Hive repair cadence", "exact `HIVE_STATE_DIR`", "Do not use `hive run` or `hive start`",
+	} {
 		if !strings.Contains(quickstart, invariant) {
 			t.Fatalf("integrated quickstart lost setup dependency disclosure %q", invariant)
 		}

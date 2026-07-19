@@ -142,6 +142,82 @@ func TestIntegratedSetupRejectsVisualHiveDisable(t *testing.T) {
 	}
 }
 
+func TestUsesNormalHiveRuntimeMatchesExecutionAuthority(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+		want   bool
+	}{
+		{name: "local repair pr", config: Config{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationRepairPR}, want: true},
+		{name: "local auto merge", config: Config{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationAutoMerge}, want: true},
+		{name: "local issues", config: Config{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationIssues}},
+		{name: "local advisory", config: Config{ExecutionMode: ExecutionLocal, VisualHive: true, Automation: AutomationAdvisory}},
+		{name: "local without visual hive", config: Config{ExecutionMode: ExecutionLocal, Automation: AutomationRepairPR}},
+		{name: "hosted repair pr", config: Config{ExecutionMode: ExecutionHosted, VisualHive: true, Automation: AutomationRepairPR}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := UsesNormalHiveRuntime(test.config); got != test.want {
+				t.Fatalf("UsesNormalHiveRuntime(%+v) = %t, want %t", test.config, got, test.want)
+			}
+		})
+	}
+}
+
+func TestManagedQuickstartAndRequiredActionsDistinguishRuntimeOwner(t *testing.T) {
+	const stateDir = "/var/lib/hive/console-fork"
+	tests := []struct {
+		name          string
+		mode          ExecutionMode
+		automation    Automation
+		normalOwner   bool
+		actionSnippet string
+	}{
+		{name: "normal repair pr", mode: ExecutionLocal, automation: AutomationRepairPR, normalOwner: true, actionSnippet: "exact HIVE_STATE_DIR"},
+		{name: "normal auto merge", mode: ExecutionLocal, automation: AutomationAutoMerge, normalOwner: true, actionSnippet: "exact HIVE_STATE_DIR"},
+		{name: "legacy local issues", mode: ExecutionLocal, automation: AutomationIssues, actionSnippet: "legacy local scheduler"},
+		{name: "hosted repair pr", mode: ExecutionHosted, automation: AutomationRepairPR, actionSnippet: "hosted controller"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := Config{
+				Repository: "owner/console-fork", DefaultBranch: "main", StateDir: stateDir,
+				ExecutionMode: test.mode, VisualHive: true, Automation: test.automation,
+				Coverage: CoverageComprehensive, MaxActiveIssues: 1, MaxRepairAttempts: 2,
+			}
+			guide := quickstart(config, RepositoryInspection{Languages: []string{"TypeScript"}})
+			plan := buildSetupPlan(SetupOptions{
+				Repository: config.Repository, StateDir: stateDir, ExecutionMode: test.mode,
+				VisualHive: true, Automation: test.automation, Coverage: config.Coverage,
+				MaxActiveIssues: config.MaxActiveIssues, MaxRepairAttempts: config.MaxRepairAttempts,
+			}, RepositoryInspection{DefaultBranch: "main"})
+			actions := strings.Join(plan.RequiredActions, "\n")
+			if !strings.Contains(actions, test.actionSnippet) {
+				t.Fatalf("required actions did not describe %q owner: %s", test.name, actions)
+			}
+			if test.normalOwner {
+				for _, required := range []string{"HIVE_STATE_DIR=" + stateDir, "normal project scope includes `owner/console-fork`", "dashboard listener is HTTP-ready", "restarting ordinary Hive/dashboard", "Use `hive stop` only when `hive status` or `hive doctor` directs cleanup"} {
+					if !strings.Contains(guide, required) {
+						t.Fatalf("normal-owner guide omitted %q: %s", required, guide)
+					}
+				}
+				for _, forbidden := range []string{"\nhive run --json\n", "\nhive start --json\n", "\nhive stop --json\n"} {
+					if strings.Contains(guide, forbidden) {
+						t.Fatalf("normal-owner guide advertised legacy command %q: %s", forbidden, guide)
+					}
+				}
+				return
+			}
+			if !strings.Contains(guide, "\nhive run --json\n") || !strings.Contains(guide, "\nhive start --json\n") || !strings.Contains(guide, "\nhive stop --json\n") {
+				t.Fatalf("%s guide lost its configured controller commands: %s", test.name, guide)
+			}
+			if strings.Contains(guide, "Use `hive stop` only when `hive status` or `hive doctor` directs cleanup") {
+				t.Fatalf("%s guide incorrectly claimed ordinary-Hive ownership: %s", test.name, guide)
+			}
+		})
+	}
+}
+
 func TestAutoMergeSetupPlanExplainsPostMergeActivation(t *testing.T) {
 	options := SetupOptions{
 		Repository: "owner/repo", Coverage: CoverageComprehensive, Automation: AutomationAutoMerge,

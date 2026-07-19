@@ -22,6 +22,15 @@ type NormalVisualWork struct {
 	Artifact hivegithub.VerifiedVisualHiveArtifact
 }
 
+// UsesNormalHiveRuntime reports whether the existing ordinary Hive/dashboard
+// process owns local Visual Hive repair cadence. Advisory and issues-only local
+// installations retain the legacy scheduler, while hosted installations remain
+// owned by their repository controller.
+func UsesNormalHiveRuntime(config Config) bool {
+	return config.ExecutionMode == ExecutionLocal && config.VisualHive &&
+		(config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge)
+}
+
 // FetchNormalVisualWork reuses the released integrated transport/verifier as a
 // narrow source for the normal service. The caller must own the shared
 // production-run lease for its complete lifetime.

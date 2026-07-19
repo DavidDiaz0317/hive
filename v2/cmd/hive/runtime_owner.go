@@ -21,8 +21,7 @@ func configuredRuntimeOwnerIntent(config integrated.Config) runtimeOwnerIntent {
 	if config.ExecutionMode == integrated.ExecutionHosted {
 		return runtimeOwnerHosted
 	}
-	if config.ExecutionMode == integrated.ExecutionLocal && config.VisualHive &&
-		(config.Automation == integrated.AutomationRepairPR || config.Automation == integrated.AutomationAutoMerge) {
+	if integrated.UsesNormalHiveRuntime(config) {
 		return runtimeOwnerNormalHive
 	}
 	return runtimeOwnerLegacyScheduler
