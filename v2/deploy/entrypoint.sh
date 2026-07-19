@@ -185,37 +185,40 @@ if [ "$(id -u)" = "0" ]; then
     cp -rn /opt/hive/seed-data/* /data/ 2>/dev/null || true
   fi
 
+  # Create the shared root before role discovery. Config-only installations
+  # have no /etc/hive/agents and no pre-existing /data/beads, so deferring the
+  # mkdir to UID provisioning would inherit the caller's owner-only umask and
+  # prevent ordinary Hive from traversing every role store on first boot.
+  mkdir -p /home/dev /data/beads
+  chown dev:node /data/beads 2>/dev/null || true
+  chmod 0750 /data/beads 2>/dev/null || true
+
   # Create beads symlinks: /home/dev/<agent>-beads -> /data/beads/<agent>
-  if [ -d /etc/hive/agents ] || [ -d /data/beads ]; then
-    mkdir -p /home/dev /data/beads
-    chown dev:node /data/beads 2>/dev/null || true
-    chmod 0750 /data/beads 2>/dev/null || true
-    if [ -d /etc/hive/agents ]; then
-      for envfile in /etc/hive/agents/*.env; do
-        [ -f "$envfile" ] || continue
-        agent="$(basename "$envfile" .env)"
-        mkdir -p "/data/beads/${agent}"
-        ln -sfn "/data/beads/${agent}" "/home/dev/${agent}-beads"
-        echo "[entrypoint] Beads symlink: /home/dev/${agent}-beads -> /data/beads/${agent}"
-      done
-    fi
-    # Include first-level hidden role stores while excluding . and .. themselves.
-    for beaddir in /data/beads/*/ /data/beads/.[!.]*/ /data/beads/..?*/; do
-      beaddir="${beaddir%/}"
-      [ -d "$beaddir" ] && [ ! -L "$beaddir" ] || continue
-      agent="$(basename "$beaddir")"
-      if [ ! -L "/home/dev/${agent}-beads" ]; then
-        ln -sfn "/data/beads/${agent}" "/home/dev/${agent}-beads"
-        echo "[entrypoint] Beads symlink: /home/dev/${agent}-beads -> /data/beads/${agent}"
-      fi
-      # Retired/disabled role stores are reopened only by ordinary Hive. Make
-      # legacy owner-only stores readable by dev without following any link;
-      # active roles are reassigned to their scoped group below.
-      find -P "$beaddir" -xdev -type d -exec chown dev:node {} + -exec chmod 0700 {} + 2>/dev/null || true
-      find -P "$beaddir" -xdev -type f -exec chown dev:node {} + -exec chmod 0600 {} + 2>/dev/null || true
+  if [ -d /etc/hive/agents ]; then
+    for envfile in /etc/hive/agents/*.env; do
+      [ -f "$envfile" ] || continue
+      agent="$(basename "$envfile" .env)"
+      mkdir -p "/data/beads/${agent}"
+      ln -sfn "/data/beads/${agent}" "/home/dev/${agent}-beads"
+      echo "[entrypoint] Beads symlink: /home/dev/${agent}-beads -> /data/beads/${agent}"
     done
-    chown dev:node /home/dev 2>/dev/null || true
   fi
+  # Include first-level hidden role stores while excluding . and .. themselves.
+  for beaddir in /data/beads/*/ /data/beads/.[!.]*/ /data/beads/..?*/; do
+    beaddir="${beaddir%/}"
+    [ -d "$beaddir" ] && [ ! -L "$beaddir" ] || continue
+    agent="$(basename "$beaddir")"
+    if [ ! -L "/home/dev/${agent}-beads" ]; then
+      ln -sfn "/data/beads/${agent}" "/home/dev/${agent}-beads"
+      echo "[entrypoint] Beads symlink: /home/dev/${agent}-beads -> /data/beads/${agent}"
+    fi
+    # Retired/disabled role stores are reopened only by ordinary Hive. Make
+    # legacy owner-only stores readable by dev without following any link;
+    # active roles are reassigned to their scoped group below.
+    find -P "$beaddir" -xdev -type d -exec chown dev:node {} + -exec chmod 0700 {} + 2>/dev/null || true
+    find -P "$beaddir" -xdev -type f -exec chown dev:node {} + -exec chmod 0600 {} + 2>/dev/null || true
+  done
+  chown dev:node /home/dev 2>/dev/null || true
 
   # Shared CLI auth/cache lives in /data/home (persistent volume).
   # Make it group-writable so all agent UIDs (node group) can use it.
@@ -433,6 +436,7 @@ print('\n'.join(sorted(names)))
       # can clean up stale workspaces at runtime without root privileges.
       chmod g+rwX "/data/agents/${agent_name}" 2>/dev/null || true
       mkdir -p "/data/beads/${agent_name}"
+      ln -sfn "/data/beads/${agent_name}" "/home/dev/${agent_name}-beads"
       # Only dev and this role join ROLE_GROUP. Setgid preserves that group on
       # files atomically replaced by either principal; links are never followed.
       find -P "/data/beads/${agent_name}" -xdev -type d -exec chown "hive-${agent_name}:${ROLE_GROUP}" {} + -exec chmod 2770 {} + 2>/dev/null || true

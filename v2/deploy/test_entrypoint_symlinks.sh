@@ -19,6 +19,18 @@ assert_contains() {
   fi
 }
 
+assert_not_contains_literal() {
+  local file="$1" pattern="$2" label="$3"
+  if grep -Fq "$pattern" "$file"; then
+    echo "  FAIL: $label"
+    echo "        unexpected literal '$pattern' found in $file"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $label"
+    PASS=$((PASS + 1))
+  fi
+}
+
 ENTRYPOINT="$(cd "$(dirname "$0")" && pwd)/entrypoint.sh"
 
 echo "=== Entrypoint symlink regression tests ==="
@@ -66,6 +78,12 @@ assert_contains "$LAUNCH_SCRIPT" \
 
 # 9. Role bead stores remain shared only with their scoped group after UID chown.
 assert_contains "$ENTRYPOINT" \
+  'mkdir -p /home/dev /data/beads' \
+  "fresh config-only installs create the shared beads root before role provisioning"
+assert_not_contains_literal "$ENTRYPOINT" \
+  'if [ -d /etc/hive/agents ] || [ -d /data/beads ]; then' \
+  "shared beads root initialization is not gated on pre-existing role state"
+assert_contains "$ENTRYPOINT" \
   'chmod 0750 /data/beads' \
   "/data/beads parent is traversable but not writable by roles"
 assert_contains "$ENTRYPOINT" \
@@ -77,6 +95,9 @@ assert_contains "$ENTRYPOINT" \
 assert_contains "$ENTRYPOINT" \
   'usermod -a -G "$ROLE_GROUP" dev' \
   "ordinary Hive joins each role-scoped bead group"
+assert_contains "$ENTRYPOINT" \
+  'ln -sfn "/data/beads/${agent_name}" "/home/dev/${agent_name}-beads"' \
+  "freshly provisioned config roles receive their normal beads symlink"
 assert_contains "$ENTRYPOINT" \
   'find -P "$beaddir" -xdev -type d' \
   "retired stores are normalized without following links"
