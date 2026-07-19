@@ -31,6 +31,7 @@ func TestExactWorkerCommandsRejectsUnconfiguredVisualHiveLookalikes(t *testing.T
 		"visual-hive run --ci ",
 		"npx visual-hive run --ci",
 		"visual-hive run --config visual-hive.config.yaml --ci",
+		"visual-hive improve-coverage && visual-hive issues --write",
 	} {
 		t.Run(command, func(t *testing.T) {
 			if _, err := exactWorkerCommands([]string{command}, configured); err == nil {

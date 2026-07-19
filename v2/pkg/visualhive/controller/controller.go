@@ -933,8 +933,13 @@ func (controller *Controller) resumeAppliedWork(
 		baseTreeSHA, treeErr := controller.baseTree(ctx, controller.installed, packet.BaseSHA)
 		repairAuthorized := controller.installed.Automation == integrated.AutomationRepairPR || controller.installed.Automation == integrated.AutomationAutoMerge
 		issueAuthorized := controller.installed.Automation == integrated.AutomationIssues || repairAuthorized
-		safeExecution := evidenceErr == nil
 		manualLifecycleHold := finding.HumanReviewRequired || finding.ObservationHumanReviewRequired || strings.TrimSpace(finding.ManualReviewKind) != ""
+		validationReady := true
+		if repairAuthorized && work.ObservationState != "absent" && !manualLifecycleHold {
+			_, validationErr := visualhive.ResolveValidationCommandArgv(work.ValidationCommands, controller.installed.TestCommands)
+			validationReady = validationErr == nil
+		}
+		safeExecution := evidenceErr == nil && validationReady
 		repairReady := safeExecution && !manualLifecycleHold && treeErr == nil && baseTreeSHA != "" && len(allowedPaths) > 0 && len(work.ValidationCommands) > 0
 		activeWIP := 0
 		if store != nil {
@@ -1314,6 +1319,9 @@ func (controller *Controller) dispatchLaunchAllowed(envelope DispatchEnvelope, f
 	issueAuthorized := controller.installed.Automation == integrated.AutomationIssues || repairAuthorized
 	if controller.installed.Automation != integrated.AutomationRepairPR && controller.installed.Automation != integrated.AutomationAutoMerge {
 		return errors.New("installed automation authority no longer permits repair dispatch")
+	}
+	if _, err := visualhive.ResolveValidationCommandArgv(envelope.ValidationCommands, controller.installed.TestCommands); err != nil {
+		return fmt.Errorf("current installed validation policy no longer permits repair dispatch: %w", err)
 	}
 	runtimePaused := controller.installed.Paused || (controller.roles != nil && controller.roles.IsPaused(envelope.Work.Role))
 	if runtimePaused {

@@ -105,7 +105,7 @@ func (g *Governor) AdmitWork(request WorkAdmissionRequest) WorkAdmissionDecision
 		return deny("authority_advisory", "installed Hive authority does not permit issue-backed repair")
 	}
 	if !request.SafeExecutionReady {
-		return deny("execution_held", "verified evidence bindings are incomplete")
+		return deny("execution_held", "verified evidence or executable validation bindings are incomplete")
 	}
 	if g.budgetExhausted() && !containsString(g.budget.IgnoredAgents, request.Role) {
 		return deny("budget_exhausted", "normal Hive token budget is exhausted for the selected role")

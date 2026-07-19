@@ -36,7 +36,7 @@ const (
 
 	// Visual Hive emits this canonical command as a request for its managed
 	// exact-PR-head workflow verdict, not as target-authored local argv.
-	normalVisualExactHeadValidationCommand = "visual-hive run --ci"
+	normalVisualExactHeadValidationCommand = visualhive.ExactHeadValidationCommand
 )
 
 type normalVisualArtifactSource struct {
@@ -237,29 +237,13 @@ func (runner *normalVisualRepairer) validateRuntime(current integrated.Config, e
 }
 
 func exactWorkerCommands(required []string, configured [][]string) ([]repair.Command, error) {
-	result := make([]repair.Command, 0, len(required))
-	for _, expected := range required {
-		if expected == normalVisualExactHeadValidationCommand {
-			// Keep the canonical request in the intake envelope and immutable
-			// specialist work order. Locally, only validate the candidate diff;
-			// normalVisualPullRequestVerifier owns the actual exact-head verdict.
-			result = append(result, repair.Command{Name: "git", Args: []string{"diff", "--check"}})
-			continue
-		}
-		matched := false
-		for _, command := range configured {
-			if len(command) > 0 && strings.Join(command, " ") == expected {
-				result = append(result, repair.Command{Name: command[0], Args: append([]string(nil), command[1:]...)})
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return nil, fmt.Errorf("verified validation command %q is not the current installed argv", expected)
-		}
+	argv, err := visualhive.ResolveValidationCommandArgv(required, configured)
+	if err != nil {
+		return nil, err
 	}
-	if len(result) == 0 {
-		return nil, errors.New("normal Worker requires at least one exact installed validation command")
+	result := make([]repair.Command, 0, len(argv))
+	for _, command := range argv {
+		result = append(result, repair.Command{Name: command[0], Args: append([]string(nil), command[1:]...)})
 	}
 	return result, nil
 }

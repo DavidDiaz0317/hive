@@ -85,7 +85,7 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 	issueClient := &controllerIssueClient{governor: gov}
 	controller, err := New(gov, lifecycle, map[string]*beads.Store{"quality": quality}, nil, issueClient, integrated.Config{
 		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(), ACMMLevel: 5,
-		Automation: integrated.AutomationRepairPR, MaxActiveIssues: 2, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40),
+		Automation: integrated.AutomationRepairPR, MaxActiveIssues: 2, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40), TestCommands: [][]string{{"go", "test", "./..."}},
 	}, 5)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +175,11 @@ func TestVisualWorkControllerAdmitsBeforeIssueAndLeavesSchedulerDispatchPending(
 	}
 	persistedDecision, _ := visualBeadAdmissionDecision(quality.FindByExternalRef(visualRef))
 	persistedFinding, _ := lifecycle.Finding(repositoryFingerprint)
+	controller.installed.TestCommands = [][]string{{"npm", "run", "test"}}
+	if err := controller.dispatchLaunchAllowed(envelope, persistedFinding); err == nil || !strings.Contains(err.Error(), "current installed validation policy") {
+		t.Fatalf("persisted dispatch ignored changed installed validation argv: %v", err)
+	}
+	controller.installed.TestCommands = [][]string{{"go", "test", "./..."}}
 	for name, mutate := range map[string]func(*DispatchEnvelope){
 		"bead ID":       func(value *DispatchEnvelope) { value.BeadID = "copied-from-another-bead" },
 		"work":          func(value *DispatchEnvelope) { value.Work.Title = "tampered" },
@@ -559,6 +564,88 @@ func TestVisualWorkControllerHeldRepairReevaluatesWithoutCountingItselfAsWIP(t *
 	}
 }
 
+func TestVisualWorkControllerHoldsUninstalledProducerRecipeBeforeIssue(t *testing.T) {
+	const recipe = "visual-hive improve-coverage && visual-hive issues --write"
+	store, err := beads.NewStore(filepath.Join(t.TempDir(), "quality"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, digest := strings.Repeat("4", 64), strings.Repeat("8", 64)
+	bundle := &visualhive.ValidatedBundle{Validation: visualhive.Validation{Trusted: true}, Manifest: visualhive.Manifest{
+		BundleID: "unsupported-validation-recipe", OverallDigest: digest,
+		Source:           visualhive.Source{Repository: "owner/repo", RepositoryID: "123", CommitSHA: strings.Repeat("d", 40), WorkflowRunID: "42"},
+		ReplayProtection: visualhive.ReplayProtection{Key: strings.Repeat("9", 64)},
+		Observations: []visualhive.Observation{{
+			Fingerprint: "coverage/source", RepositoryFingerprint: fingerprint, PublicationRole: "canonical", RootCauseKey: "coverage/source",
+			State: "present", IssueKind: "missing_visual_coverage", Severity: "medium", OwningAgentHint: "visual-hive/test-creator",
+			Title: "improve deterministic coverage", Body: "producer advisory", AffectedContracts: []string{"contract/app"},
+			ValidationCommand: recipe, FirstSeenAt: "2026-07-09T12:00:00Z",
+		}},
+	}}
+	apply, err := lifecycle.ApplyBundle(bundle, store, visualhive.ApplyLifecycleOptions{DisableIssuePublication: true, MaxActiveIssues: 1, PreferRepairable: true})
+	if err != nil || apply.Created != 1 {
+		t.Fatalf("apply unsupported recipe = %+v, %v", apply, err)
+	}
+	externalRef := "visual-hive://owner/repo/" + fingerprint
+	bead := store.FindByExternalRef(externalRef)
+	if bead == nil {
+		t.Fatal("unsupported recipe has no durable controller bead")
+	}
+	if err := store.Update(bead.ID, func(value *beads.Bead) {
+		value.Status = beads.StatusBlocked
+		value.Metadata["visual_hive_controller_owned"] = true
+		value.Metadata["visual_hive_admission_state"] = "pending"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gov := governor.New(config.GovernorConfig{Modes: map[string]config.ModeConfig{
+		"idle": {Cadences: map[string]string{"quality": "1m"}},
+	}}, map[string]config.AgentConfig{"quality": {Enabled: true, Role: "quality"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	issues := &controllerIssueClient{governor: gov}
+	controller, err := New(gov, lifecycle, map[string]*beads.Store{"quality": store}, nil, issues, integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(), ACMMLevel: 5,
+		Automation: integrated.AutomationRepairPR, MaxActiveIssues: 1, AllowedRepairPaths: []string{"src/**"},
+		VisualHiveRef: strings.Repeat("c", 40), TestCommands: [][]string{{"npm", "run", "test"}},
+	}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.baseTree = func(context.Context, integrated.Config, string) (string, error) { return strings.Repeat("f", 40), nil }
+	packet := completeControllerPacket("unsupported-validation-recipe", digest)
+	work := visualhive.AdmittedVisualWork{
+		SourceExternalRef: externalRef, Packet: packet, FindingFingerprint: "coverage/source", RepositoryFingerprint: fingerprint,
+		ObservationState: "present", Role: "quality", RoutingAllowed: true, RoutingReason: "verified route",
+		ValidationCommands: []string{recipe}, ReproductionCommands: []string{recipe},
+	}
+	source := controllerEvidenceSource{completeControllerEvidence(digest)}
+	result := resumeAppliedForTest(controller, context.Background(), source, packet, []visualhive.AdmittedVisualWork{work}, Result{Lifecycle: apply})
+	persisted := store.FindByExternalRef(externalRef)
+	finding, _ := lifecycle.Finding(fingerprint)
+	if persisted == nil {
+		t.Fatal("unsupported recipe lost its durable controller bead")
+	}
+	metadataValidationJSON, _ := json.Marshal(persisted.Metadata["visual_hive_validation_commands"])
+	var metadataValidation []string
+	if err := json.Unmarshal(metadataValidationJSON, &metadataValidation); err != nil {
+		t.Fatalf("decode persisted validation evidence: %v", err)
+	}
+	if len(result.Decisions) != 1 || result.Decisions[0].Allowed || result.Decisions[0].Code != "execution_held" ||
+		len(result.DispatchPending) != 0 || issues.upserts != 0 || persisted.Status != beads.StatusBlocked ||
+		visualBeadAdmissionState(persisted) != "denied" || finding.ValidationCommand != recipe ||
+		!reflect.DeepEqual(work.ReproductionCommands, []string{recipe}) || !reflect.DeepEqual(metadataValidation, []string{recipe}) {
+		t.Fatalf("unsupported recipe crossed admission: result=%+v upserts=%d bead=%+v finding=%+v", result, issues.upserts, persisted, finding)
+	}
+	replay := resumeAppliedForTest(controller, context.Background(), source, packet, []visualhive.AdmittedVisualWork{work}, Result{Lifecycle: apply})
+	if len(replay.Decisions) != 0 || len(replay.DispatchPending) != 0 || issues.upserts != 0 || len(gov.AdmissionHistory()) != 1 || store.Count() != 1 {
+		t.Fatalf("unsupported recipe replay duplicated work: result=%+v upserts=%d history=%+v beads=%d", replay, issues.upserts, gov.AdmissionHistory(), store.Count())
+	}
+}
+
 func TestVisualWorkControllerDenialCreatesNoIssueIntent(t *testing.T) {
 	store, err := beads.NewStore(filepath.Join(t.TempDir(), "quality"))
 	if err != nil {
@@ -591,7 +678,7 @@ func TestVisualWorkControllerDenialCreatesNoIssueIntent(t *testing.T) {
 	issues := &controllerIssueClient{governor: gov}
 	controller, err := New(gov, lifecycle, map[string]*beads.Store{"quality": store}, nil, issues, integrated.Config{
 		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(), ACMMLevel: 5, Automation: integrated.AutomationRepairPR,
-		MaxActiveIssues: 1, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40),
+		MaxActiveIssues: 1, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40), TestCommands: [][]string{{"go", "test", "./..."}},
 	}, 5)
 	if err != nil {
 		t.Fatal(err)
@@ -870,7 +957,7 @@ func TestMixedPacketAdmitsRoutedPeerAndNeverDispatchesManualHold(t *testing.T) {
 	issues := &controllerIssueClient{governor: gov}
 	controller, err := New(gov, lifecycle, map[string]*beads.Store{"quality": store}, nil, issues, integrated.Config{
 		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(), ACMMLevel: 5, Automation: integrated.AutomationRepairPR,
-		MaxActiveIssues: 3, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40),
+		MaxActiveIssues: 3, AllowedRepairPaths: []string{"src/**"}, VisualHiveRef: strings.Repeat("c", 40), TestCommands: [][]string{{"go", "test", "./..."}},
 	}, 5)
 	if err != nil {
 		t.Fatal(err)
