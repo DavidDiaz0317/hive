@@ -267,6 +267,94 @@ func TestResumeNormalOwnerNeverStartsLegacyAndLiveTransitionFailsBeforeUnpause(t
 	})
 }
 
+func TestPauseManagesOnlyConfiguredRuntimeOwner(t *testing.T) {
+	t.Run("normal owner stays live and quiesced", func(t *testing.T) {
+		stateDir := t.TempDir()
+		config := testRuntimeOwnerConfig(stateDir, integrated.AutomationRepairPR, true)
+		store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Save(config); err != nil {
+			t.Fatal(err)
+		}
+		manager := &fakeDaemonServiceManager{installed: true, enabled: true, active: true}
+		useFakeDaemonServices(t, manager)
+		if code := runIntegratedPause("pause", []string{"--state-dir", stateDir, "--json"}); code != 0 {
+			t.Fatalf("normal-owner pause returned %d", code)
+		}
+		paused, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused.Paused || len(manager.calls) != 0 {
+			t.Fatalf("normal-owner pause managed the legacy scheduler: paused=%t calls=%v", paused.Paused, manager.calls)
+		}
+	})
+
+	t.Run("legacy owner still stops its scheduler", func(t *testing.T) {
+		stateDir := t.TempDir()
+		config := testRuntimeOwnerConfig(stateDir, integrated.AutomationAdvisory, true)
+		store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Save(config); err != nil {
+			t.Fatal(err)
+		}
+		manager := &fakeDaemonServiceManager{installed: true, enabled: true, active: true}
+		useFakeDaemonServices(t, manager)
+		if code := runIntegratedPause("pause", []string{"--state-dir", stateDir, "--json"}); code != 0 {
+			t.Fatalf("legacy-owner pause returned %d", code)
+		}
+		paused, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused.Paused || len(manager.calls) == 0 {
+			t.Fatalf("legacy-owner pause skipped scheduler shutdown: paused=%t calls=%v", paused.Paused, manager.calls)
+		}
+	})
+
+	t.Run("normal owner removes an observed legacy registration", func(t *testing.T) {
+		stateDir := t.TempDir()
+		config := testRuntimeOwnerConfig(stateDir, integrated.AutomationRepairPR, true)
+		store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Save(config); err != nil {
+			t.Fatal(err)
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec, err := newDaemonServiceSpecWithIdentity(stateDir, executable, time.Minute, strings.Repeat("a", 40), strings.Repeat("b", 64))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeDaemonServiceSpec(spec); err != nil {
+			t.Fatal(err)
+		}
+		manager := &fakeDaemonServiceManager{installed: true, enabled: true, active: true}
+		useFakeDaemonServices(t, manager)
+		if code := runIntegratedPause("pause", []string{"--state-dir", stateDir, "--json"}); code != 0 {
+			t.Fatalf("normal-owner conflict pause returned %d", code)
+		}
+		paused, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused.Paused || len(manager.calls) == 0 {
+			t.Fatalf("normal-owner conflict pause preserved the legacy registration: paused=%t calls=%v", paused.Paused, manager.calls)
+		}
+		if _, exists, err := readDaemonServiceSpec(stateDir); err != nil || exists {
+			t.Fatalf("normal-owner conflict pause left the legacy descriptor: exists=%t err=%v", exists, err)
+		}
+	})
+}
+
 func TestResumeLegacyConfigReplacesInactiveNormalRecord(t *testing.T) {
 	stateDir := t.TempDir()
 	config := testRuntimeOwnerConfig(stateDir, integrated.AutomationAdvisory, true)

@@ -2157,9 +2157,12 @@ func runIntegratedPause(command string, args []string) int {
 		runtimeRunning = normalRuntimeRunning
 	}
 	if command == "pause" {
-		if _, err := stopIntegratedDaemon(*stateDir); err != nil {
-			fmt.Fprintln(os.Stderr, "Hive is safely paused, but scheduler shutdown failed:", err)
-			return 1
+		legacySchedulerObserved := priorDaemon.RuntimeRunning || priorDaemon.Service != nil && priorDaemon.Service.Managed
+		if !normalRuntimeIntent || legacySchedulerObserved {
+			if _, err := stopIntegratedDaemon(*stateDir); err != nil {
+				fmt.Fprintln(os.Stderr, "Hive is safely paused, but scheduler shutdown failed:", err)
+				return 1
+			}
 		}
 	} else {
 		if !normalRuntimeIntent {
