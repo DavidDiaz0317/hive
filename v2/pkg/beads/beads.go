@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,19 +80,19 @@ func (ft flexTime) MarshalJSON() ([]byte, error) {
 }
 
 type Bead struct {
-	ID          string            `json:"id"`
-	Title       string            `json:"title"`
-	Type        BeadType          `json:"type"`
-	Status      Status            `json:"status"`
-	Priority    Priority          `json:"priority"`
-	Actor       string            `json:"actor"`
-	ExternalRef string            `json:"external_ref,omitempty"`
+	ID          string                 `json:"id"`
+	Title       string                 `json:"title"`
+	Type        BeadType               `json:"type"`
+	Status      Status                 `json:"status"`
+	Priority    Priority               `json:"priority"`
+	Actor       string                 `json:"actor"`
+	ExternalRef string                 `json:"external_ref,omitempty"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-	Notes       string            `json:"notes,omitempty"`
-	CreatedAt   flexTime          `json:"created_at"`
-	UpdatedAt   flexTime          `json:"updated_at"`
-	ClosedAt    *flexTime         `json:"closed_at,omitempty"`
-	DependsOn   []string          `json:"depends_on,omitempty"`
+	Notes       string                 `json:"notes,omitempty"`
+	CreatedAt   flexTime               `json:"created_at"`
+	UpdatedAt   flexTime               `json:"updated_at"`
+	ClosedAt    *flexTime              `json:"closed_at,omitempty"`
+	DependsOn   []string               `json:"depends_on,omitempty"`
 }
 
 // Meta returns a metadata value as a string, or "" if missing/non-string.
@@ -108,20 +109,48 @@ func (b *Bead) Meta(key string) string {
 const maxBeadCount = 5000
 
 type Store struct {
-	dir    string
-	hiveID string
-	beads  map[string]*Bead
-	mu     sync.RWMutex
+	dir       string
+	hiveID    string
+	beads     map[string]*Bead
+	writeFile func(string, []byte, os.FileMode) error
+	rename    func(string, string) error
+	mu        sync.RWMutex
+}
+
+// BatchInput is a fully validated work item prepared by an external evidence
+// importer. SourceID is used only to reconnect dependencies within the batch.
+type BatchInput struct {
+	SourceID    string
+	Title       string
+	Type        BeadType
+	Status      Status
+	Priority    Priority
+	Actor       string
+	ExternalRef string
+	Metadata    map[string]interface{}
+	Notes       string
+	DependsOn   []string
+}
+
+// BatchResult describes an idempotent batch import.
+type BatchResult struct {
+	Created int `json:"created"`
+	Skipped int `json:"skipped"`
 }
 
 func NewStore(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating beads dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("protecting beads dir %s: %w", dir, err)
 	}
 
 	s := &Store{
-		dir:   dir,
-		beads: make(map[string]*Bead),
+		dir:       dir,
+		beads:     make(map[string]*Bead),
+		writeFile: os.WriteFile,
+		rename:    os.Rename,
 	}
 
 	if err := s.load(); err != nil {
@@ -177,6 +206,142 @@ func (s *Store) Create(title string, beadType BeadType, priority Priority, actor
 	return b, s.persist(b)
 }
 
+// ImportBatch validates and persists all items with one atomic beads.json
+// rename. Existing external references are skipped, making retries idempotent.
+func (s *Store) ImportBatch(items []BatchInput) (BatchResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := BatchResult{}
+	existingByRef := make(map[string]*Bead, len(s.beads))
+	for _, bead := range s.beads {
+		if bead.ExternalRef != "" {
+			existingByRef[bead.ExternalRef] = bead
+		}
+	}
+	seenRefs := make(map[string]bool, len(items))
+	seenSources := make(map[string]bool, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.SourceID) == "" || strings.TrimSpace(item.Title) == "" || strings.TrimSpace(item.ExternalRef) == "" {
+			return result, fmt.Errorf("batch item requires source ID, title, and external reference")
+		}
+		if !validBeadTypes[item.Type] {
+			return result, fmt.Errorf("invalid bead type %q", item.Type)
+		}
+		if !validStatus(item.Status) || item.Priority < PriorityCritical || item.Priority > PriorityMinor {
+			return result, fmt.Errorf("invalid status or priority for %q", item.ExternalRef)
+		}
+		if seenRefs[item.ExternalRef] {
+			return result, fmt.Errorf("duplicate external reference %q in batch", item.ExternalRef)
+		}
+		if seenSources[item.SourceID] {
+			return result, fmt.Errorf("duplicate source ID %q in batch", item.SourceID)
+		}
+		seenRefs[item.ExternalRef] = true
+		seenSources[item.SourceID] = true
+	}
+
+	now := flexTime{time.Now().UTC()}
+	createdIDs := make([]string, 0, len(items))
+	sourceToID := make(map[string]string, len(items))
+	for _, item := range items {
+		if existing := existingByRef[item.ExternalRef]; existing != nil {
+			sourceToID[item.SourceID] = existing.ID
+			result.Skipped++
+			continue
+		}
+		id := uuid.New().String()[:12]
+		metadata := make(map[string]interface{}, len(item.Metadata)+1)
+		for key, value := range item.Metadata {
+			metadata[key] = value
+		}
+		if s.hiveID != "" {
+			metadata[hiveIDMetadataKey] = s.hiveID
+		}
+		bead := &Bead{
+			ID: id, Title: item.Title, Type: item.Type, Status: item.Status,
+			Priority: item.Priority, Actor: item.Actor, ExternalRef: item.ExternalRef,
+			Metadata: metadata, Notes: item.Notes, CreatedAt: now, UpdatedAt: now,
+		}
+		if item.Status == StatusDone || item.Status == StatusClosed {
+			closedAt := now
+			bead.ClosedAt = &closedAt
+		}
+		s.beads[id] = bead
+		createdIDs = append(createdIDs, id)
+		sourceToID[item.SourceID] = id
+		result.Created++
+	}
+	for _, item := range items {
+		if sourceToID[item.SourceID] == "" {
+			continue
+		}
+		bead := s.beads[sourceToID[item.SourceID]]
+		if bead == nil || !contains(createdIDs, bead.ID) {
+			continue
+		}
+		for _, dependency := range item.DependsOn {
+			if target := sourceToID[dependency]; target != "" {
+				bead.DependsOn = append(bead.DependsOn, target)
+			}
+		}
+	}
+	if result.Created == 0 {
+		return result, nil
+	}
+	if err := s.persist(nil); err != nil {
+		for _, id := range createdIDs {
+			delete(s.beads, id)
+		}
+		return BatchResult{}, err
+	}
+	return result, nil
+}
+
+// RollbackImportedExternalRefs removes only the exact external references
+// created by a coordinated multi-store batch. Callers must preflight that the
+// references did not exist before import; this is not a general delete API.
+func (s *Store) RollbackImportedExternalRefs(refs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wanted := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		if strings.TrimSpace(ref) != "" {
+			wanted[ref] = true
+		}
+	}
+	removed := map[string]*Bead{}
+	for id, bead := range s.beads {
+		if bead != nil && wanted[bead.ExternalRef] {
+			removed[id] = bead
+			delete(s.beads, id)
+		}
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	if err := s.persist(nil); err != nil {
+		for id, bead := range removed {
+			s.beads[id] = bead
+		}
+		return err
+	}
+	return nil
+}
+
+func validStatus(status Status) bool {
+	return status == StatusOpen || status == StatusInProgress || status == StatusBlocked || status == StatusDone || status == StatusClosed
+}
+
+func contains(values []string, candidate string) bool {
+	for _, value := range values {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) evictOldClosed() {
 	if len(s.beads) <= maxBeadCount {
 		return
@@ -206,11 +371,19 @@ func (s *Store) Update(id string, fn func(b *Bead)) error {
 	if !ok {
 		return fmt.Errorf("bead %s not found", id)
 	}
-
-	fn(b)
-	b.UpdatedAt = flexTime{time.Now().UTC()}
-
-	return s.persist(b)
+	next, err := cloneBead(b)
+	if err != nil {
+		return fmt.Errorf("copy bead %s for update: %w", id, err)
+	}
+	fn(next)
+	next.UpdatedAt = flexTime{time.Now().UTC()}
+	candidate := cloneBeadMap(s.beads)
+	candidate[id] = next
+	if err := s.persistMap(candidate); err != nil {
+		return err
+	}
+	*b = *next
+	return nil
 }
 
 func (s *Store) Claim(id string) error {
@@ -225,6 +398,34 @@ func (s *Store) Close(id string) error {
 		b.Status = StatusClosed
 		b.ClosedAt = &now
 	})
+}
+
+// CloseWithUpdate atomically persists terminal status together with caller
+// metadata. It is used by controller-owned lifecycle projections so a crash
+// cannot leave a terminal bead reopened or missing its terminal receipt.
+func (s *Store) CloseWithUpdate(id string, fn func(b *Bead)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.beads[id]
+	if !ok {
+		return fmt.Errorf("bead %s not found", id)
+	}
+	next, err := cloneBead(b)
+	if err != nil {
+		return fmt.Errorf("copy bead %s for close: %w", id, err)
+	}
+	fn(next)
+	now := flexTime{time.Now().UTC()}
+	next.Status = StatusClosed
+	next.ClosedAt = &now
+	next.UpdatedAt = now
+	candidate := cloneBeadMap(s.beads)
+	candidate[id] = next
+	if err := s.persistMap(candidate); err != nil {
+		return err
+	}
+	*b = *next
+	return nil
 }
 
 func (s *Store) Get(id string) (*Bead, error) {
@@ -351,8 +552,12 @@ func (s *Store) load() error {
 }
 
 func (s *Store) persist(_ *Bead) error {
+	return s.persistMap(s.beads)
+}
+
+func (s *Store) persistMap(source map[string]*Bead) error {
 	var all []*Bead
-	for _, b := range s.beads {
+	for _, b := range source {
 		all = append(all, b)
 	}
 
@@ -367,10 +572,30 @@ func (s *Store) persist(_ *Bead) error {
 
 	path := filepath.Join(s.dir, beadsFileName)
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := s.writeFile(tmpPath, data, 0o600); err != nil {
 		return fmt.Errorf("writing tmp beads: %w", err)
 	}
-	return os.Rename(tmpPath, path)
+	return s.rename(tmpPath, path)
+}
+
+func cloneBeadMap(source map[string]*Bead) map[string]*Bead {
+	clone := make(map[string]*Bead, len(source))
+	for id, bead := range source {
+		clone[id] = bead
+	}
+	return clone
+}
+
+func cloneBead(source *Bead) (*Bead, error) {
+	data, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	var clone Bead
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil, err
+	}
+	return &clone, nil
 }
 
 func (s *Store) CloseAll(reason string) (int, error) {
@@ -448,7 +673,7 @@ func (s *Store) Archive(id string) error {
 	}
 
 	archivePath := filepath.Join(s.dir, archiveFileName)
-	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening archive file: %w", err)
 	}
