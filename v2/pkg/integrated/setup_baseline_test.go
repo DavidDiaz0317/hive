@@ -1306,6 +1306,14 @@ func TestSetupBaselineCaptureCancellationWaitsForExactTerminalRun(t *testing.T) 
 }
 
 func TestSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceholder(t *testing.T) {
+	for _, cancelStatus := range []int{http.StatusConflict, http.StatusInternalServerError} {
+		t.Run(strconv.Itoa(cancelStatus), func(t *testing.T) {
+			testSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceholder(t, cancelStatus)
+		})
+	}
+}
+
+func testSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceholder(t *testing.T, cancelStatus int) {
 	head, correlation, now := strings.Repeat("a", 40), strings.Repeat("b", 64), time.Now().UTC()
 	reads, cancels, forceCancels := 0, 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -1320,7 +1328,7 @@ func TestSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceh
 			_, _ = fmt.Fprintf(writer, `{"id":77,"workflow_id":12,"name":%q,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":%q,"conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, head, status, conclusion)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/cancel":
 			cancels++
-			http.Error(writer, `{"message":"run cannot be cancelled"}`, http.StatusConflict)
+			http.Error(writer, `{"message":"run cannot be cancelled"}`, cancelStatus)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/force-cancel":
 			forceCancels++
 			writer.WriteHeader(http.StatusAccepted)

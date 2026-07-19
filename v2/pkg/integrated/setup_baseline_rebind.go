@@ -421,13 +421,13 @@ func cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx context.Context, clie
 		return nil
 	}
 	response, err = client.GoGitHub().Actions.CancelWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
-	if response != nil && response.StatusCode == http.StatusConflict {
+	if response != nil && (response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusInternalServerError) {
 		live, _, liveErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
 		if liveErr != nil {
-			return fmt.Errorf("reinspect exact obsolete setup baseline run %d after cancellation conflict: %w", source.CaptureRunID, liveErr)
+			return fmt.Errorf("reinspect exact obsolete setup baseline run %d after cancellation rejection: %w", source.CaptureRunID, liveErr)
 		}
 		if !exactSetupBaselineCaptureRunForCancellation(live, source, dispatch) {
-			return fmt.Errorf("obsolete setup baseline workflow run changed identity after cancellation conflict")
+			return fmt.Errorf("obsolete setup baseline workflow run changed identity after cancellation rejection")
 		}
 		if strings.EqualFold(live.GetStatus(), "completed") {
 			return nil
