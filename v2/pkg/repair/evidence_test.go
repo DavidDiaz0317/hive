@@ -166,6 +166,45 @@ func TestLoadEvidenceSummaryEscapesMutationControlCharacters(t *testing.T) {
 	}
 }
 
+func TestLoadEvidenceSummaryStripsPlaywrightANSIStyling(t *testing.T) {
+	root := t.TempDir()
+	reason := "Expected text to be absent: Failed to fetch\n\n" +
+		"\x1b[2mexpect(\x1b[22m\x1b[31mlocator\x1b[39m) failed\n\n" +
+		"Expected: \x1b[32m0\x1b[39m\nReceived: \x1b[31m1\x1b[39m"
+	verdict, err := json.Marshal(verdictEvidence{AllContributions: []evidenceContribution{{
+		Source: "playwright", Kind: "contract_result", Status: "failed", Gating: true,
+		ContractID: "app-shell-content-health", TargetID: "localPreview", Reason: reason,
+		Key: "playwright.contract_result.app-shell-content-health",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "verdict.json"), verdict, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := LoadEvidenceSummary(root, visualhive.FindingLifecycle{
+		IssueKind: "selector_contract_failure", Title: "[Visual Hive] app-shell-content-health failed deterministic validation",
+		AffectedContracts: []string{"app-shell-content-health"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "Expected: 0") || !strings.Contains(summary, "Received: 1") || !strings.Contains(summary, `\n`) ||
+		strings.ContainsRune(summary, '\x1b') || strings.Contains(summary, "[32m") {
+		t.Fatalf("Playwright evidence styling was not safely normalized: %q", summary)
+	}
+
+	for _, unsafe := range []string{"bell\x07", "clear\x1b[2J"} {
+		if _, err := safeEvidenceValue(unsafe); err == nil || !strings.Contains(err.Error(), "unsafe control character") {
+			t.Fatalf("non-SGR control %q did not remain fail-closed: %v", unsafe, err)
+		}
+	}
+	styledSecret := "github_\x1b[31mpat_\x1b[0m" + strings.Repeat("a", 24)
+	if _, err := safeEvidenceValue(styledSecret); err == nil || !strings.Contains(err.Error(), "github-token-v1") || strings.Contains(err.Error(), "github_pat_"+strings.Repeat("a", 24)) || strings.Contains(err.Error(), styledSecret) {
+		t.Fatalf("ANSI-split credential was not rejected after normalization: %v", err)
+	}
+}
+
 func TestLoadEvidenceSummaryRejectsCredentials(t *testing.T) {
 	tests := []struct{ value, rule string }{
 		{value: "github_" + "pat_" + strings.Repeat("a", 24), rule: "github-token-v1"},

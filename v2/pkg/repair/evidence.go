@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ const maxCoverageEvidenceBytes = 2 << 20
 const maxTestCreationEvidenceBytes = 2 << 20
 
 var ErrNoActionableEvidence = errors.New("verified Visual Hive evidence has no actionable contribution")
+
+var evidenceANSIStyle = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 type verdictEvidence struct {
 	SchemaVersion    string                 `json:"schemaVersion"`
@@ -430,6 +433,11 @@ func safeEvidenceValue(value string) (string, error) {
 	if strings.ContainsRune(value, '\x00') || len(value) > 4096 {
 		return "", fmt.Errorf("verified Visual Hive evidence contains an unsafe value")
 	}
+	// Playwright failure messages may include deterministic terminal styling.
+	// Remove only complete SGR sequences; every other control sequence remains
+	// subject to the fail-closed control-character check below. Scan for secrets
+	// after normalization so styling cannot split an otherwise detectable token.
+	value = evidenceANSIStyle.ReplaceAllString(value, "")
 	if err := validateRepairTextSecrets(value, "verified Visual Hive evidence"); err != nil {
 		return "", err
 	}
