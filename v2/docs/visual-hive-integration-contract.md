@@ -1,6 +1,6 @@
 # Visual Hive -> Hive Integration Contract
 
-Status: **normative** | Effective: 2026-07-16 | Owners: Hive and Visual Hive maintainers
+Status: **normative** | Effective: 2026-07-16 | Reconciled: 2026-07-19 | Owners: Hive and Visual Hive maintainers
 Scope: the working Visual Hive -> existing Hive product
 
 This document is the single architectural and acceptance source of truth for the integration.
@@ -10,16 +10,24 @@ disagrees, this document wins until it is deliberately amended.
 
 ## Audit basis and truth labels
 
-Program bases and audit facts, not prior summaries, control this contract:
+The original architecture audit used these historical bases:
 
 - Hive `728ce71b01ad86d0187371bb16102ef6a3058063`.
-- Visual Hive `7ce03fab983bd5f966da7edcde49f694ca3bd058`, plus a separately
-  preserved uncommitted salvage candidate based on it.
+- Visual Hive `7ce03fab983bd5f966da7edcde49f694ca3bd058`, plus the then-uncommitted
+  salvage candidate based on it.
 - Live upstream KubeStellar Console `8214151d6ab9b9973d79e159eb8054d8ccabf156`.
 
-Audit used the exact Hive worktree, Visual Hive base object plus preserved working
-candidate, and Console `upstream/main`. The candidate has no commit SHA and is not
-treated as committed. `Current` is audited behavior; `Target` remains required.
+The implemented and demonstrated handoff basis is now:
+
+- live-proof Hive `45ff9ab54723baee41410875eec1fa7dbb64911d`;
+- fully gated code candidate Hive `a220ca78da60027d51456365187faaafe5239928`;
+- immutable Visual Hive producer `3015c9e7cc7b357bbd4f5551b115fb7b7f4847ec`;
+- the same read-only Console audit basis above; no upstream Console state changed.
+
+`Implemented` below describes audited candidate behavior. `Target` now means the
+remaining Console-fork coexistence proof and later release decision, not a second
+runtime implementation. Exact live runs and replay evidence are recorded in
+`visual-hive-normal-service-reconciliation.md`.
 
 ## North star
 
@@ -33,13 +41,15 @@ tests are supporting evidence. Until P0 passes, packaging/polish is not completi
 
 ### Fork-only repository boundary
 
-Until the repository owner explicitly lifts this boundary, upstream/real Hive and
-KubeStellar Console repositories, checkouts, remotes, issues, PRs, workflows, and
-production Hive state are read-only. Implementation runs only in isolated local
-branches/worktrees derived from the owner's forks. Console P0 means an actual PR
-whose base and head are both inside the Console fork, operated by a dedicated
-namespaced normal Hive built from the Hive fork. It does not authorize an upstream
-PR, an upstream workflow mutation, or use of the production KubeStellar Hive.
+The repository owner has lifted the Hive source-work boundary only for the exact
+`kubestellar/hive:dd` branch. That authority does not extend to Hive `main`, any
+other Hive branch, upstream release tags/assets/attestations, or merges. The
+upstream KubeStellar Console repository, its checkouts, remotes, issues, PRs, and
+workflows, and its production Hive state remain read-only. Console P0 means an
+actual PR whose base and head are both inside the Console fork, operated by a
+dedicated namespaced normal Hive built from the reviewed Hive candidate. It does
+not authorize an upstream Console PR, an upstream workflow mutation, or use of
+the production KubeStellar Hive.
 
 ## Exact ownership split
 
@@ -85,23 +95,27 @@ No shortcut may jump to execution or lifecycle. No `visualhive`/`vhw` work-order
 queue, `ProposalTaskRequest` store, new lease/receipt, or parallel repair state may
 become another source of truth.
 
-## Current versus target runtime
+## Implemented runtime and compatibility boundary
 
-Current:
+Implemented:
 
 - `v2/cmd/hive/main.go` builds normal governor, scheduler, `agent.Manager`, policy,
   knowledge/wiki, beads, GitHub proxy, and dashboard.
-- `v2/cmd/hive/specialist_runtime.go` separately calls `agent.NewSpecialistManager`
-  with five hard-coded roles.
-- `v2/pkg/integrated/run.go` sends findings to that manager and its own repair/lifecycle.
-- This bypasses normal governor/scheduler, policy watcher, knowledge/wiki/graph,
-  and dashboard wiring. Its local safety checks do not make it the target path.
+- The ordinary service claims the normal runtime-owner lease before Visual Hive
+  configuration, verifies one immutable packet through the integrated adapter,
+  and admits it through the existing Governor and Scheduler.
+- The existing Manager/mailbox and role policies invoke the existing repair Worker;
+  Hive alone owns the issue, branch, PR, lifecycle, audit, and dashboard state.
+- The exact-head Visual Hive receipt returns through that same controller-owned
+  lifecycle, and restart/replay reuses the same durable work without another side effect.
 
-Target:
+Compatibility boundary:
 
-- one injected normal-service seam and one admission/governor/scheduler path;
-- one ordinary `agent.Manager`, existing roles/policies/knowledge/beads/lifecycle;
-- one dashboard-visible state, with no duplicate manager, role registry, or queue.
+- `v2/cmd/hive/specialist_runtime.go` and the integrated controller retain a
+  separate specialist runtime only for compatibility paths. They are not the
+  owner for local Visual Hive `repair-pr` or `auto-merge` operation.
+- The remaining Console-fork target MUST reuse the implemented normal-service
+  path, existing roles/policies/knowledge/beads/lifecycle, and existing dashboard.
 
 The second-manager runtime is transitional compatibility, not precedent. New work
 MUST move toward the target and MUST NOT deepen the parallel path.
@@ -450,3 +464,9 @@ deferred ideas, not authority for parallel state, roles, release work, or writes
 - **2026-07-16 -- proof oracle:** failure-state/unproven AI-HPC screenshots are
   rejected; one exact-environment, human-reviewed healthy candidate may establish the
   private proof oracle, after which every run is strict and no-update.
+- **2026-07-19 -- working vertical:** the private v10 repository passed healthy
+  cadence, one prepared defect, one governed unmerged repair PR, exact-head verdict,
+  and duplicate-free ordinary-service restart/replay.
+- **2026-07-19 -- source boundary:** the owner lifted Hive source authority only for
+  exact `kubestellar/hive:dd`; Hive main/other branches and upstream Console remain
+  read-only, and release publication remains a separate decision.

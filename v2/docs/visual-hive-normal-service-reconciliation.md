@@ -5,8 +5,11 @@ exact Hive `45ff9ab54723baee41410875eec1fa7dbb64911d` and Visual Hive
 `3015c9e7cc7b357bbd4f5551b115fb7b7f4847ec`. A healthy ordinary cadence,
 prepared one-line defect, one Governor-admitted Worker repair PR, sealed
 exact-head verdict, and duplicate-free ordinary Hive restart/replay all passed.
-The repair PR remains open and unmerged. KubeStellar Console fork P0 and any
-release or upstream promotion remain separate later steps.
+The fully gated code candidate is
+`a220ca78da60027d51456365187faaafe5239928`; the contract reconciliation after
+that checkpoint is documentation/scope cleanup only. The repair PR remains open
+and unmerged. KubeStellar Console fork P0 and any release or upstream promotion
+remain separate later steps.
 
 The normative product contract is
 `docs/visual-hive-integration-contract.md`. This document records the actual
@@ -315,13 +318,15 @@ go test -run '^$' ./cmd/hive ./pkg/repair ./pkg/visualhive/controller ./pkg/visu
 ```
 
 The vertical acceptance passed three consecutive times. Exact Hive
-`45ff9ab54723baee41410875eec1fa7dbb64911d` subsequently passed every Go package
-in a clean, read-only, privileged Linux clone using a serialized main shard and
-one fresh isolated tmux-resume shard; full `go vet ./...` also passed. The split
-kept an installed-image ACMM fallback fixture out of source-unit discovery and
-prevented leaked asynchronous tmux activity from one concurrency test from
-interfering with the immediately following resume test. Both affected paths
-passed in their intended isolated environments; no product failure was hidden.
+`45ff9ab54723baee41410875eec1fa7dbb64911d` passed the pre-handoff Linux gate.
+The final code candidate `a220ca78da60027d51456365187faaafe5239928`
+subsequently passed every Go package in a clean, read-only, privileged Linux
+clone using a serialized main shard and one fresh isolated tmux-resume shard;
+full `go vet ./...` also passed. The split kept an installed-image ACMM fallback
+fixture out of source-unit discovery and prevented leaked asynchronous tmux
+activity from one concurrency test from interfering with the immediately
+following resume test. Both affected paths passed in their intended isolated
+environments; no product failure was hidden.
 
 ## Completed live disposable-repository proof
 
@@ -359,6 +364,18 @@ Release packaging, new roles, new dashboards, baseline automation, broad tool
 creation, direct Visual Hive writes, and Console `kc-agent`/MCP integration are
 not on this critical path.
 
+## Upstream review map
+
+- `d93992e0` through `728ce71b` (inclusive): integrated setup, delivery, and hosted-control foundation.
+- `844cb9e4` through `e372db54` (inclusive): normative contract, normal-service integration, exact-head verification, and replay.
+- `b4f8df98` through `ecaef46d` (inclusive): vertical-proof consolidation.
+- `bd0c6700` through `a220ca78` (inclusive, first-parent review): exact-`dd` integration, observed production fixes, and final runtime-ownership guidance.
+
+At the fully gated `a220ca78` code checkpoint, the integration merge carries the
+development lineage, so the first-parent handoff is 23 commits even though the
+complete ancestry contains 185 commits. The later reconciliation is
+documentation/scope cleanup only; no history rewrite is required for review.
+
 ## Checkpoint ledger
 
 | Commit | Result |
@@ -389,6 +406,7 @@ not on this critical path.
 | `e372db54` | genuine local Governor-to-Worker-to-verdict vertical acceptance proof |
 | `bd0c6700` | integrated governed Visual Hive runtime on exact `dd` lineage |
 | `45ff9ab5` | production and audited PR pins verified separately; v10 exact-head producer |
+| `a220ca78` | fully gated normal-Hive runtime ownership guidance and operator handoff |
 
 These commits are checkpoints on exact `dd`, not a release, merge, or claim
 that Hive `main` or upstream Console changed.
