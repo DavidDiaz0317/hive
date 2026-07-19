@@ -141,7 +141,7 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 	}
 	securedProvider := sealed.provider()
 	securedProvider.runtimeEnvironment = privateRuntime.environment
-	sandboxAlias, err := createCodexLinuxSandboxAlias(securedProvider.Command, cwd)
+	sandboxAlias, err := createCodexLinuxSandboxAlias(securedProvider.Command, filepath.Dir(securedProvider.Command))
 	if err != nil {
 		_ = privateRuntime.cleanup()
 		_ = os.Remove(cwd)
@@ -169,7 +169,7 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 	command.Dir = cwd
 	command.Env = securedProvider.commandEnvironment()
 	if sandboxAlias != "" {
-		command.Env = prependProviderExecutablePath(command.Env, cwd)
+		command.Env = prependProviderExecutablePath(command.Env, filepath.Dir(sandboxAlias))
 	}
 	command.Stdin = strings.NewReader(prompt)
 	stdout := &codexHardLimitBuffer{limit: codexStdoutHardLimit, cancel: cancel}
