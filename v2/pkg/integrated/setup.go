@@ -626,7 +626,7 @@ func setupActivationMessage(automation Automation, started, pending bool) string
 }
 
 func defaultAllowedRepairPaths() []string {
-	return []string{"src/**", "**/src/**", "public/**", "**/public/**", "index.html", "**/index.html", "visual-hive.config.yaml", "test/**", "tests/**", "**/test/**", "**/tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
+	return []string{"src/**", "**/src/**", "public/**", "**/public/**", "index.html", "**/index.html", "visual-hive.config.yaml", "scripts/testing/**", "**/scripts/testing/**", "test/**", "tests/**", "**/test/**", "**/tests/**", "**/*.test.*", "**/*.spec.*", "**/*_test.go"}
 }
 
 func defaultAllowedAutoMergePaths() []string {

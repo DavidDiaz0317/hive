@@ -33,6 +33,10 @@ const (
 	normalVisualRepairModelTimeout   = 20 * time.Minute
 	normalVisualRepairCommandTimeout = 15 * time.Minute
 	normalVisualCycleFixedOverhead   = 30 * time.Minute
+
+	// Visual Hive emits this canonical command as a request for its managed
+	// exact-PR-head workflow verdict, not as target-authored local argv.
+	normalVisualExactHeadValidationCommand = "visual-hive run --ci"
 )
 
 type normalVisualArtifactSource struct {
@@ -231,6 +235,13 @@ func (runner *normalVisualRepairer) validateRuntime(current integrated.Config, e
 func exactWorkerCommands(required []string, configured [][]string) ([]repair.Command, error) {
 	result := make([]repair.Command, 0, len(required))
 	for _, expected := range required {
+		if expected == normalVisualExactHeadValidationCommand {
+			// Keep the canonical request in the intake envelope and immutable
+			// specialist work order. Locally, only validate the candidate diff;
+			// normalVisualPullRequestVerifier owns the actual exact-head verdict.
+			result = append(result, repair.Command{Name: "git", Args: []string{"diff", "--check"}})
+			continue
+		}
 		matched := false
 		for _, command := range configured {
 			if len(command) > 0 && strings.Join(command, " ") == expected {

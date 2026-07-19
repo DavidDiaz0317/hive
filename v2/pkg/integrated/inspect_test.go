@@ -344,6 +344,19 @@ func TestVisualTestConfigRequiresHumanMergeAuthority(t *testing.T) {
 	}
 }
 
+func TestScriptsTestingDefaultsRequireHumanMergeAuthority(t *testing.T) {
+	repairPaths := defaultAllowedRepairPaths()
+	autoMergePaths := defaultAllowedAutoMergePaths()
+	for _, pattern := range []string{"scripts/testing/**", "**/scripts/testing/**"} {
+		if !contains(repairPaths, pattern) {
+			t.Fatalf("repair PR mode must allow repository test infrastructure through %q", pattern)
+		}
+		if contains(autoMergePaths, pattern) {
+			t.Fatalf("repository test infrastructure %q must remain outside the default auto-merge allowlist", pattern)
+		}
+	}
+}
+
 func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 	sha := "0123456789012345678901234567890123456789"
 	if !exactCommitPin(sha, sha) {
