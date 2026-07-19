@@ -2560,7 +2560,7 @@ func preferRepositoryComprehensiveSuite(inspection RepositoryInspection, command
 func comprehensiveAggregateScript(scripts map[string]string, selected map[string]bool) string {
 	for _, candidate := range []string{"test:all", "test:ci:heavy", "test:suite", "vh:suite", "test:ci"} {
 		body, exists := scripts[candidate]
-		if !exists || !safeAutomationScript(candidate, body) {
+		if !exists || !safeAutomationScript(candidate, body) || invokesSupersededUnscopedPlaywrightE2E(candidate, scripts) {
 			continue
 		}
 		dependencies, strict := strictPackageRunDependencies(body)

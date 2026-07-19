@@ -241,12 +241,17 @@ func packageScriptCommands(packagePath, runner string, scripts map[string]string
 	}
 	sort.Strings(names)
 	liteBody, hasLite := scripts["test:ci:lite"]
-	hasLite = hasLite && safeAutomationScript("test:ci:lite", liteBody)
+	hasLite = hasLite && safeAutomationScript("test:ci:lite", liteBody) && hasSafePackageScriptClosure("test:ci:lite", scripts)
 	if hasLite {
 		commands = append(commands, packageScriptCommand(packagePath, runner, "test:ci:lite"))
 	}
 	for _, name := range names {
-		if name == "test:ci:lite" || !safeAutomationScript(name, scripts[name]) {
+		if name == "test:ci:lite" || !safeAutomationScript(name, scripts[name]) || !hasSafePackageScriptClosure(name, scripts) {
+			continue
+		}
+		// An unscoped Playwright invocation may fan out to browsers absent from
+		// the managed runner. Prefer the repository's own explicit Chromium lane.
+		if invokesSupersededUnscopedPlaywrightE2E(name, scripts) {
 			continue
 		}
 		if hasLite && commandCoverageRank(packageScriptCommand(packagePath, runner, name)) == 1 {
@@ -262,12 +267,21 @@ func safeAutomationScript(name, body string) bool {
 	if name == "" || name == "vh:plan" || name == "vh:run" {
 		return false
 	}
+	// Every selected script runs as an isolated, non-interactive job. Exclude
+	// operator/report/live lanes and browser projects that the managed workflow
+	// does not install; segment equality avoids rejecting names like liveness.
+	for _, segment := range strings.Split(name, ":") {
+		switch segment {
+		case "debug", "report", "live", "auth-drift", "browser-matrix", "macos-popup":
+			return false
+		}
+	}
 	for _, unsafe := range []string{"watch", "update", "snapshot:update", "interactive", "headed", "open", "dev", "serve", "preview"} {
 		if strings.Contains(name, unsafe) {
 			return false
 		}
 	}
-	for _, unsafe := range []string{"--watch", "--watchall", "--update", "--update-snapshots", "--ui", "--open", "--headed"} {
+	for _, unsafe := range []string{"--watch", "--watchall", "--update", "--update-snapshots", "--ui", "--open", "--headed", "--debug", "show-report", "@live-site", "playwright_storage_state=", "--project=firefox", "--project=webkit"} {
 		if strings.Contains(body, unsafe) {
 			return false
 		}
@@ -279,6 +293,38 @@ func safeAutomationScript(name, body string) bool {
 		return false
 	}
 	return commandCoverageRank([]string{"npm", "run", name}) > 0
+}
+
+func hasSafeScopedChromiumE2E(scripts map[string]string) bool {
+	body, exists := scripts["test:e2e:chromium"]
+	body = strings.ToLower(strings.TrimSpace(body))
+	return exists && safeAutomationScript("test:e2e:chromium", body) && strings.Contains(body, "playwright test") && strings.Contains(body, "--project=chromium")
+}
+
+func isUnscopedPlaywrightE2E(body string) bool {
+	body = strings.ToLower(strings.TrimSpace(body))
+	return strings.Contains(body, "playwright test") && !strings.Contains(body, "--project") && !strings.Contains(body, "--config")
+}
+
+func hasSafePackageScriptClosure(name string, scripts map[string]string) bool {
+	_, safe := terminalPackageScripts(scripts, name)
+	return safe
+}
+
+func invokesSupersededUnscopedPlaywrightE2E(name string, scripts map[string]string) bool {
+	if !hasSafeScopedChromiumE2E(scripts) || !isUnscopedPlaywrightE2E(scripts["test:e2e"]) {
+		return false
+	}
+	terminals, safe := terminalPackageScripts(scripts, name)
+	if !safe {
+		return false
+	}
+	for terminal := range terminals {
+		if terminal.Name == "test:e2e" && terminal.Forwarded != "--project=chromium" && terminal.Forwarded != "--project\x00chromium" {
+			return true
+		}
+	}
+	return false
 }
 
 func packageRunnerForRoot(root, packageRoot string) (string, error) {

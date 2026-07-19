@@ -280,6 +280,133 @@ func TestCoverageDepthFiltersExpensiveAndUnsafeScripts(t *testing.T) {
 	}
 }
 
+func TestSafeAutomationScriptRejectsNonProductionBrowserLanes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "test:auth-drift", body: "playwright test --config auth.config.ts"},
+		{name: "test:e2e:debug", body: "playwright test --debug"},
+		{name: "test:e2e:report", body: "playwright show-report"},
+		{name: "test:visual:live", body: "playwright test --grep @live-site"},
+		{name: "test:visual:browser-matrix", body: "playwright test --config browser-matrix.config.ts"},
+		{name: "test:visual:browser-matrix:compare", body: "node compare-browser-matrix.cjs"},
+		{name: "test:visual:macos-popup", body: "playwright test --config macos-popup.config.ts"},
+		{name: "test:visual:report:pr", body: "node build-report.cjs"},
+		{name: "test:e2e:ux-sweep", body: "PLAYWRIGHT_STORAGE_STATE=auth.json playwright test --config ux.config.ts"},
+		{name: "test:e2e:firefox", body: "playwright test --project=firefox"},
+		{name: "test:e2e:webkit", body: "playwright test --project=webkit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if safeAutomationScript(test.name, test.body) {
+				t.Fatalf("non-production browser lane %q was admitted", test.name)
+			}
+		})
+	}
+}
+
+func TestSafeAutomationScriptRetainsBoundedLocalEvidenceLanes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "test:liveness", body: "node liveness.test.js"},
+		{name: "test:reporter-contract", body: "node reporter.test.js"},
+		{name: "test:e2e:chromium", body: "playwright test --project=chromium"},
+		{name: "test:e2e:fullstack", body: "cd .. && bash scripts/run-fullstack-e2e.sh"},
+		{name: "test:visual:mutations", body: "playwright test --config intensive.config.ts --grep @mutation"},
+		{name: "test:visual:adequacy", body: "node harness/analyze-test-directory.cjs"},
+		{name: "test:visual:pr", body: "playwright test --config pr.config.ts"},
+		{name: "test:e2e:perf:ttfi:gate", body: "npm run test:e2e:perf:ttfi && node compare-ttfi.mjs"},
+		{name: "test:e2e:ui-compliance:gate", body: "npm run test:e2e:ui-compliance && node compare-compliance.mjs"},
+		{name: "test:visual:groundtruth", body: "playwright test --project=semantic-groundtruth"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !safeAutomationScript(test.name, test.body) {
+				t.Fatalf("bounded local evidence lane %q was rejected", test.name)
+			}
+		})
+	}
+}
+
+func TestPackageScriptCommandsPrefersExplicitChromiumOverUnscopedPlaywright(t *testing.T) {
+	commands := packageScriptCommands(".", "npm", map[string]string{
+		"test:e2e":          "npm run build && playwright test",
+		"test:e2e:chromium": "playwright test --project=chromium",
+	})
+	if hasCommandNamed(commands, "test:e2e") || !hasCommandNamed(commands, "test:e2e:chromium") {
+		t.Fatalf("unscoped Playwright lane was not replaced by its explicit Chromium lane: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageDoesNotReintroduceSupersededUnscopedPlaywright(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:e2e":"playwright test","test:e2e:chromium":"playwright test --project=chromium","test:all":"npm run test:e2e && npm run test:e2e:chromium"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !invokesSupersededUnscopedPlaywrightE2E("test:all", inspection.packageScripts["."]) {
+		t.Fatal("aggregate's unscoped Playwright terminal was not detected")
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	if hasCommandNamed(commands, "test:e2e") || hasCommandNamed(commands, "test:all") || !hasCommandNamed(commands, "test:e2e:chromium") {
+		t.Fatalf("comprehensive aggregation reintroduced the superseded multi-browser lane: %+v", commands)
+	}
+}
+
+func TestComprehensiveCoverageRejectsWrapperAroundFilteredBrowserLanes(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "package.json", `{"scripts":{"test:e2e":"playwright test","test:e2e:chromium":"playwright test --project=chromium","test:auth-drift":"playwright test --config auth.config.ts","test:all":"npm run test:e2e && npm run test:auth-drift && npm run test:e2e:chromium"}}`)
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageComprehensive)
+	for _, rejected := range []string{"test:e2e", "test:auth-drift", "test:all"} {
+		if hasCommandNamed(commands, rejected) {
+			t.Fatalf("filtered browser lane %q re-entered through its wrapper: %+v", rejected, commands)
+		}
+	}
+	if !hasCommandNamed(commands, "test:e2e:chromium") {
+		t.Fatalf("safe Chromium lane was lost with its unsafe wrapper: %+v", commands)
+	}
+}
+
+func TestPackageScriptCommandsRetainsExplicitlyForwardedChromiumWrapper(t *testing.T) {
+	commands := packageScriptCommands(".", "npm", map[string]string{
+		"test:e2e":          "playwright test",
+		"test:e2e:chromium": "playwright test --project=chromium",
+		"test:e2e:ci":       "npm run test:e2e -- --project=chromium",
+	})
+	if !hasCommandNamed(commands, "test:e2e:ci") {
+		t.Fatalf("explicit Chromium wrapper was dropped: %+v", commands)
+	}
+}
+
+func TestPackageScriptCommandsRetainsUnscopedPlaywrightWithoutSafeChromiumAlternative(t *testing.T) {
+	for name, scripts := range map[string]map[string]string{
+		"only unscoped": {
+			"test:e2e": "playwright test",
+		},
+		"unsafe alternative": {
+			"test:e2e":          "playwright test",
+			"test:e2e:chromium": "playwright test --project=firefox",
+		},
+		"configured default": {
+			"test:e2e":          "playwright test --config local.config.ts",
+			"test:e2e:chromium": "playwright test --project=chromium",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			commands := packageScriptCommands(".", "npm", scripts)
+			if !hasCommandNamed(commands, "test:e2e") {
+				t.Fatalf("repository's only independently scoped Playwright lane was dropped: %+v", commands)
+			}
+		})
+	}
+}
+
 func hasCommandNamed(commands [][]string, name string) bool {
 	for _, command := range commands {
 		if commandScriptName(command) == name {
