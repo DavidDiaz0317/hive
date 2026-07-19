@@ -1357,6 +1357,126 @@ func testSetupBaselineCaptureCancellationForceCancelsOnlyExactAcknowledgedPlaceh
 	}
 }
 
+func TestSetupBaselineCaptureCancellationRetriesForceCancelForExactStaticPlaceholder(t *testing.T) {
+	head, correlation, now := strings.Repeat("a", 40), strings.Repeat("b", 64), time.Now().UTC()
+	reads, cancels, forceCancels := 0, 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/77":
+			reads++
+			status, conclusion := "queued", ""
+			if forceCancels >= 3 {
+				status, conclusion = "completed", "cancelled"
+			}
+			_, _ = fmt.Fprintf(writer, `{"id":77,"workflow_id":12,"name":%q,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":%q,"conclusion":%q,"repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, visualHiveProductionWorkflowName, visualHiveProductionWorkflowPath, head, status, conclusion)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/cancel":
+			cancels++
+			http.Error(writer, `{"message":"run cannot be cancelled"}`, http.StatusInternalServerError)
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/force-cancel":
+			forceCancels++
+			if forceCancels < 3 {
+				writer.Header().Set("X-GitHub-Request-Id", strconv.Itoa(forceCancels))
+				http.Error(writer, `{"message":"failed to cancel workflow run"}`, http.StatusInternalServerError)
+				return
+			}
+			writer.WriteHeader(http.StatusAccepted)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	source := SetupBaselineIntent{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", CaptureRunID: 77, CaptureHeadSHA: head, CaptureCorrelation: correlation}
+	dispatch, err := newWorkflowDispatchIntentForOperation(Config{Repository: source.Repository, RepositoryID: source.RepositoryID}, "hive-visual-hive.yml", source.DefaultBranch, setupBaselineWorkflowOperation, correlation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now.Add(time.Second)
+	dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = source.CaptureRunID, "https://example.test/runs/77", now.Add(2*time.Second)
+	dispatch.RequestDigest, err = workflowDispatchRequestDigest(dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cancelSetupBaselineCaptureRunExactBoundWithTiming(context.Background(), client, source, &dispatch, time.Millisecond, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cancels != 1 || forceCancels != 3 || reads < 5 {
+		t.Fatalf("bounded force-cancel retry calls: reads=%d cancel=%d force-cancel=%d", reads, cancels, forceCancels)
+	}
+}
+
+func TestSetupBaselineCaptureCancellationBoundsForceCancelRetriesToStaticPlaceholder(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		displayTitle     string
+		staticReads      int
+		cancelStatus     int
+		wantForceCancels int
+		wantMinReads     int
+		wantError        string
+	}{
+		{name: "persistent static placeholder", displayTitle: visualHiveProductionWorkflowName, wantForceCancels: setupBaselineForceCancelAttempts, wantError: "after 6 exact attempts"},
+		{name: "placeholder materializes during backoff", displayTitle: workflowDispatchDisplayTitle(strings.Repeat("b", 64)), staticReads: 2, wantForceCancels: 1, wantError: "no longer the acknowledged queued static placeholder"},
+		{name: "materialized correlation", displayTitle: workflowDispatchDisplayTitle(strings.Repeat("b", 64)), wantForceCancels: 1, wantError: "no longer the acknowledged queued static placeholder"},
+		{name: "ordinary cancel conflict", displayTitle: visualHiveProductionWorkflowName, cancelStatus: http.StatusConflict, wantForceCancels: 1, wantMinReads: 2, wantError: "failed to cancel workflow run"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			head, correlation, now := strings.Repeat("a", 40), strings.Repeat("b", 64), time.Now().UTC()
+			reads, cancels, forceCancels := 0, 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch {
+				case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/actions/runs/77":
+					reads++
+					displayTitle := test.displayTitle
+					if test.staticReads > 0 && reads <= test.staticReads {
+						displayTitle = visualHiveProductionWorkflowName
+					}
+					_, _ = fmt.Fprintf(writer, `{"id":77,"workflow_id":12,"name":%q,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"queued","conclusion":"","repository":{"id":123,"full_name":"owner/repo"}}`, visualHiveProductionWorkflowName, displayTitle, visualHiveProductionWorkflowPath, head)
+				case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/cancel":
+					cancels++
+					cancelStatus := test.cancelStatus
+					if cancelStatus == 0 {
+						cancelStatus = http.StatusInternalServerError
+					}
+					http.Error(writer, `{"message":"run cannot be cancelled"}`, cancelStatus)
+				case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/actions/runs/77/force-cancel":
+					forceCancels++
+					writer.Header().Set("X-GitHub-Request-Id", "request-"+strconv.Itoa(forceCancels))
+					http.Error(writer, `{"message":"failed to cancel workflow run"}`, http.StatusInternalServerError)
+				default:
+					http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			source := SetupBaselineIntent{Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", CaptureRunID: 77, CaptureHeadSHA: head, CaptureCorrelation: correlation}
+			dispatch, err := newWorkflowDispatchIntentForOperation(Config{Repository: source.Repository, RepositoryID: source.RepositoryID}, "hive-visual-hive.yml", source.DefaultBranch, setupBaselineWorkflowOperation, correlation, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatch.DispatchAttemptedAt, dispatch.DispatchAcknowledgedAt = now, now.Add(time.Second)
+			dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = source.CaptureRunID, "https://example.test/runs/77", now.Add(2*time.Second)
+			dispatch.RequestDigest, err = workflowDispatchRequestDigest(dispatch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = cancelSetupBaselineCaptureRunExactBoundWithTiming(context.Background(), client, source, &dispatch, time.Millisecond, time.Second)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("force-cancel error=%v, want substring %q", err, test.wantError)
+			}
+			wantMinReads := test.wantMinReads
+			if wantMinReads == 0 {
+				wantMinReads = 3
+			}
+			if cancels != 1 || forceCancels != test.wantForceCancels || reads < wantMinReads {
+				t.Fatalf("bounded force-cancel safety calls: reads=%d cancel=%d force-cancel=%d", reads, cancels, forceCancels)
+			}
+		})
+	}
+}
+
 func TestSetupBaselineRebindRetiresAcknowledgedStaticPlaceholderByExactRunID(t *testing.T) {
 	stateDir := t.TempDir()
 	store, err := NewStore(filepath.Join(stateDir, "integrated"))

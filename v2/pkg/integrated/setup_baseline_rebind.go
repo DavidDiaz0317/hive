@@ -23,6 +23,7 @@ const (
 	SetupBaselineRebindPrepared         = "prepared"
 	SetupBaselineRebindResourcesRetired = "resources_retired"
 	setupBaselineRebindFile             = "setup-baseline-rebind.json"
+	setupBaselineForceCancelAttempts    = 6
 )
 
 // SetupBaselineRebindIntent is the crash-safe bridge between an active hosted
@@ -422,6 +423,7 @@ func cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx context.Context, clie
 	}
 	response, err = client.GoGitHub().Actions.CancelWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
 	if response != nil && (response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusInternalServerError) {
+		retryRejectedForceCancel := response.StatusCode == http.StatusInternalServerError
 		live, _, liveErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
 		if liveErr != nil {
 			return fmt.Errorf("reinspect exact obsolete setup baseline run %d after cancellation rejection: %w", source.CaptureRunID, liveErr)
@@ -433,6 +435,9 @@ func cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx context.Context, clie
 			return nil
 		}
 		response, err = forceCancelWorkflowRunByID(ctx, client, owner, repo, source.CaptureRunID)
+		if retryRejectedForceCancel && err != nil && response != nil && response.StatusCode == http.StatusInternalServerError {
+			response, err = retryForceCancelExactSetupBaselinePlaceholder(ctx, client, owner, repo, source, dispatch, response, err, pollInterval)
+		}
 	}
 	if err != nil && (response == nil || response.StatusCode != http.StatusAccepted) {
 		return fmt.Errorf("cancel exact obsolete setup baseline run %d: %w", source.CaptureRunID, err)
@@ -457,6 +462,48 @@ func cancelSetupBaselineCaptureRunExactBoundWithTiming(ctx context.Context, clie
 		case <-ticker.C:
 		}
 	}
+}
+
+func retryForceCancelExactSetupBaselinePlaceholder(ctx context.Context, client *hivegithub.Client, owner, repo string, source SetupBaselineIntent, dispatch *WorkflowDispatchIntent, response *gh.Response, forceErr error, retryDelay time.Duration) (*gh.Response, error) {
+	lastResponse, lastErr := response, forceErr
+	delay := retryDelay
+	for attempt := 2; attempt <= setupBaselineForceCancelAttempts; attempt++ {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		live, _, readErr := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, source.CaptureRunID)
+		if readErr != nil {
+			return nil, fmt.Errorf("reinspect exact obsolete setup baseline run %d before force-cancel retry: %w", source.CaptureRunID, readErr)
+		}
+		if !exactSetupBaselineCaptureRunForCancellation(live, source, dispatch) {
+			return nil, fmt.Errorf("obsolete setup baseline workflow run changed identity before force-cancel retry")
+		}
+		if strings.EqualFold(live.GetStatus(), "completed") {
+			return nil, nil
+		}
+		if exactSetupBaselineCaptureRun(live, source) || !strings.EqualFold(live.GetStatus(), "queued") || strings.TrimSpace(live.GetConclusion()) != "" {
+			return lastResponse, fmt.Errorf("refusing to retry force-cancel because exact run %d is no longer the acknowledged queued static placeholder: %w", source.CaptureRunID, lastErr)
+		}
+		lastResponse, lastErr = forceCancelWorkflowRunByID(ctx, client, owner, repo, source.CaptureRunID)
+		if lastResponse == nil || lastResponse.StatusCode != http.StatusInternalServerError {
+			return lastResponse, lastErr
+		}
+		if delay < 2*time.Second {
+			delay *= 2
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+		}
+	}
+	requestID := ""
+	if lastResponse != nil {
+		requestID = strings.TrimSpace(lastResponse.Header.Get("X-GitHub-Request-Id"))
+	}
+	return lastResponse, fmt.Errorf("GitHub force-cancel returned HTTP 500 after %d exact attempts (request_id=%q): %w", setupBaselineForceCancelAttempts, requestID, lastErr)
 }
 
 func forceCancelWorkflowRunByID(ctx context.Context, client *hivegithub.Client, owner, repo string, runID int64) (*gh.Response, error) {
