@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ATTRIBUTES="$REPO_ROOT/.gitattributes"
 
 grep -Fq 'bash bubblewrap curl' "$DOCKERFILE"
+grep -Fq 'curl procps bzip2' "$DOCKERFILE"
+grep -Fq 'test -x /usr/bin/ps' "$DOCKERFILE"
 grep -Eq '^ARG CODEX_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$DOCKERFILE"
 grep -Fq 'npm install -g @openai/codex@${CODEX_VERSION}' "$DOCKERFILE"
 grep -Fq 'test -f /opt/hive/codex/bin/codex' "$DOCKERFILE"

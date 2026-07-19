@@ -32,7 +32,7 @@ FROM node:24-slim
 
 # --- Layer 1: system packages (rarely changes) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates bash bubblewrap curl bzip2 gosu iptables inotify-tools libevent-core-2.1-7 \
+    git ca-certificates bash bubblewrap curl procps bzip2 gosu iptables inotify-tools libevent-core-2.1-7 \
     gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -198,6 +198,7 @@ VOLUME ["/data", "/secrets"]
 
 COPY v2/deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN set -eu; \
+    test -x /usr/bin/ps; \
     runtime_scripts="/usr/local/bin/entrypoint.sh /usr/local/bin/ttyd-tmux.sh /usr/local/bin/hive-panes \
       /usr/local/bin/gh-app-token.sh /usr/local/bin/hive-config.sh /usr/local/bin/agent-launch.sh \
       /usr/local/bin/git-credential-hive.sh /usr/local/bin/gh \
