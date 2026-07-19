@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -13,6 +14,54 @@ import (
 
 func statusPtr(s Status) *Status { return &s }
 func strPtr(s string) *string    { return &s }
+
+func TestSharedStoreUsesGroupPrivatePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX group mode bits")
+	}
+	dir := filepath.Join(t.TempDir(), "shared")
+	store, err := NewSharedStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMode := func(path string, want os.FileMode) {
+		t.Helper()
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		const specialMode = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+		if got := info.Mode(); got.Perm() != want.Perm() || got&specialMode != want&specialMode {
+			t.Fatalf("mode(%s) = %v, want %v", path, got, want)
+		}
+	}
+	assertMode(dir, sharedStoreDirMode)
+
+	bead, err := store.Create("shared work", TypeTask, Priority(2), "quality", "test:shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMode(filepath.Join(dir, beadsFileName), sharedStoreFileMode)
+	if err := store.Archive(bead.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(filepath.Join(dir, archiveFileName), sharedStoreFileMode)
+	assertMode(filepath.Join(dir, beadsFileName), sharedStoreFileMode)
+}
+
+func TestSharedStoreRejectsSymlink(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "role")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := NewSharedStore(link); err == nil {
+		t.Fatal("NewSharedStore accepted a final-component symlink")
+	}
+}
 
 func TestStoreMutationsRemainInMemoryTransactionalOnPersistenceFailure(t *testing.T) {
 	tests := []struct {

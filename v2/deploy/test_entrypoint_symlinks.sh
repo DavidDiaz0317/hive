@@ -64,6 +64,57 @@ assert_contains "$LAUNCH_SCRIPT" \
   'COPILOT_GITHUB_TOKEN' \
   "agent-launch.sh exports COPILOT_GITHUB_TOKEN"
 
+# 9. Role bead stores remain shared only with their scoped group after UID chown.
+assert_contains "$ENTRYPOINT" \
+  'chmod 0750 /data/beads' \
+  "/data/beads parent is traversable but not writable by roles"
+assert_contains "$ENTRYPOINT" \
+  'chmod 2770 {} +' \
+  "role bead directories preserve their scoped group"
+assert_contains "$ENTRYPOINT" \
+  'chmod 0660 {} +' \
+  "role bead files survive cross-principal replacement"
+assert_contains "$ENTRYPOINT" \
+  'usermod -a -G "$ROLE_GROUP" dev' \
+  "ordinary Hive joins each role-scoped bead group"
+assert_contains "$ENTRYPOINT" \
+  'find -P "$beaddir" -xdev -type d' \
+  "retired stores are normalized without following links"
+assert_contains "$ENTRYPOINT" \
+  'Include first-level hidden role stores' \
+  "hidden retired role stores are normalized"
+assert_contains "$ENTRYPOINT" \
+  "agent.get('enabled', True) is not False" \
+  "explicitly disabled role stores remain private to ordinary Hive"
+assert_contains "$ENTRYPOINT" \
+  'Per-agent files replace the base entry' \
+  "per-agent overlays replace base role provisioning"
+assert_contains "$ENTRYPOINT" \
+  "effective_agents.setdefault" \
+  "pack roles cannot re-enable an explicitly configured disabled role"
+
+# 10. Restrictive caller umasks cannot hide the root-written UID map from Hive.
+assert_contains "$ENTRYPOINT" \
+  'chmod 0755 /var/run/hive' \
+  "UID map parent is traversable by the dev process"
+assert_contains "$ENTRYPOINT" \
+  'chown dev:node /var/run/hive' \
+  "UID map parent remains writable by the dev process"
+assert_contains "$ENTRYPOINT" \
+  'chmod 0644 /var/run/hive/uid-map.json' \
+  "UID map is readable by the dev process"
+assert_contains "$ENTRYPOINT" \
+  'chown dev:node /var/run/hive/uid-map.json' \
+  "dynamic UID map updates remain owned by the dev process"
+
+# 11. An explicit writable HIVE_CONFIG remains writable after root setup.
+assert_contains "$ENTRYPOINT" \
+  'chown dev:node /etc/hive/hive.yaml "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_BACKUP"' \
+  "custom config and backup ownership are normalized"
+assert_contains "$ENTRYPOINT" \
+  'chmod u+rw,go-w "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_BACKUP"' \
+  "custom config is writable only by ordinary Hive"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

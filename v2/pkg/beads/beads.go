@@ -110,6 +110,7 @@ const maxBeadCount = 5000
 
 type Store struct {
 	dir       string
+	fileMode  os.FileMode
 	hiveID    string
 	beads     map[string]*Bead
 	writeFile func(string, []byte, os.FileMode) error
@@ -138,16 +139,44 @@ type BatchResult struct {
 	Skipped int `json:"skipped"`
 }
 
+const (
+	privateStoreDirMode  os.FileMode = 0o700
+	privateStoreFileMode os.FileMode = 0o600
+	sharedStoreDirMode   os.FileMode = os.ModeSetgid | 0o770
+	sharedStoreFileMode  os.FileMode = 0o660
+)
+
+// NewStore opens an owner-private bead store.
 func NewStore(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	return newStore(dir, privateStoreDirMode, privateStoreFileMode)
+}
+
+// NewSharedStore opens a group-private role bead store shared by the ordinary
+// Hive process and its UID-isolated agent. The entrypoint provisions one
+// role-scoped group for those two identities; no other role or world identity
+// receives access.
+func NewSharedStore(dir string) (*Store, error) {
+	if info, err := os.Lstat(dir); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing shared beads dir symlink %s", dir)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspecting shared beads dir %s: %w", dir, err)
+	}
+	return newStore(dir, sharedStoreDirMode, sharedStoreFileMode)
+}
+
+func newStore(dir string, dirMode, fileMode os.FileMode) (*Store, error) {
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("creating beads dir %s: %w", dir, err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := ensureStoreMode(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("protecting beads dir %s: %w", dir, err)
 	}
 
 	s := &Store{
 		dir:       dir,
+		fileMode:  fileMode,
 		beads:     make(map[string]*Bead),
 		writeFile: os.WriteFile,
 		rename:    os.Rename,
@@ -158,6 +187,18 @@ func NewStore(dir string) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+func ensureStoreMode(path string, mode os.FileMode) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	const specialMode = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	if info.Mode().Perm() == mode.Perm() && info.Mode()&specialMode == mode&specialMode {
+		return nil
+	}
+	return os.Chmod(path, mode)
 }
 
 // SetHiveID configures the Hive ID that will be stamped into new bead metadata.
@@ -572,8 +613,11 @@ func (s *Store) persistMap(source map[string]*Bead) error {
 
 	path := filepath.Join(s.dir, beadsFileName)
 	tmpPath := path + ".tmp"
-	if err := s.writeFile(tmpPath, data, 0o600); err != nil {
+	if err := s.writeFile(tmpPath, data, s.fileMode); err != nil {
 		return fmt.Errorf("writing tmp beads: %w", err)
+	}
+	if err := ensureStoreMode(tmpPath, s.fileMode); err != nil {
+		return fmt.Errorf("protecting tmp beads: %w", err)
 	}
 	return s.rename(tmpPath, path)
 }
@@ -673,11 +717,20 @@ func (s *Store) Archive(id string) error {
 	}
 
 	archivePath := filepath.Join(s.dir, archiveFileName)
-	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(archivePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, s.fileMode)
 	if err != nil {
 		return fmt.Errorf("opening archive file: %w", err)
 	}
 	defer f.Close()
+	archiveInfo, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("statting archive file: %w", err)
+	}
+	if archiveInfo.Mode().Perm() != s.fileMode.Perm() {
+		if err := f.Chmod(s.fileMode); err != nil {
+			return fmt.Errorf("protecting archive file: %w", err)
+		}
+	}
 
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return fmt.Errorf("writing archive entry: %w", err)

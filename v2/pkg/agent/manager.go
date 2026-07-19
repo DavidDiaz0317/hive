@@ -3872,6 +3872,7 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 	// dashboard and advisory digest.
 	if agent.Config.BeadsDir != "" {
 		vars = append(vars, agentEnvPair{"BD_DIR", agent.Config.BeadsDir, false})
+		vars = append(vars, agentEnvPair{"HIVE_SHARED_ROLE_BEADS", "1", false})
 	}
 	if agent.Config.CavemanMode != "" {
 		vars = append(vars, agentEnvPair{"HIVE_CAVEMAN_MODE", agent.Config.CavemanMode, false})

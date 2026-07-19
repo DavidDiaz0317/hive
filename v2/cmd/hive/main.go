@@ -544,7 +544,7 @@ func main() {
 
 	beadStores := make(map[string]*beads.Store)
 	for name, agentCfg := range cfg.EnabledAgents() {
-		store, err := beads.NewStore(agentCfg.BeadsDir)
+		store, err := openConfiguredRoleBeadStore(name, agentCfg.BeadsDir)
 		if err != nil {
 			logger.Warn("failed to init beads store", "agent", name, "error", err)
 			continue
@@ -1958,6 +1958,18 @@ func main() {
 			dashSrv.BroadcastAgentStatus(payload)
 		}
 	}
+}
+
+func openConfiguredRoleBeadStore(role, dir string) (*beads.Store, error) {
+	if isManagedRoleBeadStore(role, dir) {
+		return beads.NewSharedStore(dir)
+	}
+	return beads.NewStore(dir)
+}
+
+func isManagedRoleBeadStore(role, dir string) bool {
+	role = strings.TrimSpace(role)
+	return role != "" && role != "." && role != ".." && !strings.ContainsAny(role, `/\\`) && sameSpecialistRuntimePath(dir, filepath.Join("/data/beads", role))
 }
 
 func runEarlyCLI(args []string) (bool, int) {

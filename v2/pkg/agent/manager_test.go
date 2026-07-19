@@ -366,6 +366,7 @@ func TestAgentEnvPairs_BDDirFromBeadsDir(t *testing.T) {
 	pairs := testEnvPairs(ap)
 
 	found := false
+	shared := false
 	for _, p := range pairs {
 		if p.Key == "BD_DIR" {
 			found = true
@@ -373,13 +374,19 @@ func TestAgentEnvPairs_BDDirFromBeadsDir(t *testing.T) {
 				t.Errorf("BD_DIR = %q, want %q", p.Value, "/data/beads/scanner")
 			}
 		}
+		if p.Key == "HIVE_SHARED_ROLE_BEADS" {
+			shared = p.Value == "1"
+		}
 	}
 	if !found {
 		t.Error("BD_DIR should be present when BeadsDir is configured")
 	}
+	if !shared {
+		t.Error("HIVE_SHARED_ROLE_BEADS=1 should accompany a configured role store")
+	}
 
-	// Count should be baseEnvVarCount + 1 for BD_DIR
-	const expectedWithBDDir = baseEnvVarCount + 1
+	// Count should be baseEnvVarCount + 2 for BD_DIR and its scoped sharing opt-in.
+	const expectedWithBDDir = baseEnvVarCount + 2
 	if len(pairs) != expectedWithBDDir {
 		t.Errorf("testEnvPairs() returned %d vars, want %d (base + BD_DIR)", len(pairs), expectedWithBDDir)
 	}
