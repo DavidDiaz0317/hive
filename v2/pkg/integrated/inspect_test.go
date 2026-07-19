@@ -801,7 +801,7 @@ func TestManagedRepositoryConfigExcludesLocalPaths(t *testing.T) {
 		t.Fatalf("integrated setup did not enable Hive additively while removing standalone writers: %+v", hiveIntegration)
 	}
 	prWorkflow, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "visual-hive-pr.yml"))
-	if err != nil || !strings.Contains(string(prWorkflow), config.VisualHiveRef) {
+	if err != nil || !strings.Contains(string(prWorkflow), visualHivePullRequestProducerCommit) || strings.Contains(string(prWorkflow), config.VisualHiveRef) {
 		t.Fatalf("managed pull request workflow is missing or not pinned: %v", err)
 	}
 }

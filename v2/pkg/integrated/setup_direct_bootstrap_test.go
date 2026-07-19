@@ -672,8 +672,13 @@ func (api *directBootstrapGitHub) serveHTTP(writer http.ResponseWriter, request 
 		api.postPulls++
 		api.mu.Unlock()
 		http.Error(writer, `{"message":"direct bootstrap must not create a PR"}`, http.StatusConflict)
-	case request.Method == http.MethodGet && request.URL.Path == "/repos/DavidDiaz0317/visual-hive/commits/"+api.visualRef:
-		_, _ = io.WriteString(writer, `{"sha":"`+api.visualRef+`"}`)
+	case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/DavidDiaz0317/visual-hive/commits/"):
+		ref := strings.TrimPrefix(request.URL.Path, "/repos/DavidDiaz0317/visual-hive/commits/")
+		if ref != api.visualRef && ref != visualHivePullRequestProducerCommit {
+			http.Error(writer, `{"message":"missing commit"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(writer, `{"sha":"`+ref+`"}`)
 	case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/owner/repo/contents/"):
 		relative := strings.TrimPrefix(request.URL.Path, "/repos/owner/repo/contents/")
 		ref := request.URL.Query().Get("ref")

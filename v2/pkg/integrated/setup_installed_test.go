@@ -118,6 +118,14 @@ func installedSetupTestServerWithWorkflowAndRef(t *testing.T, config Config, pro
 			http.Error(writer, "managed read was not bound to exact commit", http.StatusBadRequest)
 			return
 		}
+		visualCommitPrefix := "/repos/" + config.VisualHiveRepo + "/commits/"
+		if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, visualCommitPrefix) {
+			ref := strings.TrimPrefix(request.URL.Path, visualCommitPrefix)
+			if ref == config.VisualHiveRef || ref == visualHivePullRequestProducerCommit {
+				_, _ = io.WriteString(writer, `{"sha":"`+ref+`"}`)
+				return
+			}
+		}
 		switch request.URL.Path {
 		case "/repos/owner/repo":
 			_, _ = io.WriteString(writer, `{"id":123,"full_name":"owner/repo"}`)

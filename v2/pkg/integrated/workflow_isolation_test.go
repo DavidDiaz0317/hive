@@ -214,6 +214,30 @@ func isolationWorkflowConfig() Config {
 	}
 }
 
+func TestPullRequestWorkflowUsesCanonicalAuditedProducer(t *testing.T) {
+	config := isolationWorkflowConfig()
+	configuredProductionRef := strings.Repeat("f", 40)
+	config.VisualHiveRef = configuredProductionRef
+
+	production := workflow(config)
+	pullRequest := pullRequestWorkflow(config)
+	if !strings.Contains(production, configuredProductionRef) {
+		t.Fatal("production workflow does not retain its independently configured Visual Hive ref")
+	}
+	if strings.Contains(pullRequest, configuredProductionRef) {
+		t.Fatal("pull request workflow contains the independent production Visual Hive ref")
+	}
+	for _, required := range []string{
+		"ref: " + visualHivePullRequestProducerCommit,
+		"HIVE_VISUAL_HIVE_REF: " + visualHivePullRequestProducerCommit,
+		"HIVE_PRODUCER_COMMIT: " + visualHivePullRequestProducerCommit,
+	} {
+		if !strings.Contains(pullRequest, required) {
+			t.Fatalf("pull request workflow does not use its canonical audited producer %q", required)
+		}
+	}
+}
+
 func TestGeneratedWorkflowsUseCanonicalYAMLWhitespace(t *testing.T) {
 	config := isolationWorkflowConfig()
 	workflows := map[string]string{

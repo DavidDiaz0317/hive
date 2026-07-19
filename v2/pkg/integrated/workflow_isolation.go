@@ -122,6 +122,8 @@ jobs:
 // fresh verifier job. The target job has read-only GitHub permissions and runs
 // every dependency/script/browser process as a separate unprivileged account.
 func isolatedPullRequestWorkflow(config Config) string {
+	prProducerConfig := config
+	prProducerConfig.VisualHiveRef = visualHivePullRequestProducerCommit
 	setupAuthorizationJob := setupAuthorizationWorkflowJob(config)
 	uninstallCheckJob := uninstallCheckPublisherWorkflowJob()
 	repositoryJobs, repositoryNeeds := isolatedRepositoryTestWorkflowJobs(config, "setup-authorization", "github.event_name == 'pull_request' && needs.setup-authorization.outputs.operation != 'uninstall'")
@@ -131,8 +133,8 @@ func isolatedPullRequestWorkflow(config Config) string {
 		setupAuthorizationJob,
 		uninstallCheckJob,
 		repositoryJobs,
-		isolatedVisualExecutionWorkflowJob(config, true),
-		pullRequestAggregatorWorkflowJob(config, aggregatorNeeds),
+		isolatedVisualExecutionWorkflowJob(prProducerConfig, true),
+		pullRequestAggregatorWorkflowJob(prProducerConfig, aggregatorNeeds),
 	)
 	return fmt.Sprintf(`name: Visual Hive PR
 

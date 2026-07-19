@@ -2061,8 +2061,8 @@ func liveRepositoryChecks(ctx context.Context, client *hivegithub.Client, config
 	checks = append(checks, doctorCheck{Name: "setup_installed", OK: setupReady, Message: setupMessage})
 	content, _, _, workflowErr := client.GoGitHub().Repositories.GetContents(ctx, owner, repo, ".github/workflows/hive-visual-hive.yml", &gh.RepositoryContentGetOptions{Ref: config.DefaultBranch})
 	checks = append(checks, doctorCheck{Name: "workflow_installed", OK: workflowErr == nil && content != nil, Message: errorOr(workflowErr, "production workflow is installed on the target branch")})
-	visualRefErr := integrated.VerifyVisualHiveCommit(ctx, client, config.VisualHiveRepo, config.VisualHiveRef)
-	checks = append(checks, doctorCheck{Name: "visual_hive_ref_exists", OK: visualRefErr == nil, Message: errorOr(visualRefErr, "Visual Hive pin resolves to the exact remote commit")})
+	visualRefErr := integrated.VerifyVisualHiveWorkflowCommits(ctx, client, config.VisualHiveRepo, config.VisualHiveRef)
+	checks = append(checks, doctorCheck{Name: "visual_hive_ref_exists", OK: visualRefErr == nil, Message: errorOr(visualRefErr, "Visual Hive production and audited PR pins resolve to exact remote commits")})
 	if config.Automation == integrated.AutomationAutoMerge {
 		if !setupReady {
 			checks = append(checks, autoMergeProtectionDoctorCheck(false, config, hivegithub.BranchProtectionSummary{}, 0, integrated.ProtectionActivationState{}, false, nil))

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,69 @@ import (
 	"github.com/kubestellar/hive/v2/pkg/automation"
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
 )
+
+func TestVerifyVisualHiveWorkflowCommitsRequiresAuditedPullRequestProducer(t *testing.T) {
+	productionRef := strings.Repeat("f", 40)
+	for _, test := range []struct {
+		name          string
+		productionRef string
+		available     map[string]bool
+		wantRequests  []string
+		wantError     string
+	}{
+		{
+			name:          "distinct production and audited refs",
+			productionRef: productionRef,
+			available:     map[string]bool{productionRef: true, visualHivePullRequestProducerCommit: true},
+			wantRequests:  []string{productionRef, visualHivePullRequestProducerCommit},
+		},
+		{
+			name:          "audited ref missing",
+			productionRef: productionRef,
+			available:     map[string]bool{productionRef: true},
+			wantRequests:  []string{productionRef, visualHivePullRequestProducerCommit},
+			wantError:     "verify audited Visual Hive pull request producer",
+		},
+		{
+			name:          "shared production and audited ref",
+			productionRef: visualHivePullRequestProducerCommit,
+			available:     map[string]bool{visualHivePullRequestProducerCommit: true},
+			wantRequests:  []string{visualHivePullRequestProducerCommit},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requested []string
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				const prefix = "/repos/owner/visual-hive/commits/"
+				if request.Method != http.MethodGet || !strings.HasPrefix(request.URL.Path, prefix) {
+					http.NotFound(writer, request)
+					return
+				}
+				ref := strings.TrimPrefix(request.URL.Path, prefix)
+				requested = append(requested, ref)
+				if !test.available[ref] {
+					http.Error(writer, `{"message":"missing commit"}`, http.StatusNotFound)
+					return
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(writer, `{"sha":%q}`, ref)
+			}))
+			defer server.Close()
+
+			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"visual-hive"}, slog.Default())
+			err := VerifyVisualHiveWorkflowCommits(context.Background(), client, "owner/visual-hive", test.productionRef)
+			if test.wantError == "" && err != nil {
+				t.Fatalf("verify workflow commits: %v", err)
+			}
+			if test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("error = %v, want %q", err, test.wantError)
+			}
+			if !reflect.DeepEqual(requested, test.wantRequests) {
+				t.Fatalf("requested commits = %v, want %v", requested, test.wantRequests)
+			}
+		})
+	}
+}
 
 func TestInstalledVisualHiveBundleSetupApplyAndMergedRerunIsIdempotent(t *testing.T) {
 	node, err := exec.LookPath("node")
@@ -244,8 +308,13 @@ func (api *setupAcceptanceGitHub) serveHTTP(writer http.ResponseWriter, request 
 		_, _ = io.WriteString(writer, `{"JavaScript":100}`)
 	case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/branches/main/protection":
 		http.Error(writer, `{"message":"not protected"}`, http.StatusNotFound)
-	case request.Method == http.MethodGet && request.URL.Path == "/repos/DavidDiaz0317/visual-hive/commits/"+api.visualRef:
-		_, _ = io.WriteString(writer, `{"sha":"`+api.visualRef+`"}`)
+	case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/DavidDiaz0317/visual-hive/commits/"):
+		ref := strings.TrimPrefix(request.URL.Path, "/repos/DavidDiaz0317/visual-hive/commits/")
+		if ref != api.visualRef && ref != visualHivePullRequestProducerCommit {
+			http.Error(writer, `{"message":"missing commit"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(writer, `{"sha":"`+ref+`"}`)
 	case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/repos/owner/repo/git/ref/heads/"):
 		branch := strings.TrimPrefix(request.URL.Path, "/repos/owner/repo/git/ref/heads/")
 		sha, err := setupAcceptanceGitOutput(api.remote, "rev-parse", "refs/heads/"+branch)

@@ -173,6 +173,9 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 			return result, fmt.Errorf("%s requires an immutable 40-character Visual Hive commit SHA", options.Operation)
 		}
 		result.RequestedRef, options.VisualHiveRef = requested, requested
+		if err := VerifyVisualHiveWorkflowCommits(ctx, options.GitHub, config.VisualHiveRepo, requested); err != nil {
+			return result, err
+		}
 		if requested == config.VisualHiveRef {
 			// Local state is not proof that a prior upgrade PR reached the
 			// default branch. Only report a no-op when every managed production
@@ -188,9 +191,6 @@ func RunManagement(ctx context.Context, options ManagementOptions) (ManagementRe
 				result.Idempotent = true
 				return result, nil
 			}
-		}
-		if err := VerifyVisualHiveCommit(ctx, options.GitHub, config.VisualHiveRepo, requested); err != nil {
-			return result, err
 		}
 		if err := verifyManagedOperationAuthorizer(ctx, options.GitHub, config, options.Operation); err != nil {
 			return result, err

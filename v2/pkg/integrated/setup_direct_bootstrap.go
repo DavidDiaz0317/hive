@@ -291,7 +291,7 @@ func resumeDirectBootstrap(ctx context.Context, options SetupOptions, store *Sto
 	if err != nil || actor.ID != config.SetupAuthorizationActorID {
 		return result, fmt.Errorf("direct-bootstrap retry requires the exact setup authorizer ID %d: %w", config.SetupAuthorizationActorID, err)
 	}
-	if err := VerifyVisualHiveCommit(ctx, options.GitHub, config.VisualHiveRepo, config.VisualHiveRef); err != nil {
+	if err := VerifyVisualHiveWorkflowCommits(ctx, options.GitHub, config.VisualHiveRepo, config.VisualHiveRef); err != nil {
 		return result, err
 	}
 	if hasPrior {

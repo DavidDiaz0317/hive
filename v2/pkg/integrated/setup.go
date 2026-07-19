@@ -247,7 +247,7 @@ func RunSetup(ctx context.Context, options SetupOptions) (SetupResult, error) {
 		return result, err
 	}
 	if options.VisualHive {
-		if err := VerifyVisualHiveCommit(ctx, options.GitHub, options.VisualHiveRepo, options.VisualHiveRef); err != nil {
+		if err := VerifyVisualHiveWorkflowCommits(ctx, options.GitHub, options.VisualHiveRepo, options.VisualHiveRef); err != nil {
 			return result, err
 		}
 	}
@@ -678,6 +678,21 @@ func VerifyVisualHiveCommit(ctx context.Context, client *hivegithub.Client, repo
 	}
 	if !exactCommitPin(ref, commit.GetSHA()) {
 		return fmt.Errorf("Visual Hive ref resolved to %s instead of exact commit %s", commit.GetSHA(), ref)
+	}
+	return nil
+}
+
+// VerifyVisualHiveWorkflowCommits verifies both the configured production
+// release and the independently audited producer used by the pull request lane.
+func VerifyVisualHiveWorkflowCommits(ctx context.Context, client *hivegithub.Client, repository, productionRef string) error {
+	if err := VerifyVisualHiveCommit(ctx, client, repository, productionRef); err != nil {
+		return err
+	}
+	if strings.EqualFold(productionRef, visualHivePullRequestProducerCommit) {
+		return nil
+	}
+	if err := VerifyVisualHiveCommit(ctx, client, repository, visualHivePullRequestProducerCommit); err != nil {
+		return fmt.Errorf("verify audited Visual Hive pull request producer: %w", err)
 	}
 	return nil
 }
