@@ -109,19 +109,28 @@ func runCodexProviderInvocationHelper(args []string) {
 		}
 		os.Exit(0)
 	}
-	if output := os.Getenv("HIVE_TEST_CODEX_MODEL_OUTPUT"); output != "" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
-		fmt.Print(output)
-		os.Exit(0)
-	}
-	if os.Getenv("HIVE_TEST_CODEX_ECHO_PROMPT_STDERR") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
-		prompt, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			os.Exit(6)
+	if argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		output := os.Getenv("HIVE_TEST_CODEX_MODEL_OUTPUT")
+		echoPrompt := os.Getenv("HIVE_TEST_CODEX_ECHO_PROMPT_STDERR") == "1"
+		if output != "" || echoPrompt {
+			if echoPrompt {
+				prompt, err := io.ReadAll(os.Stdin)
+				if err != nil {
+					os.Exit(6)
+				}
+				fmt.Fprint(os.Stderr, codexHumanBannerPrefix)
+				fmt.Fprint(os.Stderr, "workdir: /tmp/hive-provider-test\nmodel: reviewed-test-model\n")
+				fmt.Fprint(os.Stderr, codexHumanPromptMarker)
+				_, _ = os.Stderr.Write(prompt)
+				fmt.Fprint(os.Stderr, "\n")
+			}
+			if output == "" {
+				output = "DENIED"
+				fmt.Fprint(os.Stderr, output)
+			}
+			fmt.Print(output)
+			os.Exit(0)
 		}
-		_, _ = os.Stderr.Write(prompt)
-		fmt.Fprint(os.Stderr, "DENIED")
-		fmt.Print("DENIED")
-		os.Exit(0)
 	}
 	if os.Getenv("HIVE_TEST_CODEX_STDERR_OVERFLOW") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
 		prompt, err := io.ReadAll(os.Stdin)

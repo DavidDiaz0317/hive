@@ -122,10 +122,66 @@ func TestCodexProviderAllowsPromptMirroredOnStderrWithinBoundedTransport(t *test
 	if err := provider.Health(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	prompt := strings.Repeat("bounded governed prompt\n", 4096)
+	prompt := "recurrence_key = \"rk-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n" +
+		strings.Repeat("bounded governed prompt\n", 4096)
+	if rule, confidence := classifyRepairSourceSecret([]byte(prompt)); confidence == repairSourceSecretNone || rule != "credential-assignment-entropy-v2" {
+		t.Fatalf("regression prompt no longer exercises the controller-metadata false positive: rule=%q confidence=%d", rule, confidence)
+	}
 	result, err := provider.Run(context.Background(), "", prompt)
 	if err != nil || result.Output != "DENIED" {
 		t.Fatalf("prompt-sized stderr transport failed: result=%+v err=%v", result, err)
+	}
+}
+
+func TestCodexPromptEchoExemptionRetainsFailClosedOutputScanning(t *testing.T) {
+	prompt := "recurrence_key = \"rk-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n"
+	if _, confidence := classifyRepairSourceSecret([]byte(prompt)); confidence == repairSourceSecretNone {
+		t.Fatal("regression prompt must exercise output-secret classification")
+	}
+	nearPrompt := strings.Replace(prompt, "0123456789abcdef", "1123456789abcdef", 1)
+	unsafeResidual := "const access = \"AK" + "IA" + "ABCDEFGHIJKLMNOP\""
+	humanFrame := func(value string) string {
+		return codexHumanBannerPrefix + "workdir: /tmp/hive-provider-test\nmodel: reviewed-test-model\n" + codexHumanPromptMarker + value + "\n"
+	}
+	cases := []struct {
+		name       string
+		stderr     string
+		structured bool
+		wantUnsafe bool
+	}{
+		{name: "one exact initial human echo", stderr: humanFrame(prompt) + "DENIED", wantUnsafe: false},
+		{name: "bare exact prompt remains", stderr: "progress\n" + prompt + "DENIED", wantUnsafe: true},
+		{name: "model framed exact prompt remains", stderr: "codex\n" + prompt + "DENIED", wantUnsafe: true},
+		{name: "second exact echo remains", stderr: humanFrame(prompt) + prompt + "DENIED", wantUnsafe: true},
+		{name: "near match remains", stderr: humanFrame(nearPrompt) + "DENIED", wantUnsafe: true},
+		{name: "missing renderer newline remains", stderr: strings.TrimSuffix(humanFrame(prompt), "\n"), wantUnsafe: true},
+		{name: "unsafe residual stderr remains", stderr: humanFrame(prompt) + unsafeResidual, wantUnsafe: true},
+		{name: "structured output has no exemption", stderr: prompt, structured: true, wantUnsafe: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			output := codexOutputForSecretClassification([]byte("DENIED"), []byte(test.stderr), prompt, test.structured)
+			_, confidence := classifyRepairSourceSecret(output)
+			if gotUnsafe := confidence != repairSourceSecretNone; gotUnsafe != test.wantUnsafe {
+				t.Fatalf("unexpected classification: unsafe=%t confidence=%d", gotUnsafe, confidence)
+			}
+		})
+	}
+}
+
+func TestCodexProviderRejectsUnsafeStdoutAfterPromptMirror(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
+	t.Setenv("HIVE_TEST_CODEX_ECHO_PROMPT_STDERR", "1")
+	secret := "AK" + "IA" + "ABCDEFGHIJKLMNOP"
+	t.Setenv("HIVE_TEST_CODEX_MODEL_OUTPUT", "const access = \""+secret+"\"")
+	provider := CodexProvider{Command: os.Args[0]}
+	if err := provider.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	prompt := "recurrence_key = \"rk-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n"
+	result, err := provider.Run(context.Background(), "", prompt)
+	if err == nil || !providerRunWasLaunched(err) || result.Output != "" || !strings.Contains(err.Error(), "aws-access-key-id-v1") || strings.Contains(err.Error(), secret) {
+		t.Fatalf("unsafe stdout escaped prompt-echo scanning without redaction: result=%+v err=%v", result, err)
 	}
 }
 

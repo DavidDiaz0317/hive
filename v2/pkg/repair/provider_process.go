@@ -19,6 +19,9 @@ import (
 const (
 	codexStdoutHardLimit           = 256 << 10
 	codexStderrDiagnosticHardLimit = 64 << 10
+	codexHumanPromptHeaderLimit    = 16 << 10
+	codexHumanBannerPrefix         = "OpenAI Codex v0.144.1\n--------\n"
+	codexHumanPromptMarker         = "--------\nuser\n"
 )
 
 // Human-readable `codex exec` writes the input prompt and its final response
@@ -66,28 +69,29 @@ func (b *codexHardLimitBuffer) snapshot() ([]byte, bool) {
 }
 
 type codexRunningProcess struct {
-	pid            int
-	providerSHA256 string
-	wait           func() error
-	cancel         context.CancelFunc
-	commandContext context.Context
-	stdout         *codexHardLimitBuffer
-	stderr         *codexHardLimitBuffer
-	stdoutRead     *os.File
-	stderrRead     *os.File
-	stdoutDrain    <-chan error
-	stderrDrain    <-chan error
-	privateRuntime *codexPrivateRuntime
-	sealed         *codexProviderIdentityAttestation
-	invocationRoot string
-	cwd            string
-	sandboxAlias   string
-	ownedRoot      bool
-	structured     bool
-	waitOnce       sync.Once
-	result         ProviderResult
-	err            error
-	reapErr        error
+	pid                int
+	providerSHA256     string
+	wait               func() error
+	cancel             context.CancelFunc
+	commandContext     context.Context
+	stdout             *codexHardLimitBuffer
+	stderr             *codexHardLimitBuffer
+	stdoutRead         *os.File
+	stderrRead         *os.File
+	stdoutDrain        <-chan error
+	stderrDrain        <-chan error
+	privateRuntime     *codexPrivateRuntime
+	sealed             *codexProviderIdentityAttestation
+	invocationRoot     string
+	cwd                string
+	sandboxAlias       string
+	ownedRoot          bool
+	structured         bool
+	expectedPromptEcho string
+	waitOnce           sync.Once
+	result             ProviderResult
+	err                error
+	reapErr            error
 }
 
 func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, attestation *codexProviderIdentityAttestation, prompt string, structured bool, root string) (*codexRunningProcess, error) {
@@ -255,6 +259,10 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 		return nil, err
 	}
 	cleanupSealed = false
+	expectedPromptEcho := ""
+	if !structured {
+		expectedPromptEcho = prompt
+	}
 	return &codexRunningProcess{
 		pid: command.Process.Pid, providerSHA256: attestation.IdentitySHA256,
 		wait: wait, cancel: cancel, stdout: stdout, stderr: stderr,
@@ -262,6 +270,7 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 		commandContext: commandCtx,
 		privateRuntime: privateRuntime, sealed: sealed, invocationRoot: root,
 		cwd: cwd, sandboxAlias: sandboxAlias, ownedRoot: ownedRoot, structured: structured,
+		expectedPromptEcho: expectedPromptEcho,
 	}, nil
 }
 
@@ -290,13 +299,14 @@ func (process *codexRunningProcess) WaitProvider() (ProviderResult, error) {
 		process.reapErr = errors.Join(process.reapErr, drainErr)
 		stdout, stdoutOverflow := process.stdout.snapshot()
 		stderr, stderrOverflow := process.stderr.snapshot()
+		expectedPromptEcho := process.expectedPromptEcho
+		process.expectedPromptEcho = ""
 		cleanupErr := errors.Join(drainErr, process.cleanup())
 		if stdoutOverflow || stderrOverflow {
 			process.err = &ProviderRunError{Launched: true, Cause: errors.Join(errors.New("Codex output exceeded its hard cap and the child was canceled"), cleanupErr)}
 			return
 		}
-		combined := append(append([]byte(nil), stdout...), '\n')
-		combined = append(combined, stderr...)
+		combined := codexOutputForSecretClassification(stdout, stderr, expectedPromptEcho, process.structured)
 		if rule, confidence := classifyRepairSourceSecret(combined); confidence != repairSourceSecretNone {
 			process.err = &ProviderRunError{Launched: true, Cause: errors.Join(fmt.Errorf("Codex repair run emitted unsafe output matching %s rule %s", repairSourceSecretRulesetVersion, rule), cleanupErr)}
 			return
@@ -318,6 +328,51 @@ func (process *codexRunningProcess) WaitProvider() (ProviderResult, error) {
 		}
 	})
 	return process.result, process.err
+}
+
+// codexOutputForSecretClassification excludes the byte-identical input prompt
+// only from the reviewed initial human-output frame emitted by pinned Codex
+// 0.144.1. That frame is transport input, not provider output. Authoritative
+// stdout and every other stderr byte remain fail-closed inputs to the
+// output-secret classifier. Structured mode has no reviewed prompt echo and
+// therefore receives no exemption.
+func codexOutputForSecretClassification(stdout, stderr []byte, expectedPromptEcho string, structured bool) []byte {
+	if !structured && expectedPromptEcho != "" {
+		prompt := []byte(expectedPromptEcho)
+		if offset, ok := codexHumanPromptEchoOffset(stderr, prompt); ok {
+			withoutEcho := make([]byte, 0, len(stderr)-len(prompt))
+			withoutEcho = append(withoutEcho, stderr[:offset]...)
+			withoutEcho = append(withoutEcho, stderr[offset+len(prompt):]...)
+			stderr = withoutEcho
+		}
+	}
+	combined := make([]byte, 0, len(stdout)+1+len(stderr))
+	combined = append(combined, stdout...)
+	combined = append(combined, '\n')
+	return append(combined, stderr...)
+}
+
+func codexHumanPromptEchoOffset(stderr, prompt []byte) (int, bool) {
+	if len(prompt) == 0 || !bytes.HasPrefix(stderr, []byte(codexHumanBannerPrefix)) {
+		return 0, false
+	}
+	headerEnd := len(stderr)
+	if headerEnd > codexHumanPromptHeaderLimit {
+		headerEnd = codexHumanPromptHeaderLimit
+	}
+	markerOffset := bytes.Index(stderr[len(codexHumanBannerPrefix):headerEnd], []byte(codexHumanPromptMarker))
+	if markerOffset < 0 {
+		return 0, false
+	}
+	promptOffset := len(codexHumanBannerPrefix) + markerOffset + len(codexHumanPromptMarker)
+	if promptOffset >= len(stderr) || len(prompt) > len(stderr)-promptOffset-1 {
+		return 0, false
+	}
+	promptEnd := promptOffset + len(prompt)
+	if !bytes.Equal(stderr[promptOffset:promptEnd], prompt) || stderr[promptEnd] != '\n' {
+		return 0, false
+	}
+	return promptOffset, true
 }
 
 func (process *codexRunningProcess) ReapError() error {
