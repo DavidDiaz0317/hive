@@ -432,6 +432,9 @@ func TestPathsOverlapIsPortable(t *testing.T) {
 
 func TestPortableInventoryCarriesOnlyContentBoundRepairBundles(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	directory := filepath.Join(root, "repair", "portable-git")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatal(err)
