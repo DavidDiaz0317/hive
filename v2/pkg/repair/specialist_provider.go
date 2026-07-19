@@ -286,11 +286,20 @@ func (p *SpecialistProvider) validateBuiltGovernedRequest(request agent.Speciali
 	if request.Kind != agent.SpecialistWorkOrderKindGovernedVisualHiveProposal || request.Repository != p.config.Repository ||
 		request.RepositoryFingerprint != p.config.RepositoryFingerprint || request.RecurrenceKey != p.config.RecurrenceKey || request.Attempt != p.config.Attempt ||
 		request.BaseSHA != baseSHA || request.BaseTreeSHA != baseTreeSHA || request.Specialist != p.config.Specialist || request.RouteReason != p.config.RouteReason ||
-		request.Deadline != p.config.Deadline || !reflect.DeepEqual(request.Evidence, p.config.Evidence) || !equalSpecialistStrings(request.AllowedPaths, p.config.AllowedPaths) ||
+		request.Deadline != p.config.Deadline || !reflect.DeepEqual(request.Evidence, p.config.Evidence) || !equalSpecialistAllowedPaths(request.AllowedPaths, p.config.AllowedPaths) ||
 		!equalSpecialistStrings(request.Validation, p.config.Validation) || request.ExecutorProfile == nil {
 		return errors.New("normal Scheduler request differs from the intake and Worker bindings")
 	}
 	return nil
+}
+
+func equalSpecialistAllowedPaths(left, right []string) bool {
+	left, err := agent.NormalizeSpecialistAllowedPaths(left)
+	if err != nil {
+		return false
+	}
+	right, err = agent.NormalizeSpecialistAllowedPaths(right)
+	return err == nil && equalSpecialistStrings(left, right)
 }
 
 func equalSpecialistStrings(left, right []string) bool {

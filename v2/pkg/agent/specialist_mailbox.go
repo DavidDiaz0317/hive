@@ -1390,6 +1390,13 @@ func validSpecialistRole(role SpecialistRole) bool {
 	}
 }
 
+// NormalizeSpecialistAllowedPaths returns the exact canonical path set bound
+// into immutable specialist work orders. Cross-package replay validation uses
+// this same normalization instead of reimplementing mailbox identity rules.
+func NormalizeSpecialistAllowedPaths(values []string) ([]string, error) {
+	return normalizeAllowedPaths(values)
+}
+
 func normalizeAllowedPaths(values []string) ([]string, error) {
 	if len(values) == 0 || len(values) > 512 {
 		return nil, errors.New("at least one bounded allowed path is required")

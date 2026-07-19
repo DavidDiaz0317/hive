@@ -464,6 +464,10 @@ func TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompo
 	builderCalls, reservationCalls, launchGuardCalls := 0, 0, 0
 	var reserved agent.SpecialistWorkOrder
 	config := fixture.provider.config
+	// Keep the controller binding deliberately non-canonical. The mailbox sorts
+	// the same path set before hashing and persistence; replay must compare that
+	// canonical identity without creating or reserving a second work order.
+	config.AllowedPaths = []string{"tests/**", "src/**"}
 	config.GovernedBuilder = func(_ context.Context, worktree, baseSHA, baseTreeSHA, prompt string, readiness agent.SpecialistSessionIdentity) (agent.SpecialistWorkOrderRequest, error) {
 		builderCalls++
 		if worktree != fixture.worktree || baseSHA != fixture.baseSHA || baseTreeSHA != fixture.baseTree ||
@@ -471,6 +475,7 @@ func TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompo
 			return agent.SpecialistWorkOrderRequest{}, errors.New("builder did not receive the exact Worker/readiness bindings")
 		}
 		request := fixture.provider.workOrderRequest(baseSHA, baseTreeSHA, prompt)
+		request.AllowedPaths = append([]string(nil), config.AllowedPaths...)
 		request.ExternalRef = "visual-hive://owner/repo/" + strings.Repeat("a", 64)
 		request.PacketSHA256 = strings.Repeat("1", 64)
 		request.FindingSHA256 = strings.Repeat("2", 64)
@@ -519,6 +524,14 @@ func TestGovernedSchedulerCompositionReservesOnceAndLeasedRecoveryDoesNotRecompo
 	}
 	if builderCalls != 1 || reservationCalls != 1 || reserved.ID != order.ID || reserved.RequestSHA256 != order.RequestSHA256 || order.ID != "swo-"+order.RequestSHA256 {
 		t.Fatalf("composition/reservation = builder %d reserve %d reserved=%+v order=%+v", builderCalls, reservationCalls, reserved, order)
+	}
+	if got := strings.Join(order.AllowedPaths, ","); got != "src/**,tests/**" {
+		t.Fatalf("persisted governed paths = %q, want canonical mailbox order", got)
+	}
+	drifted := order.SpecialistWorkOrderRequest
+	drifted.AllowedPaths = append(append([]string(nil), order.AllowedPaths...), "README.md")
+	if err := fixture.provider.validateBuiltGovernedRequest(drifted, fixture.baseSHA, fixture.baseTree); err == nil {
+		t.Fatal("governed replay accepted an expanded repair scope")
 	}
 	_, err = fixture.provider.runPreparedInvocation(context.Background(), fixture.worktree, order.ID)
 	var runErr *ProviderRunError
