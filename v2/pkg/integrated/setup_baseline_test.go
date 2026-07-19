@@ -1419,3 +1419,203 @@ func TestSetupBaselineRebindRetiresOnlyExactTerminalProductionDispatch(t *testin
 		})
 	}
 }
+
+type pendingSetupBaselineProductionFixture struct {
+	source   SetupBaselineIntent
+	target   Config
+	rebind   SetupBaselineRebindIntent
+	dispatch WorkflowDispatchIntent
+	baseSHA  string
+}
+
+func newPendingSetupBaselineProductionFixture(t *testing.T, stateDir string) pendingSetupBaselineProductionFixture {
+	t.Helper()
+	createdAt := time.Now().UTC()
+	setupHead, baseSHA := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	prior := SetupBaselineCandidate{Path: ".visual-hive/snapshots/linux/home.png", SHA256: strings.Repeat("c", 64), Bytes: 9}
+	priorDigest, err := setupBaselineCandidateDigest([]SetupBaselineCandidate{prior})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := SetupBaselineIntent{
+		SchemaVersion: SetupBaselineSchema, Phase: SetupBaselinePending, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
+		AuthorizerID: 42, SetupPRNumber: 2, SetupPRURL: "https://example.test/pull/2", SetupHeadSHA: setupHead,
+		VisualHiveConfigDigest: strings.Repeat("d", 64), ScreenshotContractDigest: strings.Repeat("e", 64), InitialBaselineDigest: emptySetupBaselineCandidateDigest(t),
+		PreviouslyApprovedDigest: priorDigest, PreviouslyApprovedCandidates: []SetupBaselineCandidate{prior}, RetiredCaptureCorrelations: []string{strings.Repeat("f", 64)},
+		CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	target := Config{SchemaVersion: ConfigSchema, Repository: source.Repository, RepositoryID: source.RepositoryID, DefaultBranch: source.DefaultBranch, StateDir: stateDir,
+		Coverage: CoverageComprehensive, Automation: AutomationRepairPR, Provider: "codex", SetupAuthorizationActorID: source.AuthorizerID,
+		SetupPRNumber: source.SetupPRNumber, SetupPRURL: source.SetupPRURL, SetupHeadSHA: source.SetupHeadSHA,
+		VisualHiveConfigDigest: source.VisualHiveConfigDigest, SetupBaselineContractDigest: source.ScreenshotContractDigest, SetupBaselineInitialDigest: source.InitialBaselineDigest}
+	targetDigest, err := setupBaselineRebindTargetDigest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebind := SetupBaselineRebindIntent{SchemaVersion: SetupBaselineRebindSchema, Phase: SetupBaselineRebindPrepared, Repository: source.Repository,
+		RepositoryID: source.RepositoryID, Source: source, TargetConfig: target, TargetConfigDigest: targetDigest, CreatedAt: createdAt, UpdatedAt: createdAt}
+	dispatch, err := newWorkflowDispatchIntentForOperation(target, "hive-visual-hive.yml", source.DefaultBranch, "production", strings.Repeat("1", 64), createdAt.Add(-4*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.DispatchAttemptedAt = createdAt.Add(-3 * time.Minute)
+	dispatch.DispatchAcknowledgedAt = createdAt.Add(-2 * time.Minute)
+	dispatch.RunID, dispatch.RunURL, dispatch.MatchedAt = 99, "https://example.test/runs/99", createdAt.Add(-time.Minute)
+	dispatch.RequestDigest, err = workflowDispatchRequestDigest(dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pendingSetupBaselineProductionFixture{source: source, target: target, rebind: rebind, dispatch: dispatch, baseSHA: baseSHA}
+}
+
+func TestSetupBaselineRebindPendingSourceRetiresOnlyPredatingProductionAtExactSetupBase(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newPendingSetupBaselineProductionFixture(t, stateDir)
+	if err := store.SaveSetupBaselineIntent(fixture.source); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSetupBaselineRebindIntent(fixture.rebind); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveWorkflowDispatchIntent(fixture.dispatch); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/owner/repo/pulls/2":
+			_, _ = fmt.Fprintf(writer, `{"number":2,"html_url":%q,"state":"open","merged":false,"draft":false,"head":{"ref":%q,"sha":%q,"repo":{"id":123,"full_name":"owner/repo"}},"base":{"ref":"main","sha":%q,"repo":{"id":123,"full_name":"owner/repo"}}}`, fixture.source.SetupPRURL, managedOperationBranch("setup", fixture.source.RepositoryID), fixture.source.SetupHeadSHA, fixture.baseSHA)
+		case "/repos/owner/repo/actions/runs/99":
+			_, _ = fmt.Fprintf(writer, `{"id":99,"display_title":%q,"path":%q,"event":"workflow_dispatch","head_branch":"main","head_sha":%q,"status":"completed","conclusion":"success","repository":{"id":123,"full_name":"owner/repo"}}`, fixture.dispatch.ExpectedDisplayTitle, visualHiveProductionWorkflowPath, fixture.baseSHA)
+		default:
+			http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+	if err := reconcileActiveSetupBaselineReconfiguration(context.Background(), store, fixture.target, fixture.source.SetupHeadSHA, false, client); err != nil {
+		t.Fatal(err)
+	}
+	rebind, exists, err := store.LoadSetupBaselineRebindIntent()
+	if err != nil || !exists || rebind.Phase != SetupBaselineRebindResourcesRetired || !containsExact(rebind.Source.RetiredCaptureCorrelations, fixture.dispatch.CorrelationID) {
+		t.Fatalf("pending source did not complete exact resource retirement: exists=%t rebind=%+v err=%v", exists, rebind, err)
+	}
+	if _, exists, err := store.LoadSetupBaselineIntent(); err != nil || exists {
+		t.Fatalf("retired pending source remained active: exists=%t err=%v", exists, err)
+	}
+	if _, exists, err := store.LoadWorkflowDispatchIntent(); err != nil || exists {
+		t.Fatalf("retired production dispatch remained active: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestSetupBaselineRebindPendingSourceRejectsInexactProductionEvidence(t *testing.T) {
+	type liveEvidence struct {
+		prState, prHeadRef, prHeadSHA, prBaseRef, prBaseSHA string
+		prHeadRepo, prBaseRepo                              string
+		prHeadRepoID, prBaseRepoID                          int64
+		prMerged, prDraft                                   bool
+		runTitle, runPath, runHead, runRepo                 string
+		runRepoID                                           int64
+	}
+	tests := []struct {
+		name   string
+		mutate func(*pendingSetupBaselineProductionFixture, *liveEvidence)
+	}{
+		{name: "pending source has capture identity", mutate: func(f *pendingSetupBaselineProductionFixture, _ *liveEvidence) {
+			f.source.CaptureCorrelation = strings.Repeat("2", 64)
+		}},
+		{name: "dispatch is not acknowledged", mutate: func(f *pendingSetupBaselineProductionFixture, _ *liveEvidence) {
+			f.dispatch.DispatchAcknowledgedAt = time.Time{}
+		}},
+		{name: "dispatch does not predate source", mutate: func(f *pendingSetupBaselineProductionFixture, _ *liveEvidence) {
+			f.dispatch.DispatchAcknowledgedAt, f.dispatch.MatchedAt = f.source.CreatedAt, f.source.CreatedAt
+		}},
+		{name: "dispatch timing is out of order", mutate: func(f *pendingSetupBaselineProductionFixture, _ *liveEvidence) {
+			f.dispatch.PreparedAt = f.dispatch.DispatchAttemptedAt.Add(time.Second)
+		}},
+		{name: "setup base is not immutable", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) { live.prBaseSHA = "main" }},
+		{name: "setup head changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.prHeadSHA = strings.Repeat("3", 40)
+		}},
+		{name: "setup refs changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.prHeadRef, live.prBaseRef = "feature", "trunk"
+		}},
+		{name: "setup repository numeric identity changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.prHeadRepoID, live.prBaseRepoID = 999, 999
+		}},
+		{name: "setup pull is not open", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) { live.prState = "closed" }},
+		{name: "run title changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) { live.runTitle = "unrelated" }},
+		{name: "run path changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.runPath = ".github/workflows/other.yml"
+		}},
+		{name: "run repository numeric identity changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.runRepoID = 999
+		}},
+		{name: "run head changed", mutate: func(_ *pendingSetupBaselineProductionFixture, live *liveEvidence) {
+			live.runHead = strings.Repeat("4", 40)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store, err := NewStore(filepath.Join(stateDir, "integrated"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := newPendingSetupBaselineProductionFixture(t, stateDir)
+			live := liveEvidence{
+				prState: "open", prHeadRef: managedOperationBranch("setup", fixture.source.RepositoryID), prHeadSHA: fixture.source.SetupHeadSHA,
+				prBaseRef: fixture.source.DefaultBranch, prBaseSHA: fixture.baseSHA, prHeadRepo: fixture.source.Repository, prBaseRepo: fixture.source.Repository,
+				prHeadRepoID: 123, prBaseRepoID: 123, runTitle: fixture.dispatch.ExpectedDisplayTitle, runPath: visualHiveProductionWorkflowPath,
+				runHead: fixture.baseSHA, runRepo: fixture.source.Repository, runRepoID: 123,
+			}
+			test.mutate(&fixture, &live)
+			fixture.rebind.Source = fixture.source
+			fixture.dispatch.RequestDigest, err = workflowDispatchRequestDigest(fixture.dispatch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveSetupBaselineRebindIntent(fixture.rebind); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveWorkflowDispatchIntent(fixture.dispatch); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/repos/owner/repo/pulls/2":
+					_ = json.NewEncoder(writer).Encode(map[string]any{
+						"number": 2, "html_url": fixture.source.SetupPRURL, "state": live.prState, "merged": live.prMerged, "draft": live.prDraft,
+						"head": map[string]any{"ref": live.prHeadRef, "sha": live.prHeadSHA, "repo": map[string]any{"id": live.prHeadRepoID, "full_name": live.prHeadRepo}},
+						"base": map[string]any{"ref": live.prBaseRef, "sha": live.prBaseSHA, "repo": map[string]any{"id": live.prBaseRepoID, "full_name": live.prBaseRepo}},
+					})
+				case "/repos/owner/repo/actions/runs/99":
+					_ = json.NewEncoder(writer).Encode(map[string]any{
+						"id": 99, "display_title": live.runTitle, "path": live.runPath, "event": "workflow_dispatch", "head_branch": "main", "head_sha": live.runHead,
+						"status": "completed", "conclusion": "success", "repository": map[string]any{"id": live.runRepoID, "full_name": live.runRepo},
+					})
+				default:
+					http.Error(writer, request.Method+" "+request.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client := hivegithub.NewClientForTest(server.URL, "owner", []string{"repo"}, slog.Default())
+			err = retireTerminalProductionDispatchForSetupRebind(context.Background(), store, client, &fixture.rebind, fixture.dispatch)
+			if err == nil {
+				t.Fatal("inexact pending production evidence was retired")
+			}
+			if _, exists, loadErr := store.LoadWorkflowDispatchIntent(); loadErr != nil || !exists {
+				t.Fatalf("rejected dispatch state was not retained: exists=%t err=%v", exists, loadErr)
+			}
+			persisted, exists, loadErr := store.LoadSetupBaselineRebindIntent()
+			if loadErr != nil || !exists || persisted.Phase != SetupBaselineRebindPrepared || containsExact(persisted.Source.RetiredCaptureCorrelations, fixture.dispatch.CorrelationID) {
+				t.Fatalf("rejected rebind state changed: exists=%t rebind=%+v err=%v", exists, persisted, loadErr)
+			}
+		})
+	}
+}

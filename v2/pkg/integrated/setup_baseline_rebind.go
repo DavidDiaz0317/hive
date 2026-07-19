@@ -271,15 +271,41 @@ func retireSetupBaselineRebindResources(ctx context.Context, store *Store, clien
 }
 
 func retireTerminalProductionDispatchForSetupRebind(ctx context.Context, store *Store, client *hivegithub.Client, rebind *SetupBaselineRebindIntent, dispatch WorkflowDispatchIntent) error {
-	if rebind == nil || rebind.Source.Phase != SetupBaselineMerged || dispatch.Operation != "production" || dispatch.RunID <= 0 {
+	if rebind == nil || dispatch.Operation != "production" || dispatch.RunID <= 0 {
 		return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+	}
+	if err := validateWorkflowDispatchIntent(dispatch); err != nil {
+		return fmt.Errorf("validate terminal production dispatch before setup baseline rebind: %w", err)
 	}
 	if err := validateWorkflowDispatchOperationBinding(dispatch, rebind.TargetConfig, "hive-visual-hive.yml", rebind.Source.DefaultBranch, "production"); err != nil {
 		return fmt.Errorf("validate terminal production dispatch before setup baseline rebind: %w", err)
 	}
-	owner, repo, ok := strings.Cut(rebind.Source.Repository, "/")
+	source := rebind.Source
+	expectedHead := source.MergeSHA
+	pending := exactPreCaptureSetupBaselinePending(source)
+	if source.Phase != SetupBaselineMerged && !pending {
+		return fmt.Errorf("a different workflow dispatch must be recovered before setup baseline rebind")
+	}
+	if pending && (dispatch.DispatchAcknowledgedAt.IsZero() || dispatch.MatchedAt.IsZero() ||
+		!dispatch.PreparedAt.Before(source.CreatedAt) || !dispatch.DispatchAttemptedAt.Before(source.CreatedAt) ||
+		!dispatch.DispatchAcknowledgedAt.Before(source.CreatedAt) || !dispatch.MatchedAt.Before(source.CreatedAt) ||
+		dispatch.PreparedAt.After(dispatch.DispatchAttemptedAt) || dispatch.DispatchAttemptedAt.After(dispatch.DispatchAcknowledgedAt) ||
+		dispatch.DispatchAcknowledgedAt.After(dispatch.MatchedAt)) {
+		return fmt.Errorf("production workflow dispatch does not exactly predate the pending setup baseline")
+	}
+	owner, repo, ok := strings.Cut(source.Repository, "/")
 	if !ok || owner == "" || repo == "" || client == nil || client.GoGitHub() == nil {
 		return fmt.Errorf("inspect terminal production dispatch before setup baseline rebind: GitHub access is required")
+	}
+	if pending {
+		pull, _, err := client.GoGitHub().PullRequests.Get(ctx, owner, repo, source.SetupPRNumber)
+		if err != nil {
+			return fmt.Errorf("inspect source setup pull request before setup baseline rebind: %w", err)
+		}
+		expectedHead, err = exactPendingSetupProductionHead(pull, source)
+		if err != nil {
+			return err
+		}
 	}
 	run, _, err := client.GoGitHub().Actions.GetWorkflowRunByID(ctx, owner, repo, dispatch.RunID)
 	if err != nil {
@@ -287,7 +313,8 @@ func retireTerminalProductionDispatchForSetupRebind(ctx context.Context, store *
 	}
 	missing, bindingErr := exactWorkflowRunBindingState(run, dispatch)
 	if bindingErr != nil || len(missing) > 0 || run.GetPath() != visualHiveProductionWorkflowPath ||
-		!strings.EqualFold(run.GetRepository().GetFullName(), rebind.Source.Repository) || !strings.EqualFold(run.GetHeadSHA(), rebind.Source.MergeSHA) {
+		!strings.EqualFold(run.GetRepository().GetFullName(), source.Repository) || run.GetRepository().GetID() <= 0 ||
+		strconv.FormatInt(run.GetRepository().GetID(), 10) != strings.TrimSpace(source.RepositoryID) || !strings.EqualFold(run.GetHeadSHA(), expectedHead) {
 		return fmt.Errorf("production workflow dispatch no longer matches its exact durable setup baseline binding")
 	}
 	if !strings.EqualFold(run.GetStatus(), "completed") || strings.TrimSpace(run.GetConclusion()) == "" {
@@ -309,6 +336,33 @@ func retireTerminalProductionDispatchForSetupRebind(ctx context.Context, store *
 		return fmt.Errorf("retire exact terminal production workflow dispatch: %w", err)
 	}
 	return nil
+}
+
+func exactPreCaptureSetupBaselinePending(source SetupBaselineIntent) bool {
+	return source.Phase == SetupBaselinePending && source.CaptureCorrelation == "" && source.CaptureHeadSHA == "" && source.CaptureRunID == 0 && source.CaptureRunURL == "" &&
+		source.ArtifactID == 0 && source.ArtifactName == "" && source.ArtifactRoot == "" && source.CaptureCandidateDigest == "" && len(source.CaptureCandidates) == 0 &&
+		source.CandidateDigest == "" && len(source.Candidates) == 0 && source.Branch == "" && source.CommitSHA == "" && source.Marker == "" && source.PRNumber == 0 &&
+		source.PRURL == "" && source.BaseSHA == "" && source.DiffDigest == "" && source.ApprovalPlanDigest == "" && source.ApprovalActorID == 0 && source.ApprovalReason == "" &&
+		source.MergeAttemptedAt.IsZero() && source.MergeSHA == "" && source.ProductionRunID == 0 && source.ProductionHeadSHA == "" && !source.ExistingHeadReverified &&
+		source.DispatchAttemptedAt.IsZero() && source.DispatchAcknowledgedAt.IsZero() && source.PendingAudit == nil
+}
+
+func exactPendingSetupProductionHead(pull *gh.PullRequest, source SetupBaselineIntent) (string, error) {
+	if pull == nil || pull.GetHead() == nil || pull.GetBase() == nil || pull.GetHead().GetRepo() == nil || pull.GetBase().GetRepo() == nil {
+		return "", fmt.Errorf("source setup pull request no longer matches its exact durable pending baseline binding")
+	}
+	head, base := pull.GetHead(), pull.GetBase()
+	headRepo, baseRepo := head.GetRepo(), base.GetRepo()
+	baseSHA := strings.ToLower(strings.TrimSpace(base.GetSHA()))
+	if pull.GetNumber() != source.SetupPRNumber || pull.GetHTMLURL() != source.SetupPRURL || pull.GetState() != "open" ||
+		pull.Merged == nil || pull.GetMerged() || pull.Draft == nil || pull.GetDraft() || head.GetRef() != managedOperationBranch("setup", source.RepositoryID) ||
+		!strings.EqualFold(head.GetSHA(), source.SetupHeadSHA) || base.GetRef() != source.DefaultBranch ||
+		!strings.EqualFold(headRepo.GetFullName(), source.Repository) || !strings.EqualFold(baseRepo.GetFullName(), source.Repository) ||
+		headRepo.GetID() <= 0 || baseRepo.GetID() <= 0 || strconv.FormatInt(headRepo.GetID(), 10) != strings.TrimSpace(source.RepositoryID) ||
+		strconv.FormatInt(baseRepo.GetID(), 10) != strings.TrimSpace(source.RepositoryID) || !immutableCommit.MatchString(baseSHA) {
+		return "", fmt.Errorf("source setup pull request no longer matches its exact durable pending baseline binding")
+	}
+	return baseSHA, nil
 }
 
 func cancelSetupBaselineCaptureRunExact(ctx context.Context, client *hivegithub.Client, source SetupBaselineIntent) error {
