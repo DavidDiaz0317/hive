@@ -558,10 +558,14 @@ func TestGeneratedPullRequestExecutionUsesDistinctEvidenceAuthority(t *testing.T
 	executionText := workflowJobText(execution)
 	for _, required := range []string{
 		"sudo useradd --create-home --shell /usr/sbin/nologin hive-evidence",
-		`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`,
+		`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root"`,
 		"Target principal can access the protected evidence root",
 		"/usr/bin/unshare --mount --fork /opt/hive-target/trusted/run-visual-hive-evidence",
+		"runtime_modules=/opt/hive-target/trusted/visual-hive-runtime/node_modules",
+		`case "$runtime_modules" in`,
+		`"$evidence_root"|"$evidence_root"/*) echo "Visual Hive runtime modules entered the evidence root"`,
 		"mount --bind /opt/hive-target/trusted/visual-hive-tooling/node_modules \"$runtime_modules\"",
+		`"NODE_PATH=$runtime_modules"`,
 		"exec /usr/bin/sudo -n -u hive-target -- /usr/bin/env -i",
 		"exec /usr/bin/sudo -n -u hive-evidence -- /usr/bin/env -i",
 		"hive-visual-target-child-shell",
@@ -576,6 +580,10 @@ func TestGeneratedPullRequestExecutionUsesDistinctEvidenceAuthority(t *testing.T
 		if !strings.Contains(executionText, required) {
 			t.Fatalf("PR execution does not enforce the distinct evidence authority invariant %q", required)
 		}
+	}
+	if strings.Contains(executionText, `runtime_modules="$evidence_root/node_modules"`) ||
+		strings.Contains(executionText, `sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`) {
+		t.Fatal("Visual Hive runtime dependencies still enter the complete evidence root")
 	}
 	var pipeline string
 	for _, step := range execution.Steps {
@@ -634,6 +642,23 @@ func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.
 	for _, workflow := range workflows {
 		t.Run(workflow.name, func(t *testing.T) {
 			execution := parseIsolatedWorkflow(t, workflow.generated).Jobs[workflow.job]
+			executionText := workflowJobText(execution)
+			for _, required := range []string{
+				"sudo install -d -o root -g root -m 0555 /opt/hive-target/trusted/visual-hive-runtime /opt/hive-target/trusted/visual-hive-runtime/node_modules",
+				"runtime_modules=/opt/hive-target/trusted/visual-hive-runtime/node_modules",
+				"mount --bind /opt/hive-target/trusted/visual-hive-tooling/node_modules \"$runtime_modules\"",
+				`mount -o remount,bind,ro "$runtime_modules"`,
+				`"PATH=$runtime_modules/.bin:/usr/local/bin:/usr/bin:/bin"`,
+				`"NODE_PATH=$runtime_modules"`,
+			} {
+				if !strings.Contains(executionText, required) {
+					t.Fatalf("%s execution does not keep immutable runtime modules outside complete evidence: missing %q", workflow.name, required)
+				}
+			}
+			if strings.Contains(executionText, `runtime_modules="$evidence_root/node_modules"`) ||
+				strings.Contains(executionText, `mount --bind /opt/hive-target/trusted/visual-hive-tooling/node_modules "$evidence_root/node_modules"`) {
+				t.Fatalf("%s execution still mounts runtime dependencies inside complete evidence", workflow.name)
+			}
 			preflightIndex := -1
 			prepareIndex := -1
 			collectionIndex := -1
@@ -664,7 +689,7 @@ func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.
 				`sudo find "$evidence_root" -type l -print -quit`,
 				`sudo find "$evidence_root" ! -type d ! -type f -print -quit`,
 				`sudo chown -R hive-evidence:hive-evidence "$evidence_root"`,
-				`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`,
+				`sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root"`,
 			} {
 				if !strings.Contains(prepareRun, required) {
 					t.Fatalf("evidence preparation step is missing %q", required)
@@ -672,6 +697,9 @@ func TestGeneratedVisualExecutionPreparesEvidenceAfterBrowserHandoff(t *testing.
 			}
 			if strings.Contains(prepareRun, `evidence_root="$GITHUB_WORKSPACE/.visual-hive"`) || strings.Contains(prepareRun, "rm -rf") {
 				t.Fatalf("evidence preparation does not preserve the tracked evidence tree:\n%s", prepareRun)
+			}
+			if strings.Contains(prepareRun, `sudo install -d -o hive-evidence -g hive-evidence -m 0700 "$evidence_root" "$evidence_root/node_modules"`) {
+				t.Fatalf("evidence preparation still creates a runtime mountpoint inside the complete artifact root:\n%s", prepareRun)
 			}
 		})
 	}

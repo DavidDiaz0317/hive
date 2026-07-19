@@ -17,6 +17,10 @@ const (
 	isolatedTargetWorkspace   = isolatedTargetRoot + "/workspace"
 	isolatedTrustedRoot       = isolatedTargetRoot + "/trusted"
 	isolatedTrustedTooling    = isolatedTrustedRoot + "/visual-hive-tooling"
+	// Runtime dependencies are sealed tooling, not evidence. Keep them outside
+	// .visual-hive so its complete artifact index remains exhaustive.
+	isolatedRuntimeRoot       = isolatedTrustedRoot + "/visual-hive-runtime"
+	isolatedRuntimeModules    = isolatedRuntimeRoot + "/node_modules"
 	isolatedTargetShell       = isolatedTrustedRoot + "/target-shell"
 	isolatedTargetBash        = isolatedTrustedRoot + "/target-bash"
 	isolatedEvidenceLauncher  = isolatedTrustedRoot + "/run-visual-hive-evidence"
@@ -1904,6 +1908,8 @@ target_bash=` + isolatedTargetBash + `
 target_shell=` + isolatedTargetShell + `
 evidence_launcher=` + isolatedEvidenceLauncher + `
 sudo install -o root -g root -m 0555 "$(readlink -f /bin/bash)" "$target_bash"
+sudo install -d -o root -g root -m 0555 ` + isolatedRuntimeRoot + ` ` + isolatedRuntimeModules + `
+test "$(stat -c '%u:%g:%a' ` + isolatedRuntimeModules + `)" = "0:0:555"
 target_shell_source="$RUNNER_TEMP/hive-visual-target-shell-${GITHUB_RUN_ID}"
 evidence_launcher_source="$RUNNER_TEMP/hive-visual-evidence-launcher-${GITHUB_RUN_ID}"
 rm -f -- "$target_shell_source" "$evidence_launcher_source"
@@ -1955,11 +1961,14 @@ for name in HIVE_TARGET_WORKSPACE HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH; do
   test -n "${!name:-}"
 done
 evidence_root="$HIVE_TARGET_WORKSPACE/.visual-hive"
-runtime_modules="$evidence_root/node_modules"
+runtime_modules=` + isolatedRuntimeModules + `
 test "$(stat -c '%u:%g:%a' "$evidence_root")" = "$(id -u ` + isolatedEvidenceAccount + `):$(id -g ` + isolatedEvidenceAccount + `):700"
-test "$(stat -c '%u:%g:%a' "$runtime_modules")" = "$(id -u ` + isolatedEvidenceAccount + `):$(id -g ` + isolatedEvidenceAccount + `):700"
+test "$(stat -c '%u:%g:%a' "$runtime_modules")" = "0:0:555"
+case "$runtime_modules" in
+  "$evidence_root"|"$evidence_root"/*) echo "Visual Hive runtime modules entered the evidence root" >&2; exit 1 ;;
+esac
 if find "$runtime_modules" -mindepth 1 -print -quit | grep -q .; then
-  echo "Protected evidence module mountpoint is not empty" >&2
+  echo "Protected runtime module mountpoint is not empty" >&2
   exit 1
 fi
 mount --make-rprivate /
@@ -1972,7 +1981,8 @@ mount -o remount,bind,ro "$system_shell"
 evidence_environment=(
   "HOME=/home/` + isolatedEvidenceAccount + `"
   "TMPDIR=/home/` + isolatedEvidenceAccount + `/.cache/tmp"
-  "PATH=` + isolatedTrustedTooling + `/node_modules/.bin:/usr/local/bin:/usr/bin:/bin"
+  "PATH=$runtime_modules/.bin:/usr/local/bin:/usr/bin:/bin"
+  "NODE_PATH=$runtime_modules"
   "LANG=C.UTF-8"
   "CI=true"
   "PLAYWRIGHT_BROWSERS_PATH=$HIVE_TRUSTED_PLAYWRIGHT_BROWSERS_PATH"
@@ -2026,10 +2036,10 @@ if [ -d "$evidence_root" ] && sudo find "$evidence_root" ! -type d ! -type f -pr
   exit 1
 fi
 if [ -e "$evidence_root/node_modules" ] || [ -L "$evidence_root/node_modules" ]; then
-  echo "Tracked Visual Hive evidence reserves the runtime node_modules path" >&2
+  echo "Tracked Visual Hive evidence contains a dependency tree" >&2
   exit 1
 fi
-sudo install -d -o ` + isolatedEvidenceAccount + ` -g ` + isolatedEvidenceAccount + ` -m 0700 "$evidence_root" "$evidence_root/node_modules"
+sudo install -d -o ` + isolatedEvidenceAccount + ` -g ` + isolatedEvidenceAccount + ` -m 0700 "$evidence_root"
 sudo chown -R ` + isolatedEvidenceAccount + `:` + isolatedEvidenceAccount + ` "$evidence_root"
 sudo find "$evidence_root" -type d -exec chmod 0700 {} +
 sudo find "$evidence_root" -type f -exec chmod 0600 {} +
