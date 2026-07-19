@@ -231,7 +231,7 @@ func TestCodexSpecialistForceReapIsIdempotentAfterExactWaitProof(t *testing.T) {
 		},
 		cancel: cancel, commandContext: ctx,
 		stdout: &codexHardLimitBuffer{limit: codexStdoutHardLimit},
-		stderr: &codexHardLimitBuffer{limit: codexStderrHardLimit},
+		stderr: &codexHardLimitBuffer{limit: codexStderrCaptureLimit("")},
 	}
 	process := &codexSpecialistChildProcess{process: running, providerSHA256: strings.Repeat("a", 64)}
 	if err := process.ForceReap(context.Background()); err != nil {

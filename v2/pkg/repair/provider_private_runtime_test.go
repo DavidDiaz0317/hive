@@ -115,6 +115,34 @@ func TestCodexProviderOutputOverflowCancelsContainedProcess(t *testing.T) {
 	}
 }
 
+func TestCodexProviderAllowsPromptMirroredOnStderrWithinBoundedTransport(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
+	t.Setenv("HIVE_TEST_CODEX_ECHO_PROMPT_STDERR", "1")
+	provider := CodexProvider{Command: os.Args[0]}
+	if err := provider.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	prompt := strings.Repeat("bounded governed prompt\n", 4096)
+	result, err := provider.Run(context.Background(), "", prompt)
+	if err != nil || result.Output != "DENIED" {
+		t.Fatalf("prompt-sized stderr transport failed: result=%+v err=%v", result, err)
+	}
+}
+
+func TestCodexProviderStderrBeyondPromptAwareLimitCancelsContainedProcess(t *testing.T) {
+	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
+	t.Setenv("HIVE_TEST_CODEX_STDERR_OVERFLOW", "1")
+	provider := CodexProvider{Command: os.Args[0]}
+	if err := provider.Health(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	prompt := strings.Repeat("bounded governed prompt\n", 4096)
+	result, err := provider.Run(context.Background(), "", prompt)
+	if err == nil || !providerRunWasLaunched(err) || result.Output != "" || !strings.Contains(err.Error(), "hard cap") {
+		t.Fatalf("stderr overflow did not cancel fail-closed: result=%+v err=%v", result, err)
+	}
+}
+
 func TestCodexProviderRejectsAndCleansUnexpectedNeutralCWDFile(t *testing.T) {
 	t.Setenv("GO_WANT_CODEX_PROVIDER_HELPER", "1")
 	provider := CodexProvider{Command: os.Args[0]}

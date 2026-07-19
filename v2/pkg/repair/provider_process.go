@@ -17,9 +17,18 @@ import (
 )
 
 const (
-	codexStdoutHardLimit = 256 << 10
-	codexStderrHardLimit = 64 << 10
+	codexStdoutHardLimit           = 256 << 10
+	codexStderrDiagnosticHardLimit = 64 << 10
 )
+
+// Human-readable `codex exec` writes the input prompt and its final response
+// to stderr as progress output. Keep that transport bounded, but account for
+// the two payloads that Codex is expected to mirror before reserving a fixed
+// diagnostic allowance. The authoritative response on stdout retains its
+// independent hard limit.
+func codexStderrCaptureLimit(prompt string) int {
+	return len(prompt) + codexStdoutHardLimit + codexStderrDiagnosticHardLimit
+}
 
 type codexHardLimitBuffer struct {
 	mu       sync.Mutex
@@ -173,7 +182,11 @@ func startCodexAttestedProcess(ctx context.Context, provider CodexProvider, atte
 	}
 	command.Stdin = strings.NewReader(prompt)
 	stdout := &codexHardLimitBuffer{limit: codexStdoutHardLimit, cancel: cancel}
-	stderr := &codexHardLimitBuffer{limit: codexStderrHardLimit, cancel: cancel}
+	stderrLimit := codexStderrDiagnosticHardLimit
+	if !structured {
+		stderrLimit = codexStderrCaptureLimit(prompt)
+	}
+	stderr := &codexHardLimitBuffer{limit: stderrLimit, cancel: cancel}
 	stdoutRead, stdoutWrite, err := os.Pipe()
 	if err != nil {
 		cancel()

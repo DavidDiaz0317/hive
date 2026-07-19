@@ -113,6 +113,28 @@ func runCodexProviderInvocationHelper(args []string) {
 		fmt.Print(output)
 		os.Exit(0)
 	}
+	if os.Getenv("HIVE_TEST_CODEX_ECHO_PROMPT_STDERR") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		prompt, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			os.Exit(6)
+		}
+		_, _ = os.Stderr.Write(prompt)
+		fmt.Fprint(os.Stderr, "DENIED")
+		fmt.Print("DENIED")
+		os.Exit(0)
+	}
+	if os.Getenv("HIVE_TEST_CODEX_STDERR_OVERFLOW") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
+		prompt, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			os.Exit(6)
+		}
+		block := strings.Repeat("x", 4096)
+		limit := codexStderrCaptureLimit(string(prompt))
+		for written := 0; written <= limit+len(block); written += len(block) {
+			fmt.Fprint(os.Stderr, block)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("HIVE_TEST_CODEX_OUTPUT_OVERFLOW") == "1" && argumentSequencePresent(args, "exec") && optionValue(args, "--output-schema") == "" {
 		block := strings.Repeat("x", 4096)
 		for written := 0; written <= codexStdoutHardLimit+len(block); written += len(block) {
