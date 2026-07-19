@@ -471,6 +471,94 @@ func TestVisualWorkControllerIssueOnlyPersistsStageWithoutDispatch(t *testing.T)
 	}
 }
 
+func TestVisualWorkControllerHeldRepairReevaluatesWithoutCountingItselfAsWIP(t *testing.T) {
+	store, err := beads.NewStore(filepath.Join(t.TempDir(), "quality"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := visualhive.NewLifecycleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := strings.Repeat("6", 64)
+	digest := strings.Repeat("7", 64)
+	bundle := &visualhive.ValidatedBundle{
+		Validation: visualhive.Validation{Trusted: true, Status: "failed"},
+		Manifest: visualhive.Manifest{
+			SchemaVersion: "visual-hive.bundle.v2", BundleID: "held-repair", OverallDigest: digest,
+			GeneratedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC), ExpiresAt: time.Date(2030, 7, 9, 12, 0, 0, 0, time.UTC),
+			Producer:         visualhive.Producer{Name: "visual-hive", GitCommit: strings.Repeat("c", 40)},
+			Source:           visualhive.Source{Repository: "owner/repo", RepositoryID: "123", Ref: "refs/heads/main", CommitSHA: strings.Repeat("d", 40), WorkflowRunID: "42"},
+			ReplayProtection: visualhive.ReplayProtection{Key: strings.Repeat("e", 64)},
+			Observations: []visualhive.Observation{{
+				Fingerprint: "selector/source", RepositoryFingerprint: fingerprint, PublicationRole: "canonical", RootCauseKey: "selector/source",
+				State: "present", IssueKind: "selector_contract_failure", Severity: "high", OwningAgentHint: "visual-hive/test-maintainer",
+				Title: "selector contract failed", Body: "deterministic content mismatch", Labels: []string{"visual-hive"},
+				AffectedContracts: []string{"app-shell-content-health"}, ValidationCommand: "visual-hive run --ci", FirstSeenAt: "2026-07-09T12:00:00Z",
+			}},
+		},
+	}
+	apply, err := lifecycle.ApplyBundle(bundle, store, visualhive.ApplyLifecycleOptions{MaxActiveIssues: 1, PreferRepairable: true, DisableIssuePublication: true})
+	if err != nil || apply.Created != 1 {
+		t.Fatalf("apply held-repair fixture = %+v, %v", apply, err)
+	}
+	externalRef := "visual-hive://owner/repo/" + fingerprint
+	bead := store.FindByExternalRef(externalRef)
+	if bead == nil {
+		t.Fatal("held-repair fixture has no controller bead")
+	}
+	if err := store.Update(bead.ID, func(value *beads.Bead) {
+		value.Status = beads.StatusBlocked
+		value.Metadata["visual_hive_controller_owned"] = true
+		value.Metadata["visual_hive_admission_state"] = "pending"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gov := governor.New(config.GovernorConfig{Modes: map[string]config.ModeConfig{
+		"idle": {Cadences: map[string]string{"quality": "1m"}},
+	}}, map[string]config.AgentConfig{"quality": {Enabled: true, Role: "quality"}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	issues := &controllerIssueClient{governor: gov}
+	controller, err := New(gov, lifecycle, map[string]*beads.Store{"quality": store}, nil, issues, integrated.Config{
+		Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main", StateDir: t.TempDir(), ACMMLevel: 5,
+		Automation: integrated.AutomationRepairPR, MaxActiveIssues: 1, AllowedRepairPaths: []string{"scripts/testing/**"}, VisualHiveRef: strings.Repeat("c", 40),
+	}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeAvailable := false
+	controller.baseTree = func(context.Context, integrated.Config, string) (string, error) {
+		if !treeAvailable {
+			return "", errors.New("verified base is not yet fetched")
+		}
+		return strings.Repeat("f", 40), nil
+	}
+	packet := completeControllerPacket("held-repair", digest)
+	work := visualhive.AdmittedVisualWork{
+		SourceExternalRef: externalRef, FindingFingerprint: "selector/source", RepositoryFingerprint: fingerprint,
+		Role: "quality", RoutingReason: "verified selector contract route", RoutingAllowed: true,
+		ValidationCommands: []string{"visual-hive run --ci"}, Packet: packet,
+	}
+	evidence := controllerEvidenceSource{completeControllerEvidence(digest)}
+	first := resumeAppliedForTest(controller, context.Background(), evidence, packet, []visualhive.AdmittedVisualWork{work}, Result{Lifecycle: apply})
+	if len(first.Decisions) != 1 || !first.Decisions[0].Allowed || first.Decisions[0].ActiveWIP != 0 || len(first.DispatchPending) != 0 ||
+		issues.upserts != 1 || visualBeadAdmissionState(store.FindByExternalRef(externalRef)) != "admitted_repair_held" {
+		t.Fatalf("missing base was not durably held after admission: result=%+v upserts=%d bead=%+v", first, issues.upserts, store.FindByExternalRef(externalRef))
+	}
+
+	treeAvailable = true
+	second := resumeAppliedForTest(controller, context.Background(), evidence, packet, []visualhive.AdmittedVisualWork{work}, Result{Lifecycle: apply})
+	if len(second.Decisions) != 1 || !second.Decisions[0].Allowed || second.Decisions[0].ActiveWIP != 0 || len(second.DispatchPending) != 1 ||
+		issues.upserts != 1 || visualBeadAdmissionState(store.FindByExternalRef(externalRef)) != "admitted_dispatch_pending" {
+		t.Fatalf("held repair counted itself against WIP during recovery: result=%+v upserts=%d bead=%+v", second, issues.upserts, store.FindByExternalRef(externalRef))
+	}
+	if len(gov.AdmissionHistory()) != 2 || second.DispatchPending[0].BaseTreeSHA != strings.Repeat("f", 40) ||
+		!reflect.DeepEqual(second.DispatchPending[0].AllowedRepairPaths, []string{"scripts/testing/**"}) ||
+		!reflect.DeepEqual(second.DispatchPending[0].ValidationCommands, []string{"visual-hive run --ci"}) {
+		t.Fatalf("recovered dispatch lost its exact policy: %+v history=%+v", second.DispatchPending, gov.AdmissionHistory())
+	}
+}
+
 func TestVisualWorkControllerDenialCreatesNoIssueIntent(t *testing.T) {
 	store, err := beads.NewStore(filepath.Join(t.TempDir(), "quality"))
 	if err != nil {

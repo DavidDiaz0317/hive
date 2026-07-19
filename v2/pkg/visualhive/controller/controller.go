@@ -939,6 +939,9 @@ func (controller *Controller) resumeAppliedWork(
 		activeWIP := 0
 		if store != nil {
 			for _, candidate := range store.List(beads.ListFilter{}) {
+				if candidate.ID == bead.ID {
+					continue
+				}
 				candidateStage := visualBeadAdmissionState(candidate)
 				if candidate.Status == beads.StatusOpen || candidate.Status == beads.StatusInProgress ||
 					candidateStage == "admitted_awaiting_issue" || candidateStage == "admitted_dispatch_pending" || candidateStage == "admitted_repair_held" || candidateStage == "admitted_manual_review_held" {

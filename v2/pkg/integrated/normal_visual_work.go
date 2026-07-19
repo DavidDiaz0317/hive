@@ -2,9 +2,11 @@ package integrated
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
@@ -83,7 +85,63 @@ func FetchNormalVisualWork(ctx context.Context, stateDir string, timeout time.Du
 		}
 		return NormalVisualWork{}, err
 	}
+	if _, err := synchronizeNormalVisualWorkBase(runCtx, config, workflow.HeadSHA); err != nil {
+		return NormalVisualWork{}, err
+	}
 	return NormalVisualWork{Config: config, Workflow: workflow, Artifact: verified}, nil
+}
+
+// synchronizeNormalVisualWorkBase makes the already verified live workflow
+// head available to the normal repair controller without moving or cleaning
+// the Hive-owned checkout. The explicit refspec prevents a target-controlled
+// remote name or ref from widening this authenticated transport boundary.
+func synchronizeNormalVisualWorkBase(ctx context.Context, config Config, expectedHead string) (string, error) {
+	expectedHead = strings.ToLower(strings.TrimSpace(expectedHead))
+	if !immutableCommit.MatchString(expectedHead) {
+		return "", errors.New("normal Visual Hive work requires an immutable verified workflow head")
+	}
+	branch := strings.TrimSpace(config.DefaultBranch)
+	if !validLegacyBranchName(branch) {
+		return "", errors.New("normal Visual Hive work requires a safe installed default branch")
+	}
+	exists, err := validateManagedCheckoutBeforeGit(config.CheckoutDir, config.Repository)
+	if err != nil {
+		return "", fmt.Errorf("validate managed checkout before normal Visual Hive synchronization: %w", err)
+	}
+	if !exists {
+		return "", errors.New("normal Visual Hive managed checkout is unavailable")
+	}
+	remoteURL := RepositoryCloneURL(config.Repository)
+	remoteRef := "refs/remotes/origin/" + branch
+	refspec := "+refs/heads/" + branch + ":" + remoteRef
+	if _, err := gitTransport(ctx, config.CheckoutDir, remoteURL, "fetch", "--no-tags", "--no-recurse-submodules", remoteURL, refspec); err != nil {
+		return "", fmt.Errorf("fetch verified normal Visual Hive base: %w", err)
+	}
+	fetchedHead, err := git(ctx, config.CheckoutDir, "rev-parse", "--verify", remoteRef+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve fetched normal Visual Hive head: %w", err)
+	}
+	fetchedHead = strings.ToLower(strings.TrimSpace(fetchedHead))
+	if !immutableCommit.MatchString(fetchedHead) || fetchedHead != expectedHead {
+		return "", fmt.Errorf("fetched default-branch head %s does not match verified workflow head %s", fetchedHead, expectedHead)
+	}
+	tree, err := git(ctx, config.CheckoutDir, "rev-parse", "--verify", expectedHead+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("resolve verified normal Visual Hive base tree: %w", err)
+	}
+	tree = strings.ToLower(strings.TrimSpace(tree))
+	if !validNormalVisualGitObjectID(tree) {
+		return "", errors.New("verified normal Visual Hive base tree identity is invalid")
+	}
+	return tree, nil
+}
+
+func validNormalVisualGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // ConsumeNormalVisualWork retires only the exact durable workflow dispatch.

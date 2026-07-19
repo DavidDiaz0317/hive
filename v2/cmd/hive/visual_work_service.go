@@ -40,12 +40,16 @@ const (
 )
 
 type normalVisualArtifactSource struct {
-	stateDir string
-	timeout  time.Duration
-	github   *hivegithub.Client
+	stateDir          string
+	timeout           time.Duration
+	github            *hivegithub.Client
+	gitTransportToken func(context.Context) (string, error)
 }
 
 func (source *normalVisualArtifactSource) Fetch(ctx context.Context) (integrated.NormalVisualWork, error) {
+	if source.gitTransportToken != nil {
+		ctx = gittransport.WithControllerTokenSource(ctx, source.gitTransportToken)
+	}
 	return integrated.FetchNormalVisualWork(ctx, source.stateDir, source.timeout, source.github)
 }
 
@@ -313,7 +317,10 @@ func configureNormalVisualWorkRunner(
 		}
 		return current, manager.GetACMMLevel(), nil
 	}
-	source := &normalVisualArtifactSource{stateDir: installed.StateDir, timeout: normalVisualArtifactFetchTimeout, github: github}
+	source := &normalVisualArtifactSource{
+		stateDir: installed.StateDir, timeout: normalVisualArtifactFetchTimeout, github: github,
+		gitTransportToken: gitTransportToken,
+	}
 	repairer := &normalVisualRepairer{
 		scheduler: sched, manager: manager, controller: controller, lifecycle: lifecycle, github: github,
 		gitTransportToken: gitTransportToken, expectedRemoteURL: integrated.RepositoryCloneURL(installed.Repository),
