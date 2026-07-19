@@ -376,6 +376,10 @@ func TestGeneratedWorkflowsIsolateTargetProcessesFromLifecycleAuthority(t *testi
 		"HIVE_TRUSTED_NODE_SHA", `"$HIVE_TRUSTED_NODE" "$VISUAL_HIVE_CLI" pipeline`, `sudo -u hive-target -- test ! -w "$HIVE_TRUSTED_NODE"`,
 		"hive.visual-runner-outcome.v1", ".visual-hive/hive-runner-outcome.json", "visual-hive-raw-${{ github.run_id }}",
 		`runner_pipeline_exit="$RUNNER_TEMP/hive-visual-pipeline-exit-${GITHUB_RUN_ID}.txt"`,
+		`sudo -u hive-evidence -- test ! -e .visual-hive/pipeline-exit-code.txt`,
+		`sudo -u hive-evidence -- test -f .visual-hive/hive-runner-outcome.json`,
+		`sudo -u hive-evidence -- test ! -w .visual-hive/hive-runner-outcome.json`,
+		`sudo -u hive-evidence -- stat -c '%u:%g:%a' .visual-hive/pipeline-exit-code.txt`,
 		"raw evidence contains a hard-linked file", `sudo find "$evidence_root" -xdev -type f -exec chmod 0444 -- {} +`,
 		"steps.seal_raw_evidence.outcome == 'success'",
 	} {

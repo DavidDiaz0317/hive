@@ -472,7 +472,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
             ''|*[!0-9]*) echo "Visual pipeline exit code is invalid" >&2; exit 1 ;;
             *) test "$HIVE_TARGET_PIPELINE_OUTCOME" = "failure" ;;
           esac
-          test ! -e .visual-hive/pipeline-exit-code.txt
+          sudo -u %s -- test ! -e .visual-hive/pipeline-exit-code.txt
           sudo install -o root -g root -m 0444 "$runner_pipeline_exit" .visual-hive/pipeline-exit-code.txt
           rm -f -- "$runner_pipeline_exit"
           runner_outcome="$RUNNER_TEMP/hive-visual-runner-outcome-${GITHUB_RUN_ID}.json"
@@ -492,12 +492,12 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
           sudo rm -f -- .visual-hive/hive-runner-outcome.json
           sudo install -o root -g root -m 0444 "$runner_outcome" .visual-hive/hive-runner-outcome.json
           rm -f -- "$runner_outcome"
-          test -f .visual-hive/hive-runner-outcome.json
-          test ! -L .visual-hive/hive-runner-outcome.json
-          test -r .visual-hive/hive-runner-outcome.json
-          test ! -w .visual-hive/hive-runner-outcome.json
-          test "$(stat -c '%%u:%%g:%%a' .visual-hive/pipeline-exit-code.txt)" = "0:0:444"
-          test "$(stat -c '%%u:%%g:%%a' .visual-hive/hive-runner-outcome.json)" = "0:0:444"
+          sudo -u %s -- test -f .visual-hive/hive-runner-outcome.json
+          sudo -u %s -- test ! -L .visual-hive/hive-runner-outcome.json
+          sudo -u %s -- test -r .visual-hive/hive-runner-outcome.json
+          sudo -u %s -- test ! -w .visual-hive/hive-runner-outcome.json
+          test "$(sudo -u %s -- stat -c '%%u:%%g:%%a' .visual-hive/pipeline-exit-code.txt)" = "0:0:444"
+          test "$(sudo -u %s -- stat -c '%%u:%%g:%%a' .visual-hive/hive-runner-outcome.json)" = "0:0:444"
           test "$(git rev-parse HEAD)" = "%s"
 %s
 %s
@@ -529,7 +529,9 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		isolatedTargetAccount, isolatedEvidenceAccount, indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10),
 		isolatedTargetAccount, isolatedEvidenceAccount, "$HIVE_TARGET_HEAD_SHA",
 		isolatedTargetAccount, isolatedEvidenceAccount, isolatedTargetAccount, isolatedEvidenceAccount,
-		indentWorkflowShell(validateIsolatedVisualEvidenceBeforeSealShell(), 10), "$HIVE_TARGET_HEAD_SHA", runnerAttestation,
+		indentWorkflowShell(validateIsolatedVisualEvidenceBeforeSealShell(), 10), isolatedEvidenceAccount,
+		isolatedEvidenceAccount, isolatedEvidenceAccount, isolatedEvidenceAccount, isolatedEvidenceAccount, isolatedEvidenceAccount, isolatedEvidenceAccount,
+		"$HIVE_TARGET_HEAD_SHA", runnerAttestation,
 		indentWorkflowShell(sealIsolatedVisualEvidenceShell(), 10), uploadArtifactActionSHA, rawArtifact,
 		indentWorkflowShell(finalEnforcement, 10))
 }
