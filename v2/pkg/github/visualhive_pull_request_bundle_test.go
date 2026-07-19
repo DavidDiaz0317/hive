@@ -783,6 +783,13 @@ func TestVisualHivePullRequestBundleRequestRequiresOnlyIndependentImmutablePins(
 	}
 }
 
+func TestVisualHivePullRequestProducerCommitMatchesAuditedRuntime(t *testing.T) {
+	const auditedProducerCommit = "dcfc3f5816739a2f4937b66e1a319b3918571231"
+	if VisualHivePullRequestProducerCommit != auditedProducerCommit {
+		t.Fatalf("Visual Hive PR producer pin %q does not match audited runtime %q", VisualHivePullRequestProducerCommit, auditedProducerCommit)
+	}
+}
+
 func TestVerifiedVisualHivePullRequestBundleRejectsLocalForgeryAndTamper(t *testing.T) {
 	if _, err := (VerifiedVisualHivePullRequestBundle{}).Receipt(); err == nil {
 		t.Fatal("zero/local verified PR capability was accepted")
