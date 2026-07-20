@@ -2867,6 +2867,41 @@ func targetPackageInstallShell() string {
               corepack_enabled=1
             fi
           }
+          validate_package_scope() {
+            local lockfile="$1"
+            local package_dir
+            package_dir="$(dirname "$lockfile")"
+            if [ -f "$package_dir/package.json" ]; then
+              return 0
+            fi
+            if [ "$(basename "$lockfile")" != "package-lock.json" ]; then
+              echo "Package lock $lockfile has no sibling package.json" >&2
+              return 1
+            fi
+            if ! node - "$lockfile" <<'NODE'
+          const fs = require("fs");
+          const lockfile = process.argv[2];
+          const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+          let lock;
+          try {
+            lock = JSON.parse(fs.readFileSync(lockfile, "utf8"));
+          } catch (_) {
+            process.exit(1);
+          }
+          if (!isObject(lock) || !isObject(lock.packages) || Object.keys(lock.packages).length !== 0) {
+            process.exit(1);
+          }
+          if (Object.prototype.hasOwnProperty.call(lock, "dependencies") &&
+              (!isObject(lock.dependencies) || Object.keys(lock.dependencies).length !== 0)) {
+            process.exit(1);
+          }
+          NODE
+            then
+              echo "Orphan npm lock $lockfile is not provably inert; add its package.json or remove the stale lock" >&2
+              return 1
+            fi
+            echo "Ignoring provably inert orphan npm lock $lockfile (no sibling package.json)"
+          }
           while IFS= read -r -d '' lockfile; do
             package_dir="$(dirname "$lockfile")"
             lock_count=0
@@ -2877,10 +2912,14 @@ func targetPackageInstallShell() string {
               echo "Package scope $package_dir must contain exactly one supported lockfile" >&2
               exit 1
             fi
+            validate_package_scope "$lockfile"
           done < <(find . \( -name package-lock.json -o -name pnpm-lock.yaml -o -name yarn.lock \) -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)
           while IFS= read -r -d '' lockfile; do
             package_dir="$(dirname "$lockfile")"
-            test -f "$package_dir/package.json"
+            if [ ! -f "$package_dir/package.json" ]; then
+              validate_package_scope "$lockfile"
+              continue
+            fi
             test -f "$package_dir/package-lock.json"
             (cd "$package_dir" && npm ci)
           done < <(find . -name package-lock.json -not -path '*/node_modules/*' -not -path './.git/*' -print0 | sort -z)

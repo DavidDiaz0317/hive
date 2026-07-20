@@ -112,6 +112,7 @@ func TestInspectCheckoutRejectsAmbiguousPackageLocks(t *testing.T) {
 func TestTargetPackageInstallHandlesMixedLockedAndLocklessRoots(t *testing.T) {
 	bash := workflowBash(t)
 	root := t.TempDir()
+	writeFixture(t, root, "package-lock.json", `{"name":"console","lockfileVersion":3,"requires":true,"packages":{}}`)
 	writeFixture(t, root, "locked/package.json", `{}`)
 	writeFixture(t, root, "locked/package-lock.json", `{}`)
 	writeFixture(t, root, "lockless/package.json", `{}`)
@@ -157,11 +158,82 @@ func TestTargetPackageInstallHandlesMixedLockedAndLocklessRoots(t *testing.T) {
 	if strings.Contains(value, "workspace/packages/member") {
 		t.Fatalf("ancestor lock-owned workspace member was installed twice:\n%s\nshell output:\n%s", value, shellOutput)
 	}
+	if strings.Contains(value, "npm:"+filepath.Base(root)+":ci") {
+		t.Fatalf("inert orphan npm lock was installed as a package scope:\n%s\nshell output:\n%s", value, shellOutput)
+	}
+	if !strings.Contains(string(shellOutput), "Ignoring provably inert orphan npm lock ./package-lock.json") {
+		t.Fatalf("inert orphan npm lock was not reported deterministically:\n%s", shellOutput)
+	}
 	installShell := targetPackageInstallShell()
 	for _, required := range []string{"yarn --version", "yarn install --immutable", "yarn install --frozen-lockfile"} {
 		if !strings.Contains(installShell, required) {
 			t.Fatalf("Yarn major-version compatibility missing %q:\n%s", required, installShell)
 		}
+	}
+}
+
+func TestTargetPackageInstallRejectsUnsafeOrphanLocks(t *testing.T) {
+	bash := workflowBash(t)
+	tests := []struct {
+		name     string
+		lockfile string
+		content  string
+	}{
+		{name: "malformed npm", lockfile: "package-lock.json", content: `{`},
+		{name: "missing packages", lockfile: "package-lock.json", content: `{"lockfileVersion":3}`},
+		{name: "nonempty packages", lockfile: "package-lock.json", content: `{"lockfileVersion":3,"packages":{"node_modules/example":{"version":"1.0.0"}}}`},
+		{name: "nonempty legacy dependencies", lockfile: "package-lock.json", content: `{"lockfileVersion":3,"packages":{},"dependencies":{"example":{"version":"1.0.0"}}}`},
+		{name: "pnpm", lockfile: "pnpm-lock.yaml", content: "lockfileVersion: '9.0'\n"},
+		{name: "yarn", lockfile: "yarn.lock", content: "# yarn\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFixture(t, root, test.lockfile, test.content)
+			lines := strings.Split(targetPackageInstallShell(), "\n")
+			for index := range lines {
+				lines[index] = strings.TrimPrefix(lines[index], "          ")
+			}
+			command := exec.Command(bash, "-e", "-o", "pipefail", "-c", strings.Join(lines, "\n"))
+			command.Dir = root
+			output, runErr := command.CombinedOutput()
+			if runErr == nil {
+				t.Fatalf("unsafe orphan lock was accepted:\n%s", output)
+			}
+			if !strings.Contains(string(output), "has no sibling package.json") &&
+				!strings.Contains(string(output), "is not provably inert") {
+				t.Fatalf("unsafe orphan lock failed without a clear diagnostic: %v\n%s", runErr, output)
+			}
+		})
+	}
+}
+
+func TestTargetPackageInstallRevalidatesBeforeSkippingChangedScope(t *testing.T) {
+	bash := workflowBash(t)
+	root := t.TempDir()
+	writeFixture(t, root, "aaa/package.json", `{}`)
+	writeFixture(t, root, "aaa/package-lock.json", `{}`)
+	writeFixture(t, root, "zzz/package.json", `{}`)
+	writeFixture(t, root, "zzz/package-lock.json", `{"lockfileVersion":3,"packages":{"node_modules/example":{"version":"1.0.0"}}}`)
+	fakeBin := filepath.Join(root, "fake-bin")
+	writeFixture(t, fakeBin, "npm", "#!/usr/bin/env bash\nif [ \"$(basename \"$PWD\")\" = aaa ]; then rm -f \"$MUTATE_TARGET\"; fi\n")
+	if err := os.Chmod(filepath.Join(fakeBin, "npm"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(targetPackageInstallShell(), "\n")
+	for index := range lines {
+		lines[index] = strings.TrimPrefix(lines[index], "          ")
+	}
+	script := "export PATH=" + shellQuote(bashFilesystemPath(fakeBin)) + ":\"$PATH\"\n" + strings.Join(lines, "\n")
+	command := exec.Command(bash, "-e", "-o", "pipefail", "-c", script)
+	command.Dir = root
+	command.Env = append(os.Environ(), "MUTATE_TARGET="+bashFilesystemPath(filepath.Join(root, "zzz", "package.json")))
+	output, runErr := command.CombinedOutput()
+	if runErr == nil {
+		t.Fatalf("scope changed after validation was silently skipped:\n%s", output)
+	}
+	if !strings.Contains(string(output), "is not provably inert") {
+		t.Fatalf("changed scope failed without the inert-lock diagnostic: %v\n%s", runErr, output)
 	}
 }
 
