@@ -157,10 +157,11 @@ func TestRunnerOwnedResolutionScopesRequireFreshStrictReceipts(t *testing.T) {
 }
 
 type isolatedWorkflowJob struct {
-	Name  string            `yaml:"name"`
-	If    string            `yaml:"if"`
-	Needs workflowNeedsList `yaml:"needs"`
-	Steps []struct {
+	Name           string            `yaml:"name"`
+	If             string            `yaml:"if"`
+	Needs          workflowNeedsList `yaml:"needs"`
+	TimeoutMinutes int               `yaml:"timeout-minutes"`
+	Steps          []struct {
 		ID   string            `yaml:"id"`
 		Name string            `yaml:"name"`
 		If   string            `yaml:"if"`
@@ -313,6 +314,9 @@ func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T
 				job, exists := document.Jobs[jobID]
 				if !exists || job.Name != fmt.Sprintf("Hive repository test %03d", index+1) {
 					t.Fatalf("expanded repository job %q is missing or renamed: %+v", jobID, job)
+				}
+				if job.TimeoutMinutes != 60 {
+					t.Fatalf("expanded repository job %q timeout is %d minutes, want 60", jobID, job.TimeoutMinutes)
 				}
 				if len(job.Steps) != len(first.Steps) {
 					t.Fatalf("expanded repository job %q has %d steps, want %d", jobID, len(job.Steps), len(first.Steps))
@@ -1905,6 +1909,7 @@ func TestProductionPrerequisiteRequiresExactTopologyAndSuccessfulVisualExecution
 		`{"repository-test-001":{"result":"success"}}`,
 		`{"repository-test-001":{"result":"success"},"repository-test-002":{"result":"success"},"visual-hive-execution":{"result":"success"}}`,
 		`{"repository-test-001":{"result":"skipped"},"visual-hive-execution":{"result":"success"}}`,
+		`{"repository-test-001":{"result":"cancelled"},"visual-hive-execution":{"result":"success"}}`,
 	} {
 		if err := run(invalid); err == nil {
 			t.Fatalf("invalid production prerequisite topology/outcome was accepted: %s", invalid)
@@ -1949,6 +1954,7 @@ func TestPullRequestEnforcementUsesOnlyRunnerOwnedJobTopology(t *testing.T) {
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"failure"},"repository-test-001":{"result":"success"}}`,
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"success"},"repository-test-002":{"result":"success"}}`,
 		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"}}`,
+		`HIVE_NEEDS_JSON={"visual-hive-execution":{"result":"success"},"repository-test-001":{"result":"cancelled"}}`,
 	} {
 		environment := replaceEnvironment(baseEnv, "HIVE_NEEDS_JSON", invalid)
 		if err := run(environment); err == nil {
