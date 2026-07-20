@@ -263,6 +263,94 @@ func TestGeneratedWorkflowsUseCanonicalYAMLWhitespace(t *testing.T) {
 	}
 }
 
+func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T) {
+	const maximumWorkflowBytes = 512 * 1024
+	config := isolationWorkflowConfig()
+	config.TestCommands = make([][]string, 256)
+	for index := range config.TestCommands {
+		config.TestCommands[index] = []string{"node", "--test", fmt.Sprintf("fixture-%03d.test.js", index+1)}
+	}
+	anchors := []string{
+		"hive-repository-test-checkout",
+		"hive-repository-test-setup-node",
+		"hive-repository-test-setup-python",
+		"hive-repository-test-prepare-account",
+		"hive-repository-test-install-dependencies",
+		"hive-repository-test-seal-checkout",
+		"hive-repository-test-cleanup",
+	}
+	tests := []struct {
+		name      string
+		generated string
+	}{
+		{name: "production", generated: workflow(config)},
+		{name: "pull-request", generated: pullRequestWorkflow(config)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if len(test.generated) >= maximumWorkflowBytes {
+				t.Fatalf("maximum 256-command workflow is %d bytes, want less than %d", len(test.generated), maximumWorkflowBytes)
+			}
+			if strings.Contains(test.generated, "<<:") {
+				t.Fatal("generated workflow uses unsupported YAML merge-key semantics")
+			}
+			for _, anchor := range anchors {
+				if definitions := strings.Count(test.generated, "&"+anchor); definitions != 1 {
+					t.Fatalf("anchor %q has %d definitions, want 1", anchor, definitions)
+				}
+				if aliases := strings.Count(test.generated, "*"+anchor); aliases != len(config.TestCommands)-1 {
+					t.Fatalf("anchor %q has %d aliases, want %d", anchor, aliases, len(config.TestCommands)-1)
+				}
+			}
+
+			document := parseIsolatedWorkflow(t, test.generated)
+			first := document.Jobs["repository-test-001"]
+			if len(first.Steps) != 8 {
+				t.Fatalf("expanded first repository job has %d steps, want 8", len(first.Steps))
+			}
+			for index, command := range config.TestCommands {
+				jobID := fmt.Sprintf("repository-test-%03d", index+1)
+				job, exists := document.Jobs[jobID]
+				if !exists || job.Name != fmt.Sprintf("Hive repository test %03d", index+1) {
+					t.Fatalf("expanded repository job %q is missing or renamed: %+v", jobID, job)
+				}
+				if len(job.Steps) != len(first.Steps) {
+					t.Fatalf("expanded repository job %q has %d steps, want %d", jobID, len(job.Steps), len(first.Steps))
+				}
+				commandSteps := 0
+				for stepIndex, step := range job.Steps {
+					if step.Name == "Execute exact repository test command" {
+						commandSteps++
+						quoted := make([]string, 0, len(command))
+						for _, argument := range command {
+							quoted = append(quoted, shellQuote(argument))
+						}
+						expected := "set -euo pipefail\n" + isolatedTargetEnvPrefix() + " " + strings.Join(quoted, " ") + "\n"
+						if step.Run != expected {
+							t.Fatalf("expanded repository job %q command changed:\n got %q\nwant %q", jobID, step.Run, expected)
+						}
+						continue
+					}
+					got, err := json.Marshal(step)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want, err := json.Marshal(first.Steps[stepIndex])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("expanded repository job %q step %d differs from its anchored definition", jobID, stepIndex+1)
+					}
+				}
+				if commandSteps != 1 {
+					t.Fatalf("expanded repository job %q has %d exact command steps, want 1", jobID, commandSteps)
+				}
+			}
+		})
+	}
+}
+
 func TestGeneratedWorkflowLongRunScalarsContainNoGitHubExpressions(t *testing.T) {
 	const githubExpressionLengthLimit = 21000
 	longRunScalars := 0

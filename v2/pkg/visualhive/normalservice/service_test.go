@@ -591,6 +591,127 @@ func TestNormalServicePauseReleasesRealLeaseAndResumesExactLedgerWithoutDuplicat
 	finalLease()
 }
 
+func TestNormalServiceSetupBaselinePROpenReleasesLeaseAndApprovedResumes(t *testing.T) {
+	stateDir := t.TempDir()
+	store, err := integrated.NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prOpen := normalServiceSetupBaselineIntent(t, integrated.SetupBaselinePROpen)
+	starts := make(chan int, 4)
+	source := &setupBaselineQuiescenceSource{
+		starts: starts,
+		onFirst: func() error {
+			return store.SaveSetupBaselineIntent(prOpen)
+		},
+	}
+	fixture := newServiceFixture(t)
+	service, err := New(Options{
+		StateDir: filepath.Join(stateDir, "visual-hive"), PollInterval: time.Hour, LeaseRetry: 10 * time.Millisecond, QuiesceInterval: 10 * time.Millisecond,
+		AcquireLease:  func() (func(), error) { return integrated.AcquireNormalVisualWorkLease(stateDir) },
+		ShouldQuiesce: func() (bool, error) { return integrated.NormalVisualWorkRequiresSetupQuiescence(stateDir) },
+		Source:        source, Intake: fixture.intake, Repairer: fixture.repairer, Verdict: fixture.verifier, PullRequestState: fixture.verifier,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		service.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("normal service did not stop")
+		}
+	}()
+
+	select {
+	case call := <-starts:
+		if call != 1 {
+			t.Fatalf("first setup-baseline service fetch = %d", call)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("normal service did not reach setup-baseline reconciliation")
+	}
+	approvalLease := acquireNormalServiceTestLease(t, stateDir, 3*time.Second)
+	approvalLease()
+	time.Sleep(50 * time.Millisecond)
+	stillFree := acquireNormalServiceTestLease(t, stateDir, time.Second)
+	stillFree()
+
+	approved := prOpen
+	approved.Phase = integrated.SetupBaselineApproved
+	approved.ApprovalPlanDigest = strings.Repeat("2", 64)
+	approved.ApprovalActorID = approved.AuthorizerID
+	approved.ApprovalReason = "reviewed"
+	if err := store.SaveSetupBaselineIntent(approved); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case call := <-starts:
+		if call != 2 {
+			t.Fatalf("resumed setup-baseline service fetch = %d", call)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("normal service did not reacquire after exact approval")
+	}
+	if release, err := integrated.AcquireNormalVisualWorkLease(stateDir); !errors.Is(err, integrated.ErrRunInProgress) {
+		if err == nil {
+			release()
+		}
+		t.Fatalf("approved service did not reacquire the production lease: %v", err)
+	}
+}
+
+func acquireNormalServiceTestLease(t *testing.T, stateDir string, timeout time.Duration) func() {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		release, err := integrated.AcquireNormalVisualWorkLease(stateDir)
+		if err == nil {
+			return release
+		}
+		if !errors.Is(err, integrated.ErrRunInProgress) {
+			t.Fatalf("acquire normal service test lease: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("normal service retained the production lease past the setup-baseline approval hold")
+	return nil
+}
+
+func normalServiceSetupBaselineIntent(t *testing.T, phase string) integrated.SetupBaselineIntent {
+	t.Helper()
+	now := time.Now().UTC()
+	correlation := strings.Repeat("c", 64)
+	candidate := integrated.SetupBaselineCandidate{Path: ".visual-hive/snapshots/linux/home.png", SHA256: strings.Repeat("e", 64), Bytes: 9}
+	candidatesJSON, err := json.Marshal([]integrated.SetupBaselineCandidate{candidate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateDigest := sha256.Sum256(candidatesJSON)
+	emptyJSON, err := json.Marshal([]integrated.SetupBaselineCandidate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyDigest := sha256.Sum256(emptyJSON)
+	return integrated.SetupBaselineIntent{
+		SchemaVersion: integrated.SetupBaselineSchema, Phase: phase, Repository: "owner/repo", RepositoryID: "123", DefaultBranch: "main",
+		AuthorizerID: 42, SetupPRNumber: 1, SetupPRURL: "https://example.test/pull/1", SetupHeadSHA: strings.Repeat("a", 40),
+		VisualHiveConfigDigest: strings.Repeat("8", 64), ScreenshotContractDigest: strings.Repeat("9", 64), InitialBaselineDigest: hex.EncodeToString(emptyDigest[:]),
+		CaptureCorrelation: correlation, CaptureHeadSHA: strings.Repeat("a", 40), CaptureRunID: 77, CaptureRunURL: "https://example.test/run/77",
+		ArtifactID: 88, ArtifactName: "artifact", ArtifactRoot: "root", CaptureCandidateDigest: hex.EncodeToString(candidateDigest[:]), CaptureCandidates: []integrated.SetupBaselineCandidate{candidate},
+		CandidateDigest: hex.EncodeToString(candidateDigest[:]), Candidates: []integrated.SetupBaselineCandidate{candidate}, Branch: "hive/setup-baseline-123", CommitSHA: strings.Repeat("f", 40),
+		Marker: "<!-- hive-setup-baseline: owner/repo:" + correlation + " -->", PRNumber: 2, PRURL: "https://example.test/pull/2", BaseSHA: strings.Repeat("a", 40),
+		DiffDigest: strings.Repeat("1", 64), CreatedAt: now, UpdatedAt: now, DispatchAttemptedAt: now, DispatchAcknowledgedAt: now,
+	}
+}
+
 func waitForSuccessfulCycle(t *testing.T, cycles <-chan error, timeout time.Duration) {
 	t.Helper()
 	timer := time.NewTimer(timeout)
@@ -762,6 +883,35 @@ func (blockingArtifactSource) Fetch(ctx context.Context) (integrated.NormalVisua
 }
 
 func (blockingArtifactSource) Consume(integrated.WorkflowRunEvidence, bool) error {
+	return nil
+}
+
+type setupBaselineQuiescenceSource struct {
+	mu      sync.Mutex
+	calls   int
+	starts  chan<- int
+	onFirst func() error
+}
+
+func (source *setupBaselineQuiescenceSource) Fetch(ctx context.Context) (integrated.NormalVisualWork, error) {
+	source.mu.Lock()
+	source.calls++
+	call := source.calls
+	source.mu.Unlock()
+	if call == 1 && source.onFirst != nil {
+		if err := source.onFirst(); err != nil {
+			return integrated.NormalVisualWork{}, err
+		}
+	}
+	source.starts <- call
+	if call == 1 {
+		return integrated.NormalVisualWork{}, errors.New("setup baseline review requires exact approval")
+	}
+	<-ctx.Done()
+	return integrated.NormalVisualWork{}, ctx.Err()
+}
+
+func (*setupBaselineQuiescenceSource) Consume(integrated.WorkflowRunEvidence, bool) error {
 	return nil
 }
 

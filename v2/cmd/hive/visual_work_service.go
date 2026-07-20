@@ -328,6 +328,10 @@ func configureNormalVisualWorkRunner(
 			if err != nil || requested {
 				return requested, err
 			}
+			setupHeld, err := integrated.NormalVisualWorkRequiresSetupQuiescence(installed.StateDir)
+			if err != nil || setupHeld {
+				return true, err
+			}
 			current, _, err := loader()
 			if err != nil {
 				return true, err
@@ -342,7 +346,9 @@ func configureNormalVisualWorkRunner(
 		Source: source, Intake: controller, Repairer: repairer, PullRequestState: verdict,
 		// The verifier applies only its opaque check-evidence capability. The
 		// service/controller still own completion and workflow consumption; no
-		// merge, baseline, issue-resolution, or repository-write authority exists.
+		// baseline approval, issue-resolution, merge, or unrelated repository-write
+		// authority exists. Setup baseline progression reuses the integrated state
+		// machine and quiesces for exact external approval.
 		Verdict: verdict, Logger: logger, OnCycleStart: health.StartCycle, OnCycle: health.RecordCycle, OnInactive: health.RecordInactive,
 	})
 	if err != nil {

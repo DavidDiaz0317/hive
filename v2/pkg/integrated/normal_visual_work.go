@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -22,6 +23,12 @@ type NormalVisualWork struct {
 	Artifact hivegithub.VerifiedVisualHiveArtifact
 }
 
+// ErrNormalVisualSetupBaselinePending means the final read-only production
+// gate found a valid setup-baseline checkpoint that is not production-ready.
+// Errors while advancing that checkpoint retain their own identity and are
+// reported normally; this sentinel is not authority to bypass or approve it.
+var ErrNormalVisualSetupBaselinePending = errors.New("normal Visual Hive setup baseline is pending")
+
 // UsesNormalHiveRuntime reports whether the existing ordinary Hive/dashboard
 // process owns local Visual Hive repair cadence. Advisory and issues-only local
 // installations retain the legacy scheduler, while hosted installations remain
@@ -31,9 +38,11 @@ func UsesNormalHiveRuntime(config Config) bool {
 		(config.Automation == AutomationRepairPR || config.Automation == AutomationAutoMerge)
 }
 
-// FetchNormalVisualWork reuses the released integrated transport/verifier as a
-// narrow source for the normal service. The caller must own the shared
-// production-run lease for its complete lifetime.
+// FetchNormalVisualWork reuses the released integrated setup-baseline state
+// machine and production transport/verifier as a narrow source for the normal
+// service. The caller must own the shared production-run lease for its complete
+// lifetime. Baseline approval remains an exact external operator action; no
+// normal production dispatch is permitted before production verification.
 func FetchNormalVisualWork(ctx context.Context, stateDir string, timeout time.Duration, client *hivegithub.Client) (NormalVisualWork, error) {
 	if client == nil || stateDir == "" {
 		return NormalVisualWork{}, errors.New("normal Visual Hive fetch requires GitHub and persistent state")
@@ -70,6 +79,16 @@ func FetchNormalVisualWork(ctx context.Context, stateDir string, timeout time.Du
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if err := reconcileNormalVisualSetupBaselineBeforeProduction(runCtx, store, config, client); err != nil {
+		return NormalVisualWork{}, err
+	}
+	// Keep a final read-only gate adjacent to the mutation. The production-run
+	// lease excludes setup changes between reconciliation and this dispatch,
+	// while this check prevents a future refactor from silently removing the
+	// production-verified prerequisite.
+	if err := requireNormalVisualSetupBaselineProductionReady(store, config); err != nil {
+		return NormalVisualWork{}, err
+	}
 	workflow, err := dispatchAndWait(runCtx, client, config)
 	if err != nil {
 		return NormalVisualWork{}, err
@@ -98,6 +117,74 @@ func FetchNormalVisualWork(ctx context.Context, stateDir string, timeout time.Du
 		return NormalVisualWork{}, err
 	}
 	return NormalVisualWork{Config: config, Workflow: workflow, Artifact: verified}, nil
+}
+
+func reconcileNormalVisualSetupBaselineBeforeProduction(ctx context.Context, store *Store, config Config, client *hivegithub.Client) error {
+	intent, blocked, err := reconcileRequiredSetupBaselineBeforeRun(ctx, store, config, client)
+	if !blocked {
+		return err
+	}
+	phase := strings.TrimSpace(intent.Phase)
+	if phase == "" {
+		phase = "unknown"
+	}
+	if err != nil {
+		return fmt.Errorf("advance normal Visual Hive setup baseline phase %s: %w", phase, err)
+	}
+	return fmt.Errorf("%w: phase %s", ErrNormalVisualSetupBaselinePending, phase)
+}
+
+func requireNormalVisualSetupBaselineProductionReady(store *Store, config Config) error {
+	if store == nil {
+		return errors.New("normal Visual Hive production gate requires persistent state")
+	}
+	if rebind, exists, err := store.LoadSetupBaselineRebindIntent(); err != nil {
+		return fmt.Errorf("read normal Visual Hive setup baseline rebind gate: %w", err)
+	} else if exists {
+		return fmt.Errorf("%w: reconfiguration phase %s", ErrNormalVisualSetupBaselinePending, rebind.Phase)
+	}
+	intent, exists, err := store.LoadSetupBaselineIntent()
+	if err != nil {
+		return fmt.Errorf("read normal Visual Hive setup baseline gate: %w", err)
+	}
+	if !exists {
+		if config.SetupBaselineRequired {
+			return fmt.Errorf("%w: required checkpoint is missing", ErrNormalVisualSetupBaselinePending)
+		}
+		return nil
+	}
+	if intent.Repository != config.Repository || intent.RepositoryID != config.RepositoryID || intent.DefaultBranch != config.DefaultBranch || intent.AuthorizerID != config.SetupAuthorizationActorID ||
+		intent.SetupPRNumber != config.SetupPRNumber || intent.SetupPRURL != config.SetupPRURL || !strings.EqualFold(intent.SetupHeadSHA, config.SetupHeadSHA) ||
+		!strings.EqualFold(intent.VisualHiveConfigDigest, config.VisualHiveConfigDigest) || !strings.EqualFold(intent.ScreenshotContractDigest, config.SetupBaselineContractDigest) ||
+		!strings.EqualFold(intent.InitialBaselineDigest, config.SetupBaselineInitialDigest) || !reflect.DeepEqual(intent.InitialBaselineCandidates, config.SetupBaselineInitialCandidates) {
+		return errors.New("normal Visual Hive production gate found a setup baseline bound to different installed configuration")
+	}
+	if intent.Phase != SetupBaselineProductionVerified || intent.PendingAudit != nil {
+		return fmt.Errorf("%w: phase %s", ErrNormalVisualSetupBaselinePending, intent.Phase)
+	}
+	return nil
+}
+
+// NormalVisualWorkRequiresSetupQuiescence reports only setup states that must
+// be completed by a command outside the ordinary service cycle. The service
+// remains active for every machine-owned baseline phase, but releases the
+// production lease while exact human approval is held or a setup rebind owns
+// the next command.
+func NormalVisualWorkRequiresSetupQuiescence(stateDir string) (bool, error) {
+	store, err := NewStore(filepath.Join(stateDir, "integrated"))
+	if err != nil {
+		return true, err
+	}
+	if _, exists, err := store.LoadSetupBaselineRebindIntent(); err != nil {
+		return true, err
+	} else if exists {
+		return true, nil
+	}
+	intent, exists, err := store.LoadSetupBaselineIntent()
+	if err != nil {
+		return true, err
+	}
+	return exists && intent.Phase == SetupBaselinePROpen, nil
 }
 
 // synchronizeNormalVisualWorkBase makes the already verified live workflow

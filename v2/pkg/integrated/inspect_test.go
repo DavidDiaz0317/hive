@@ -505,8 +505,20 @@ func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	if !containsString(value, "pipeline-exit-code.txt") || !containsString(value, "set +e") {
 		t.Fatal("workflow must publish evidence after a deterministic red verdict")
 	}
-	if strings.Count(value, "persist-credentials: false") != len(config.TestCommands)+9 {
-		t.Fatal("production workflow must remove credentials from every isolated repository test, target, verifier, tooling, and guarded seed checkout")
+	credentiallessCheckouts := 0
+	for jobName, job := range parseIsolatedWorkflow(t, value).Jobs {
+		for _, step := range job.Steps {
+			if step.Uses != "actions/checkout@"+checkoutActionSHA {
+				continue
+			}
+			credentiallessCheckouts++
+			if persist, exists := step.With["persist-credentials"]; !exists || persist != false {
+				t.Fatalf("production workflow checkout in job %q retained credentials: %v", jobName, persist)
+			}
+		}
+	}
+	if credentiallessCheckouts != len(config.TestCommands)+9 {
+		t.Fatalf("production workflow expanded to %d credentialless checkouts, want %d", credentiallessCheckouts, len(config.TestCommands)+9)
 	}
 	if strings.Count(value, "include-hidden-files: true") != 5 {
 		t.Fatal("raw, independently verified, and lifecycle-bundle uploads must opt in to hidden .visual-hive artifacts")

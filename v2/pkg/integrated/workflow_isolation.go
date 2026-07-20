@@ -183,6 +183,56 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
 		if condition != "" {
 			gate += fmt.Sprintf("    if: ${{ %s }}\n", condition)
 		}
+		prerequisiteSteps := `      - *hive-repository-test-checkout
+      - *hive-repository-test-setup-node
+      - *hive-repository-test-setup-python
+      - *hive-repository-test-prepare-account
+      - *hive-repository-test-install-dependencies
+      - *hive-repository-test-seal-checkout`
+		cleanupStep := `      - *hive-repository-test-cleanup`
+		if jobIndex == 1 {
+			prerequisiteSteps = fmt.Sprintf(`      - &hive-repository-test-checkout
+        uses: actions/checkout@%s
+        with:
+          ref: %s
+          fetch-depth: 1
+          persist-credentials: false
+      - &hive-repository-test-setup-node
+        uses: actions/setup-node@%s
+        with:
+          node-version: 22.23.1
+      - &hive-repository-test-setup-python
+        uses: actions/setup-python@%s
+        with:
+          python-version: "3.11"
+      - &hive-repository-test-prepare-account
+        name: Prepare isolated target account
+        shell: bash
+        run: |
+%s
+      - &hive-repository-test-install-dependencies
+        name: Install repository test dependencies
+        shell: bash
+        run: |
+%s
+      - &hive-repository-test-seal-checkout
+        name: Stop dependency processes and verify exact tracked source
+        shell: bash
+        env:
+          HIVE_TARGET_HEAD_SHA: %s
+        run: |
+%s`, checkoutActionSHA, checkoutRef, setupNodeActionSHA, setupPythonActionSHA,
+				indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10),
+				indentWorkflowShell(dependencyInstall, 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10))
+			cleanupStep = fmt.Sprintf(`      - &hive-repository-test-cleanup
+        name: Terminate isolated target processes and reverify source
+        if: always()
+        shell: bash
+        env:
+          HIVE_TARGET_HEAD_SHA: %s
+        run: |
+%s`, checkoutRef, indentWorkflowShell(verifyImmutableTargetCheckoutShell(), 10))
+		}
 		fmt.Fprintf(&jobs, `  %s:
     name: Hive repository test %03d
 %s    permissions:
@@ -190,48 +240,15 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@%s
-        with:
-          ref: %s
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-node@%s
-        with:
-          node-version: 22.23.1
-      - uses: actions/setup-python@%s
-        with:
-          python-version: "3.11"
-      - name: Prepare isolated target account
-        shell: bash
-        run: |
-%s
-      - name: Install repository test dependencies
-        shell: bash
-        run: |
-%s
-      - name: Stop dependency processes and verify exact tracked source
-        shell: bash
-        env:
-          HIVE_TARGET_HEAD_SHA: %s
-        run: |
 %s
       - name: Execute exact repository test command
         shell: bash
         run: |
           set -euo pipefail
           %s %s
-      - name: Terminate isolated target processes and reverify source
-        if: always()
-        shell: bash
-        env:
-          HIVE_TARGET_HEAD_SHA: %s
-        run: |
 %s
 
-`, jobID, jobIndex, gate, checkoutActionSHA, checkoutRef, setupNodeActionSHA, setupPythonActionSHA,
-			indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10),
-			indentWorkflowShell(dependencyInstall, 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
-			isolatedTargetEnvPrefix(), strings.Join(quoted, " "), checkoutRef, indentWorkflowShell(verifyImmutableTargetCheckoutShell(), 10))
+`, jobID, jobIndex, gate, prerequisiteSteps, isolatedTargetEnvPrefix(), strings.Join(quoted, " "), cleanupStep)
 	}
 	return strings.TrimSuffix(jobs.String(), "\n"), workflowNeeds(jobNames)
 }
