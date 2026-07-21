@@ -473,11 +473,15 @@ func TestResume_ClearsPausedFlag(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("legacy tmux/su-exec agent runtime is Linux-only")
 	}
+	installPassingTmuxStub(t)
 	t.Setenv("HIVE_WORK_DIR", t.TempDir())
 	cfgs := map[string]config.AgentConfig{
 		"worker": makeAgentConfig("claude", "sonnet"),
 	}
 	m := NewManager(cfgs, discardLogger(), ProjectContext{})
+	// Resume state is the subject here; exercise it without depending on the
+	// production per-agent UID/su-exec boundary on an ordinary CI runner.
+	m.agents["worker"].UID = 0
 
 	_ = m.Pause("worker", "test", "test pause")
 	if err := m.Resume(context.Background(), "worker", "test", "test resume"); err != nil {

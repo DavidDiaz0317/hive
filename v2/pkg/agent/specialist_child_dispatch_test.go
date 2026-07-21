@@ -349,6 +349,9 @@ func TestSpecialistChildPreservesCopilotParentAndAllowsConcurrentNormalKick(t *t
 	}
 	manager := newManager(map[string]config.AgentConfig{"quality": configBefore}, testSpecialistLogger(), ProjectContext{Org: "fork-only"}, t.TempDir())
 	parent := manager.agents["quality"]
+	// This test exercises persistent-role isolation, not the production
+	// per-agent UID boundary. Keep tmux entirely behind the local stub.
+	parent.UID = 0
 	startedAt := time.Now().Add(-time.Hour).UTC()
 	parent.State, parent.PID, parent.StartedAt = StateRunning, 4242, &startedAt
 	parent.tmuxSession, parent.tmuxSocket, parent.launchGen = "persistent-quality-pane", "persistent-socket", 17
