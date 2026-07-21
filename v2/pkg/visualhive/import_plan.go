@@ -172,7 +172,7 @@ func (bundle *ValidatedBundle) BuildImportPlan() (VerifiedImportPlan, error) {
 			work.Bead = cloneBatchInput(input)
 		}
 		if command := strings.TrimSpace(observation.ValidationCommand); command != "" {
-			work.ValidationCommands = []string{command}
+			work.ValidationCommands = verifiedObservationValidationCommands(command)
 			work.ReproductionCommands = []string{command}
 			work.ReproductionSource = "verified_observation_validation_command"
 		}
@@ -194,6 +194,17 @@ func (bundle *ValidatedBundle) BuildImportPlan() (VerifiedImportPlan, error) {
 		provenanceVerified: true, sourceVerified: true, verifiedSourceRoot: bundle.verifiedSourceRoot,
 	}
 	return VerifiedImportPlan{packet: packet, works: works, seal: &verifiedImportPlanSeal{bundle: canonical, digest: digest}}, nil
+}
+
+// verifiedObservationValidationCommands translates trusted Visual Hive CLI
+// guidance into the managed exact-PR-head validation seam. The granular
+// producer command remains the reproduction command and in the evidence; Hive
+// never executes it as target-owned shell text.
+func verifiedObservationValidationCommands(command string) []string {
+	if strings.HasPrefix(command, "visual-hive ") {
+		return []string{ExactHeadValidationCommand}
+	}
+	return []string{command}
 }
 
 func (p VerifiedImportPlan) validate() error {

@@ -48,3 +48,13 @@ func TestResolveValidationCommandArgv(t *testing.T) {
 		t.Fatal("resolved argv aliases installed configuration")
 	}
 }
+
+func TestVerifiedObservationValidationCommands(t *testing.T) {
+	granular := "visual-hive mutate --config visual-hive.config.yaml --enforce-min-score"
+	if got := verifiedObservationValidationCommands(granular); !reflect.DeepEqual(got, []string{ExactHeadValidationCommand}) {
+		t.Fatalf("trusted Visual Hive guidance did not bind to exact-head validation: %v", got)
+	}
+	if got := verifiedObservationValidationCommands("npm --prefix AvProj run test:ui"); !reflect.DeepEqual(got, []string{"npm --prefix AvProj run test:ui"}) {
+		t.Fatalf("repository validation argv was changed: %v", got)
+	}
+}
