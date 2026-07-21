@@ -187,6 +187,7 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
       - *hive-repository-test-setup-node
       - *hive-repository-test-setup-python
       - *hive-repository-test-prepare-account
+      - *hive-repository-test-provision-tools
       - *hive-repository-test-install-dependencies
       - *hive-repository-test-seal-checkout`
 		cleanupStep := `      - *hive-repository-test-cleanup`
@@ -210,6 +211,11 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
         shell: bash
         run: |
 %s
+      - &hive-repository-test-provision-tools
+        name: Provision trusted repository test tools
+        shell: bash
+        run: |
+%s
       - &hive-repository-test-install-dependencies
         name: Install repository test dependencies
         shell: bash
@@ -223,6 +229,7 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
         run: |
 %s`, checkoutActionSHA, checkoutRef, setupNodeActionSHA, setupPythonActionSHA,
 				indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10),
+				indentWorkflowShell(trustedRepositoryTestPrerequisitesShell(), 10),
 				indentWorkflowShell(dependencyInstall, 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10))
 			cleanupStep = fmt.Sprintf(`      - &hive-repository-test-cleanup
         name: Terminate isolated target processes and reverify source
@@ -1898,6 +1905,43 @@ echo "HIVE_TARGET_WORKSPACE=$target_workspace" >> "$GITHUB_ENV"
 		isolatedTargetAccount, isolatedTargetAccount, isolatedTargetAccount,
 		isolatedTargetRoot, isolatedTargetWorkspace, isolatedTrustedRoot,
 		isolatedTargetAccount, isolatedTargetAccount)
+}
+
+func trustedRepositoryTestPrerequisitesShell() string {
+	return `set -euo pipefail
+sudo apt-get update -qq
+sudo apt-get install -y -qq --no-install-recommends ripgrep
+rg_path="$(readlink -f /usr/bin/rg)"
+test "$rg_path" = "/usr/bin/rg"
+test -x "$rg_path"
+test "$(dpkg-query -S "$rg_path")" = "ripgrep: /usr/bin/rg"
+test "$(stat -Lc '%u:%g' "$rg_path")" = "0:0"
+if sudo -u ` + isolatedTargetAccount + ` -- test -w "$rg_path"; then
+  echo "System ripgrep executable is writable by the isolated target account" >&2
+  exit 1
+fi
+rg_version="$($rg_path --version | sed -n '1p')"
+case "$rg_version" in
+  'ripgrep '[0-9]*) ;;
+  *) echo "System ripgrep reported an invalid version: $rg_version" >&2; exit 1 ;;
+esac
+target_rg="$(` + isolatedTargetEnvPrefix() + ` bash --noprofile --norc -c 'command -v rg')"
+test "$(readlink -f "$target_rg")" = "$rg_path"
+probe_output="$(` + isolatedTargetEnvPrefix() + ` bash --noprofile --norc -c '
+set -euo pipefail
+probe_root="$HOME/.cache/tmp/hive-rg-package-manager-probe"
+rm -rf -- "$probe_root"
+mkdir -p "$probe_root"
+printf "%s\n" "{\"scripts\":{\"hive-rg-probe\":\"command -v rg && rg --version\"}}" > "$probe_root/package.json"
+npm --prefix "$probe_root" run --silent hive-rg-probe
+rm -rf -- "$probe_root"
+')"
+test "$(printf '%s\n' "$probe_output" | sed -n '1p')" = "$rg_path"
+if ! printf '%s\n' "$probe_output" | grep -Fqx "$rg_version"; then
+  echo "Ordinary target npm execution did not report the provisioned system ripgrep version" >&2
+  exit 1
+fi
+`
 }
 
 // prepareIsolatedVisualEvidenceRuntimeShell installs the runner-owned

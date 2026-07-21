@@ -276,6 +276,7 @@ func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T
 		"hive-repository-test-setup-node",
 		"hive-repository-test-setup-python",
 		"hive-repository-test-prepare-account",
+		"hive-repository-test-provision-tools",
 		"hive-repository-test-install-dependencies",
 		"hive-repository-test-seal-checkout",
 		"hive-repository-test-cleanup",
@@ -306,8 +307,8 @@ func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T
 
 			document := parseIsolatedWorkflow(t, test.generated)
 			first := document.Jobs["repository-test-001"]
-			if len(first.Steps) != 8 {
-				t.Fatalf("expanded first repository job has %d steps, want 8", len(first.Steps))
+			if len(first.Steps) != 9 {
+				t.Fatalf("expanded first repository job has %d steps, want 9", len(first.Steps))
 			}
 			for index, command := range config.TestCommands {
 				jobID := fmt.Sprintf("repository-test-%03d", index+1)
@@ -352,6 +353,57 @@ func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestGeneratedRepositoryTestsProvisionTrustedRipgrep(t *testing.T) {
+	for workflowName, generated := range map[string]string{
+		"production":   workflow(isolationWorkflowConfig()),
+		"pull-request": pullRequestWorkflow(isolationWorkflowConfig()),
+	} {
+		document := parseIsolatedWorkflow(t, generated)
+		for _, jobID := range []string{"repository-test-001", "repository-test-002"} {
+			job := document.Jobs[jobID]
+			stepIndex := map[string]int{}
+			for index, step := range job.Steps {
+				stepIndex[step.Name] = index
+			}
+			for _, stepName := range []string{"Prepare isolated target account", "Install repository test dependencies", "Execute exact repository test command"} {
+				if _, exists := stepIndex[stepName]; !exists {
+					t.Fatalf("%s workflow job %q lacks required step %q", workflowName, jobID, stepName)
+				}
+			}
+			provisionIndex, exists := stepIndex["Provision trusted repository test tools"]
+			if !exists {
+				t.Fatalf("%s workflow job %q lacks trusted tool provisioning", workflowName, jobID)
+			}
+			if !(stepIndex["Prepare isolated target account"] < provisionIndex &&
+				provisionIndex < stepIndex["Install repository test dependencies"] &&
+				stepIndex["Install repository test dependencies"] < stepIndex["Execute exact repository test command"]) {
+				t.Fatalf("%s workflow job %q provisions trusted tools in the wrong order: %+v", workflowName, jobID, stepIndex)
+			}
+			provision := job.Steps[provisionIndex].Run
+			for _, required := range []string{
+				"sudo apt-get install -y -qq --no-install-recommends ripgrep",
+				`rg_path="$(readlink -f /usr/bin/rg)"`,
+				`test "$rg_path" = "/usr/bin/rg"`,
+				`test "$(dpkg-query -S "$rg_path")" = "ripgrep: /usr/bin/rg"`,
+				`test "$(stat -Lc '%u:%g' "$rg_path")" = "0:0"`,
+				`System ripgrep executable is writable by the isolated target account`,
+				`case "$rg_version" in`,
+				`target_rg="$(` + isolatedTargetEnvPrefix() + ` bash --noprofile --norc -c 'command -v rg')"`,
+				`test "$(readlink -f "$target_rg")" = "$rg_path"`,
+				`npm --prefix "$probe_root" run --silent hive-rg-probe`,
+				`Ordinary target npm execution did not report the provisioned system ripgrep version`,
+			} {
+				if !strings.Contains(provision, required) {
+					t.Fatalf("%s workflow job %q trusted ripgrep prerequisite is missing %q", workflowName, jobID, required)
+				}
+			}
+			if strings.Count(provision, isolatedTargetEnvPrefix()) != 2 {
+				t.Fatalf("%s workflow job %q does not verify ripgrep through the exact target environment", workflowName, jobID)
+			}
+		}
 	}
 }
 
