@@ -3,6 +3,7 @@ package integrated
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	hivegithub "github.com/kubestellar/hive/v2/pkg/github"
@@ -159,7 +160,7 @@ jobs:
 func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition string) (string, string) {
 	var jobs strings.Builder
 	jobNames := make([]string, 0, len(config.TestCommands))
-	dependencyInstall := isolatedTargetDependencyShell(false)
+	dependencyInstall := isolatedTargetDependencyShell(config.TestCommands, false)
 	checkoutRef := "${{ github.sha }}"
 	if prerequisite != "" {
 		checkoutRef = "${{ github.event.pull_request.head.sha }}"
@@ -553,7 +554,7 @@ func isolatedVisualExecutionWorkflowJob(config Config, pullRequest bool, conditi
 		config.VisualHiveRepo, config.VisualHiveRef, setupNodeActionSHA, setupPythonActionSHA, config.VisualHiveRef,
 		indentWorkflowShell(prepareIsolatedTargetAccountShell(), 10), isolatedTrustedTooling,
 		indentWorkflowShell(prepareIsolatedVisualEvidenceRuntimeShell(pullRequest), 10), captureScope,
-		indentWorkflowShell(isolatedTargetDependencyShell(true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
+		indentWorkflowShell(isolatedTargetDependencyShell(config.TestCommands, true), 10), checkoutRef, indentWorkflowShell(verifyAndSealTargetCheckoutShell(), 10),
 		indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10), indentWorkflowShell(prepareIsolatedVisualEvidenceRootShell(), 10), targetPipelineEnv, evidenceLauncherPrefix, modeArgs, sealIdentityEnv,
 		isolatedTargetAccount, isolatedEvidenceAccount, isolatedTargetAccount, isolatedEvidenceAccount,
 		isolatedTargetAccount, isolatedEvidenceAccount, indentWorkflowShell(trustedBrowserHandoffVerificationShell(), 10),
@@ -2456,13 +2457,13 @@ fi
 `, isolatedTargetAccount)
 }
 
-func isolatedTargetDependencyShell(includeTrustedBrowser bool) string {
+func isolatedTargetDependencyShell(commands [][]string, includeTrustedBrowser bool) string {
+	packageScopes, err := selectedPackageDependencyScopes(commands)
+	if err != nil {
+		return fmt.Sprintf("set -euo pipefail\necho %s >&2\nexit 1\n", shellQuote("Hive rejected selected package dependency scope: "+err.Error()))
+	}
 	targetInstall := strings.ReplaceAll(dedentWorkflowShell(targetPackageInstallShell()), "corepack enable", "corepack enable --install-directory /home/hive-target/.local/bin")
-	pythonInstall := `if [ -f pyproject.toml ]; then
-  python -m pip install -e .
-elif [ -f requirements.txt ]; then
-  python -m pip install -r requirements.txt
-fi`
+	pythonInstall := selectedPythonDependencyInstallShell(packageScopes)
 	trustedBrowserBefore := ""
 	trustedBrowserAfter := ""
 	targetEnvironment := isolatedTargetEnvPrefix()
@@ -2576,6 +2577,91 @@ done < <(find . -path '*/node_modules/@playwright/test/cli.js' -not -path './.gi
 HIVE_TARGET_DEPENDENCIES
 %s
 `, trustedBrowserBefore, targetEnvironment, targetInstall, pythonInstall, trustedBrowserAfter)
+}
+
+func selectedPackageDependencyScopes(commands [][]string) ([]string, error) {
+	selected := map[string]bool{}
+	for _, command := range commands {
+		packageScope, _, _, ok := packageScriptCommandParts(command)
+		if !ok {
+			if selectedRootPythonCommand(command) {
+				selected["."] = true
+			}
+			continue
+		}
+		normalized, err := normalizeSelectedPackageScope(packageScope)
+		if err != nil {
+			return nil, err
+		}
+		selected[normalized] = true
+	}
+	scopes := make([]string, 0, len(selected))
+	for scope := range selected {
+		scopes = append(scopes, scope)
+	}
+	sort.Strings(scopes)
+	return scopes, nil
+}
+
+func selectedRootPythonCommand(command []string) bool {
+	if len(command) == 0 {
+		return false
+	}
+	executable := strings.ToLower(strings.ReplaceAll(command[0], `\`, "/"))
+	if index := strings.LastIndex(executable, "/"); index >= 0 {
+		executable = executable[index+1:]
+	}
+	executable = strings.TrimSuffix(executable, ".exe")
+	return executable == "python" || executable == "python3" || strings.HasPrefix(executable, "python3.") || executable == "pytest" || executable == "py.test"
+}
+
+func normalizeSelectedPackageScope(scope string) (string, error) {
+	if scope == "." {
+		return scope, nil
+	}
+	if scope == "" || strings.TrimSpace(scope) != scope || strings.ContainsAny(scope, "\x00\r\n\t") {
+		return "", fmt.Errorf("package scope %q is empty or contains unsupported whitespace", scope)
+	}
+	normalized := strings.ReplaceAll(scope, `\`, "/")
+	if strings.HasPrefix(normalized, "/") || (len(normalized) >= 2 && normalized[1] == ':' && ((normalized[0] >= 'a' && normalized[0] <= 'z') || (normalized[0] >= 'A' && normalized[0] <= 'Z'))) {
+		return "", fmt.Errorf("package scope %q must be repository-relative", scope)
+	}
+	if strings.HasPrefix(normalized, "-") {
+		return "", fmt.Errorf("package scope %q cannot be interpreted safely as a package installer argument", scope)
+	}
+	segments := strings.Split(normalized, "/")
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("package scope %q contains an unsafe path segment", scope)
+		}
+	}
+	return strings.Join(segments, "/"), nil
+}
+
+func selectedPythonDependencyInstallShell(packageScopes []string) string {
+	lines := []string{
+		`install_python_scope() {`,
+		`  local scope="$1"`,
+		`  local pyproject`,
+		`  local requirements`,
+		`  if [ "$scope" = "." ]; then`,
+		`    pyproject="pyproject.toml"`,
+		`    requirements="requirements.txt"`,
+		`  else`,
+		`    pyproject="$scope/pyproject.toml"`,
+		`    requirements="$scope/requirements.txt"`,
+		`  fi`,
+		`  if [ -f "$pyproject" ]; then`,
+		`    python -m pip install "$scope"`,
+		`  elif [ -f "$requirements" ]; then`,
+		`    python -m pip install -r "$requirements"`,
+		`  fi`,
+		`}`,
+	}
+	for _, scope := range packageScopes {
+		lines = append(lines, "install_python_scope "+shellQuote(scope))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func trustedBrowserHandoffVerificationShell() string {

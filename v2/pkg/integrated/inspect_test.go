@@ -352,6 +352,91 @@ func TestCoverageDepthFiltersExpensiveAndUnsafeScripts(t *testing.T) {
 	}
 }
 
+func TestEssentialCoveragePrefersSafeMatchingCheckOverBuildWriter(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "AvProj/package.json", `{"scripts":{"build:css":"node scripts/build-tailwind.mjs","check:css":"node scripts/build-tailwind.mjs --check","build:assets":"node scripts/build-assets.mjs"}}`)
+	writeFixture(t, root, "Other/package.json", `{"scripts":{"build:css":"node scripts/build-tailwind.mjs"}}`)
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageEssential)
+	if !hasCommand(commands, "npm", "--prefix", "AvProj", "run", "check:css") {
+		t.Fatalf("safe CSS verifier was not selected: %+v", commands)
+	}
+	if hasCommand(commands, "npm", "--prefix", "AvProj", "run", "build:css") {
+		t.Fatalf("matching CSS writer remained selected beside its verifier: %+v", commands)
+	}
+	for _, want := range [][]string{
+		{"npm", "--prefix", "AvProj", "run", "build:assets"},
+		{"npm", "--prefix", "Other", "run", "build:css"},
+	} {
+		if !hasCommand(commands, want...) {
+			t.Fatalf("unmatched writer %v was suppressed: %+v", want, commands)
+		}
+	}
+}
+
+func TestBuildWriterRequiresSafeSelectedRankOneCheckSibling(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		scripts  string
+		coverage Coverage
+		build    string
+	}{
+		{
+			name:     "unsafe check is not admitted",
+			scripts:  `{"scripts":{"build:css":"node build-css.mjs","check:css":"node check-css.mjs || true"}}`,
+			coverage: CoverageEssential,
+			build:    "build:css",
+		},
+		{
+			name:     "rank two check cannot replace writer",
+			scripts:  `{"scripts":{"build:visual":"node build-visual.mjs","check:visual":"node build-visual.mjs --check"}}`,
+			coverage: CoverageStandard,
+			build:    "build:visual",
+		},
+		{
+			name:     "no-op check is not equivalent",
+			scripts:  `{"scripts":{"build:css":"node build-css.mjs","check:css":"echo ok"}}`,
+			coverage: CoverageEssential,
+			build:    "build:css",
+		},
+		{
+			name:     "unrelated check is not equivalent",
+			scripts:  `{"scripts":{"build:css":"node build-css.mjs","check:css":"node unrelated.mjs --check"}}`,
+			coverage: CoverageEssential,
+			build:    "build:css",
+		},
+		{
+			name:     "transitive writer is not an exact verifier",
+			scripts:  `{"scripts":{"build:css":"node build-css.mjs","check:css":"npm run build:css -- --check"}}`,
+			coverage: CoverageEssential,
+			build:    "build:css",
+		},
+		{
+			name:     "chained build body remains a writer",
+			scripts:  `{"scripts":{"build:css":"node preflight.mjs && node build-css.mjs","check:css":"node preflight.mjs && node build-css.mjs --check"}}`,
+			coverage: CoverageEssential,
+			build:    "build:css",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFixture(t, root, "package.json", test.scripts)
+			inspection, err := InspectCheckout(root, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			commands := testCommandsForCoverage(inspection, test.coverage)
+			if !hasCommandNamed(commands, test.build) {
+				t.Fatalf("writer %q was suppressed without a safe selected rank-one sibling: %+v", test.build, commands)
+			}
+		})
+	}
+}
+
 func TestSafeAutomationScriptRejectsNonProductionBrowserLanes(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -569,7 +654,7 @@ func TestExactCommitPinRejectsAbbreviatedOrDifferentRefs(t *testing.T) {
 func TestWorkflowUsesTwoArtifactProvenanceAndPinnedActions(t *testing.T) {
 	config := Config{DefaultBranch: "main", VisualHiveRepo: "owner/visual-hive", VisualHiveRef: "0123456789012345678901234567890123456789", ACMMLevel: 4, TestCommands: [][]string{{"node", "--test"}, {"npm", "--prefix", "dashboard", "run", "test:ci:lite"}, {"python", "-m", "pytest", "-q"}}}
 	value := workflow(config)
-	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "name: Hive repository test 002", "name: Hive repository test 003", "visual-hive-execution", "visual-hive-production", "setup-baseline-capture", "setup-baseline-verify", "--bootstrap-baselines", "hive-setup-baselines-${{ inputs.hive_dispatch_id }}", "setup-baseline-manifest.json", `runner: "ubuntu-latest"`, "sudo -u hive-target -- env -i", "env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY", "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", "python -m pip install -e .", "steps.evidence.outputs.artifact-id", "visual-hive-raw-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "hive-runner-outcome.json", "plan and report lack an exact one-to-one contract evaluation binding", "evaluated-contracts.txt", "authoritative-resolution.txt", "baselines list", "Raw evidence contains a symbolic link", "--authoritative-for-resolution"} {
+	for _, required := range []string{checkoutActionSHA, setupNodeActionSHA, setupPythonActionSHA, uploadArtifactActionSHA, downloadArtifactActionSHA, "name: Hive repository test 001", "name: Hive repository test 002", "name: Hive repository test 003", "visual-hive-execution", "visual-hive-production", "setup-baseline-capture", "setup-baseline-verify", "--bootstrap-baselines", "hive-setup-baselines-${{ inputs.hive_dispatch_id }}", "setup-baseline-manifest.json", `runner: "ubuntu-latest"`, "sudo -u hive-target -- env -i", "env -u GITHUB_TOKEN -u GH_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STEP_SUMMARY", "npm --prefix dashboard run test:ci:lite", "python -m pytest -q", "find . -name package-lock.json", `python -m pip install "$scope"`, "steps.evidence.outputs.artifact-id", "visual-hive-raw-${{ github.run_id }}", "visual-hive-bundle-${{ github.run_id }}", "hive-runner-outcome.json", "plan and report lack an exact one-to-one contract evaluation binding", "evaluated-contracts.txt", "authoritative-resolution.txt", "baselines list", "Raw evidence contains a symbolic link", "--authoritative-for-resolution"} {
 		if !containsString(value, required) {
 			t.Fatalf("workflow missing %q", required)
 		}

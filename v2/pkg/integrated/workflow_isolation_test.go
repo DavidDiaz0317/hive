@@ -473,7 +473,7 @@ func TestGeneratedWorkflowSealStepBindsExactHeadOutsideLongRunScalar(t *testing.
 }
 
 func TestIsolatedDependencyInstallPinsTheTargetWorkingDirectory(t *testing.T) {
-	shell := isolatedTargetDependencyShell(false)
+	shell := isolatedTargetDependencyShell(nil, false)
 	if !strings.Contains(shell, `test "$(pwd -P)" = "$HIVE_TARGET_WORKSPACE"`) {
 		t.Fatal("isolated dependency installation does not verify its inherited runner-owned workspace")
 	}
@@ -517,6 +517,122 @@ func TestIsolatedDependencyInstallPinsTheTargetWorkingDirectory(t *testing.T) {
 	} {
 		if !strings.Contains(review, required) {
 			t.Fatalf("runner-owned review does not preserve the target evidence root: missing %q", required)
+		}
+	}
+}
+
+func TestSelectedPackageDependencyScopesAreSafeSortedAndDeduplicated(t *testing.T) {
+	commands := [][]string{
+		{"npm", "--prefix", "packages/zeta", "run", "test"},
+		{"npm", "--prefix", "AvProj", "run", "test:django"},
+		{"pnpm", "--dir", "AvProj", "run", "check:css"},
+		{"yarn", "--cwd", "packages/alpha", "run", "test"},
+		{"npm", "run", "test"},
+		{"python", "-m", "pytest", "-q"},
+	}
+	scopes, err := selectedPackageDependencyScopes(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{".", "AvProj", "packages/alpha", "packages/zeta"}
+	if strings.Join(scopes, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("selected package scopes = %v, want %v", scopes, want)
+	}
+
+	for _, unsafe := range []string{"../outside", "AvProj/../outside", "/absolute", `C:\absolute`, "AvProj//nested", "AvProj/./nested", " AvProj", "--installer-option"} {
+		t.Run(unsafe, func(t *testing.T) {
+			_, scopeErr := selectedPackageDependencyScopes([][]string{{"npm", "--prefix", unsafe, "run", "test"}})
+			if scopeErr == nil {
+				t.Fatalf("unsafe selected package scope %q was accepted", unsafe)
+			}
+		})
+	}
+}
+
+func TestIsolatedDependencyInstallUsesOnlySelectedPythonScopesWithoutSourceWrites(t *testing.T) {
+	commands := [][]string{
+		{"npm", "--prefix", "packages/zeta", "run", "test"},
+		{"npm", "--prefix", "AvProj", "run", "test:django"},
+		{"npm", "--prefix", "AvProj", "run", "check:css"},
+	}
+	shell := isolatedTargetDependencyShell(commands, false)
+	for _, required := range []string{
+		`install_python_scope AvProj`,
+		`install_python_scope packages/zeta`,
+		`pyproject="$scope/pyproject.toml"`,
+		`requirements="$scope/requirements.txt"`,
+		`python -m pip install "$scope"`,
+		`python -m pip install -r "$requirements"`,
+	} {
+		if !strings.Contains(shell, required) {
+			t.Fatalf("selected Python dependency install omitted %q:\n%s", required, shell)
+		}
+	}
+	if strings.Index(shell, "install_python_scope AvProj") > strings.Index(shell, "install_python_scope packages/zeta") {
+		t.Fatal("selected nested Python scopes are not emitted in deterministic order")
+	}
+	if strings.Count(shell, "install_python_scope AvProj") != 1 {
+		t.Fatalf("duplicate selected scope was installed %d times", strings.Count(shell, "install_python_scope AvProj"))
+	}
+	for _, forbidden := range []string{
+		`install_python_scope .`,
+		"pip install -e",
+		"find . -name requirements",
+		"find . -name pyproject",
+		"Unselected/requirements.txt",
+		"Unselected/pyproject.toml",
+	} {
+		if strings.Contains(shell, forbidden) {
+			t.Fatalf("selected Python dependency install contains forbidden discovery or source-writing form %q", forbidden)
+		}
+	}
+}
+
+func TestRootPythonDependenciesRequireAnExactSelectedRootScope(t *testing.T) {
+	for _, commands := range [][][]string{
+		{{"npm", "run", "test"}},
+		{{"python", "-m", "pytest", "-q"}},
+		{{"pytest", "-q"}},
+	} {
+		shell := isolatedTargetDependencyShell(commands, false)
+		if !strings.Contains(shell, `install_python_scope .`) {
+			t.Fatalf("selected root command did not preserve root Python dependency behavior: %v", commands)
+		}
+	}
+
+	nestedOnly := isolatedTargetDependencyShell([][]string{{"npm", "--prefix", "AvProj", "run", "test"}}, false)
+	if strings.Contains(nestedOnly, `install_python_scope .`) {
+		t.Fatal("nested-only package selection installed an unrelated root Python manifest")
+	}
+}
+
+func TestGeneratedRepositoryAndVisualJobsInstallExactSelectedPythonScope(t *testing.T) {
+	config := isolationWorkflowConfig()
+	config.TestCommands = [][]string{{"npm", "--prefix", "AvProj", "run", "test:django:collectstatic"}}
+	document := parseIsolatedWorkflow(t, workflow(config))
+	for _, jobID := range []string{"repository-test-001", visualExecutionJobName, setupBaselineCaptureJobID} {
+		job, exists := document.Jobs[jobID]
+		if !exists {
+			t.Fatalf("generated workflow is missing %q", jobID)
+		}
+		found := false
+		for _, step := range job.Steps {
+			if !strings.Contains(step.Run, "HIVE_TARGET_DEPENDENCIES") {
+				continue
+			}
+			found = true
+			if !strings.Contains(step.Run, "install_python_scope AvProj") || !strings.Contains(step.Run, `requirements="$scope/requirements.txt"`) {
+				t.Fatalf("job %q did not bind AvProj/requirements.txt through the exact selected scope:\n%s", jobID, step.Run)
+			}
+			if strings.Contains(step.Run, `install_python_scope .`) {
+				t.Fatalf("job %q installed an unrelated root Python manifest for nested-only selection", jobID)
+			}
+			if strings.Contains(step.Run, "pip install -e") || strings.Contains(step.Run, "find . -name requirements") {
+				t.Fatalf("job %q uses source-writing or recursive Python dependency installation", jobID)
+			}
+		}
+		if !found {
+			t.Fatalf("job %q lacks the isolated dependency step", jobID)
 		}
 	}
 }
@@ -1493,7 +1609,7 @@ func TestTrustedCollectorUsesSealedPinnedAndTargetPlaywrightBrowsers(t *testing.
 			t.Fatalf("pull-request verifier still reads %s from the pipeline envelope", stale)
 		}
 	}
-	dependencyShell := isolatedTargetDependencyShell(true)
+	dependencyShell := isolatedTargetDependencyShell(nil, true)
 	install := strings.Index(dependencyShell, `sudo env PLAYWRIGHT_BROWSERS_PATH="$trusted_browser_path" "$HIVE_TRUSTED_NODE" "$tooling_playwright" install --with-deps chromium`)
 	targetDependencies := strings.Index(dependencyShell, "HIVE_TARGET_DEPENDENCIES")
 	if install < 0 || targetDependencies < 0 || install > targetDependencies {

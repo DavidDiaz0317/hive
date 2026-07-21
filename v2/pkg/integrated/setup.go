@@ -2363,6 +2363,9 @@ func readSetupBaselineBlob(ctx context.Context, checkout, objectSHA string) ([]b
 }
 
 func writeManagedFiles(root string, config Config, inspection RepositoryInspection) error {
+	if _, err := selectedPackageDependencyScopes(config.TestCommands); err != nil {
+		return fmt.Errorf("refuse selected package dependency scope: %w", err)
+	}
 	if managedPathPreimagesConfigured(config) {
 		if err := validateManagedPathPreimages(config.ManagedPreimagesVersion, config.ManagedPathPreimages, managedSetupFilesForConfig(config)); err != nil {
 			return fmt.Errorf("refuse managed writes with an invalid managed-path preimage ledger: %w", err)
@@ -2444,12 +2447,71 @@ func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage)
 			commands = append(commands, append([]string(nil), command...))
 		}
 	}
+	commands = preferSafePackageCheckCommands(inspection, commands)
 	commands = preferRepositoryComprehensiveSuite(inspection, commands, coverage)
 	if maximumRank < 3 || !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(inspection, commands) {
 		return sortTestCommands(commands)
 	}
 	commands = append(commands, []string{"node", "--test"})
 	return sortTestCommands(commands)
+}
+
+// preferSafePackageCheckCommands avoids running a repository writer when the
+// same package exposes an admitted, deterministic rank-one verifier for the
+// exact output. The check must already be selected at this coverage depth and
+// retain the same package-manager scope as its build sibling.
+func preferSafePackageCheckCommands(inspection RepositoryInspection, commands [][]string) [][]string {
+	checks := map[string]bool{}
+	for _, command := range commands {
+		packagePath, runner, name, ok := packageScriptCommandParts(command)
+		if !ok || !strings.HasPrefix(name, "check:") || commandCoverageRank(command) != 1 {
+			continue
+		}
+		suffix := strings.TrimPrefix(name, "check:")
+		if suffix == "" {
+			continue
+		}
+		scripts := inspection.packageScripts[packagePath]
+		if !safePackageCheckReplacesBuild(scripts, suffix) {
+			continue
+		}
+		checks[runner+"\x00"+packagePath+"\x00"+suffix] = true
+	}
+	if len(checks) == 0 {
+		return commands
+	}
+	result := make([][]string, 0, len(commands))
+	for _, command := range commands {
+		packagePath, runner, name, ok := packageScriptCommandParts(command)
+		if ok && strings.HasPrefix(name, "build:") {
+			suffix := strings.TrimPrefix(name, "build:")
+			if suffix != "" && checks[runner+"\x00"+packagePath+"\x00"+suffix] {
+				continue
+			}
+		}
+		result = append(result, command)
+	}
+	return result
+}
+
+func safePackageCheckReplacesBuild(scripts map[string]string, suffix string) bool {
+	checkName := "check:" + suffix
+	buildName := "build:" + suffix
+	checkBody, checkExists := scripts[checkName]
+	buildBody, buildExists := scripts[buildName]
+	if !checkExists || !buildExists ||
+		!safeAutomationScript(checkName, checkBody) || !hasSafePackageScriptClosure(checkName, scripts) ||
+		!safeAutomationScript(buildName, buildBody) || !hasSafePackageScriptClosure(buildName, scripts) {
+		return false
+	}
+	buildBody = strings.TrimSpace(buildBody)
+	if strings.Contains(buildBody, "&&") {
+		return false
+	}
+	if _, transitive := strictPackageRunDependencies(buildBody); transitive {
+		return false
+	}
+	return buildBody != "" && strings.TrimSpace(checkBody) == buildBody+" --check"
 }
 
 func commandCoverageRank(command []string) int {
