@@ -857,21 +857,20 @@ func TestReconcileVerifiedSetupBaselineDispatchPreservesProductionRetry(t *testi
 	}
 }
 
-func TestPostBaselineProductionValidationRequiresCanonicalPassedTrustedAuthoritative(t *testing.T) {
+func TestPostBaselineProductionValidationRequiresCanonicalPassedTrustedEvidence(t *testing.T) {
 	for _, test := range []struct {
-		name          string
-		status        string
-		trusted       bool
-		authoritative bool
-		want          bool
+		name    string
+		status  string
+		trusted bool
+		want    bool
 	}{
-		{name: "canonical", status: "passed", trusted: true, authoritative: true, want: true},
-		{name: "noncanonical status", status: "valid", trusted: true, authoritative: true},
-		{name: "untrusted", status: "passed", authoritative: true},
-		{name: "non-authoritative", status: "passed", trusted: true},
+		{name: "authoritative clean scan", status: "passed", trusted: true, want: true},
+		{name: "non-authoritative finding scan", status: "passed", trusted: true, want: true},
+		{name: "noncanonical status", status: "valid", trusted: true},
+		{name: "untrusted", status: "passed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := postBaselineProductionValidationAccepted(test.status, test.trusted, test.authoritative); got != test.want {
+			if got := postBaselineProductionValidationAccepted(test.status, test.trusted); got != test.want {
 				t.Fatalf("acceptance=%t want=%t", got, test.want)
 			}
 		})

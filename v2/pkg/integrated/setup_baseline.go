@@ -744,8 +744,8 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 		if err != nil {
 			return intent, true, fmt.Errorf("validate post-baseline production bundle without lifecycle writes: %w", err)
 		}
-		if !postBaselineProductionValidationAccepted(bundle.Validation.Status, bundle.Validation.Trusted, bundle.Validation.Authoritative) {
-			return intent, true, fmt.Errorf("post-baseline production bundle is not trusted authoritative valid evidence")
+		if !postBaselineProductionValidationAccepted(bundle.Validation.Status, bundle.Validation.Trusted) {
+			return intent, true, fmt.Errorf("post-baseline production bundle is not trusted valid evidence")
 		}
 		if _, err := requireLiveInstalledWorkflowHead(ctx, client, config, workflow.HeadSHA); err != nil {
 			return intent, true, err
@@ -878,8 +878,14 @@ func reconcileSetupBaselineBeforeRun(ctx context.Context, store *Store, config C
 	return intent, true, fmt.Errorf("setup baseline review PR %s is ready; run %s", intent.PRURL, setupBaselinePlanCommand(config.StateDir, intent))
 }
 
-func postBaselineProductionValidationAccepted(status string, trusted, authoritative bool) bool {
-	return status == "passed" && trusted && authoritative
+func postBaselineProductionValidationAccepted(status string, trusted bool) bool {
+	// This gate proves that the installed hosted workflow can produce a
+	// structurally valid, provenance-trusted bundle. It must not require a
+	// defect-free scan: a failed Visual Hive verdict is exactly the evidence
+	// the governed lifecycle needs to create present findings. The bundle's
+	// authoritative flag remains intact and continues to gate absence-based
+	// resolution in the lifecycle importer.
+	return status == "passed" && trusted
 }
 
 func reconcileVerifiedSetupBaselineDispatch(store *Store, intent SetupBaselineIntent) error {
