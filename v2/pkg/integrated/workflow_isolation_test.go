@@ -315,8 +315,8 @@ func TestGeneratedRepositoryTestAnchorsPreserveMaximumPlanSemantics(t *testing.T
 				if !exists || job.Name != fmt.Sprintf("Hive repository test %03d", index+1) {
 					t.Fatalf("expanded repository job %q is missing or renamed: %+v", jobID, job)
 				}
-				if job.TimeoutMinutes != 60 {
-					t.Fatalf("expanded repository job %q timeout is %d minutes, want 60", jobID, job.TimeoutMinutes)
+				if job.TimeoutMinutes != 90 {
+					t.Fatalf("expanded repository job %q timeout is %d minutes, want 90", jobID, job.TimeoutMinutes)
 				}
 				if len(job.Steps) != len(first.Steps) {
 					t.Fatalf("expanded repository job %q has %d steps, want %d", jobID, len(job.Steps), len(first.Steps))

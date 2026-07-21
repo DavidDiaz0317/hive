@@ -238,7 +238,7 @@ func isolatedRepositoryTestWorkflowJobs(config Config, prerequisite, condition s
 %s    permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
 %s
       - name: Execute exact repository test command
