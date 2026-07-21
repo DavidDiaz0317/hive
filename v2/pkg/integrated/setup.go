@@ -2448,12 +2448,40 @@ func testCommandsForCoverage(inspection RepositoryInspection, coverage Coverage)
 		}
 	}
 	commands = preferSafePackageCheckCommands(inspection, commands)
+	commands = preferBaselineAwareLintCheckCommands(inspection, commands)
 	commands = preferRepositoryComprehensiveSuite(inspection, commands, coverage)
 	if maximumRank < 3 || !containsValue(inspection.Languages, "TypeScript/JavaScript") || hasRepositoryUnitCommand(inspection, commands) {
 		return sortTestCommands(commands)
 	}
 	commands = append(commands, []string{"node", "--test"})
 	return sortTestCommands(commands)
+}
+
+// preferBaselineAwareLintCheckCommands removes a redundant raw lint command
+// only when the same selected package exposes a rank-one baseline verifier
+// whose committed implementation demonstrably executes the same eslint scope
+// and fails on new violations. Unproven pairs remain selected and therefore
+// fail visibly instead of silently weakening lint coverage.
+func preferBaselineAwareLintCheckCommands(inspection RepositoryInspection, commands [][]string) [][]string {
+	checks := map[string]bool{}
+	for _, command := range commands {
+		packagePath, runner, name, ok := packageScriptCommandParts(command)
+		if ok && name == "lint:check" && commandCoverageRank(command) == 1 && inspection.baselineLint[packagePath] {
+			checks[runner+"\x00"+packagePath] = true
+		}
+	}
+	if len(checks) == 0 {
+		return commands
+	}
+	result := make([][]string, 0, len(commands))
+	for _, command := range commands {
+		packagePath, runner, name, ok := packageScriptCommandParts(command)
+		if ok && name == "lint" && checks[runner+"\x00"+packagePath] {
+			continue
+		}
+		result = append(result, command)
+	}
+	return result
 }
 
 // preferSafePackageCheckCommands avoids running a repository writer when the

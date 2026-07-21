@@ -61,6 +61,7 @@ type RepositoryInspection struct {
 	Signals          map[string]string `json:"signals"`
 	packageScripts   map[string]map[string]string
 	packageRunners   map[string]string
+	baselineLint     map[string]bool
 }
 
 type SetupPlan struct {

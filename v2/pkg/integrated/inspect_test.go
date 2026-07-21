@@ -378,6 +378,52 @@ func TestEssentialCoveragePrefersSafeMatchingCheckOverBuildWriter(t *testing.T) 
 	}
 }
 
+func TestEssentialCoveragePrefersProvenBaselineAwareLintCheck(t *testing.T) {
+	root := t.TempDir()
+	writeFixture(t, root, "web/package.json", `{"scripts":{"lint":"eslint .","lint:check":"node scripts/lint-baseline-check.mjs"}}`)
+	writeFixture(t, root, "web/.eslint-baseline.json", `[]`)
+	writeFixture(t, root, "web/scripts/lint-baseline-check.mjs", `
+import { execSync } from "node:child_process";
+const baseline = ".eslint-baseline.json";
+execSync("npx eslint . --format json");
+const newEntries = [];
+if (newEntries.length > 0) process.exit(1);
+process.exit(0);
+`)
+
+	inspection, err := InspectCheckout(root, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := testCommandsForCoverage(inspection, CoverageEssential)
+	if !hasCommand(commands, "npm", "--prefix", "web", "run", "lint:check") {
+		t.Fatalf("baseline-aware lint verifier was not selected: %+v", commands)
+	}
+	if hasCommand(commands, "npm", "--prefix", "web", "run", "lint") {
+		t.Fatalf("redundant raw lint remained beside its proven verifier: %+v", commands)
+	}
+}
+
+func TestUnprovenBaselineLintNeverSuppressesRawLint(t *testing.T) {
+	for _, source := range []string{
+		`process.exit(0)`,
+		`execSync("npx eslint src --format json"); const newEntries = []; if (newEntries.length > 0) process.exit(1); process.exit(0)`,
+	} {
+		root := t.TempDir()
+		writeFixture(t, root, "package.json", `{"scripts":{"lint":"eslint .","lint:check":"node scripts/lint-baseline-check.mjs"}}`)
+		writeFixture(t, root, ".eslint-baseline.json", `[]`)
+		writeFixture(t, root, "scripts/lint-baseline-check.mjs", source)
+		inspection, err := InspectCheckout(root, "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commands := testCommandsForCoverage(inspection, CoverageEssential)
+		if !hasCommandNamed(commands, "lint") || !hasCommandNamed(commands, "lint:check") {
+			t.Fatalf("unproven verifier suppressed lint execution: %+v", commands)
+		}
+	}
+}
+
 func TestBuildWriterRequiresSafeSelectedRankOneCheckSibling(t *testing.T) {
 	for _, test := range []struct {
 		name     string

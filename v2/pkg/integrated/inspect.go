@@ -30,6 +30,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		Signals:        map[string]string{},
 		packageScripts: map[string]map[string]string{},
 		packageRunners: map[string]string{},
+		baselineLint:   map[string]bool{},
 	}
 	committedFiles, hasCommittedHead := committedFileSet(root)
 	languages, frameworks, managers := map[string]bool{}, map[string]bool{}, map[string]bool{}
@@ -47,6 +48,7 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 			packagePath = "."
 		}
 		inspection.packageScripts[packagePath] = cloneScriptMap(packageData.Scripts)
+		inspection.baselineLint[packagePath] = hasBaselineAwareLintCheck(packageRoot, packageData.Scripts)
 		languages["TypeScript/JavaScript"] = true
 		for name := range mergeMaps(packageData.Dependencies, packageData.DevDependencies) {
 			switch {
@@ -161,6 +163,45 @@ func InspectCheckout(root, defaultBranch string) (RepositoryInspection, error) {
 		return strings.Join(inspection.TestCommands[i], "\x00") < strings.Join(inspection.TestCommands[j], "\x00")
 	})
 	return inspection, nil
+}
+
+func hasBaselineAwareLintCheck(packageRoot string, scripts map[string]string) bool {
+	lintBody, hasLint := scripts["lint"]
+	checkBody, hasCheck := scripts["lint:check"]
+	if !hasLint || !hasCheck || strings.TrimSpace(strings.ToLower(lintBody)) != "eslint ." ||
+		!safeAutomationScript("lint", lintBody) || !hasSafePackageScriptClosure("lint", scripts) ||
+		!safeAutomationScript("lint:check", checkBody) || !hasSafePackageScriptClosure("lint:check", scripts) {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSpace(checkBody))
+	if len(fields) != 2 || strings.ToLower(fields[0]) != "node" {
+		return false
+	}
+	relative := filepath.Clean(fields[1])
+	if filepath.IsAbs(relative) || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	extension := strings.ToLower(filepath.Ext(relative))
+	if extension != ".js" && extension != ".mjs" && extension != ".cjs" {
+		return false
+	}
+	source, err := os.ReadFile(filepath.Join(packageRoot, relative))
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(string(source))
+	for _, required := range []string{
+		"eslint . --format json",
+		".eslint-baseline.json",
+		"newentries.length > 0",
+		"process.exit(1)",
+		"process.exit(0)",
+	} {
+		if !strings.Contains(lower, required) {
+			return false
+		}
+	}
+	return exists(filepath.Join(packageRoot, ".eslint-baseline.json"))
 }
 
 func committedFileSet(root string) (map[string]bool, bool) {
