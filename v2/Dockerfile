@@ -12,8 +12,9 @@ COPY v2/ .
 
 ARG GIT_HASH=unknown
 ARG GIT_BRANCH=unknown
-RUN GIT_HASH=$(git -C /repo rev-parse HEAD 2>/dev/null || echo "unknown") && \
-    GIT_SHORT=$(git -C /repo rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
+RUN DETECTED_GIT_HASH=$(git -C /repo rev-parse HEAD 2>/dev/null || true) && \
+    if [ "$GIT_HASH" = "unknown" ] || [ -z "$GIT_HASH" ]; then GIT_HASH=${DETECTED_GIT_HASH:-unknown}; fi && \
+    GIT_SHORT=$(printf '%s' "$GIT_HASH" | cut -c1-12) && \
     if [ "$GIT_BRANCH" = "unknown" ] || [ -z "$GIT_BRANCH" ]; then GIT_BRANCH=$(git -C /repo rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown"); fi && \
     GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -ldflags "-X main.gitHash=${GIT_HASH} -X main.gitShort=${GIT_SHORT} -X main.gitBranch=${GIT_BRANCH}" -o /hive ./cmd/hive && \
     GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -o /bd ./cmd/bd
